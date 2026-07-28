@@ -1,0 +1,291 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package pgconf owns every PostgreSQL parameter pgelastic decides for itself: which
+// ones the operator owns, what values it computes for them, and how the resulting
+// configuration files are rendered and hashed.
+//
+// It is shared between the operator and the in-pod instance manager on purpose. The
+// admission webhook rejects an owned parameter and the config generator drops it again,
+// so a stale object that was admitted before a parameter became owned still cannot
+// poison a pod that reads it later.
+package pgconf
+
+import (
+	"maps"
+	"slices"
+
+	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+)
+
+// SettingContext mirrors pg_settings.context. It is what decides whether applying a new
+// value costs a reload, a restart of the postmaster, or nothing at all.
+type SettingContext string
+
+const (
+	// ContextInternal cannot change after initdb.
+	ContextInternal SettingContext = "internal"
+	// ContextPostmaster needs a full postmaster restart, which drops every tenant
+	// connection on the instance.
+	ContextPostmaster SettingContext = "postmaster"
+	// ContextSighup is applied by a reload.
+	ContextSighup SettingContext = "sighup"
+	// ContextSuperuserBackend is fixed for the lifetime of a backend, settable only by a
+	// superuser at connection time.
+	ContextSuperuserBackend SettingContext = "superuser-backend"
+	// ContextBackend is fixed for the lifetime of a backend.
+	ContextBackend SettingContext = "backend"
+	// ContextSuperuser is settable at run time by a superuser.
+	ContextSuperuser SettingContext = "superuser"
+	// ContextUser is settable at run time by any client, which is why every Tier 2
+	// control is advisory rather than enforced.
+	ContextUser SettingContext = "user"
+)
+
+// Ownership says who decides a parameter's value.
+type Ownership string
+
+const (
+	// OwnershipFixed means the operator computes the value from the instance's own shape
+	// - its class, its volumes, its topology - and any user-supplied value is dropped.
+	OwnershipFixed Ownership = "Fixed"
+	// OwnershipBlocked means the parameter must stay at the operator's constant value.
+	// Blocking is about safety rather than sizing: these are the parameters that let a
+	// user route around the operator or invalidate a guarantee the product sells.
+	OwnershipBlocked Ownership = "Blocked"
+	// OwnershipUser means the parameter is the tenant's to set.
+	OwnershipUser Ownership = "User"
+)
+
+// Owned describes one operator-owned parameter.
+type Owned struct {
+	// Ownership distinguishes a computed value from a constant one.
+	Ownership Ownership
+	// Context is the pg_settings.context this parameter is classified by.
+	Context SettingContext
+	// Value is the constant emitted for a blocked parameter. It is empty for fixed
+	// parameters, whose value is computed per instance, and for the one blocked
+	// parameter that is deliberately never emitted at all.
+	Value string
+	// Omit records that the parameter is owned but must not appear in the config file.
+	// The only member is wal_log_hints: PG18 turns data checksums on by default, which
+	// makes it redundant for pg_rewind while still costing WAL volume. Blocking it
+	// without emitting it is what stops a user turning that cost back on.
+	Omit bool
+}
+
+// EnforcedParameters are the five parameters whose value on a standby must be at least
+// the primary's, in the exact set PostgreSQL checks. Starting recovery below any of them
+// FATALs with "recovery aborted because of insufficient parameter settings", so a replica
+// raises each to max(desired, pg_controldata) on every non-first start.
+var EnforcedParameters = []string{
+	GUCMaxConnections,
+	GUCMaxPreparedTransactions,
+	GUCMaxWALSenders,
+	GUCMaxWorkerProcesses,
+	GUCMaxLocksPerTransaction,
+}
+
+// CustomGUCPrefix namespaces the parameters pgelastic defines itself. They are readable
+// with a plain SHOW over any backend connection, which is what binds them to the running
+// postmaster rather than to a file somebody may have rewritten since.
+const CustomGUCPrefix = "pgelastic."
+
+const (
+	// GUCPrimaryEpoch carries the fence token into the postmaster so the proxy can read
+	// it back off any backend connection.
+	GUCPrimaryEpoch = CustomGUCPrefix + "primary_epoch"
+	// GUCConfigSHA256 identifies the configuration the postmaster actually loaded. It is
+	// read back with current_setting() and never from pg_show_all_file_settings(), so
+	// that the hash and pending_restart always describe the same reload.
+	GUCConfigSHA256 = CustomGUCPrefix + "config_sha256"
+)
+
+// GUC names pgelastic refers to by name in more than one place. Spelling a parameter name
+// twice is how a rename becomes a silent no-op, so the ones that matter are named here.
+const (
+	GUCMaxConnections          = "max_connections"
+	GUCMaxPreparedTransactions = "max_prepared_transactions"
+	GUCMaxWALSenders           = "max_wal_senders"
+	GUCMaxWorkerProcesses      = "max_worker_processes"
+	GUCMaxLocksPerTransaction  = "max_locks_per_transaction"
+	GUCWALLevel                = "wal_level"
+	GUCWALLogHints             = "wal_log_hints"
+	GUCTrackCommitTimestamp    = "track_commit_timestamp"
+	GUCSynchronousStandbyNames = "synchronous_standby_names"
+	GUCArchiveMode             = "archive_mode"
+	GUCArchiveCommand          = "archive_command"
+	GUCAllowAlterSystem        = "allow_alter_system"
+	GUCRestartAfterCrash       = "restart_after_crash"
+	GUCIOMethod                = "io_method"
+	GUCLoggingCollector        = "logging_collector"
+	GUCSharedPreloadLibraries  = "shared_preload_libraries"
+	GUCClusterName             = "cluster_name"
+)
+
+// valueOff and valueOn are the two boolean literals PostgreSQL accepts in a config file.
+const (
+	valueOff = "off"
+	valueOn  = "on"
+)
+
+// ownedParameters is the classification table. Everything absent from it is the user's.
+var ownedParameters = map[string]Owned{
+	// Capacity. max_connections is the number the whole product rests on, and it is
+	// PGC_POSTMASTER, so it is monotonically non-decreasing within an instance
+	// generation: capacity is reclaimed by migrating tenants away, never by shrinking it.
+	GUCMaxConnections:                {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"superuser_reserved_connections": {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"reserved_connections":           {Ownership: OwnershipFixed, Context: ContextPostmaster},
+
+	// Replication and live migration. Retrofitting either of the first two costs a
+	// fleet-wide rolling restart, so both are set at bootstrap and never changed.
+	GUCWALLevel:                      {Ownership: OwnershipBlocked, Context: ContextPostmaster, Value: "logical"},
+	GUCTrackCommitTimestamp:          {Ownership: OwnershipBlocked, Context: ContextPostmaster, Value: valueOn},
+	GUCMaxWALSenders:                 {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"max_replication_slots":          {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"max_active_replication_origins": {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	GUCMaxWorkerProcesses:            {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	GUCMaxPreparedTransactions:       {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	GUCMaxLocksPerTransaction:        {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"hot_standby":                    {Ownership: OwnershipBlocked, Context: ContextPostmaster, Value: valueOn},
+	"hot_standby_feedback":           {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOn},
+	"sync_replication_slots":         {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOn},
+	"synchronized_standby_slots":     {Ownership: OwnershipFixed, Context: ContextSighup},
+	GUCSynchronousStandbyNames:       {Ownership: OwnershipFixed, Context: ContextSighup},
+	"synchronous_commit":             {Ownership: OwnershipFixed, Context: ContextUser},
+	"primary_conninfo":               {Ownership: OwnershipFixed, Context: ContextSighup},
+	"primary_slot_name":              {Ownership: OwnershipFixed, Context: ContextSighup},
+	"restore_command":                {Ownership: OwnershipFixed, Context: ContextSighup},
+	"recovery_target_time":           {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"recovery_target_lsn":            {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"recovery_target_name":           {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"recovery_target_action":         {Ownership: OwnershipFixed, Context: ContextPostmaster},
+
+	// WAL retention, derived from the WAL volume: losing a slot costs a bounded replica
+	// rebuild, losing the primary costs every tenant on the instance their guarantee.
+	"max_slot_wal_keep_size": {Ownership: OwnershipFixed, Context: ContextSighup},
+	"wal_keep_size":          {Ownership: OwnershipFixed, Context: ContextSighup},
+
+	// pg_rewind viability. Blocked but never emitted, see Owned.Omit.
+	GUCWALLogHints: {Ownership: OwnershipBlocked, Context: ContextPostmaster, Omit: true},
+
+	// Archiving. archive_mode is PGC_POSTMASTER and is therefore on from bootstrap even
+	// before a repository exists, because turning it on later is a restart that drops
+	// every tenant connection.
+	GUCArchiveMode:    {Ownership: OwnershipBlocked, Context: ContextPostmaster, Value: valueOn},
+	GUCArchiveCommand: {Ownership: OwnershipFixed, Context: ContextSighup},
+	"archive_timeout": {Ownership: OwnershipFixed, Context: ContextSighup},
+
+	// Routing around the operator, and self-healing that hides a fault.
+	GUCAllowAlterSystem: {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOff},
+	GUCRestartAfterCrash: {
+		Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOff,
+	},
+	"fsync":            {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOn},
+	"full_page_writes": {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOn},
+
+	// io_uring needs a bespoke seccomp profile, so PG18's default worker method stands
+	// and io_workers is the tuning knob instead.
+	GUCIOMethod: {Ownership: OwnershipBlocked, Context: ContextPostmaster, Value: "worker"},
+
+	// Logging. logging_collector is what creates the syslogger, which is what makes the
+	// scoped reaper necessary: syslogger.c sets SIG_IGN on SIGINT/SIGTERM/SIGQUIT, so the
+	// collector always outlives the postmaster.
+	GUCLoggingCollector:        {Ownership: OwnershipBlocked, Context: ContextPostmaster, Value: valueOn},
+	"log_destination":          {Ownership: OwnershipBlocked, Context: ContextSighup, Value: "csvlog"},
+	"log_directory":            {Ownership: OwnershipFixed, Context: ContextSighup},
+	"log_filename":             {Ownership: OwnershipFixed, Context: ContextSighup},
+	"log_rotation_age":         {Ownership: OwnershipBlocked, Context: ContextSighup, Value: "0"},
+	"log_rotation_size":        {Ownership: OwnershipBlocked, Context: ContextSighup, Value: "0"},
+	"log_truncate_on_rotation": {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOff},
+
+	// Connectivity. Nothing may reach 5432 except through the proxy, and the superuser is
+	// reachable only over the Unix socket by peer authentication.
+	"listen_addresses":        {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"port":                    {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"unix_socket_directories": {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"password_encryption":     {Ownership: OwnershipBlocked, Context: ContextSighup, Value: "scram-sha-256"},
+	"ssl":                     {Ownership: OwnershipFixed, Context: ContextSighup},
+	"ssl_cert_file":           {Ownership: OwnershipFixed, Context: ContextSighup},
+	"ssl_key_file":            {Ownership: OwnershipFixed, Context: ContextSighup},
+	"ssl_ca_file":             {Ownership: OwnershipFixed, Context: ContextSighup},
+	"hba_file":                {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"ident_file":              {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"data_directory":          {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	GUCClusterName:            {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	GUCSharedPreloadLibraries: {Ownership: OwnershipFixed, Context: ContextPostmaster},
+
+	// PG18 moved autovacuum_max_workers to PGC_SIGHUP, so the slot count is what has to
+	// be sized once at creation and the worker count stays tunable as tenant density
+	// changes.
+	"autovacuum_worker_slots": {Ownership: OwnershipFixed, Context: ContextPostmaster},
+
+	// Memory, computed from the pod's own limits rather than left at a boot default that
+	// bears no relation to the container it is running in.
+	"shared_buffers":       {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"effective_cache_size": {Ownership: OwnershipFixed, Context: ContextUser},
+}
+
+// Classify reports how a parameter is owned. Unknown parameters belong to the user: the
+// table enumerates what pgelastic takes, not what PostgreSQL offers.
+func Classify(name string) Owned {
+	if owned, ok := ownedParameters[name]; ok {
+		return owned
+	}
+	return Owned{Ownership: OwnershipUser, Context: ContextUser}
+}
+
+// IsOwned reports whether the operator owns a parameter, whether by computing its value
+// or by pinning it.
+func IsOwned(name string) bool {
+	_, ok := ownedParameters[name]
+	return ok
+}
+
+// OwnedNames lists every operator-owned parameter in sorted order.
+func OwnedNames() []string {
+	return slices.Sorted(maps.Keys(ownedParameters))
+}
+
+// UserParameters drops every operator-owned parameter from a spec's parameter map and
+// reports which ones were dropped. The webhook rejects them too; this second pass is what
+// makes an object admitted under an older classification harmless.
+func UserParameters(parameters map[string]pgelasticv1alpha1.GUCValue) (map[string]string, []string) {
+	kept := make(map[string]string, len(parameters))
+	var dropped []string
+	for name, value := range parameters {
+		if IsOwned(name) {
+			dropped = append(dropped, name)
+			continue
+		}
+		kept[name] = string(value)
+	}
+	slices.Sort(dropped)
+	return kept, dropped
+}
+
+// BlockedDefaults returns the constant values for every blocked parameter that is emitted
+// at all, keyed by name.
+func BlockedDefaults() map[string]string {
+	values := make(map[string]string)
+	for name, owned := range ownedParameters {
+		if owned.Ownership == OwnershipBlocked && !owned.Omit {
+			values[name] = owned.Value
+		}
+	}
+	return values
+}

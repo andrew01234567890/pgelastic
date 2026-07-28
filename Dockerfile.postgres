@@ -1,0 +1,28 @@
+# The pgelastic PostgreSQL image.
+#
+# PostgreSQL 18 only: there is no major-version upgrade path in v1, and pinning the major
+# version is what lets the design omit wal_log_hints (PG18 turns data checksums on by
+# default) and rely on io_method = worker being the default.
+#
+# The instance manager is deliberately NOT in this image. It arrives at runtime from an
+# init container that does nothing but cp, so upgrading the agent does not mean rebuilding
+# and re-certifying the database image.
+FROM postgres:18
+
+# pgBackRest does WAL archiving and physical backup. Writing that natively is a large
+# correctness surface - multipart uploads, retry idempotency, partial-object detection,
+# timeline history, .partial segments, manifests, checksum verification, expiry safety -
+# where every bug is a silent data-loss bug found only at restore time.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends pgbackrest; \
+    rm -rf /var/lib/apt/lists/*
+
+# The WAL mount point and the log directory have to exist and be writable before the
+# volumes are mounted over them, because the pod runs as the postgres user and cannot
+# create a directory under a root-owned parent.
+RUN set -eux; \
+    mkdir -p /var/lib/postgresql/wal /var/log/postgresql; \
+    chown -R postgres:postgres /var/lib/postgresql /var/log/postgresql
+
+USER 999:999

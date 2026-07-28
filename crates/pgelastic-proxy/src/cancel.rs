@@ -92,11 +92,30 @@ pub struct CancelTarget {
 pub struct CancelRoute {
     target: Arc<Mutex<Option<CancelTarget>>>,
     in_flight: Arc<AtomicUsize>,
+    client: Option<pgelastic_capacity::ClientId>,
 }
 
 impl CancelRoute {
+    /// A route for a session the allocator does not govern.
+    ///
+    /// Session mode only, where the client owns one backend for its whole life
+    /// and there is no pooled capacity for a cancel storm to eat into. Every
+    /// pooled session uses [`for_client`](Self::for_client) so its cancels are
+    /// admitted through the ladder like any other backend connection.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A route whose cancels draw on `client`'s tenant cancel credit.
+    pub fn for_client(client: pgelastic_capacity::ClientId) -> Self {
+        Self {
+            client: Some(client),
+            ..Self::default()
+        }
+    }
+
+    pub fn client(&self) -> Option<pgelastic_capacity::ClientId> {
+        self.client
     }
 
     pub fn set(&self, target: Option<CancelTarget>) {
@@ -363,6 +382,18 @@ mod tests {
         // cancel and nobody else's query is cancelled in its place.
         route.set(None);
         assert!(registry.lookup(&token).unwrap().resolve().is_none());
+    }
+
+    /// The credit pool exists to keep a cancel storm out of a *pooled* tenant's
+    /// capacity. A session-mode client holds its one backend for its whole life
+    /// and takes nothing from the allocator, so its route names no client to
+    /// charge.
+    #[test]
+    fn only_a_pooled_route_names_a_client_to_charge_a_cancel_to() {
+        assert!(CancelRoute::new().client().is_none());
+
+        let client = pgelastic_capacity::ClientId(7);
+        assert_eq!(CancelRoute::for_client(client).client(), Some(client));
     }
 
     #[test]
