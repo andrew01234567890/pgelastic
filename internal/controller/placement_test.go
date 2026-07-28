@@ -27,7 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -269,7 +269,7 @@ var _ = Describe("pool capacity planning", Ordered, func() {
 
 	var (
 		reconciler *PgElasticPoolReconciler
-		recorder   *record.FakeRecorder
+		recorder   *events.FakeRecorder
 		collector  *metering.Collector
 		pool       *pgelasticv1alpha1.PgElasticPool
 		instances  []*pgelasticv1alpha1.PgInstance
@@ -306,7 +306,7 @@ var _ = Describe("pool capacity planning", Ordered, func() {
 
 	BeforeEach(func() {
 		collector = metering.NewCollector(metering.Options{}, nil)
-		recorder = record.NewFakeRecorder(64)
+		recorder = events.NewFakeRecorder(64)
 		reconciler = &PgElasticPoolReconciler{
 			Client:   cachedClient,
 			Scheme:   cachedClient.Scheme(),
@@ -421,7 +421,7 @@ var _ = Describe("storage expansion", Ordered, func() {
 		reconciler = &PgElasticPoolReconciler{
 			Client:   cachedClient,
 			Scheme:   cachedClient.Scheme(),
-			Recorder: record.NewFakeRecorder(64),
+			Recorder: events.NewFakeRecorder(64),
 			Metering: metering.NewCollector(metering.Options{}, nil),
 			Now:      func() time.Time { return placementClock },
 		}
@@ -500,7 +500,7 @@ var _ = Describe("stale metrics", Ordered, func() {
 		reconciler := &PgElasticPoolReconciler{
 			Client:   cachedClient,
 			Scheme:   cachedClient.Scheme(),
-			Recorder: record.NewFakeRecorder(64),
+			Recorder: events.NewFakeRecorder(64),
 			Metering: collector,
 			Now:      func() time.Time { return placementClock },
 		}
@@ -602,7 +602,7 @@ var _ = Describe("auto mode", Ordered, func() {
 		reconciler = &PgElasticPoolReconciler{
 			Client:   cachedClient,
 			Scheme:   cachedClient.Scheme(),
-			Recorder: record.NewFakeRecorder(64),
+			Recorder: events.NewFakeRecorder(64),
 			Metering: collector,
 			Now:      func() time.Time { return placementClock },
 		}

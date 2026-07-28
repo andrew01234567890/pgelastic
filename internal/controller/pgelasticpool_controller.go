@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -69,7 +69,7 @@ const (
 type PgElasticPoolReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 
 	// Metering is the trailing-window store both this controller and the tenant controller
 	// read their recommenders out of. A nil collector means the pool is unmetered, which the
@@ -546,7 +546,7 @@ func (r *PgElasticPoolReconciler) execute(
 	}
 
 	if result.applied {
-		r.event(pool, corev1.EventTypeNormal, eventActionExecuted,
+		r.event(pool, corev1.EventTypeNormal, eventActionExecuted, actionExecute,
 			"%s: %s", action.Class, action.Detail)
 	}
 	return result, nil
@@ -700,7 +700,7 @@ func (r *PgElasticPoolReconciler) emitMigrations(
 			}
 			return emitted, err
 		}
-		r.event(pool, corev1.EventTypeNormal, eventMigrationEmitted,
+		r.event(pool, corev1.EventTypeNormal, eventMigrationEmitted, actionEmitMigration,
 			"moving %s from %s to %s, worth %d%% of the source's utilization",
 			move.Tenant, move.From, move.To, move.ExpectedImprovementPercent)
 		emitted = true
@@ -774,31 +774,40 @@ func (r *PgElasticPoolReconciler) recordPlan(pool *pgelasticv1alpha1.PgElasticPo
 	if r.Recorder == nil {
 		return
 	}
-	r.Recorder.Eventf(pool, corev1.EventTypeNormal, eventAutoscalePlan, "%s", plan.Summary)
+	r.Recorder.Eventf(pool, nil, corev1.EventTypeNormal, eventAutoscalePlan, actionPlan, "%s", plan.Summary)
 	for _, action := range plan.Actions {
 		if action.Permitted {
 			continue
 		}
-		r.Recorder.Eventf(pool, corev1.EventTypeNormal, eventActionRefused,
+		r.Recorder.Eventf(pool, nil, corev1.EventTypeNormal, eventActionRefused, actionRefuse,
 			"%s not executed: %s (%s)", action.Class, action.Reason, action.Message)
 	}
 }
 
 func (r *PgElasticPoolReconciler) event(
 	pool *pgelasticv1alpha1.PgElasticPool,
-	eventType, reason, format string,
+	eventType, reason, action, format string,
 	args ...any,
 ) {
 	if r.Recorder == nil {
 		return
 	}
-	r.Recorder.Eventf(pool, eventType, reason, format, args...)
+	r.Recorder.Eventf(pool, nil, eventType, reason, action, format, args...)
 }
+
+// The events API takes an action alongside the reason: the reason is why, the action is
+// what was done. Keeping them distinct is the whole point of the newer API.
+const (
+	actionPlan          = "Plan"
+	actionRefuse        = "Refuse"
+	actionExecute       = "Execute"
+	actionEmitMigration = "EmitMigration"
+)
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PgElasticPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorderFor("pgelasticpool")
+		r.Recorder = mgr.GetEventRecorder("pgelasticpool")
 	}
 	if r.APIReader == nil {
 		r.APIReader = mgr.GetAPIReader()
