@@ -70,7 +70,12 @@ func (r Reporter) object() *unstructured.Unstructured {
 }
 
 // Report applies this member's own entry in the instances list.
-func (r Reporter) Report(ctx context.Context, observation MemberObservation, healthy bool) error {
+func (r Reporter) Report(
+	ctx context.Context,
+	observation MemberObservation,
+	healthy bool,
+	rejoining RejoinMethod,
+) error {
 	member := map[string]any{
 		"name":              r.Member,
 		"role":              string(instanceRole(observation.Role)),
@@ -81,6 +86,12 @@ func (r Reporter) Report(ctx context.Context, observation MemberObservation, hea
 		"healthy":           healthy,
 		"walReceiverActive": observation.WALReceiverActive,
 		"walVolumeFull":     observation.WALVolumeFull,
+	}
+	// The key is omitted rather than emptied when no rejoin is running. Under server-side
+	// apply a field the manager stops including is removed, which is exactly the clearing
+	// this needs, and the field is an enum that an empty string is not a member of.
+	if rejoining != "" {
+		member["rejoining"] = string(rejoining)
 	}
 
 	object := r.object()

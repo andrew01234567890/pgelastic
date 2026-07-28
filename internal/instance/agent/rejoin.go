@@ -50,15 +50,44 @@ const controlFile = "global/pg_control"
 // postmasterLockFile records the PID of the postmaster that owns a data directory.
 const postmasterLockFile = "postmaster.pid"
 
-// Rejoin brings a member that used to be a primary back as a standby of the new one.
+// RejoinMethod names which of the two ways back a member is currently taking.
+type RejoinMethod string
+
+const (
+	// RejoinRewinding is pg_rewind: minutes of WAL rather than the whole data directory.
+	RejoinRewinding RejoinMethod = "rewinding"
+	// RejoinRecloning is the pg_basebackup fallback. It takes minutes to hours, saturates a
+	// connection and a replication slot, and leaves the instance at reduced redundancy
+	// throughout - which is why it is reported rather than merely done.
+	RejoinRecloning RejoinMethod = "recloning"
+)
+
+// RejoinObserver is told each time a rejoin changes which path it is on. It is nil on the
+// bootstrap path, where no status server is running yet to report to.
+type RejoinObserver func(method RejoinMethod)
+
+func (o RejoinObserver) note(method RejoinMethod) {
+	if o != nil {
+		o(method)
+	}
+}
+
+// Rejoin brings a member whose history has diverged back onto the primary's.
 //
 // It always tries pg_rewind and always has an automatic re-clone behind it. A rewind is
 // minutes of WAL where a re-clone is the whole data directory, but a rewind that cannot
 // reach a common ancestor is not a failure to be retried - it is a divergence, and the only
 // correct answer to a divergence is to take the new primary's history wholesale.
-func Rejoin(ctx context.Context, options Options, tools pgtool.Toolchain, primary string) error {
+func Rejoin(
+	ctx context.Context,
+	options Options,
+	tools pgtool.Toolchain,
+	primary string,
+	observer RejoinObserver,
+) error {
 	log := logf.FromContext(ctx)
 	host := PeerHost(primary, options.PeerService, options.Namespace)
+	observer.note(RejoinRewinding)
 
 	// Anything still waiting in archive_status belongs to the postmaster that just died. It
 	// is archived before the rewind because a rewind removes exactly the segments that have
@@ -70,7 +99,7 @@ func Rejoin(ctx context.Context, options Options, tools pgtool.Toolchain, primar
 
 	if err := ensureCleanShutdown(ctx, options, tools); err != nil {
 		log.Error(err, "the data directory could not be shut down cleanly; re-cloning instead")
-		return join(ctx, options, tools, primary)
+		return reclone(ctx, options, tools, primary, observer)
 	}
 
 	if err := guardControlFile(options.DataDir); err != nil {
@@ -89,12 +118,23 @@ func Rejoin(ctx context.Context, options Options, tools pgtool.Toolchain, primar
 	}
 	if err != nil {
 		log.Error(err, "pg_rewind did not succeed; re-cloning from the primary", "primary", primary)
-		return join(ctx, options, tools, primary)
+		return reclone(ctx, options, tools, primary, observer)
 	}
 	_ = os.Remove(filepath.Join(options.DataDir, controlFileBackup))
 
 	log.Info("rewound onto the new primary's history", "primary", primary)
 	return followPrimary(options, host)
+}
+
+func reclone(
+	ctx context.Context,
+	options Options,
+	tools pgtool.Toolchain,
+	primary string,
+	observer RejoinObserver,
+) error {
+	observer.note(RejoinRecloning)
+	return join(ctx, options, tools, primary)
 }
 
 func rewindWithRetries(

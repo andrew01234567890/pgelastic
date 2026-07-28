@@ -57,8 +57,63 @@ func (s *Supervisor) reconcileRole(
 	case RoleReplica:
 		s.promoteIfChosen(ctx, instance)
 		s.followCurrentPrimary(ctx, instance)
+		s.rejoinIfDiverged(ctx, observation, instance)
 	case RoleUnknown:
 	}
+}
+
+// divergenceGrace is how long a replica must hold the same position, with a primary that is
+// not this member present, before divergence is evaluated at all.
+//
+// A standby reconnecting to a primary that has just moved stops advancing for a few seconds
+// and is perfectly healthy. The grace is long enough that an ordinary reconnection never
+// reaches the evaluation, and short enough that a member which can never reconnect is not
+// left there: the diverged case does not resolve itself, it loops forever.
+const divergenceGrace = 30 * time.Second
+
+// rejoinIfDiverged is the trigger the split-brain catalogue's fourth row was missing.
+//
+// A member in recovery was previously assumed to be safe - its history had only ever been
+// received, never written - and that assumption is wrong. A standby that received WAL past
+// the point the new primary forked at holds records no other copy has; its WAL receiver is
+// refused every time it asks, and it asks forever. So the trigger is a receiver that has
+// stayed down, and the verdict is taken from the primary's own timeline history rather than
+// from the shape of the error that produced it.
+func (s *Supervisor) rejoinIfDiverged(
+	ctx context.Context,
+	observation MemberObservation,
+	instance *pgelasticv1alpha1.PgInstance,
+) {
+	primary := instance.Status.CurrentPrimary
+	if primary == "" || primary == s.options.Member ||
+		ha.FailoverInProgress(primary, instance.Status.TargetPrimary) {
+		s.clearStranded()
+		return
+	}
+	// The clock is reset by WAL arriving, never by the WAL receiver being reported up. A
+	// member that cannot stream has its receiver restarted every wal_retrieve_retry_interval
+	// and killed again immediately, so pg_stat_wal_receiver holds a row often enough that a
+	// check trusting the flag alone would keep resetting itself and never reach a verdict.
+	// The flag is still worth consulting to skip the evaluation on a member that is plainly
+	// fine.
+	held := observation.HeldPosition()
+	if s.noteProgress(held) || observation.WALReceiverActive || !s.strandedFor(divergenceGrace) {
+		return
+	}
+
+	log := logf.FromContext(ctx)
+	divergence, err := DetectDivergence(s.options.WALDir, held, PrimaryTimeline(instance, primary))
+	if err != nil {
+		log.Error(err, "could not read the timeline history while checking for divergence")
+		return
+	}
+	if !divergence.Diverged {
+		return
+	}
+	log.Info("this member's history has diverged from the primary's; rejoining",
+		"member", s.options.Member, "primary", primary,
+		"reason", divergence.Reason, "detail", divergence.Message)
+	s.requestRejoin(ctx, primary)
 }
 
 // followCurrentPrimary repoints a running standby at whoever the primary is now.
@@ -210,6 +265,68 @@ func (s *Supervisor) noteRenewal(failingSince time.Time) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	s.leaseUnverifiedSince = failingSince
+}
+
+// noteProgress records this member's position and reports whether it moved since the last
+// reading, resetting the stranded clock when it did.
+func (s *Supervisor) noteProgress(position ha.TimelinePosition) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	moved := position.Timeline > s.heldPosition.Timeline || position.LSN > s.heldPosition.LSN
+	s.heldPosition = position
+	if moved {
+		s.strandedSince = time.Time{}
+	}
+	return moved
+}
+
+// strandedFor starts the clock on the first call and reports whether it has run out.
+func (s *Supervisor) strandedFor(grace time.Duration) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.strandedSince.IsZero() {
+		s.strandedSince = time.Now()
+	}
+	return time.Since(s.strandedSince) >= grace
+}
+
+func (s *Supervisor) clearStranded() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.strandedSince = time.Time{}
+}
+
+// requestRejoin queues the rejoin and records who it is onto, so the supervisor's own
+// goroutine owns the stop, the rewind and the start rather than the observe tick.
+func (s *Supervisor) requestRejoin(ctx context.Context, primary string) {
+	s.mutex.Lock()
+	s.rejoinPrimary = primary
+	s.mutex.Unlock()
+	select {
+	case s.commands <- CommandRejoin:
+	default:
+		logf.FromContext(ctx).V(1).Info("a shutdown is already queued")
+	}
+}
+
+func (s *Supervisor) rejoinTarget() string {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.rejoinPrimary
+}
+
+// noteRejoin publishes which of the two ways back this member is on, to the probes and to
+// the CR. Both matter: the startup probe must stop restarting a Pod through a rewind that
+// outlives every kubelet deadline, and the operator must not count the burst headroom of an
+// instance that is rebuilding a member as available.
+func (s *Supervisor) noteRejoin(ctx context.Context, method RejoinMethod) {
+	s.update(func(state *ProbeState) { state.Rejoin = method })
+	if s.options.Client == nil {
+		return
+	}
+	if err := s.reporter().Report(ctx, s.ProbeState().Observation, false, method); err != nil {
+		logf.FromContext(ctx).Error(err, "could not report the rejoin", "method", method)
+	}
 }
 
 // promotionRetryDelay paces a promotion that has been refused.

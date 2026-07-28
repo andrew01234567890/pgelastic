@@ -65,9 +65,12 @@ const (
 // entry still names itself because nobody has written the new one yet. currentPrimary is
 // last, because it is the field that lags furthest behind reality.
 //
-// A member already in recovery is never asked to rejoin. Its history has not diverged - it
-// only ever received WAL - so the worst that can be wrong with it is which host it is
-// streaming from.
+// A member already in recovery is never asked to rejoin *by this function*: nothing it is
+// given can tell a standby that is merely behind from one that received WAL past the point
+// the primary's history forked at. That second case is real and it does not resolve itself,
+// so the caller compares this member's position against the primary's timeline history and
+// escalates the answer from Follow to Rejoin when the two cannot be reconciled by
+// streaming. See DetectDivergence.
 func StartupDecision(self string, inRecovery bool, currentPrimary, targetPrimary, leaseHolder string) StartupAction {
 	designated := currentPrimary
 	if targetPrimary != "" && targetPrimary != TargetPrimaryPending {

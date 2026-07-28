@@ -103,14 +103,56 @@ func PrepareToFollow(ctx context.Context, options Options, tools pgtool.Toolchai
 	if action.Follow == "" {
 		return nil
 	}
+	if !action.Rejoin {
+		action = escalateDivergedStandby(ctx, options, tools, instance, action)
+	}
 
 	host := PeerHost(action.Follow, options.PeerService, options.Namespace)
 	if !action.Rejoin {
 		return followPrimary(options, host)
 	}
-	log.Info("this member is out of recovery and is not the primary; rejoining",
+	log.Info("this member cannot follow the primary as it stands; rejoining",
 		"member", options.Member, "primary", action.Follow, "reason", action.Reason)
-	return Rejoin(ctx, options, tools, action.Follow)
+	return Rejoin(ctx, options, tools, action.Follow, nil)
+}
+
+// escalateDivergedStandby turns "repoint at the new primary" into "rewind or re-clone" for
+// a standby whose own history has diverged.
+//
+// Being in recovery used to be treated as proof that a member's history was intact, on the
+// grounds that it had only ever received WAL. That is false: a standby that received WAL
+// past the point the primary's history forked at holds records nothing else has, and
+// repointing it produces a member that asks to stream, is refused, and asks again forever.
+// The evidence is read from the stopped data directory and the newest timeline history file
+// the member fetched from the primary, so no postmaster has to be started to find out.
+func escalateDivergedStandby(
+	ctx context.Context,
+	options Options,
+	tools pgtool.Toolchain,
+	instance *pgelasticv1alpha1.PgInstance,
+	action ha.StartupAction,
+) ha.StartupAction {
+	log := logf.FromContext(ctx)
+	data, err := tools.ControlData(ctx, options.DataDir)
+	if err != nil {
+		log.Info("could not read the control file; leaving the data directory alone", "error", err.Error())
+		return action
+	}
+	divergence, err := DetectDivergence(options.WALDir, StoppedPosition(data),
+		PrimaryTimeline(instance, action.Follow))
+	if err != nil {
+		log.Info("could not read the timeline history", "error", err.Error())
+		return action
+	}
+	if !divergence.Diverged {
+		return action
+	}
+	log.Info("this member's history has diverged from the primary's",
+		"member", options.Member, "primary", action.Follow,
+		"reason", divergence.Reason, "detail", divergence.Message)
+	action.Rejoin = true
+	action.Reason = divergence.Reason
+	return action
 }
 
 // designatedPrimary decides what this member is bootstrapping as.

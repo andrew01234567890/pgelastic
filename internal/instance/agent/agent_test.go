@@ -170,10 +170,12 @@ func TestStartupProbeTreatsRejectAsSuccess(t *testing.T) {
 	}
 }
 
-func TestStartupProbeIsSkippedDuringARewind(t *testing.T) {
-	state := ProbeState{RewindInProgress: true, LastPing: pgtool.PingNoResponse}
-	if result := StartupProbe(state); !result.OK {
-		t.Error("the startup probe must not restart a pod in the middle of a pg_rewind")
+func TestStartupProbeIsSkippedDuringARejoin(t *testing.T) {
+	for _, method := range []RejoinMethod{RejoinRewinding, RejoinRecloning} {
+		state := ProbeState{Rejoin: method, LastPing: pgtool.PingNoResponse}
+		if result := StartupProbe(state); !result.OK {
+			t.Errorf("the startup probe must not restart a pod in the middle of %s", method)
+		}
 	}
 }
 

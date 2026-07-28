@@ -92,7 +92,12 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 	$(MAKE) test-e2e-instance E2E_CONTEXT=kind-$(KIND_CLUSTER)
+# Migration drives two full three-node instances through logical replication. On a
+# two-core runner it does not fit the per-push budget, so it runs with the chaos specs
+# rather than being given a longer timeout that would only make the slow path flakier.
+ifeq ($(E2E_HEAVY),true)
 	$(MAKE) test-e2e-migration E2E_CONTEXT=kind-$(KIND_CLUSTER)
+endif
 	$(MAKE) cleanup-test-e2e
 
 # The instance e2e provisions a real three-node PostgreSQL 18 instance and asserts on what

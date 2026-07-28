@@ -82,7 +82,7 @@ func (r *PgInstanceReconciler) reconcileFailover(
 	ctx context.Context,
 	instance *pgelasticv1alpha1.PgInstance,
 	pods []corev1.Pod,
-) (ha.Decision, error) {
+) ha.Decision {
 	observation := ha.Observation{
 		Members:           r.observeMembers(ctx, pods),
 		CurrentPrimary:    instance.Status.CurrentPrimary,
@@ -98,15 +98,9 @@ func (r *PgInstanceReconciler) reconcileFailover(
 
 	decision := ha.Decide(observation)
 	recordFailoverDecision(instance, decision)
-
-	if decision.DemoteMember != "" {
-		if err := r.stripRoleLabel(ctx, pods, decision.DemoteMember); err != nil {
-			return decision, err
-		}
-	}
 	logf.FromContext(ctx).V(1).Info("failover decision", "phase", decision.Phase,
 		"reason", decision.Reason, "message", decision.Message)
-	return decision, nil
+	return decision
 }
 
 // observeMembers asks every member directly and pairs its answer with the kubelet's verdict
@@ -150,11 +144,12 @@ func (r *PgInstanceReconciler) pollMembers(ctx context.Context, pods []corev1.Po
 	return members
 }
 
-// stripRoleLabel takes the old primary out of the read-write Service's selector.
+// stripRoleLabel takes a member out of the read-write Service's selector.
 //
-// It is the first thing phase one does, and it is done before anything else because a
-// Service that still names a member nobody can reach is a Service handing every tenant a
-// connection to a dead socket.
+// It has exactly one caller, and deliberately so: two writers of the same label in one
+// reconcile pass work from the same list of Pods, and the second one loses on resource
+// version. reconcileRoleLabels owns the label, and ha.Decision.ServingPrimary is the single
+// answer it drives both directions from.
 func (r *PgInstanceReconciler) stripRoleLabel(
 	ctx context.Context,
 	pods []corev1.Pod,

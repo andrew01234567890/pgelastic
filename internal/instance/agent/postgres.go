@@ -54,12 +54,17 @@ type MemberObservation struct {
 	// or not recovery has replayed it yet.
 	ReceivedLSN string
 	ReplayLSN   string
-	// Timeline is the highest timeline this member holds WAL for: the control file's, or
-	// the one its WAL receiver is streaming on when that is further ahead. The control file
-	// alone lags a timeline switch by a whole restartpoint, which would make a standby that
-	// has already received the new history look like one that had been left behind on the
-	// old.
-	Timeline          int32
+	// Timeline is the highest timeline this member holds WAL for: the control file's, the
+	// one recovery last replayed on, or the one its WAL receiver is streaming on, whichever
+	// is furthest ahead. The control file alone lags a timeline switch by a whole
+	// restartpoint, which would make a standby that has already received the new history
+	// look like one that had been left behind on the old.
+	Timeline int32
+	// MinRecoveryEndLSN is pg_control_recovery()'s durable record of how far recovery has
+	// got. It is carried alongside the two live positions because it is the only one that
+	// survives a postmaster restart, and divergence has to be decidable on a member whose
+	// WAL receiver has never once succeeded in this postmaster's lifetime.
+	MinRecoveryEndLSN string
 	ReplayLag         time.Duration
 	WALReceiverActive bool
 	// WALVolumeFull is measured from the filesystem rather than read from PostgreSQL, so
@@ -107,7 +112,9 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		                     THEN pg_last_wal_replay_lsn()
 		                     ELSE pg_current_wal_lsn() END::text, ''),
 		       GREATEST((SELECT timeline_id FROM pg_control_checkpoint()),
+		                (SELECT min_recovery_end_timeline FROM pg_control_recovery()),
 		                COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0)),
+		       COALESCE((SELECT min_recovery_end_lsn::text FROM pg_control_recovery()), ''),
 		       COALESCE(EXTRACT(epoch FROM now() - pg_last_xact_replay_timestamp()), 0)::float8,
 		       EXISTS (SELECT 1 FROM pg_stat_wal_receiver),
 		       COALESCE(current_setting('pgelastic.config_sha256', true), ''),
@@ -121,6 +128,7 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		&observation.ReceivedLSN,
 		&observation.ReplayLSN,
 		&observation.Timeline,
+		&observation.MinRecoveryEndLSN,
 		&lagSeconds,
 		&observation.WALReceiverActive,
 		&observation.ConfigSHA256,

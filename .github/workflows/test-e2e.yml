@@ -76,7 +76,7 @@ jobs:
       # hands that same cluster to the suites it chains as E2E_CONTEXT=kind-<cluster>.
       # Those targets build both images and kind-load them themselves.
       - name: Run e2e without the chaos specs
-        run: make test-e2e E2E_LABEL_FILTER='!chaos'
+        run: make test-e2e E2E_LABEL_FILTER='!chaos' E2E_HEAVY=false
 
   chaos:
     if: github.event_name == 'schedule' || inputs.chaos
@@ -116,6 +116,13 @@ jobs:
       # against a run where the uneventful path was proven on the same cluster.
       - name: Run the full instance suite
         run: make test-e2e-instance E2E_CONTEXT="kind-${KIND_CLUSTER}"
+
+      # Migration drives two full three-node instances through logical replication, which
+      # does not fit the per-push budget on a two-core runner. It belongs here rather than
+      # nowhere: the alternative was a longer timeout on the per-push job, which would only
+      # have made the slow path flakier without covering it any better.
+      - name: Run the migration suite
+        run: make test-e2e-migration E2E_CONTEXT="kind-${KIND_CLUSTER}"
 
       - name: Tear down the kind cluster
         if: always()

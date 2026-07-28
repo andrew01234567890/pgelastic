@@ -128,6 +128,9 @@ type Decision struct {
 	// DemoteMember is a member whose role label must be stripped so the read-write Service
 	// stops selecting it.
 	DemoteMember string
+	// ServingPrimary is the member the read-write Service may select right now, empty when
+	// nobody may be selected.
+	ServingPrimary string
 	// SetFailingSince and ClearFailingSince maintain the persisted debounce origin, which
 	// lives on the CR so an operator restart does not restart the countdown.
 	SetFailingSince   *time.Time
@@ -160,6 +163,47 @@ func FailoverInProgress(currentPrimary, targetPrimary string) bool {
 // behind the Lease, so that a confused operator cannot promote anybody and a dead operator
 // cannot promote anybody either.
 func Decide(observation Observation) Decision {
+	decision := decide(observation)
+	decision.ServingPrimary = servingPrimary(observation, decision)
+	return decision
+}
+
+// servingPrimary is the member the read-write Service may select, which is a different
+// question from "is a failover in progress" and must not be answered with it.
+//
+// Freezing the role label for the whole of a failover leaves a healthy current primary
+// unlabelled - and an <instance>-rw Service with no endpoints refuses every connection -
+// for as long as the operator is merely *considering* a failover. What the freeze exists
+// for is the demoted primary, and that is exactly the first clause below: the instant a
+// different member is named in targetPrimary, nobody is serving until that member says it
+// is.
+func servingPrimary(observation Observation, decision Decision) string {
+	primary := observation.CurrentPrimary
+	if primary == "" || decision.SplitBrain || decision.DemoteMember == primary {
+		return ""
+	}
+	target := observation.TargetPrimary
+	if decision.TargetPrimary != "" {
+		target = decision.TargetPrimary
+	}
+	if target != "" && target != TargetPrimaryPending && target != primary {
+		return ""
+	}
+	// An unreachable member is not a demoted one. Under either of these two vetoes the
+	// evidence says the operator cannot see the member rather than that the member has
+	// stopped serving, and taking the label away on that reading would break a healthy
+	// instance because the operator was having a bad day.
+	if decision.Veto == VetoOperatorIsolated || decision.Veto == VetoPrimaryUnobservable {
+		return primary
+	}
+	member, known := memberNamed(observation.Members, primary)
+	if !known || !member.StatusReachable || member.InRecovery {
+		return ""
+	}
+	return primary
+}
+
+func decide(observation Observation) Decision {
 	if brain := splitBrain(observation); brain != nil {
 		return *brain
 	}

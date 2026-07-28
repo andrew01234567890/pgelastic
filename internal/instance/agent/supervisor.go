@@ -34,6 +34,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/ha"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgtool"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
@@ -58,6 +59,26 @@ const (
 	// does not restart in place - the member has to rejoin, and rejoining begins with the
 	// bootstrap path deciding between a rewind and a re-clone.
 	CommandFence
+	// CommandRejoin stops the postmaster, takes this member's history back onto the
+	// primary's, and starts it again. It is a rejoin in place rather than an exit because
+	// the alternative loses the status endpoint for the whole of a rewind - and for the
+	// whole of a re-clone, which is minutes to hours - leaving the operator with silence at
+	// exactly the moment the instance is at reduced redundancy.
+	CommandRejoin
+)
+
+// postmasterOutcome is what the supervisor must do once one postmaster lifetime has ended.
+type postmasterOutcome int
+
+const (
+	// outcomeStop is the end of the agent: the kubelet is asking, or the postmaster exited
+	// on its own and restart_after_crash is off precisely so that becomes a visible
+	// Kubernetes event rather than a silent self-heal.
+	outcomeStop postmasterOutcome = iota
+	// outcomeRestart is an in-place restart for a parameter that needs one.
+	outcomeRestart
+	// outcomeRejoin is a rewind or a re-clone, then a start.
+	outcomeRejoin
 )
 
 // Options is everything the agent was told by the Pod it is running in.
@@ -114,6 +135,15 @@ type Supervisor struct {
 	// spent on, so a parameter that reports pending_restart forever costs one restart
 	// rather than an endless loop of them.
 	restartedFor map[string]bool
+	// heldPosition is the last position this member was seen holding, and strandedSince is
+	// when it stopped moving while a primary that is not this member existed. Divergence is
+	// only ever evaluated once that has held for divergenceGrace, because a standby between
+	// reconnections looks identical to one that can never reconnect until it has had time to
+	// prove otherwise.
+	heldPosition  ha.TimelinePosition
+	strandedSince time.Time
+	// rejoinPrimary is the member a queued rejoin must take this one back onto.
+	rejoinPrimary string
 }
 
 // NewSupervisor builds the agent.
@@ -169,29 +199,85 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if err := s.writeConfig(ctx, nil); err != nil {
 			return err
 		}
-		restart, err := s.runPostmaster(ctx, signals)
+		outcome, err := s.runPostmaster(ctx, signals)
 		if err != nil {
 			return err
 		}
-		if !restart || ctx.Err() != nil {
+		if outcome == outcomeStop || ctx.Err() != nil {
 			// restart_after_crash is off precisely so that a crashed postmaster becomes a
 			// visible Kubernetes event rather than a silent self-heal. The agent honours
 			// that: it does not respawn on its own, it exits and lets the kubelet record
 			// the restart.
 			return nil
 		}
+		if outcome == outcomeRejoin {
+			if err := s.runRejoin(ctx); err != nil {
+				return err
+			}
+			continue
+		}
 		log.Info("restarting the postmaster in place")
 	}
 }
 
+// rejoinAttempts and rejoinRetryDelay bound how long a rejoin keeps trying before the agent
+// gives up and lets the kubelet restart the container.
+//
+// A handful of attempts is worth having because the commonest reason a rejoin fails is that
+// the primary is momentarily unreachable - which, in the middle of a failover, is exactly
+// when a rejoin starts. Retrying forever is not: a member that can never rebuild has to
+// become a Pod restart somebody notices rather than a status field somebody has to read.
+const (
+	rejoinAttempts   = 3
+	rejoinRetryDelay = 10 * time.Second
+)
+
+// runRejoin takes this member's data directory back onto the primary's history.
+//
+// The probe state is published before the first byte moves, and cleared only once the whole
+// thing is over. That is what makes the design's "a member silently re-cloning for ten
+// minutes must be visible" true: the startup probe stops fighting a rewind that outlives
+// every kubelet deadline, and the operator sees a member that is rebuilding rather than a
+// member that is merely not ready.
+func (s *Supervisor) runRejoin(ctx context.Context) error {
+	log := logf.FromContext(ctx)
+	primary := s.rejoinTarget()
+	if primary == "" {
+		return nil
+	}
+	s.noteRejoin(ctx, RejoinRewinding)
+	defer s.noteRejoin(ctx, "")
+
+	var lastErr error
+	for attempt := 1; attempt <= rejoinAttempts; attempt++ {
+		log.Info("rejoining the instance",
+			"primary", primary, "member", s.options.Member, "attempt", attempt)
+		lastErr = Rejoin(ctx, s.options, s.tools, primary, func(method RejoinMethod) {
+			s.noteRejoin(ctx, method)
+		})
+		if lastErr == nil {
+			s.clearStranded()
+			log.Info("rejoined the instance", "primary", primary, "member", s.options.Member)
+			return nil
+		}
+		log.Error(lastErr, "the rejoin did not finish", "primary", primary, "attempt", attempt)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(rejoinRetryDelay):
+		}
+	}
+	return fmt.Errorf("rejoining %s: %w", primary, lastErr)
+}
+
 // runPostmaster spawns one postmaster and services the inner select until it exits.
-func (s *Supervisor) runPostmaster(ctx context.Context, signals chan os.Signal) (bool, error) {
+func (s *Supervisor) runPostmaster(ctx context.Context, signals chan os.Signal) (postmasterOutcome, error) {
 	log := logf.FromContext(ctx)
 
 	command := exec.Command(s.postgresBinary(), "-D", s.options.DataDir)
 	command.Stdout, command.Stderr = os.Stdout, os.Stderr
 	if err := command.Start(); err != nil {
-		return false, fmt.Errorf("starting the postmaster: %w", err)
+		return outcomeStop, fmt.Errorf("starting the postmaster: %w", err)
 	}
 	s.mutex.Lock()
 	s.postmasterPID = command.Process.Pid
@@ -214,11 +300,11 @@ func (s *Supervisor) runPostmaster(ctx context.Context, signals chan os.Signal) 
 		select {
 		case err := <-exited:
 			log.Info("postmaster exited", "error", err)
-			return false, nil
+			return outcomeStop, nil
 		case <-ctx.Done():
 			s.stop(context.WithoutCancel(ctx), CauseKubelet)
 			<-exited
-			return false, nil
+			return outcomeStop, nil
 		case received := <-signals:
 			if received == syscall.SIGCHLD {
 				s.reap(ctx)
@@ -226,16 +312,22 @@ func (s *Supervisor) runPostmaster(ctx context.Context, signals chan os.Signal) 
 			}
 			s.stop(context.WithoutCancel(ctx), CauseKubelet)
 			<-exited
-			return false, nil
+			return outcomeStop, nil
 		case command := <-s.commands:
-			if command == CommandFence {
+			switch command {
+			case CommandFence:
 				s.stop(context.WithoutCancel(ctx), CauseFence)
 				<-exited
-				return false, nil
+				return outcomeStop, nil
+			case CommandRejoin:
+				s.stop(context.WithoutCancel(ctx), CauseSwitchover)
+				<-exited
+				return outcomeRejoin, nil
+			case CommandRestart:
+				s.stop(ctx, CauseSwitchover)
+				<-exited
+				return outcomeRestart, nil
 			}
-			s.stop(ctx, CauseSwitchover)
-			<-exited
-			return true, nil
 		case <-ticker.C:
 			s.observe(ctx)
 		}
@@ -386,7 +478,7 @@ func (s *Supervisor) report(ctx context.Context, observation MemberObservation) 
 	if s.options.Client == nil {
 		return
 	}
-	if err := s.reporter().Report(ctx, observation, true); err != nil {
+	if err := s.reporter().Report(ctx, observation, true, ""); err != nil {
 		logf.FromContext(ctx).Error(err, "could not report member status")
 	}
 }

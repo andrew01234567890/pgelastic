@@ -42,10 +42,12 @@ type ProbeState struct {
 	// from pg_isready during a bootstrap that has not finished, and treating those two as
 	// the same state is how a pod gets marked ready before it has a postmaster.
 	CanCheck bool
-	// RewindInProgress suspends the startup probe entirely. A pg_rewind can run for far
-	// longer than any startup deadline, and letting the kubelet restart the pod mid-rewind
-	// leaves a data directory that is neither the old one nor the new one.
-	RewindInProgress bool
+	// Rejoin is the path a rejoin is currently taking, empty when none is running. While it
+	// is set the startup probe is suspended entirely: a pg_rewind can run for far longer
+	// than any startup deadline, and a re-clone for longer still, so letting the kubelet
+	// restart the pod through one leaves a data directory that is neither the old one nor
+	// the new one.
+	Rejoin RejoinMethod
 	// Role is the member's replication role.
 	Role Role
 	// ReplayLag is how far behind the primary this member is.
@@ -70,8 +72,8 @@ type ProbeState struct {
 // state the startup probe exists to wait through, and calling it a failure restarts a pod
 // that was about to become healthy.
 func StartupProbe(state ProbeState) ProbeResult {
-	if state.RewindInProgress {
-		return probeOK("skipped while pg_rewind runs")
+	if state.Rejoin != "" {
+		return probeOK("skipped while the member is " + string(state.Rejoin))
 	}
 	switch state.LastPing {
 	case pgtool.PingOK:

@@ -125,10 +125,7 @@ func (r *PgInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// The failover decision runs before the role labels are reconciled, because phase one
 	// of a failover is precisely a decision to take a label away, and re-applying it from
 	// the members' own stale reports in the same pass would undo it.
-	decision, err := r.reconcileFailover(ctx, instance, pods)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	decision := r.reconcileFailover(ctx, instance, pods)
 	if err := r.reconcileRoleLabels(ctx, instance, decision, pods); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -450,20 +447,26 @@ func configHashOf(builder provision.Builder) string {
 }
 
 // reconcileRoleLabels flips the label the two Services and the two PodDisruptionBudgets
-// select on, from what each member's own agent reported about itself.
+// select on.
 //
-// It does nothing at all while a failover is in progress. The sentinel exists so that
-// "targetPrimary != currentPrimary" is a total freeze signal, and relabelling from members'
-// reports during a failover is exactly the kind of half-converged state it exists to
-// prevent: the old primary's own last report still says "primary".
+// The primary label follows ha.Decision.ServingPrimary and nothing else, because the
+// question "which member may the read-write Service select" is not the question "is a
+// failover in progress". The replica label is still frozen for the whole of a failover: a
+// member's own last report is the half-converged state the sentinel exists to disregard,
+// and nothing needs the read-only Service to converge mid-failover.
 func (r *PgInstanceReconciler) reconcileRoleLabels(
 	ctx context.Context,
 	instance *pgelasticv1alpha1.PgInstance,
 	decision ha.Decision,
 	pods []corev1.Pod,
 ) error {
-	if ha.FailoverInProgress(instance.Status.CurrentPrimary, targetPrimaryAfter(instance, decision)) ||
-		decision.SplitBrain {
+	if decision.SplitBrain {
+		return nil
+	}
+	if err := r.applyPrimaryLabel(ctx, pods, decision.ServingPrimary); err != nil {
+		return err
+	}
+	if ha.FailoverInProgress(instance.Status.CurrentPrimary, targetPrimaryAfter(instance, decision)) {
 		return nil
 	}
 	roles := map[string]pgelasticv1alpha1.InstanceRole{}
@@ -472,28 +475,54 @@ func (r *PgInstanceReconciler) reconcileRoleLabels(
 	}
 	for i := range pods {
 		pod := &pods[i]
-		role, ok := roles[pod.Name]
-		if !ok || role == pgelasticv1alpha1.InstanceRoleUnknown {
-			continue
-		}
 		// A member's own report is enough to make it a replica and never enough to make it
-		// the primary. status.currentPrimary is the only field that says which member the
-		// read-write Service may select, and a demoted primary whose last report still
-		// claims the role would otherwise be handed it straight back - putting two members
-		// behind one Service, which is the failure this whole file exists to prevent.
-		if role == pgelasticv1alpha1.InstanceRolePrimary && pod.Name != instance.Status.CurrentPrimary {
-			if err := r.stripRoleLabel(ctx, pods, pod.Name); err != nil {
-				return err
-			}
-			continue
-		}
-		if pod.Labels[provision.LabelRole] == string(role) {
+		// the primary. The primary label belongs to applyPrimaryLabel alone, which takes its
+		// answer from status.currentPrimary: a demoted primary whose last report still claims
+		// the role would otherwise be handed it straight back, putting two members behind one
+		// Service, which is the failure this whole file exists to prevent.
+		if roles[pod.Name] != pgelasticv1alpha1.InstanceRoleReplica ||
+			pod.Labels[provision.LabelRole] == string(pgelasticv1alpha1.InstanceRoleReplica) ||
+			pod.Name == decision.ServingPrimary {
 			continue
 		}
 		updated := pod.DeepCopy()
-		updated.Labels[provision.LabelRole] = string(role)
+		updated.Labels[provision.LabelRole] = string(pgelasticv1alpha1.InstanceRoleReplica)
 		if err := r.Update(ctx, updated); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// applyPrimaryLabel puts the read-write Service's selector on the member that is genuinely
+// serving, and takes it off every other member that still carries it.
+//
+// Both halves matter and they are not symmetrical. Granting it late is an endpoint-less
+// Service refusing connections a healthy primary could have served; leaving it on a demoted
+// member is two members behind one Service, which is worse. ha.Decision.ServingPrimary is
+// the single answer both halves are driven from, so they cannot disagree.
+func (r *PgInstanceReconciler) applyPrimaryLabel(
+	ctx context.Context,
+	pods []corev1.Pod,
+	serving string,
+) error {
+	for i := range pods {
+		pod := &pods[i]
+		labelled := pod.Labels[provision.LabelRole] == string(pgelasticv1alpha1.InstanceRolePrimary)
+		switch {
+		case pod.Name == serving && !labelled:
+			updated := pod.DeepCopy()
+			if updated.Labels == nil {
+				updated.Labels = map[string]string{}
+			}
+			updated.Labels[provision.LabelRole] = string(pgelasticv1alpha1.InstanceRolePrimary)
+			if err := r.Update(ctx, updated); err != nil {
+				return err
+			}
+		case pod.Name != serving && labelled:
+			if err := r.stripRoleLabel(ctx, pods, pod.Name); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -612,10 +641,29 @@ func phaseOf(
 		decision.SplitBrain {
 		return pgelasticv1alpha1.InstancePhaseFailingOver
 	}
+	if rejoiningMember(instance) != nil {
+		return pgelasticv1alpha1.InstancePhaseRecloning
+	}
 	if readyMembers(pods) < replicas {
 		return pgelasticv1alpha1.InstancePhaseDegraded
 	}
 	return pgelasticv1alpha1.InstancePhaseReady
+}
+
+// rejoiningMember is the first member rebuilding itself onto the primary's history, nil
+// when none is.
+//
+// It moves the whole instance out of Ready, which is what stops allocatableOf publishing
+// any headroom: a member rewinding or re-cloning leaves the instance at two thirds
+// redundancy, and quorum-gated failover is impossible while it is there, so promising
+// tenants that capacity would be promising something the instance cannot honour.
+func rejoiningMember(instance *pgelasticv1alpha1.PgInstance) *pgelasticv1alpha1.InstanceMemberStatus {
+	for i, member := range instance.Status.Instances {
+		if member.Rejoining != "" {
+			return &instance.Status.Instances[i]
+		}
+	}
+	return nil
 }
 
 func readyMembers(pods []corev1.Pod) int32 {
@@ -643,7 +691,7 @@ func conditionsFor(
 		condition(pgelasticv1alpha1.ConditionReady, ready, instance.Generation,
 			readyReason(phase), fmt.Sprintf("%d of %d members are ready", readyMembers(pods), replicas)),
 		condition(pgelasticv1alpha1.ConditionProgressing, !ready, instance.Generation,
-			progressingReason(ready), string(phase)),
+			progressingReason(phase), progressingMessage(instance, phase)),
 	)
 	degraded := phase == pgelasticv1alpha1.InstancePhaseDegraded
 	conditions = append(conditions, condition(pgelasticv1alpha1.ConditionDegraded, degraded,
@@ -658,11 +706,26 @@ func readyReason(phase pgelasticv1alpha1.InstancePhase) string {
 	return pgelasticv1alpha1.ReasonPending
 }
 
-func progressingReason(ready bool) string {
-	if ready {
+// progressingReason names a re-cloning instance as such, because that reason is what the
+// autoscaler and the rebalancer refuse to act through: moving tenants onto an instance that
+// is rebuilding a member compounds a change already in flight.
+func progressingReason(phase pgelasticv1alpha1.InstancePhase) string {
+	switch phase {
+	case pgelasticv1alpha1.InstancePhaseReady:
 		return pgelasticv1alpha1.ReasonStable
+	case pgelasticv1alpha1.InstancePhaseRecloning:
+		return pgelasticv1alpha1.ReasonRecloning
+	default:
+		return pgelasticv1alpha1.ReasonPending
 	}
-	return pgelasticv1alpha1.ReasonPending
+}
+
+func progressingMessage(instance *pgelasticv1alpha1.PgInstance, phase pgelasticv1alpha1.InstancePhase) string {
+	member := rejoiningMember(instance)
+	if phase != pgelasticv1alpha1.InstancePhaseRecloning || member == nil {
+		return string(phase)
+	}
+	return fmt.Sprintf("%s is %s onto the primary's history", member.Name, member.Rejoining)
 }
 
 func degradedReason(degraded bool) string {
