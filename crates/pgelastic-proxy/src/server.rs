@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 use crate::backend;
 use crate::cancel::{CancelRegistry, CancelRoute, CancelToken};
 use crate::config::Config;
+use crate::epoch::FenceRuntime;
 use crate::error::{ProxyError, Result};
 use crate::handshake::{self, Accepted, ClientAuth};
 use crate::metrics::{AuthOutcome, Metrics, RejectReason};
@@ -33,6 +34,7 @@ pub struct Proxy {
     pub cancels: Arc<CancelRegistry>,
     pub metrics: Arc<Metrics>,
     pub pools: Arc<PoolManager>,
+    pub fence: FenceRuntime,
     permits: Arc<Semaphore>,
 }
 
@@ -87,8 +89,10 @@ impl Proxy {
 
         let permits = Arc::new(Semaphore::new(config.listen.max_client_connections.max(1)));
         let kdf = KdfPool::new(config.auth.kdf_concurrency);
-        let pools = PoolManager::new(config.pool.clone(), Arc::clone(&metrics))?;
+        let fence = FenceRuntime::from(&config.fence);
+        let pools = PoolManager::new(config.pool.clone(), fence.clone(), Arc::clone(&metrics))?;
         pools.publish_budget();
+        metrics.in_doubt(fence.fence.in_doubt().len());
 
         Ok(Arc::new(Self {
             auth: Arc::new(ClientAuth::new(verifiers, iterations)?),
@@ -99,6 +103,7 @@ impl Proxy {
             cancels: CancelRegistry::new(),
             metrics,
             pools,
+            fence,
             permits,
         }))
     }
@@ -147,6 +152,7 @@ pub async fn spawn(proxy: Arc<Proxy>, shutdown: watch::Sender<bool>) -> Result<R
 
     let (alive, idle) = mpsc::channel::<std::convert::Infallible>(1);
     let receiver = shutdown.subscribe();
+    spawn_fence_paths(&proxy, &shutdown).await?;
     let accept = tokio::spawn(accept_loop(proxy, listener, receiver, alive));
 
     info!(%address, "proxy listening");
@@ -157,6 +163,94 @@ pub async fn spawn(proxy: Arc<Proxy>, shutdown: watch::Sender<bool>) -> Result<R
         accept,
         drain_timeout,
     })
+}
+
+/// Starts the sweeper and whichever of the two optional delivery paths are
+/// configured.
+///
+/// The verify path needs nothing started: it runs inside every checkout, which
+/// is what makes it the one that survives a partition.
+async fn spawn_fence_paths(proxy: &Arc<Proxy>, shutdown: &watch::Sender<bool>) -> Result<()> {
+    tokio::spawn(sweep_loop(
+        Arc::clone(&proxy.pools),
+        proxy.fence.clone(),
+        Arc::clone(&proxy.metrics),
+        shutdown.subscribe(),
+    ));
+
+    if proxy.config.fence.verify_at_checkout {
+        tokio::spawn(crate::epoch::verify::probe_loop(
+            crate::epoch::verify::Prober {
+                backend: proxy.config.backend.clone(),
+                tls: proxy.backend_tls.clone(),
+                kdf: proxy.kdf.clone(),
+                fence: Arc::clone(&proxy.fence.fence),
+                metrics: Arc::clone(&proxy.metrics),
+            },
+            shutdown.subscribe(),
+        ));
+    }
+
+    if let Some(address) = &proxy.config.fence.push_address {
+        let listener = TcpListener::bind(crate::config::resolve(address)?).await?;
+        info!(address = %listener.local_addr()?, "epoch push endpoint listening");
+        tokio::spawn(crate::epoch::admin::serve(
+            listener,
+            Arc::clone(&proxy.fence.fence),
+            shutdown.subscribe(),
+        ));
+    }
+
+    if let Some(watch) = &proxy.config.fence.watch {
+        tokio::spawn(crate::epoch::watch::run(
+            crate::epoch::watch::WatchTarget {
+                namespace: watch.namespace.clone(),
+                name: watch.name.clone(),
+            },
+            Arc::clone(&proxy.fence.fence),
+            shutdown.subscribe(),
+        ));
+    }
+    Ok(())
+}
+
+/// Severs superseded parked sockets the moment the epoch moves.
+///
+/// Every checkout sweeps too, so this is not what makes the fence correct — it
+/// is what makes it prompt on an idle pool, where the next checkout might be
+/// minutes away and the sockets would sit there ESTABLISHED in the meantime.
+async fn sweep_loop(
+    pools: Arc<PoolManager>,
+    fence: FenceRuntime,
+    metrics: Arc<Metrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut epochs = fence.fence.subscribe();
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            changed = epochs.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+        let epoch = *epochs.borrow_and_update();
+        metrics.primary_epoch(epoch);
+        let severed = pools.sever_superseded();
+        if let Some(advanced_at) = fence.fence.advanced_at() {
+            let elapsed = advanced_at.elapsed();
+            metrics.fence_latency(elapsed);
+            info!(
+                %epoch,
+                severed,
+                elapsed_us = elapsed.as_micros(),
+                deadline_ms = fence.fence.timing().fence_deadline().as_millis(),
+                "the epoch fence completed"
+            );
+        }
+    }
 }
 
 async fn accept_loop(
@@ -261,7 +355,7 @@ async fn serve(
     let result = if key.mode() == pgelastic_pool::PoolMode::Transaction {
         multiplexed(proxy, &mut session, &key, &role, &mut shutdown).await
     } else {
-        bound(proxy, &mut session, &mut shutdown).await
+        bound(proxy, &mut session, &role, &mut shutdown).await
     };
 
     if let Err(error) = &result
@@ -276,6 +370,7 @@ async fn serve(
 async fn bound(
     proxy: &Arc<Proxy>,
     session: &mut handshake::ClientSession,
+    role: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let mut link = match backend::connect(
@@ -295,9 +390,101 @@ async fn bound(
     };
     proxy.metrics.backend_auth(AuthOutcome::Success);
     proxy.metrics.backend_opened();
-    let result = relay(proxy, session, &mut link, shutdown).await;
+
+    let fenced = match verify_bound(proxy, session, &mut link, role).await {
+        Ok(fenced) => fenced,
+        Err(error) => {
+            proxy.metrics.client_rejected(RejectReason::Backend);
+            proxy
+                .metrics
+                .backend_severed(crate::epoch::FenceAction::Close);
+            proxy.metrics.backend_closed();
+            link.stream.sever();
+            return Err(error);
+        }
+    };
+
+    let result = relay(proxy, session, &mut link, &fenced, shutdown).await;
     proxy.metrics.backend_closed();
     result
+}
+
+/// Tags a bound link with the epoch it proved it was serving.
+///
+/// A replication connection is deliberately not probed: a physical walsender
+/// answers replication commands and nothing else, so a `SELECT` there is a
+/// protocol error rather than a verification. It is tagged with what the proxy
+/// knows instead, which still lets a later push or watch sever it — a
+/// replication stream to a demoted primary is exactly as dangerous as a client
+/// one.
+async fn verify_bound<'a>(
+    proxy: &'a Arc<Proxy>,
+    session: &handshake::ClientSession,
+    link: &mut backend::BackendSession,
+    role: &str,
+) -> Result<session::Fenced<'a>> {
+    let mut fenced = session::Fenced {
+        runtime: &proxy.fence,
+        opened_under: proxy.fence.current(),
+        tenant: role.to_owned(),
+        backend_pid: link.key_data.as_ref().map(|data| data.process_id),
+        lsn: None,
+    };
+
+    for message in &link.parameters {
+        if let BackendMessage::ParameterStatus(status) = message
+            && let Some((epoch, observation)) =
+                crate::epoch::verify::observe_parameter_status(&proxy.fence.fence, status)
+        {
+            proxy
+                .metrics
+                .epoch_observed(crate::epoch::EpochSource::Verify, observation.into());
+            fenced.opened_under = epoch;
+        }
+    }
+
+    let replication = session.startup.get(b"replication").is_some();
+    if proxy.config.fence.verify_at_checkout && !replication {
+        let mut relay = crate::relay::FrameRelay::default();
+        relay.extend_from_slice(link.buf.as_slice());
+        let probe = crate::epoch::verify::probe(&mut link.stream, &mut relay).await?;
+        // Whatever the probe read past its own answer belongs to the session.
+        link.buf = pgelastic_wire::MessageBuffer::new();
+        fenced.backend_pid = probe.backend_pid.or(fenced.backend_pid);
+        fenced.lsn = probe.lsn;
+        match probe.epoch {
+            Some(epoch) => {
+                let observation = proxy
+                    .fence
+                    .fence
+                    .observe(crate::epoch::EpochSource::Verify, epoch);
+                proxy
+                    .metrics
+                    .epoch_observed(crate::epoch::EpochSource::Verify, observation.into());
+                fenced.opened_under = epoch;
+            }
+            None if proxy.config.fence.require_epoch => {
+                return Err(ProxyError::SupersededEpoch {
+                    message: "this backend carries no pgelastic.primary_epoch, so the epoch it \
+                              is serving cannot be established"
+                        .to_owned(),
+                });
+            }
+            None => {}
+        }
+    }
+    proxy.metrics.primary_epoch(proxy.fence.current());
+
+    if fenced.opened_under < proxy.fence.current() {
+        return Err(ProxyError::SupersededEpoch {
+            message: format!(
+                "this backend is serving primary epoch {} and the cluster has reached {}",
+                fenced.opened_under,
+                proxy.fence.current()
+            ),
+        });
+    }
+    Ok(fenced)
 }
 
 /// Greets the client with the backend's session state, then relays until the
@@ -306,6 +493,7 @@ async fn relay(
     proxy: &Arc<Proxy>,
     session: &mut handshake::ClientSession,
     link: &mut backend::BackendSession,
+    fenced: &session::Fenced<'_>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let token = CancelToken::mint(proxy.config.routing.cancel_routing_id)?;
@@ -330,14 +518,17 @@ async fn relay(
     let ending = session::run(
         &mut session.stream,
         &mut link.stream,
-        session::Pending {
-            from_client: &pending_from_client,
-            from_backend: &pending_from_backend,
+        session::Context {
+            pending: session::Pending {
+                from_client: &pending_from_client,
+                from_backend: &pending_from_backend,
+            },
+            limits: limits(proxy),
+            metrics: &proxy.metrics,
+            force_after: proxy.config.drain.shutdown_timeout(),
+            fence: fenced,
         },
-        limits(proxy),
-        &proxy.metrics,
         shutdown,
-        proxy.config.drain.shutdown_timeout(),
     )
     .await;
 
@@ -352,6 +543,12 @@ async fn relay(
         Ok(Ending::PeerClosed) => {
             session::terminate_backend(&mut link.stream).await;
             Ok(())
+        }
+        // A fenced session's socket has already been armed for an RST, and a
+        // `Terminate` on it would be one more message the demoted primary is
+        // free to finish its current statement before honouring.
+        Err(error @ (ProxyError::SupersededEpoch { .. } | ProxyError::OutcomeUnknown { .. })) => {
+            Err(error)
         }
         Err(error) => {
             session::terminate_backend(&mut link.stream).await;

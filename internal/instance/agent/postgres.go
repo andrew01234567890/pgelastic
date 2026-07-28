@@ -45,18 +45,42 @@ func Connect(ctx context.Context, socketDir string, port int32) (*pgx.Conn, erro
 // reports it, because the agent is the only party that can read pg_is_in_recovery() on
 // this member without a network hop that the failure being diagnosed may have removed.
 type MemberObservation struct {
-	Role              Role
-	LSN               string
+	Role Role
+	// LSN is the member's headline position: the current insert position on a primary, the
+	// replay position on a standby.
+	LSN string
+	// ReceivedLSN and ReplayLSN are reported separately because candidate selection orders
+	// on both, received first. WAL that has been received is durable on this member whether
+	// or not recovery has replayed it yet.
+	ReceivedLSN string
+	ReplayLSN   string
+	// Timeline is the highest timeline this member holds WAL for: the control file's, or
+	// the one its WAL receiver is streaming on when that is further ahead. The control file
+	// alone lags a timeline switch by a whole restartpoint, which would make a standby that
+	// has already received the new history look like one that had been left behind on the
+	// old.
 	Timeline          int32
 	ReplayLag         time.Duration
 	WALReceiverActive bool
+	// WALVolumeFull is measured from the filesystem rather than read from PostgreSQL, so
+	// that the answer survives a postmaster that has already stopped - which is precisely
+	// the state a candidate is in when the veto has to be evaluated.
+	WALVolumeFull bool
+	// SyncStandbys and StreamingStandbys come from pg_stat_replication and describe what is
+	// happening right now.
 	SyncStandbys      []string
 	StreamingStandbys []string
-	SyncStandbyNames  string
-	NumSync           int32
-	ConfigSHA256      string
-	PendingRestart    bool
-	MaxConnections    int32
+	// SyncStandbyNames is the clause the postmaster loaded, and VotingMembers and NumSync
+	// are parsed out of it. They are the quorum gate's N and W, and they deliberately come
+	// from the loaded value rather than from pg_stat_replication: a member PostgreSQL never
+	// loaded as a voter is not a voter, however healthily it happens to be streaming.
+	SyncStandbyNames string
+	NumSync          int32
+	VotingMembers    []string
+	ConfigSHA256     string
+	PendingRestart   bool
+	MaxConnections   int32
+	PrimaryEpoch     int64
 }
 
 // Observe reads the member's own state out of the running postmaster.
@@ -76,16 +100,26 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		SELECT COALESCE(CASE WHEN pg_is_in_recovery()
 		                     THEN pg_last_wal_replay_lsn()
 		                     ELSE pg_current_wal_lsn() END::text, ''),
-		       (SELECT timeline_id FROM pg_control_checkpoint()),
+		       COALESCE(CASE WHEN pg_is_in_recovery()
+		                     THEN pg_last_wal_receive_lsn()
+		                     ELSE pg_current_wal_lsn() END::text, ''),
+		       COALESCE(CASE WHEN pg_is_in_recovery()
+		                     THEN pg_last_wal_replay_lsn()
+		                     ELSE pg_current_wal_lsn() END::text, ''),
+		       GREATEST((SELECT timeline_id FROM pg_control_checkpoint()),
+		                COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0)),
 		       COALESCE(EXTRACT(epoch FROM now() - pg_last_xact_replay_timestamp()), 0)::float8,
 		       EXISTS (SELECT 1 FROM pg_stat_wal_receiver),
 		       COALESCE(current_setting('pgelastic.config_sha256', true), ''),
 		       EXISTS (SELECT 1 FROM pg_settings WHERE pending_restart),
 		       current_setting('max_connections')::int,
-		       current_setting('synchronous_standby_names')`
+		       current_setting('synchronous_standby_names'),
+		       COALESCE(current_setting('pgelastic.primary_epoch', true), '0')::bigint`
 	var lagSeconds float64
 	err := conn.QueryRow(ctx, stateQuery).Scan(
 		&observation.LSN,
+		&observation.ReceivedLSN,
+		&observation.ReplayLSN,
 		&observation.Timeline,
 		&lagSeconds,
 		&observation.WALReceiverActive,
@@ -93,12 +127,13 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		&observation.PendingRestart,
 		&observation.MaxConnections,
 		&observation.SyncStandbyNames,
+		&observation.PrimaryEpoch,
 	)
 	if err != nil {
 		return observation, err
 	}
 	observation.ReplayLag = time.Duration(lagSeconds * float64(time.Second))
-	observation.NumSync, _ = ParseSyncStandbyNames(observation.SyncStandbyNames)
+	observation.NumSync, observation.VotingMembers = ParseSyncStandbyNames(observation.SyncStandbyNames)
 
 	if observation.Role != RolePrimary {
 		return observation, nil
@@ -177,32 +212,28 @@ type Contract struct {
 // happens before any standby exists, so a synchronous commit here would wait forever for a
 // quorum that cannot yet be formed - a deadlock produced by the durability setting that
 // makes the product correct in every other circumstance.
-func BootstrapRoles(ctx context.Context, conn *pgx.Conn, replicationPassword, opsPassword string) error {
-	statements := []string{
+func BootstrapRoles(ctx context.Context, conn *pgx.Conn, replicationPassword, opsPassword, rewindPassword string) error {
+	statements := make([]string, 0, 9)
+	statements = append(statements,
 		`SET LOCAL synchronous_commit = 'local'`,
-		fmt.Sprintf(
-			`DO $$ BEGIN
-			   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN
-			     CREATE ROLE %s WITH LOGIN REPLICATION PASSWORD %s;
-			   ELSE
-			     ALTER ROLE %s WITH LOGIN REPLICATION PASSWORD %s;
-			   END IF;
-			 END $$`,
-			quoteLiteral(provision.ReplicationRole), provision.ReplicationRole,
-			quoteLiteral(replicationPassword), provision.ReplicationRole,
-			quoteLiteral(replicationPassword)),
-		fmt.Sprintf(
-			`DO $$ BEGIN
-			   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN
-			     CREATE ROLE %s WITH LOGIN PASSWORD %s;
-			   ELSE
-			     ALTER ROLE %s WITH LOGIN PASSWORD %s;
-			   END IF;
-			 END $$`,
-			quoteLiteral(provision.OpsRole), provision.OpsRole,
-			quoteLiteral(opsPassword), provision.OpsRole, quoteLiteral(opsPassword)),
+		upsertRole(provision.ReplicationRole, replicationPassword, "REPLICATION"),
+		upsertRole(provision.OpsRole, opsPassword, ""),
 		fmt.Sprintf(`GRANT pg_monitor, pg_signal_backend, pg_use_reserved_connections TO %s`,
 			provision.OpsRole),
+		upsertRole(provision.RewindRole, rewindPassword, ""),
+	)
+	// pg_rewind reads the source's data directory over an ordinary connection, so the role
+	// it dials as needs exactly these four functions and nothing else. Granting it a
+	// predefined role instead, or superuser, would hand file-read access far wider than the
+	// data directory to a credential that lives in every member's environment.
+	for _, function := range []string{
+		"pg_ls_dir(text,boolean,boolean)",
+		"pg_stat_file(text,boolean)",
+		"pg_read_binary_file(text)",
+		"pg_read_binary_file(text,bigint,bigint,boolean)",
+	} {
+		statements = append(statements,
+			fmt.Sprintf(`GRANT EXECUTE ON FUNCTION %s TO %s`, function, provision.RewindRole))
 	}
 
 	transaction, err := conn.Begin(ctx)
@@ -248,6 +279,43 @@ func SynchronousStandbyNames(quorum string, streaming []string) string {
 	return fmt.Sprintf("%s (%s)", quorum, strings.Join(quoted, ","))
 }
 
+// ConvergeSyncMembers decides the quorum set for the next reload.
+//
+// Under dataDurability Required the answer is the union of what PostgreSQL already loaded
+// and what is streaming now, intersected with the members this instance is allowed to have.
+// Growing is safe - a named standby that has not connected yet blocks commits, which is the
+// declared contract - while shrinking is not: dropping a standby the moment it stops
+// streaming turns a stalled commit into a silently asynchronous one, and nobody outside the
+// server can tell the difference afterwards.
+//
+// Under Preferred the set follows what is streaming, because degrading to asynchronous
+// replication is precisely what that setting asks for.
+func ConvergeSyncMembers(loaded, streaming, members []string, required bool) []string {
+	allowed := make(map[string]bool, len(members))
+	for _, member := range members {
+		allowed[member] = true
+	}
+	keep := make(map[string]bool, len(streaming))
+	for _, member := range streaming {
+		if allowed[member] {
+			keep[member] = true
+		}
+	}
+	if required {
+		for _, member := range loaded {
+			if allowed[member] {
+				keep[member] = true
+			}
+		}
+	}
+	converged := make([]string, 0, len(keep))
+	for member := range keep {
+		converged = append(converged, member)
+	}
+	slices.Sort(converged)
+	return converged
+}
+
 // ParseSyncStandbyNames extracts W and the voting members from a loaded
 // synchronous_standby_names clause.
 //
@@ -283,6 +351,21 @@ func ParseSyncStandbyNames(value string) (int32, []string) {
 		}
 	}
 	return int32(numSync), members
+}
+
+// upsertRole creates or re-passwords one login role. It is idempotent because bootstrap
+// runs in an init container, and an init container runs again on every Pod restart.
+func upsertRole(name, password, attributes string) string {
+	return fmt.Sprintf(
+		`DO $$ BEGIN
+		   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN
+		     CREATE ROLE %s WITH LOGIN %s PASSWORD %s;
+		   ELSE
+		     ALTER ROLE %s WITH LOGIN %s PASSWORD %s;
+		   END IF;
+		 END $$`,
+		quoteLiteral(name), name, attributes, quoteLiteral(password),
+		name, attributes, quoteLiteral(password))
 }
 
 func quoteLiteral(value string) string {

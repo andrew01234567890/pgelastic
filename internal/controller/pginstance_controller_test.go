@@ -307,7 +307,8 @@ var _ = Describe("PgInstance controller", func() {
 				Name:      provision.CredentialsSecretName(instance.Name)}, secret)).To(Succeed())
 			Expect(secret.Data).To(HaveKey(provision.SecretKeyReplicationPassword))
 			Expect(secret.Data).To(HaveKey(provision.SecretKeyOpsPassword))
-			Expect(secret.Data).To(HaveLen(2))
+			Expect(secret.Data).To(HaveKey(provision.SecretKeyRewindPassword))
+			Expect(secret.Data).To(HaveLen(3))
 		})
 
 		It("hands the agent a configuration carrying the derived capacity", func() {
@@ -353,13 +354,14 @@ var _ = Describe("PgInstance controller", func() {
 			Expect(status.Phase).To(Equal(pgelasticv1alpha1.InstancePhaseBootstrapping))
 		})
 
-		It("seeds a stable primary epoch and a target primary", func() {
+		It("leaves the primary epoch to the member that holds the role", func() {
 			instance = makeInstance("epoch")
 			Expect(k8sClient.Create(ctx, instance)).To(Succeed())
 			reconcileNow(reconciler, instance)
 
 			status := refetch(instance).Status
-			Expect(status.PrimaryEpoch).To(Equal(initialPrimaryEpoch))
+			Expect(status.PrimaryEpoch).To(BeZero(),
+				"an operator that owned the fence token could drive it backwards from a stale read")
 			Expect(status.TargetPrimary).To(Equal(provision.MemberName(instance.Name, 1)))
 		})
 

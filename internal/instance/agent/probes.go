@@ -52,6 +52,15 @@ type ProbeState struct {
 	ReplayLag time.Duration
 	// LastPing is the most recent pg_isready result.
 	LastPing pgtool.PingResult
+	// Observation is the last reading the supervisor took from the postmaster, and
+	// Observed says whether there has ever been one. The status endpoint serves it rather
+	// than opening its own connection, so that a probe cannot consume a backend slot on an
+	// instance that is already short of them.
+	Observation MemberObservation
+	Observed    bool
+	// WALVolumeFull is measured from the filesystem rather than from PostgreSQL, so it is
+	// still answerable when the postmaster is not.
+	WALVolumeFull bool
 }
 
 // StartupProbe answers whether the postmaster has got far enough to be waited on.

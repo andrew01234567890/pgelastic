@@ -16,7 +16,11 @@ limitations under the License.
 
 package provision
 
-import "github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
+)
 
 // Filesystem layout inside a Postgres pod. The agent and the operator both compile against
 // these constants, so a path can never be spelled two different ways.
@@ -40,6 +44,10 @@ const (
 	AgentBinary = AgentMountPath + "/" + AgentBinaryName
 	// SourceAgentBinary is where the binary sits in the agent image.
 	SourceAgentBinary = "/" + AgentBinaryName
+	// SourceVerifyBinary is where the durability oracle sits in the same image. It travels
+	// with the agent so a chaos run can drive it from inside the cluster, against the
+	// read-write Service, which is the route a tenant's connection takes.
+	SourceVerifyBinary = "/pgelastic-verify"
 	// ConfigMountPath holds the generated configuration.
 	ConfigMountPath = "/etc/pgelastic"
 	// ConfigFileName is the operator's decisions, rendered by the agent.
@@ -77,6 +85,11 @@ const (
 	// OpsRole is the control plane's non-superuser role, holding pg_monitor,
 	// pg_signal_backend and pg_use_reserved_connections and nothing else.
 	OpsRole = "pgelastic_ops"
+	// RewindRole is what pg_rewind connects to the new primary as. It is a role of its own
+	// rather than a reuse of OpsRole because it needs exactly four function grants and
+	// nothing else: a rewind connection can read any file in the data directory, so the
+	// role that does it must be able to do nothing more than that.
+	RewindRole = "pgelastic_rewind"
 )
 
 // Secret keys.
@@ -85,26 +98,29 @@ const (
 	SecretKeyReplicationPassword = "replication-password"
 	// SecretKeyOpsPassword is the ops role's password.
 	SecretKeyOpsPassword = "ops-password"
+	// SecretKeyRewindPassword is the rewind role's password.
+	SecretKeyRewindPassword = "rewind-password"
 )
 
 // Environment variables the agent reads. They are declared here rather than in the agent
 // so the operator that writes them and the agent that reads them cannot drift.
 const (
-	EnvInstance     = "PGELASTIC_INSTANCE"
-	EnvNamespace    = "PGELASTIC_NAMESPACE"
-	EnvMember       = "PGELASTIC_MEMBER"
-	EnvSerial       = "PGELASTIC_SERIAL"
-	EnvPodIP        = "PGELASTIC_POD_IP"
-	EnvDataDir      = "PGDATA"
-	EnvWALDir       = "PGELASTIC_WAL_DIR"
-	EnvConfigFile   = "PGELASTIC_CONFIG_FILE"
-	EnvSocketDir    = "PGELASTIC_SOCKET_DIR"
-	EnvLogDir       = "PGELASTIC_LOG_DIR"
-	EnvStatusPort   = "PGELASTIC_STATUS_PORT"
-	EnvPeerService  = "PGELASTIC_PEER_SERVICE"
-	EnvReplPassword = "PGELASTIC_REPLICATION_PASSWORD"
-	EnvOpsPassword  = "PGELASTIC_OPS_PASSWORD"
-	EnvBinDir       = "PGELASTIC_PG_BIN_DIR"
+	EnvInstance       = "PGELASTIC_INSTANCE"
+	EnvNamespace      = "PGELASTIC_NAMESPACE"
+	EnvMember         = "PGELASTIC_MEMBER"
+	EnvSerial         = "PGELASTIC_SERIAL"
+	EnvPodIP          = "PGELASTIC_POD_IP"
+	EnvDataDir        = "PGDATA"
+	EnvWALDir         = "PGELASTIC_WAL_DIR"
+	EnvConfigFile     = "PGELASTIC_CONFIG_FILE"
+	EnvSocketDir      = "PGELASTIC_SOCKET_DIR"
+	EnvLogDir         = "PGELASTIC_LOG_DIR"
+	EnvStatusPort     = "PGELASTIC_STATUS_PORT"
+	EnvPeerService    = "PGELASTIC_PEER_SERVICE"
+	EnvReplPassword   = "PGELASTIC_REPLICATION_PASSWORD"
+	EnvOpsPassword    = "PGELASTIC_OPS_PASSWORD"
+	EnvRewindPassword = "PGELASTIC_REWIND_PASSWORD"
+	EnvBinDir         = "PGELASTIC_PG_BIN_DIR"
 )
 
 // AgentConfig is everything the operator decided, handed to the agent as one document.
@@ -128,11 +144,27 @@ type AgentConfig struct {
 	// DataDurability decides whether losing quorum stalls commits or degrades to
 	// asynchronous replication.
 	DataDurability string `json:"dataDurability"`
+	// Lease parameterises the promotion Lease the agent holds.
+	Lease LeaseTimings `json:"lease"`
 	// PeerService is the headless Service that gives members stable DNS names.
 	PeerService string `json:"peerService"`
 	// CollationContract is what initdb was pinned to, so a member can refuse to join a
 	// pool whose contract differs rather than discovering the difference at restore time.
 	CollationContract CollationContract `json:"collationContract"`
+}
+
+// LeaseTimings are the promotion Lease's four durations, handed to the agent because the
+// agent, not the operator, is what holds the lease.
+//
+// They are also the proxy's fencing deadline, which is why they travel as one struct:
+// shortening the lease duration shortens the deadline in lockstep, and a deployment where
+// the two disagree has a window in which a new primary exists and the old one is still
+// being written to.
+type LeaseTimings struct {
+	LeaseDuration         metav1.Duration `json:"leaseDuration"`
+	RenewDeadline         metav1.Duration `json:"renewDeadline"`
+	RetryPeriod           metav1.Duration `json:"retryPeriod"`
+	ReleasedLeaseDuration metav1.Duration `json:"releasedLeaseDuration"`
 }
 
 // CollationContract is the initdb side of the immutable tuple published in status.

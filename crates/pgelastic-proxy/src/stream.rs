@@ -102,6 +102,44 @@ impl<P, T> MaybeTls<P, T> {
     }
 }
 
+impl BackendStream {
+    /// The socket underneath, whether or not TLS was negotiated over it.
+    pub fn socket(&self) -> &tokio::net::TcpStream {
+        match self {
+            Self::Plain(socket) => socket,
+            Self::Tls(stream) => stream.get_ref().0,
+        }
+    }
+
+    /// Severs the connection with an RST rather than a FIN.
+    ///
+    /// This is the primitive the primary-epoch fence is built on. A graceful
+    /// close is a request the peer may take its time honouring, and a demoted
+    /// primary finishing one more `COMMIT` while the socket drains is exactly
+    /// the write `pg_rewind` is about to discard. A zero linger makes the close
+    /// an RST: the kernel discards anything queued and the backend's
+    /// `pg_terminate_backend` is not needed for the connection to be gone.
+    ///
+    /// Best effort by construction — a socket already torn down by the peer has
+    /// nothing to reset — and the connection is dropped either way.
+    ///
+    /// Through `socket2` rather than `TcpStream::set_linger`, which is
+    /// deprecated because a *non-zero* linger blocks the closing thread. A zero
+    /// linger is the opposite: it is what makes the close immediate.
+    pub fn sever(self) {
+        self.arm_reset();
+        drop(self);
+    }
+
+    /// Arms the socket so that whenever it is dropped the close is an RST.
+    ///
+    /// For the callers that cannot consume the stream — a bound session holds it
+    /// by `&mut` for its whole life — but still must not let it close politely.
+    pub fn arm_reset(&self) {
+        let _ = socket2::SockRef::from(self.socket()).set_linger(Some(std::time::Duration::ZERO));
+    }
+}
+
 impl<P, T> AsyncRead for MaybeTls<P, T>
 where
     P: AsyncRead + Unpin,

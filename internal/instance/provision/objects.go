@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/ha"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 )
 
@@ -105,8 +107,9 @@ func (b Builder) meta(name string, labels map[string]string) metav1.ObjectMeta {
 
 // Replicas is the configured member count.
 func (b Builder) Replicas() int32 {
-	if ha := b.Instance.Spec.HighAvailability; ha != nil && ha.Replicas != nil {
-		return *ha.Replicas
+	if highAvailability := b.Instance.Spec.HighAvailability; highAvailability != nil &&
+		highAvailability.Replicas != nil {
+		return *highAvailability.Replicas
 	}
 	return 3
 }
@@ -182,9 +185,11 @@ func (b Builder) AgentConfig() AgentConfig {
 			PeerSources:     b.PeerSources,
 			ReplicationRole: ReplicationRole,
 			OpsRole:         OpsRole,
+			RewindRole:      RewindRole,
 		},
 		Quorum:         quorum(spec),
 		DataDurability: string(dataDurability(spec)),
+		Lease:          leaseTimings(spec),
 		PeerService:    PeerServiceName(b.name()),
 		CollationContract: CollationContract{
 			Encoding:       "UTF8",
@@ -314,6 +319,7 @@ func (b Builder) env(serial int32) []corev1.EnvVar {
 		{Name: EnvPeerService, Value: PeerServiceName(b.name())},
 		fromSecret(EnvReplPassword, SecretKeyReplicationPassword),
 		fromSecret(EnvOpsPassword, SecretKeyOpsPassword),
+		fromSecret(EnvRewindPassword, SecretKeyRewindPassword),
 	}
 }
 
@@ -462,22 +468,82 @@ func (b Builder) PodDisruptionBudgets() []*policyv1.PodDisruptionBudget {
 }
 
 func synchronousCommit(spec pgelasticv1alpha1.PgInstanceSpec) pgelasticv1alpha1.SynchronousCommitLevel {
-	if ha := spec.HighAvailability; ha != nil && ha.SynchronousCommit != nil {
-		return *ha.SynchronousCommit
+	if highAvailability := spec.HighAvailability; highAvailability != nil &&
+		highAvailability.SynchronousCommit != nil {
+		return *highAvailability.SynchronousCommit
 	}
 	return pgelasticv1alpha1.SynchronousCommitOn
 }
 
 func dataDurability(spec pgelasticv1alpha1.PgInstanceSpec) pgelasticv1alpha1.DataDurability {
-	if ha := spec.HighAvailability; ha != nil && ha.DataDurability != nil {
-		return *ha.DataDurability
+	if highAvailability := spec.HighAvailability; highAvailability != nil &&
+		highAvailability.DataDurability != nil {
+		return *highAvailability.DataDurability
 	}
 	return pgelasticv1alpha1.DataDurabilityRequired
 }
 
+// leaseTimings resolves the promotion Lease's four durations, falling back to the validated
+// defaults for anything the spec leaves unset.
+func leaseTimings(spec pgelasticv1alpha1.PgInstanceSpec) LeaseTimings {
+	defaults := ha.DefaultLeaseConfig()
+	timings := LeaseTimings{
+		LeaseDuration:         metav1.Duration{Duration: defaults.LeaseDuration},
+		RenewDeadline:         metav1.Duration{Duration: defaults.RenewDeadline},
+		RetryPeriod:           metav1.Duration{Duration: defaults.RetryPeriod},
+		ReleasedLeaseDuration: metav1.Duration{Duration: defaults.ReleasedLeaseDuration},
+	}
+	lease := leaseSpec(spec)
+	if lease == nil {
+		return timings
+	}
+	for target, configured := range map[*metav1.Duration]*metav1.Duration{
+		&timings.LeaseDuration:         lease.LeaseDuration,
+		&timings.RenewDeadline:         lease.RenewDeadline,
+		&timings.RetryPeriod:           lease.RetryPeriod,
+		&timings.ReleasedLeaseDuration: lease.ReleasedLeaseDuration,
+	} {
+		if configured != nil && configured.Duration > 0 {
+			*target = *configured
+		}
+	}
+	return timings
+}
+
+func leaseSpec(spec pgelasticv1alpha1.PgInstanceSpec) *pgelasticv1alpha1.PrimaryLeaseSpec {
+	if spec.HighAvailability == nil {
+		return nil
+	}
+	return spec.HighAvailability.PrimaryLease
+}
+
+// FailoverDelay is how long an unhealthy primary is debounced before a failover starts. It
+// is deliberately non-zero: a spurious failover costs a timeline bump, a rewind or a full
+// re-clone, a window at reduced redundancy during which failover is impossible, and a
+// connection reset for every tenant on the instance.
+func FailoverDelay(spec pgelasticv1alpha1.PgInstanceSpec) time.Duration {
+	if highAvailability := spec.HighAvailability; highAvailability != nil &&
+		highAvailability.FailoverDelay != nil {
+		return highAvailability.FailoverDelay.Duration
+	}
+	return 10 * time.Second
+}
+
+// FailoverQuorumEnabled reports whether promotion is gated on quorum evidence. Turning it
+// off permits promoting a standby that cannot be proven to hold the last acknowledged
+// commit, so it defaults on.
+func FailoverQuorumEnabled(spec pgelasticv1alpha1.PgInstanceSpec) bool {
+	if highAvailability := spec.HighAvailability; highAvailability != nil &&
+		highAvailability.FailoverQuorum != nil {
+		return *highAvailability.FailoverQuorum
+	}
+	return true
+}
+
 func quorum(spec pgelasticv1alpha1.PgInstanceSpec) string {
-	if ha := spec.HighAvailability; ha != nil && ha.Quorum != nil && *ha.Quorum != "" {
-		return *ha.Quorum
+	if highAvailability := spec.HighAvailability; highAvailability != nil &&
+		highAvailability.Quorum != nil && *highAvailability.Quorum != "" {
+		return *highAvailability.Quorum
 	}
 	return "ANY 1"
 }

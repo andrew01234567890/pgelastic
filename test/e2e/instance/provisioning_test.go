@@ -87,6 +87,7 @@ func fetchInstance() *pgelasticv1alpha1.PgInstance {
 
 var _ = Describe("Provisioning a three-node PostgreSQL 18 instance", Ordered, func() {
 	BeforeAll(func() {
+		probeNamespace.Store(e2eNamespace)
 		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: e2eNamespace}}
 		Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, namespace))).To(Succeed())
 

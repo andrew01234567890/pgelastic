@@ -21,12 +21,18 @@
 //! - [`pool`] and [`txn`] are the wiring: the map of pools, and the loop that
 //!   drives checkout and check-in from the gate rather than from a second copy
 //!   of it.
+//! - [`epoch`] owns the primary-epoch fence. Kubernetes Services cannot tear
+//!   down an established TCP connection, so a demoted primary keeps serving
+//!   writes that `pg_rewind` is about to discard. Every backend socket
+//!   originates here, so the proxy can sever rather than deregister — and it is
+//!   the only component in the system that can.
 
 #![allow(clippy::must_use_candidate)]
 
 pub mod backend;
 pub mod cancel;
 pub mod config;
+pub mod epoch;
 pub mod error;
 pub mod handshake;
 pub mod metrics;

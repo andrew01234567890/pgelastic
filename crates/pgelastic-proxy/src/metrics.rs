@@ -84,6 +84,56 @@ impl ConnectGateOutcome {
 /// when nothing has been refused.
 const ERROR_CODES: [pgelastic_capacity::ErrorCode; 6] = pgelastic_capacity::ErrorCode::ALL;
 
+/// What one epoch observation meant, as a metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochOutcome {
+    Unchanged,
+    Advanced,
+    Regressed,
+}
+
+const EPOCH_OUTCOMES: [EpochOutcome; 3] = [
+    EpochOutcome::Unchanged,
+    EpochOutcome::Advanced,
+    EpochOutcome::Regressed,
+];
+
+impl EpochOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::Advanced => "advanced",
+            Self::Regressed => "regressed",
+        }
+    }
+}
+
+impl From<crate::epoch::Observation> for EpochOutcome {
+    fn from(observation: crate::epoch::Observation) -> Self {
+        match observation {
+            crate::epoch::Observation::Unchanged => Self::Unchanged,
+            crate::epoch::Observation::Advanced { .. } => Self::Advanced,
+            crate::epoch::Observation::Regressed { .. } => Self::Regressed,
+        }
+    }
+}
+
+const FENCE_ACTIONS: [crate::epoch::FenceAction; 4] = [
+    crate::epoch::FenceAction::Close,
+    crate::epoch::FenceAction::DrainThenClose,
+    crate::epoch::FenceAction::ResetNow,
+    crate::epoch::FenceAction::ReportUnknown,
+];
+
+fn fence_action_label(action: crate::epoch::FenceAction) -> &'static str {
+    match action {
+        crate::epoch::FenceAction::Close => "close",
+        crate::epoch::FenceAction::DrainThenClose => "drain_then_close",
+        crate::epoch::FenceAction::ResetNow => "reset_now",
+        crate::epoch::FenceAction::ReportUnknown => "report_unknown",
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Metrics {
     clients_accepted: AtomicU64,
@@ -109,6 +159,15 @@ pub struct Metrics {
     pins: [AtomicU64; pgelastic_pool::PinReason::ALL.len()],
     /// The elastic/pinned split, refreshed from the pool manager's ledger.
     budget: [AtomicI64; 3],
+    primary_epoch: AtomicI64,
+    /// `source x outcome`, flattened row-major over the three of each.
+    epoch_observations: [AtomicU64; 9],
+    backends_severed: [AtomicU64; FENCE_ACTIONS.len()],
+    in_doubt: AtomicI64,
+    /// Microseconds from the epoch advancing to the last sweep completing.
+    /// Microseconds rather than milliseconds because a healthy fence finishes
+    /// inside one, and a gauge that always reads zero proves nothing.
+    fence_latency_us: AtomicI64,
 }
 
 impl Metrics {
@@ -235,6 +294,43 @@ impl Metrics {
         self.budget[2].store(i64::from(elastic_limit), Ordering::Relaxed);
     }
 
+    /// Records one epoch observation and the epoch the fence now holds.
+    pub fn epoch_observed(&self, source: crate::epoch::EpochSource, outcome: EpochOutcome) {
+        let index = source as usize * EPOCH_OUTCOMES.len() + outcome as usize;
+        self.epoch_observations[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn primary_epoch(&self, epoch: crate::epoch::Epoch) {
+        self.primary_epoch.store(
+            i64::try_from(epoch.get()).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// One backend socket severed by the fence, labelled with what the policy
+    /// said to do about whatever it was carrying.
+    pub fn backend_severed(&self, action: crate::epoch::FenceAction) {
+        self.backends_severed[action as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many transactions the proxy has recorded as undecidable. A gauge
+    /// rather than a counter because a restart replays the durable log, and an
+    /// operator reconciling an instance wants the whole set, not this process's
+    /// share of it.
+    pub fn in_doubt(&self, total: usize) {
+        self.in_doubt
+            .store(i64::try_from(total).unwrap_or(i64::MAX), Ordering::Relaxed);
+    }
+
+    /// How long the last fence took, from the epoch advancing to the sweep
+    /// finishing. Asserted against `fence.lease.retryPeriod`.
+    pub fn fence_latency(&self, elapsed: std::time::Duration) {
+        self.fence_latency_us.store(
+            i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(2048);
         let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
@@ -324,7 +420,71 @@ impl Metrics {
             ],
         );
         self.render_pooling(&mut out);
+        self.render_fence(&mut out);
         out
+    }
+
+    /// The primary-epoch fence's half of the exposition.
+    fn render_fence(&self, out: &mut String) {
+        let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        gauge(
+            out,
+            "pgelastic_proxy_primary_epoch",
+            "The highest primary epoch this proxy has ever observed. Never decreases.",
+            self.primary_epoch.load(Ordering::Relaxed),
+        );
+        let mut observations = Vec::new();
+        for source in crate::epoch::EpochSource::ALL {
+            for outcome in EPOCH_OUTCOMES {
+                observations.push((
+                    format!(
+                        "source=\"{}\",outcome=\"{}\"",
+                        source.label(),
+                        outcome.label()
+                    ),
+                    load(
+                        &self.epoch_observations
+                            [source as usize * EPOCH_OUTCOMES.len() + outcome as usize],
+                    ),
+                ));
+            }
+        }
+        counter(
+            out,
+            "pgelastic_proxy_epoch_observations_total",
+            "Primary-epoch readings, by which of the three delivery paths carried them \
+             and what they meant.",
+            &observations
+                .iter()
+                .map(|(labels, value)| (labels.as_str(), *value))
+                .collect::<Vec<_>>(),
+        );
+        counter(
+            out,
+            "pgelastic_proxy_backends_severed_total",
+            "Backend sockets severed by the epoch fence, by what the in-flight policy \
+             said to do about what they were carrying.",
+            &labelled(&FENCE_ACTIONS.map(|action| {
+                (
+                    format!("action=\"{}\"", fence_action_label(action)),
+                    load(&self.backends_severed[action as usize]),
+                )
+            })),
+        );
+        gauge(
+            out,
+            "pgelastic_proxy_in_doubt_transactions",
+            "Transactions whose commit was forwarded and whose outcome was never observed. \
+             Neither succeeded nor failed; each needs reconciling by hand.",
+            self.in_doubt.load(Ordering::Relaxed),
+        );
+        gauge(
+            out,
+            "pgelastic_proxy_epoch_fence_latency_us",
+            "Microseconds from the epoch advancing to every older backend socket being \
+             severed. Must stay under the lease's retryPeriod.",
+            self.fence_latency_us.load(Ordering::Relaxed),
+        );
     }
 
     /// The pooling half of the exposition.
@@ -508,12 +668,65 @@ mod tests {
             "pgelastic_proxy_cancel_requests_total",
             "pgelastic_proxy_relayed_bytes_total",
             "pgelastic_proxy_session_drains_total",
+            "pgelastic_proxy_primary_epoch",
+            "pgelastic_proxy_epoch_observations_total",
+            "pgelastic_proxy_backends_severed_total",
+            "pgelastic_proxy_in_doubt_transactions",
+            "pgelastic_proxy_epoch_fence_latency_us",
         ] {
             assert!(
                 rendered.contains(&format!("# TYPE {name}")),
                 "missing {name}"
             );
         }
+    }
+
+    #[test]
+    fn the_fence_reports_every_path_and_every_verdict_even_at_zero() {
+        let rendered = Metrics::new().render();
+        for source in crate::epoch::EpochSource::ALL {
+            for outcome in EPOCH_OUTCOMES {
+                assert!(
+                    rendered.contains(&format!(
+                        "source=\"{}\",outcome=\"{}\"}} 0",
+                        source.label(),
+                        outcome.label()
+                    )),
+                    "missing the {source}/{} series",
+                    outcome.label()
+                );
+            }
+        }
+        for action in FENCE_ACTIONS {
+            assert!(
+                rendered.contains(&format!("action=\"{}\"}} 0", fence_action_label(action))),
+                "missing the {action:?} series"
+            );
+        }
+    }
+
+    #[test]
+    fn an_in_doubt_transaction_is_visible_as_a_gauge_rather_than_only_in_a_log() {
+        let metrics = Metrics::new();
+        metrics.epoch_observed(
+            crate::epoch::EpochSource::Push,
+            crate::epoch::Observation::Advanced {
+                from: crate::epoch::Epoch::UNKNOWN,
+                to: crate::epoch::Epoch::new(7),
+            }
+            .into(),
+        );
+        metrics.primary_epoch(crate::epoch::Epoch::new(7));
+        metrics.backend_severed(crate::epoch::FenceAction::ReportUnknown);
+        metrics.in_doubt(1);
+        metrics.fence_latency(std::time::Duration::from_micros(850));
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("pgelastic_proxy_primary_epoch 7"));
+        assert!(rendered.contains("source=\"push\",outcome=\"advanced\"} 1"));
+        assert!(rendered.contains("action=\"report_unknown\"} 1"));
+        assert!(rendered.contains("pgelastic_proxy_in_doubt_transactions 1"));
+        assert!(rendered.contains("pgelastic_proxy_epoch_fence_latency_us 850"));
     }
 
     #[test]

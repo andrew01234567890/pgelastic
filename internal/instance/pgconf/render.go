@@ -225,6 +225,8 @@ type HBAConfig struct {
 	ReplicationRole string
 	// OpsRole is the control plane's non-superuser role.
 	OpsRole string
+	// RewindRole is the role pg_rewind dials the new primary as.
+	RewindRole string
 }
 
 // RenderHBA generates pg_hba.conf wholesale. The trailing catch-all initdb writes is
@@ -248,6 +250,9 @@ func RenderHBA(config HBAConfig) string {
 	}
 	for _, source := range config.PeerSources {
 		fmt.Fprintf(&builder, "host all %s %s scram-sha-256\n", config.OpsRole, source)
+	}
+	for _, source := range config.PeerSources {
+		fmt.Fprintf(&builder, "host all %s %s scram-sha-256\n", config.RewindRole, source)
 	}
 	for _, source := range config.ProxySources {
 		fmt.Fprintf(&builder, "host all all %s scram-sha-256\n", source)

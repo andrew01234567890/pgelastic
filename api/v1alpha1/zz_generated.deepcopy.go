@@ -3328,6 +3328,11 @@ func (in *QuorumEvidence) DeepCopyInto(out *QuorumEvidence) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.StreamingMembers != nil {
+		in, out := &in.StreamingMembers, &out.StreamingMembers
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.ObservedAt != nil {
 		in, out := &in.ObservedAt, &out.ObservedAt
 		*out = (*in).DeepCopy()

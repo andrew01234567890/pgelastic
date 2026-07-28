@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"maps"
 	"os"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/ha"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 )
@@ -42,13 +44,6 @@ import (
 // requeueInterval paces the provisioning ladder. Members are created one per reconcile and
 // each waits for the one before it, so the loop needs a heartbeat rather than only edges.
 const requeueInterval = 5 * time.Second
-
-// initialPrimaryEpoch is the epoch a freshly bootstrapped instance publishes.
-//
-// It starts at one rather than zero so that "no epoch has ever been published" and "the
-// first primary" are distinguishable. The proxy's in-memory epoch never decreases, so a
-// zero would be indistinguishable from an unset field on the fencing path.
-const initialPrimaryEpoch int64 = 1
 
 // Environment overrides for the images and the placement strictness, read once at setup.
 const (
@@ -76,6 +71,18 @@ type PgInstanceReconciler struct {
 	// ProxySources and PeerSources are the pg_hba source addresses.
 	ProxySources []string
 	PeerSources  []string
+	// Prober asks each member to describe itself. It is an interface so a test can drive
+	// the failover state machine without three real postmasters; production leaves it nil
+	// and gets a direct HTTP poll of each Pod IP.
+	Prober MemberProber
+	// ProbeTTL is how long one round of member observations is reused for. Zero polls every
+	// member on every reconcile, which is what a test driving the reconciler by hand needs:
+	// it changes what a member reports and then expects the very next reconcile to see it.
+	ProbeTTL time.Duration
+
+	// observations reuses one round of member polls across the burst of reconciles that
+	// each member's own status write produces.
+	observations observationCache
 }
 
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pginstances,verbs=get;list;watch;create;update;patch;delete
@@ -115,13 +122,20 @@ func (r *PgInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileRoleLabels(ctx, instance, pods); err != nil {
+	// The failover decision runs before the role labels are reconciled, because phase one
+	// of a failover is precisely a decision to take a label away, and re-applying it from
+	// the members' own stale reports in the same pass would undo it.
+	decision, err := r.reconcileFailover(ctx, instance, pods)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.publishStatus(ctx, instance, builder, groups, pods); err != nil {
+	if err := r.reconcileRoleLabels(ctx, instance, decision, pods); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: requeueInterval}, nil
+	if err := r.publishStatus(ctx, instance, builder, groups, pods, decision); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: failoverRequeue(decision)}, nil
 }
 
 func (r *PgInstanceReconciler) builderFor(
@@ -150,12 +164,16 @@ func (r *PgInstanceReconciler) builderFor(
 // max_wal_senders is PGC_POSTMASTER.
 const migrationSlotHeadroom int32 = 4
 
-// fieldObservedGeneration is the status field both apply paths stamp.
-const fieldObservedGeneration = "observedGeneration"
+// Status fields both apply paths stamp, spelled once so the two cannot drift.
+const (
+	fieldObservedGeneration = "observedGeneration"
+	fieldPhase              = "phase"
+)
 
 func replicasOf(instance *pgelasticv1alpha1.PgInstance) int32 {
-	if ha := instance.Spec.HighAvailability; ha != nil && ha.Replicas != nil {
-		return *ha.Replicas
+	if highAvailability := instance.Spec.HighAvailability; highAvailability != nil &&
+		highAvailability.Replicas != nil {
+		return *highAvailability.Replicas
 	}
 	return 3
 }
@@ -221,12 +239,17 @@ func (r *PgInstanceReconciler) ensureCredentials(
 	if err != nil {
 		return err
 	}
+	rewind, err := randomPassword()
+	if err != nil {
+		return err
+	}
 	secret = &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace},
 		Type:       corev1.SecretTypeOpaque,
 		StringData: map[string]string{
 			provision.SecretKeyReplicationPassword: replication,
 			provision.SecretKeyOpsPassword:         ops,
+			provision.SecretKeyRewindPassword:      rewind,
 		},
 	}
 	return r.ensure(ctx, instance, secret)
@@ -428,11 +451,21 @@ func configHashOf(builder provision.Builder) string {
 
 // reconcileRoleLabels flips the label the two Services and the two PodDisruptionBudgets
 // select on, from what each member's own agent reported about itself.
+//
+// It does nothing at all while a failover is in progress. The sentinel exists so that
+// "targetPrimary != currentPrimary" is a total freeze signal, and relabelling from members'
+// reports during a failover is exactly the kind of half-converged state it exists to
+// prevent: the old primary's own last report still says "primary".
 func (r *PgInstanceReconciler) reconcileRoleLabels(
 	ctx context.Context,
 	instance *pgelasticv1alpha1.PgInstance,
+	decision ha.Decision,
 	pods []corev1.Pod,
 ) error {
+	if ha.FailoverInProgress(instance.Status.CurrentPrimary, targetPrimaryAfter(instance, decision)) ||
+		decision.SplitBrain {
+		return nil
+	}
 	roles := map[string]pgelasticv1alpha1.InstanceRole{}
 	for _, member := range instance.Status.Instances {
 		roles[member.Name] = member.Role
@@ -441,6 +474,17 @@ func (r *PgInstanceReconciler) reconcileRoleLabels(
 		pod := &pods[i]
 		role, ok := roles[pod.Name]
 		if !ok || role == pgelasticv1alpha1.InstanceRoleUnknown {
+			continue
+		}
+		// A member's own report is enough to make it a replica and never enough to make it
+		// the primary. status.currentPrimary is the only field that says which member the
+		// read-write Service may select, and a demoted primary whose last report still
+		// claims the role would otherwise be handed it straight back - putting two members
+		// behind one Service, which is the failure this whole file exists to prevent.
+		if role == pgelasticv1alpha1.InstanceRolePrimary && pod.Name != instance.Status.CurrentPrimary {
+			if err := r.stripRoleLabel(ctx, pods, pod.Name); err != nil {
+				return err
+			}
 			continue
 		}
 		if pod.Labels[provision.LabelRole] == string(role) {
@@ -468,13 +512,12 @@ func (r *PgInstanceReconciler) publishStatus(
 	builder provision.Builder,
 	groups []provision.Group,
 	pods []corev1.Pod,
+	decision ha.Decision,
 ) error {
 	capacity := builder.Capacity
 	status := map[string]any{
 		fieldObservedGeneration: instance.Generation,
-		"phase":                 string(phaseOf(instance, groups, pods, builder.Replicas())),
-		"primaryEpoch":          primaryEpochOf(instance),
-		"targetPrimary":         targetPrimaryOf(instance),
+		fieldPhase:              string(phaseOf(instance, groups, pods, decision, builder.Replicas())),
 		"capacity": map[string]any{
 			"maxConnections":   int64(capacity.MaxConnections),
 			"reservedForAdmin": int64(capacity.SuperuserReserved + capacity.Reserved),
@@ -485,8 +528,14 @@ func (r *PgInstanceReconciler) publishStatus(
 			"allocated": instance.Spec.Storage.Size.String(),
 		},
 		"instances":  syncSetEntries(instance),
-		"conditions": conditionsFor(instance, groups, pods, builder.Replicas()),
+		"conditions": conditionsFor(instance, groups, pods, decision, builder.Replicas()),
 	}
+	maps.Copy(status, failoverStatus(instance, decision))
+	// primaryEpoch is deliberately absent. It belongs to whichever member holds the role,
+	// which derives it from the Lease's transition counter and publishes it together with
+	// currentPrimary in a single write. An operator that re-applied it from a copy of the
+	// object it read some moments ago would drive the fence token backwards, and a lower
+	// epoch is what the proxy treats as a fence trigger rather than as new information.
 
 	object := statusApplyObject(instance)
 	object.Object["status"] = status
@@ -509,7 +558,7 @@ func allocatableOf(instance *pgelasticv1alpha1.PgInstance, capacity pgconf.Capac
 // bump belongs to the promotion path, which derives it from the Lease's LeaderTransitions
 // counter.
 func primaryEpochOf(instance *pgelasticv1alpha1.PgInstance) int64 {
-	return max(instance.Status.PrimaryEpoch, initialPrimaryEpoch)
+	return max(instance.Status.PrimaryEpoch, ha.InitialPrimaryEpoch)
 }
 
 // targetPrimaryOf seeds the operator's decision at bootstrap and otherwise leaves it
@@ -550,6 +599,7 @@ func phaseOf(
 	instance *pgelasticv1alpha1.PgInstance,
 	groups []provision.Group,
 	pods []corev1.Pod,
+	decision ha.Decision,
 	replicas int32,
 ) pgelasticv1alpha1.InstancePhase {
 	if len(groups) == 0 {
@@ -557,6 +607,10 @@ func phaseOf(
 	}
 	if instance.Status.CurrentPrimary == "" || int32(len(pods)) < replicas {
 		return pgelasticv1alpha1.InstancePhaseBootstrapping
+	}
+	if ha.FailoverInProgress(instance.Status.CurrentPrimary, targetPrimaryAfter(instance, decision)) ||
+		decision.SplitBrain {
+		return pgelasticv1alpha1.InstancePhaseFailingOver
 	}
 	if readyMembers(pods) < replicas {
 		return pgelasticv1alpha1.InstancePhaseDegraded
@@ -578,9 +632,10 @@ func conditionsFor(
 	instance *pgelasticv1alpha1.PgInstance,
 	groups []provision.Group,
 	pods []corev1.Pod,
+	decision ha.Decision,
 	replicas int32,
 ) []any {
-	phase := phaseOf(instance, groups, pods, replicas)
+	phase := phaseOf(instance, groups, pods, decision, replicas)
 	ready := phase == pgelasticv1alpha1.InstancePhaseReady
 
 	conditions := make([]any, 0, 3)
@@ -593,7 +648,7 @@ func conditionsFor(
 	degraded := phase == pgelasticv1alpha1.InstancePhaseDegraded
 	conditions = append(conditions, condition(pgelasticv1alpha1.ConditionDegraded, degraded,
 		instance.Generation, degradedReason(degraded), quorumMessage(instance)))
-	return conditions
+	return append(conditions, failoverConditions(instance, decision)...)
 }
 
 func readyReason(phase pgelasticv1alpha1.InstancePhase) string {
@@ -656,7 +711,7 @@ func (r *PgInstanceReconciler) publishInvalid(
 	object := statusApplyObject(instance)
 	object.Object["status"] = map[string]any{
 		fieldObservedGeneration: instance.Generation,
-		"phase":                 string(pgelasticv1alpha1.InstancePhasePending),
+		fieldPhase:              string(pgelasticv1alpha1.InstancePhasePending),
 		"conditions": []any{
 			condition(pgelasticv1alpha1.ConditionReady, false, instance.Generation,
 				pgelasticv1alpha1.ReasonInvalidSpec, cause.Error()),
@@ -677,6 +732,9 @@ func (r *PgInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.AntiAffinity == "" {
 		r.AntiAffinity = provision.AntiAffinityPolicy(
 			envOrDefault(envPodAntiAffinity, string(provision.AntiAffinityRequired)))
+	}
+	if r.ProbeTTL == 0 {
+		r.ProbeTTL = defaultProbeTTL
 	}
 	if r.PeerSources == nil {
 		// "all" until the operator is told the pod CIDR. It admits only the replication

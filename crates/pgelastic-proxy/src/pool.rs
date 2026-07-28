@@ -38,6 +38,7 @@ use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::config::PoolConfig;
+use crate::epoch::{Epoch, EpochSource, FenceRuntime, InDoubtKey};
 use crate::error::{ProxyError, Result};
 use crate::metrics::{ConnectGateOutcome, Metrics};
 use crate::relay::FrameRelay;
@@ -82,6 +83,17 @@ impl Denial {
             message: failure.message.clone(),
         }
     }
+
+    /// A checkout refused because the backend behind it is on a superseded
+    /// primary epoch. Nothing was forwarded, so this is a definite failure and
+    /// safe to retry — which is exactly what distinguishes it from
+    /// [`ProxyError::OutcomeUnknown`](crate::error::ProxyError::OutcomeUnknown).
+    fn superseded(message: impl std::fmt::Display) -> Self {
+        Self {
+            sqlstate: crate::error::sqlstate::READ_ONLY_SQL_TRANSACTION,
+            message: format!("{}: {message}", crate::error::fence_code::SUPERSEDED_EPOCH),
+        }
+    }
 }
 
 impl std::fmt::Display for Denial {
@@ -104,6 +116,21 @@ pub struct BackendConn {
     /// The backend's real cancel key. Never handed to a client.
     pub key_data: Option<BackendKeyData>,
     pub address: String,
+    /// The primary epoch this link was opened — or last verified — under.
+    ///
+    /// The fence compares this against the highest epoch the proxy has ever
+    /// seen, and anything below it is severed before it can carry another
+    /// client's write to a postmaster that is about to be rewound.
+    pub epoch: Epoch,
+    /// The backend's own PID, one of the four fields the in-doubt log is keyed
+    /// by. Read from the verification probe, which is the only place it is
+    /// available on a link the proxy did not just open.
+    pub backend_pid: Option<i32>,
+    /// The last WAL LSN this link reported, and `None` if it never reported
+    /// one. Not the LSN of any particular commit — it bounds the region a
+    /// reconciliation has to inspect, which is what the in-doubt log needs it
+    /// for.
+    pub lsn: Option<String>,
 }
 
 impl BackendConn {
@@ -111,6 +138,20 @@ impl BackendConn {
     /// unexpected EOF.
     pub async fn close(mut self) {
         crate::session::terminate_backend(&mut self.stream).await;
+    }
+
+    /// Severs the link with an RST, without waiting for anything.
+    ///
+    /// The fence's primitive. A `Terminate` is a request the backend may honour
+    /// after it has finished the `COMMIT` it is in the middle of, and that
+    /// commit is exactly what must not happen.
+    pub fn sever(self) {
+        self.stream.sever();
+    }
+
+    /// The in-doubt key for a transaction on this link.
+    pub fn in_doubt_key(&self, tenant: &str, epoch: Epoch) -> InDoubtKey {
+        InDoubtKey::new(tenant, epoch, self.backend_pid, self.lsn.clone())
     }
 }
 
@@ -197,12 +238,17 @@ impl std::fmt::Debug for Connector<'_> {
 pub struct PoolManager {
     inner: Mutex<Inner>,
     config: PoolConfig,
+    fence: FenceRuntime,
     metrics: Arc<Metrics>,
     next_link_id: AtomicU64,
 }
 
 impl PoolManager {
-    pub fn new(config: PoolConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>> {
+    pub fn new(
+        config: PoolConfig,
+        fence: FenceRuntime,
+        metrics: Arc<Metrics>,
+    ) -> Result<Arc<Self>> {
         let pool_spec = pgelastic_capacity::PoolSpec {
             backend_connections: config.backend_connections,
             headroom_percent: config.headroom_percent,
@@ -252,6 +298,7 @@ impl PoolManager {
                 login_retry,
             }),
             config,
+            fence,
             metrics,
             next_link_id: AtomicU64::new(1),
         }))
@@ -259,6 +306,10 @@ impl PoolManager {
 
     pub fn config(&self) -> &PoolConfig {
         &self.config
+    }
+
+    pub fn fence(&self) -> &FenceRuntime {
+        &self.fence
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -529,6 +580,52 @@ impl PoolManager {
         }
     }
 
+    /// Severs every parked link opened under a superseded epoch.
+    ///
+    /// **Sever, do not deregister.** The link is closed with an RST rather than
+    /// a `Terminate`, because a graceful close leaves the backend free to
+    /// finish whatever it was doing first, and a demoted primary finishing one
+    /// more commit is the entire failure this fence exists to prevent.
+    ///
+    /// Returns how many were severed. Called at the head of every checkout, so
+    /// the ordering the design requires — *before any further checkout* — holds
+    /// by construction rather than by a timer being fast enough; the background
+    /// sweeper only makes it prompt for an idle pool.
+    pub fn sever_superseded(&self) -> usize {
+        let current = self.fence.current();
+        let mut severed = Vec::new();
+        {
+            let mut inner = self.lock();
+            let stale: Vec<pgelastic_capacity::ServerId> = inner
+                .parked
+                .iter()
+                .filter(|(_, parked)| parked.conn.epoch < current)
+                .map(|(server, _)| *server)
+                .collect();
+            for server in stale {
+                if let Some(conn) = inner.unpark(server) {
+                    let grants = inner.allocator.backend_died(server);
+                    inner.dispatch(grants);
+                    severed.push(conn);
+                }
+            }
+        }
+
+        let count = severed.len();
+        for conn in severed {
+            debug!(
+                epoch = %conn.epoch,
+                %current,
+                "severing a parked backend socket opened under a superseded primary epoch"
+            );
+            self.metrics.backend_closed();
+            self.metrics
+                .backend_severed(crate::epoch::FenceAction::Close);
+            conn.sever();
+        }
+        count
+    }
+
     /// Turns a capacity slot into a physical link under `request.key`.
     async fn attach(
         &self,
@@ -536,6 +633,10 @@ impl PoolManager {
         connector: &Connector<'_>,
         lease: Lease,
     ) -> std::result::Result<Checkout, Denial> {
+        // Before anything is claimed: a link parked across a promotion is
+        // precisely the one that would carry this client to a demoted primary.
+        self.sever_superseded();
+
         let server = lease.server;
         let (parked, stale) = {
             let mut inner = self.lock();
@@ -553,12 +654,34 @@ impl PoolManager {
                 .is_ok()
             {
                 conn.link.check_lifetime(Instant::now());
-                self.metrics.checkout(true);
-                return Ok(Checkout {
-                    server,
-                    conn,
-                    lease,
-                });
+                match self.verify_epoch(&mut conn).await {
+                    Ok(()) => {
+                        self.metrics.checkout(true);
+                        return Ok(Checkout {
+                            server,
+                            conn,
+                            lease,
+                        });
+                    }
+                    Err(denial) => {
+                        // The parked link is gone, but the capacity slot is
+                        // fungible: fall through and open a fresh one, which
+                        // will reach whatever the Service now points at.
+                        debug!(%denial, "a parked link failed its epoch check and is severed");
+                        {
+                            let mut inner = self.lock();
+                            let _ = inner.ledger.close();
+                            if let Some(pool) = inner.pools.get_mut(request.key) {
+                                pool.active.remove(&server);
+                            }
+                        }
+                        self.metrics.backend_closed();
+                        self.metrics
+                            .backend_severed(crate::epoch::FenceAction::Close);
+                        conn.sever();
+                        return self.open_verified(request, connector, server, lease).await;
+                    }
+                }
             }
             // The link is in a state a client can no longer be handed, so it is
             // dropped and replaced rather than repaired.
@@ -573,7 +696,44 @@ impl PoolManager {
             tokio::spawn(conn.close());
         }
 
-        match self.gated_open(request, connector, server).await {
+        self.open_verified(request, connector, server, lease).await
+    }
+
+    /// Opens a fresh link and refuses to hand it over unless it proves which
+    /// epoch it is serving.
+    ///
+    /// A newly opened link that is already superseded means the address the
+    /// proxy dialled is a demoted primary. There is nothing to retry against,
+    /// so the client is refused: a stalled tenant is recoverable and a write to
+    /// a postmaster that is about to be rewound is not.
+    async fn open_verified(
+        &self,
+        request: &AcquireRequest<'_>,
+        connector: &Connector<'_>,
+        server: pgelastic_capacity::ServerId,
+        lease: Lease,
+    ) -> std::result::Result<Checkout, Denial> {
+        let opened = match self.gated_open(request, connector, server).await {
+            Ok(mut conn) => match self.verify_epoch(&mut conn).await {
+                Ok(()) => Ok(conn),
+                Err(denial) => {
+                    self.metrics.backend_closed();
+                    self.metrics
+                        .backend_severed(crate::epoch::FenceAction::Close);
+                    let mut inner = self.lock();
+                    let _ = inner.ledger.close();
+                    if let Some(pool) = inner.pools.get_mut(request.key) {
+                        pool.active.remove(&server);
+                    }
+                    drop(inner);
+                    conn.sever();
+                    Err(denial)
+                }
+            },
+            Err(denial) => Err(denial),
+        };
+
+        match opened {
             Ok(conn) => {
                 self.metrics.checkout(false);
                 Ok(Checkout {
@@ -589,6 +749,61 @@ impl PoolManager {
                 Err(denial)
             }
         }
+    }
+
+    /// The pull/verify path, run on every link before a client touches it.
+    ///
+    /// Mandatory rather than an optimisation: a proxy cut off from the API
+    /// server and unreachable by the promoting agent still learns, from the
+    /// connection itself, which postmaster is on the other end of it. That is
+    /// why this runs on parked links as well as fresh ones, and why it is the
+    /// last thing between a checkout and a client.
+    async fn verify_epoch(&self, conn: &mut BackendConn) -> std::result::Result<(), Denial> {
+        if self.fence.verify_at_checkout {
+            let probe = crate::epoch::verify::probe(&mut conn.stream, &mut conn.relay)
+                .await
+                .map_err(|error| {
+                    Denial::backend(format!(
+                        "verifying a backend's primary epoch failed: {error}"
+                    ))
+                })?;
+            if probe.backend_pid.is_some() {
+                conn.backend_pid = probe.backend_pid;
+            }
+            if probe.lsn.is_some() {
+                conn.lsn = probe.lsn;
+            }
+            match probe.epoch {
+                Some(observed) => {
+                    let observation = self.fence.fence.observe(EpochSource::Verify, observed);
+                    self.metrics
+                        .epoch_observed(EpochSource::Verify, observation.into());
+                    self.metrics.primary_epoch(self.fence.current());
+                    conn.epoch = observed;
+                }
+                None if self.fence.require_epoch => {
+                    return Err(Denial::superseded(
+                        "this backend carries no pgelastic.primary_epoch, so the epoch it is \
+                         serving cannot be established",
+                    ));
+                }
+                // The backend publishes no epoch at all. That is not evidence
+                // that it is superseded, so the link is tagged with what the
+                // proxy knows and a later push or watch still fences it.
+                None => conn.epoch = self.fence.current(),
+            }
+        } else {
+            conn.epoch = self.fence.current();
+        }
+
+        let current = self.fence.current();
+        if conn.epoch < current {
+            return Err(Denial::superseded(format!(
+                "this backend is serving primary epoch {} and the cluster has reached {current}",
+                conn.epoch
+            )));
+        }
+        Ok(())
     }
 
     /// Opens a link through the pool's connect gate.
@@ -710,11 +925,23 @@ impl PoolManager {
         );
 
         let mut vars = VariableCache::new();
+        // The zero-round-trip half of the verify path: if the epoch GUC is
+        // `GUC_REPORT` the postmaster volunteers it in the start-up parameter
+        // set, and the probe below has nothing left to learn.
+        let mut reported_epoch = None;
         for message in &session.parameters {
             if let BackendMessage::ParameterStatus(status) = message {
                 vars.observe(&status.name, &status.value);
+                if let Some((epoch, observation)) =
+                    crate::epoch::verify::observe_parameter_status(&self.fence.fence, status)
+                {
+                    self.metrics
+                        .epoch_observed(EpochSource::Verify, observation.into());
+                    reported_epoch = Some(epoch);
+                }
             }
         }
+        self.metrics.primary_epoch(self.fence.current());
 
         let mut relay = FrameRelay::new(
             crate::relay::DEFAULT_INLINE_FRAME_BYTES,
@@ -736,8 +963,11 @@ impl PoolManager {
             link,
             statements: ServerStatements::new(self.config.max_server_statements),
             vars,
+            backend_pid: session.key_data.as_ref().map(|data| data.process_id),
             key_data: session.key_data,
             address: connector.backend.address.clone(),
+            epoch: reported_epoch.unwrap_or_else(|| self.fence.current()),
+            lsn: None,
         })
     }
 
@@ -816,6 +1046,35 @@ impl PoolManager {
 
         self.metrics.backend_closed();
         tokio::spawn(conn.close());
+    }
+
+    /// Drops a checked-out link with an RST rather than a `Terminate`.
+    ///
+    /// [`discard`](Self::discard) asks the backend to go away and lets it
+    /// finish first. The fence cannot afford that: the statement it would be
+    /// finishing is the write `pg_rewind` is about to discard.
+    pub fn sever(&self, checkout: Checkout, action: crate::epoch::FenceAction) {
+        let Checkout {
+            server,
+            conn,
+            lease,
+        } = checkout;
+        let pin = conn.link.pin();
+        let key = conn.link.key().clone();
+
+        let mut inner = self.lock();
+        if let Some(pool) = inner.pools.get_mut(&key) {
+            pool.active.remove(&server);
+            pool.idle.remove(&server);
+        }
+        Self::record_unpin(&mut inner, pin);
+        let outcome = inner.allocator.release(lease);
+        inner.dispatch(outcome.grants);
+        drop(inner);
+
+        self.metrics.backend_closed();
+        self.metrics.backend_severed(action);
+        conn.sever();
     }
 
     /// Refreshes the exported budget gauges from the ledger.
@@ -1080,7 +1339,7 @@ mod tests {
     use crate::config::{PoolModeConfig, TenantConfig};
 
     fn manager(config: PoolConfig) -> Arc<PoolManager> {
-        PoolManager::new(config, Metrics::new()).unwrap()
+        PoolManager::new(config, FenceRuntime::in_memory(), Metrics::new()).unwrap()
     }
 
     fn transaction_config(backend_connections: u32) -> PoolConfig {
@@ -1116,7 +1375,7 @@ mod tests {
             }],
             ..PoolConfig::default()
         };
-        assert!(PoolManager::new(config, Metrics::new()).is_err());
+        assert!(PoolManager::new(config, FenceRuntime::in_memory(), Metrics::new()).is_err());
     }
 
     #[tokio::test]

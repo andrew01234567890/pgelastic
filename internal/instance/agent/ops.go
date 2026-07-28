@@ -19,51 +19,11 @@ package agent
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-	"time"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 )
-
-// promoteTimeout bounds pg_ctl promote itself. The check that follows it has its own,
-// longer deadline.
-const promoteTimeout = 60 * time.Second
-
-// Promote takes a standby out of recovery.
-//
-// This is the local half only. The full promotion sequence - acquire the Lease, re-verify
-// the quorum evidence, promote, CHECKPOINT, rewrite synchronous_standby_names before
-// accepting writes, bump the epoch, terminate stale backends, write currentPrimary - is
-// the failover state machine's, and is deliberately not started from here: a promotion
-// that can be triggered locally is a promotion that can happen without the quorum gate.
-func Promote(ctx context.Context, options Options) error {
-	log := logf.FromContext(ctx)
-	tools := toolchain(options)
-
-	if err := tools.Promote(ctx, promoteTimeout); err != nil {
-		return err
-	}
-
-	// PostgreSQL removes standby.signal itself. It is never deleted by hand, and its
-	// continued existence past the deadline is a hard failure rather than something to be
-	// tidied away: the file still being there means the promotion did not happen.
-	deadline := time.Now().Add(promoteTimeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(filepath.Join(options.DataDir, StandbySignal)); os.IsNotExist(err) {
-			log.Info("promotion completed", "member", options.Member)
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-		}
-	}
-	return fmt.Errorf("standby.signal still exists %s after promoting %s", promoteTimeout, options.Member)
-}
 
 // ArchiveWAL is archive_command.
 //
