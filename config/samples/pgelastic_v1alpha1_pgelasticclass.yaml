@@ -1,0 +1,9 @@
+apiVersion: pgelastic.io/v1alpha1
+kind: PgElasticClass
+metadata:
+  labels:
+    app.kubernetes.io/name: pgelastic
+    app.kubernetes.io/managed-by: kustomize
+  name: pgelasticclass-sample
+spec:
+  # TODO(user): Add fields here

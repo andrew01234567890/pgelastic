@@ -1,0 +1,1453 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgelasticclasses.pgelastic.io
+spec:
+  group: pgelastic.io
+  names:
+    categories:
+    - pgelastic
+    kind: PgElasticClass
+    listKind: PgElasticClassList
+    plural: pgelasticclasses
+    shortNames:
+    - pgec
+    singular: pgelasticclass
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.tier
+      name: Tier
+      type: string
+    - jsonPath: .spec.tenancyModel
+      name: Tenancy
+      type: string
+    - jsonPath: .status.poolCount
+      name: Pools
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    - jsonPath: .spec.controllerName
+      name: Controller
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          PgElasticClass is the cluster-scoped policy object a platform admin owns. It binds a
+          controller, fixes the capacity model and density caps, publishes the governance honesty
+          table, and supplies the defaults every PgElasticClass-bound pool inherits.
+
+          The controller adds the finalizer pgelastic.io/pools-exist while any pool references the
+          class, so deleting a class cannot orphan a running pool's policy.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of PgElasticClass
+            properties:
+              admittedNamespaces:
+                description: |-
+                  admittedNamespaces selects which namespaces may create pools bound to this class.
+                  Consent is bidirectional: a pool must also admit the tenant's namespace. One-way
+                  selection, where naming an object is enough to use it, is a tenancy escape.
+                properties:
+                  from:
+                    default: Same
+                    description: from selects the namespace-matching strategy.
+                    enum:
+                    - All
+                    - Selector
+                    - Same
+                    type: string
+                  selector:
+                    description: selector matches namespaces by label. Only consulted
+                      when from is Selector.
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector
+                          requirements. The requirements are ANDed.
+                        items:
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector
+                                applies to.
+                              type: string
+                            operator:
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                    type: object
+                    x-kubernetes-map-type: atomic
+                type: object
+              capacityModel:
+                description: |-
+                  capacityModel declares what the elastic budget is denominated in and how it is
+                  enforced.
+                properties:
+                  enforcement:
+                    default: ProxyLease
+                    description: enforcement names the primitive that makes the budget
+                      real.
+                    enum:
+                    - ProxyLease
+                    - ProxyLeaseWithDatabaseBackstop
+                    type: string
+                  minFloor:
+                    default: 1
+                    description: |-
+                      minFloor is the smallest non-zero guaranteed reservation a tenant may hold. A
+                      guarantee between 1 and this value is rejected at admission rather than rounded,
+                      because a floor too small to survive one client's connection burst is a promise the
+                      pool cannot be held to. A guarantee of exactly 0 is always allowed and means
+                      BestEffort.
+                    format: int32
+                    maximum: 1024
+                    minimum: 1
+                    type: integer
+                  scoringDimensions:
+                    default:
+                    - name: BackendConnections
+                      weight: 1000
+                    - name: StorageBytes
+                      weight: 400
+                    - name: RelationCount
+                      weight: 100
+                    description: |-
+                      scoringDimensions are consulted ONLY when scoring a placement candidate or an
+                      autoscaling recommendation. Nothing here is enforced, reserved or guaranteed at any
+                      tier: CPU, storage throughput and relation count are observed after the fact, and a
+                      tenant that exceeds its observed profile is not throttled for it. The single
+                      enforced dimension is `unit`.
+                    items:
+                      description: |-
+                        CapacityScoringDimension weights one observed dimension in placement and autoscaling
+                        scoring.
+                      properties:
+                        name:
+                          description: name of the observed dimension.
+                          enum:
+                          - BackendConnections
+                          - CPUSeconds
+                          - StorageBytes
+                          - RelationCount
+                          - WriteBytes
+                          - TransactionRate
+                          type: string
+                        weight:
+                          default: 100
+                          description: |-
+                            weight is relative to the other listed dimensions; the score is normalised across
+                            whatever is present, so absolute magnitudes carry no meaning.
+                          format: int32
+                          maximum: 10000
+                          minimum: 0
+                          type: integer
+                      required:
+                      - name
+                      type: object
+                    maxItems: 8
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  unit:
+                    default: BackendConnections
+                    description: |-
+                      unit is immutable: every reservation, ledger entry and status number recorded under
+                      this class is denominated in it, and there is no conversion that preserves a
+                      guarantee already granted.
+                    enum:
+                    - BackendConnections
+                    type: string
+                    x-kubernetes-validations:
+                    - message: unit is immutable
+                      rule: self == oldSelf
+                type: object
+              controllerName:
+                default: pgelastic.io/elastic-pool-controller
+                description: |-
+                  controllerName is the controller that reconciles pools bound to this class, in the
+                  form "example.com/controller-name". Following the GatewayClass precedent, a
+                  controller whose own name does not match this value ignores the object silently: it
+                  sets no conditions and raises no error, because an unmatched class belongs to a
+                  different controller and is not a failure.
+                maxLength: 253
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\/[A-Za-z0-9\/\-._~%!$&'()*+,;=:]+$
+                type: string
+                x-kubernetes-validations:
+                - message: controllerName is immutable
+                  rule: self == oldSelf
+              defaults:
+                description: |-
+                  defaults are applied to pools of this class that leave the corresponding field
+                  unset. A pool may override any of them; the class does not clamp.
+                properties:
+                  admission:
+                    description: admission defaults for the pool's connection admission
+                      ladder.
+                    properties:
+                      allowedWorkloadClassNames:
+                        description: |-
+                          allowedWorkloadClassNames restricts which workload classes tenants of this class
+                          may select. Empty means every class is allowed.
+                        items:
+                          maxLength: 253
+                          type: string
+                        maxItems: 32
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      defaultWorkloadClassName:
+                        description: defaultWorkloadClassName is applied to a tenant
+                          that names no workload class.
+                        maxLength: 253
+                        type: string
+                      maxWait:
+                        default: 30s
+                        description: maxWait bounds time in the admission queue before
+                          the request is failed.
+                        type: string
+                      notifyAfter:
+                        default: 5s
+                        description: |-
+                          notifyAfter is when a waiting client receives a NoticeResponse telling it the
+                          connection is queued rather than hung. Without it a slow admission is
+                          indistinguishable from a dead proxy.
+                        type: string
+                      quarantineWindow:
+                        default: 168h
+                        description: quarantineWindow is how long a new tenant is
+                          observed before promotion.
+                        type: string
+                      queueDepthPerTenant:
+                        default: 64
+                        description: |-
+                          queueDepthPerTenant bounds waiters per tenant so one tenant's backlog cannot
+                          exhaust proxy memory or starve the scheduler's ordering pass.
+                        format: int32
+                        maximum: 10000
+                        minimum: 1
+                        type: integer
+                      requireQuarantine:
+                        default: true
+                        description: |-
+                          requireQuarantine forces a new tenant into an observation window on a restricted
+                          workload class before it can hold production capacity, so an uncharacterised
+                          workload cannot be admitted straight into a reservation it will not fit.
+                        type: boolean
+                      reservationMode:
+                        default: Strict
+                        description: |-
+                          reservationMode decides whether an idle tenant's unused guarantee may be lent out.
+                          Strict does not lend, matching Azure: lending makes every guaranteed request
+                          trigger a revocation, which decays the guarantee into a promise plus an eviction
+                          latency. Tenants wanting lendable capacity set guaranteed to 0.
+                        enum:
+                        - Strict
+                        - Lendable
+                        type: string
+                      strategy:
+                        default: WeightedDeficit
+                        description: |-
+                          strategy orders waiters once the budget is exhausted. WeightedDeficit serves the
+                          largest guarantee deficit first, then the least-satisfied burst fraction, weighted
+                          by workload class. Fifo ignores guarantees entirely and exists only as an escape
+                          hatch for debugging.
+                        enum:
+                        - WeightedDeficit
+                        - Fifo
+                        type: string
+                    type: object
+                  headroomPercent:
+                    default: 25
+                    description: |-
+                      headroomPercent is withheld from the pool total before any guarantee is granted:
+                      allocatable = total * (1 - headroomPercent/100). The webhook enforces
+                      sum(guaranteed) <= allocatable, so this is what keeps a fully-reserved pool from
+                      having nothing left for a failover or a rolling restart.
+                    format: int32
+                    maximum: 50
+                    minimum: 0
+                    type: integer
+                  migration:
+                    description: migration defaults for tenant moves.
+                    properties:
+                      allowAutomatic:
+                        default: true
+                        description: allowAutomatic lets the rebalancer and autoscaler
+                          start moves without a human.
+                        type: boolean
+                      maxPause:
+                        default: 1s
+                        description: |-
+                          maxPause is the cutover budget: if clients would be queued longer than this, the
+                          cutover is abandoned and the tenant keeps serving from the source.
+                        type: string
+                      offlineWindow:
+                        description: offlineWindow is when an Offline move may run.
+                        properties:
+                          duration:
+                            description: duration is how long the window stays open
+                              once started.
+                            type: string
+                          schedule:
+                            description: schedule is a standard five-field cron expression
+                              giving the window start.
+                            maxLength: 256
+                            type: string
+                          timeZone:
+                            default: UTC
+                            description: timeZone is an IANA zone name. Defaults to
+                              UTC.
+                            maxLength: 64
+                            type: string
+                        required:
+                        - duration
+                        - schedule
+                        type: object
+                      requireApproval:
+                        default: false
+                        description: requireApproval holds every move at the preflight
+                          gate until a human approves it.
+                        type: boolean
+                      rollbackWindow:
+                        default: 1h
+                        description: |-
+                          rollbackWindow is how long the source database is kept, connections refused, after a
+                          successful cutover. Dropping it immediately makes an undetected cutover defect
+                          unrecoverable.
+                        type: string
+                      strategy:
+                        default: Online
+                        description: |-
+                          strategy selects the default move mechanism. Online uses logical replication and
+                          queues clients through a sub-second cutover. Offline dumps and restores, pausing for
+                          tens of seconds, and is confined to a maintenance window.
+                        enum:
+                        - Online
+                        - Offline
+                        type: string
+                    type: object
+                  migrationHeadroomPercent:
+                    default: 10
+                    description: |-
+                      migrationHeadroomPercent is withheld on top of headroomPercent while a tenant
+                      migration is in flight, because during cutover the tenant's data and connections
+                      exist on both the source and the target instance at once.
+                    format: int32
+                    maximum: 50
+                    minimum: 0
+                    type: integer
+                  placement:
+                    description: placement defaults for the tenant scheduler.
+                    properties:
+                      maxSkewTenants:
+                        default: 15
+                        description: |-
+                          maxSkewTenants bounds the tenant-count difference between the fullest and emptiest
+                          instance before placement prefers the emptier one regardless of fit.
+                        format: int32
+                        maximum: 1000
+                        minimum: 0
+                        type: integer
+                      observationWindow:
+                        default: 168h
+                        description: |-
+                          observationWindow is the trailing window the percentile is computed over. A week
+                          covers the weekly cycle most business workloads have.
+                        type: string
+                      packOnPercentile:
+                        default: P95
+                        description: |-
+                          packOnPercentile selects the statistic of the trailing observation window that
+                          placement packs against. Never the mean: bursty tenants are the premise of an
+                          elastic pool, and a mean hides exactly the peaks that collide.
+                        enum:
+                        - P50
+                        - P95
+                        - P99
+                        - Peak
+                        type: string
+                      strategy:
+                        default: BestFitDecreasing
+                        description: |-
+                          strategy selects the bin-packing algorithm. PowerOfTwoChoices is used for admitting
+                          a single new tenant, where a full scan buys nothing.
+                        enum:
+                        - BestFitDecreasing
+                        - PowerOfTwoChoices
+                        - Spread
+                        type: string
+                    type: object
+                  pooling:
+                    description: pooling defaults for the proxy's connection pool
+                      behaviour.
+                    properties:
+                      idleSelection:
+                        default: Lifo
+                        description: |-
+                          idleSelection picks which idle backend is handed out next. Lifo keeps the working
+                          set small so serverIdleTimeout can actually retire the tail.
+                        enum:
+                        - Lifo
+                        - Fifo
+                        type: string
+                      ignoreStartupParameters:
+                        default:
+                        - extra_float_digits
+                        - options
+                        description: ignoreStartupParameters are startup-packet parameters
+                          excluded from the pool key.
+                        items:
+                          maxLength: 63
+                          type: string
+                        maxItems: 32
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      maxPinDuration:
+                        default: 1h
+                        description: |-
+                          maxPinDuration closes a pinned backend that has held its client's state for too
+                          long.
+                        type: string
+                      maxPinnedFractionPercent:
+                        default: 20
+                        description: |-
+                          maxPinnedFractionPercent bounds how much of a pool may be pinned. Pinned backends
+                          are removed from the elastic budget and gauged separately, so an unbounded pinned
+                          fraction makes the pool's effective ceiling unexplainable.
+                        format: int32
+                        maximum: 100
+                        minimum: 0
+                        type: integer
+                      mode:
+                        default: Transaction
+                        description: mode selects when a backend is returned to the
+                          pool.
+                        enum:
+                        - Session
+                        - Transaction
+                        - Statement
+                        type: string
+                      pinningPolicy:
+                        default: Pin
+                        description: |-
+                          pinningPolicy handles session state that cannot be scrubbed, such as LISTEN, a WITH
+                          HOLD cursor or setseed(). Pinning costs throughput; scrubbing incorrectly leaks one
+                          tenant's data to another.
+                        enum:
+                        - Pin
+                        - Close
+                        - Error
+                        type: string
+                      preparedStatements:
+                        default: Extended
+                        description: |-
+                          preparedStatements selects protocol-level prepared statement support. Extended
+                          keeps transaction mode usable by every mainstream driver, all of which auto-prepare
+                          by default. Full additionally rewrites SQL-level PREPARE, which is not implemented
+                          in v1.
+                        enum:
+                        - Disabled
+                        - Extended
+                        - Full
+                        type: string
+                      preparedStatementsLimit:
+                        default: 1000
+                        description: preparedStatementsLimit bounds the per-backend
+                          statement cache, evicted LRU.
+                        format: int32
+                        maximum: 100000
+                        minimum: 0
+                        type: integer
+                      resetMode:
+                        default: DirtyTracked
+                        description: resetMode selects how much session state is scrubbed
+                          before reuse.
+                        enum:
+                        - None
+                        - DirtyTracked
+                        - SmartDiscard
+                        - DiscardAll
+                        - Verified
+                        type: string
+                      serverIdleTimeout:
+                        default: 600s
+                        description: |-
+                          serverIdleTimeout closes idle backends. It is suppressed at or below a tenant's
+                          guaranteed floor, since reaping a reserved connection only forces it to be
+                          re-established.
+                        type: string
+                      serverLifetime:
+                        default: 3600s
+                        description: serverLifetime recycles a backend regardless
+                          of activity.
+                        type: string
+                      serverLifetimeJitter:
+                        default: 300s
+                        description: |-
+                          serverLifetimeJitter spreads recycling. Without it a pool established in one burst
+                          tears itself down in one burst an hour later, which is a self-inflicted outage.
+                        type: string
+                      startupParameterPolicy:
+                        default: PoolKey
+                        description: |-
+                          startupParameterPolicy handles a startup parameter the proxy does not track.
+                          PoolKey is the only setting that is both safe and compatible: RESET ALL restores
+                          session-start values, so startup parameters are part of session identity and cannot
+                          be scrubbed away.
+                        enum:
+                        - Reject
+                        - Ignore
+                        - PoolKey
+                        type: string
+                      trackExtraParameters:
+                        description: |-
+                          trackExtraParameters are GUC_REPORT parameters added to the variable cache beyond
+                          the built-in set, so a difference between client and backend is corrected rather
+                          than silently inherited from the previous client.
+                        items:
+                          maxLength: 63
+                          type: string
+                        maxItems: 32
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                  rebalancing:
+                    description: rebalancing defaults for reactive tenant movement.
+                    properties:
+                      blackoutWindows:
+                        description: |-
+                          blackoutWindows are recurring periods during which no automatic move starts. A move
+                          already in flight when a window opens runs to completion, because aborting mid-
+                          cutover is riskier than finishing.
+                        items:
+                          description: TimeWindow is a recurring window expressed
+                            as a cron start plus a duration.
+                          properties:
+                            duration:
+                              description: duration is how long the window stays open
+                                once started.
+                              type: string
+                            schedule:
+                              description: schedule is a standard five-field cron
+                                expression giving the window start.
+                              maxLength: 256
+                              type: string
+                            timeZone:
+                              default: UTC
+                              description: timeZone is an IANA zone name. Defaults
+                                to UTC.
+                              maxLength: 64
+                              type: string
+                          required:
+                          - duration
+                          - schedule
+                          type: object
+                        maxItems: 16
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      enabled:
+                        default: true
+                        description: enabled turns automatic rebalancing on.
+                        type: boolean
+                      evaluationInterval:
+                        default: 15m
+                        description: evaluationInterval is how often imbalance is
+                          scored.
+                        type: string
+                      forbidMoveWhenSourceUtilizationAbovePercent:
+                        default: 65
+                        description: |-
+                          forbidMoveWhenSourceUtilizationAbovePercent blocks moves off an instance that is
+                          too busy to also run logical replication decoding for the departing tenant.
+                        format: int32
+                        maximum: 100
+                        minimum: 0
+                        type: integer
+                      hotTenantUtilizationThresholdPercent:
+                        default: 15
+                        description: |-
+                          hotTenantUtilizationThresholdPercent is the utilization at or above which a tenant
+                          counts as hot and is excluded under ColdTenantsOnly.
+                        format: int32
+                        maximum: 100
+                        minimum: 0
+                        type: integer
+                      maxConcurrentMigrations:
+                        default: 1
+                        description: |-
+                          maxConcurrentMigrations bounds in-flight moves per pool. Each move holds a
+                          replication slot and duplicates the tenant's storage.
+                        format: int32
+                        maximum: 16
+                        minimum: 1
+                        type: integer
+                      minImbalancePercent:
+                        default: 20
+                        description: |-
+                          minImbalancePercent is the spread between instances below which a move is not worth
+                          its risk.
+                        format: int32
+                        maximum: 100
+                        minimum: 1
+                        type: integer
+                      mode:
+                        default: ColdTenantsOnly
+                        description: |-
+                          mode restricts which tenants may be moved. Moving a hot tenant consumes exactly the
+                          resources that are scarce on an instance that is already the reason to rebalance.
+                        enum:
+                        - ColdTenantsOnly
+                        - AnyTenant
+                        - Disabled
+                        type: string
+                    type: object
+                type: object
+              density:
+                description: |-
+                  density caps how much a single instance or pool may be packed. These are hard
+                  admission limits, not scheduler hints.
+                properties:
+                  maxBackendConnectionsPerInstance:
+                    default: 500
+                    description: |-
+                      maxBackendConnectionsPerInstance caps the allocatable connections derived from an
+                      instance class. PostgreSQL's per-snapshot and ProcArray costs grow with
+                      max_connections, so raising this trades pool headroom for latency on every backend.
+                    format: int32
+                    maximum: 5000
+                    minimum: 10
+                    type: integer
+                  maxInstancesPerPool:
+                    default: 16
+                    description: maxInstancesPerPool bounds how far a pool may scale
+                      out.
+                    format: int32
+                    maximum: 64
+                    minimum: 1
+                    type: integer
+                  maxRelationsPerInstance:
+                    default: 200000
+                    description: |-
+                      maxRelationsPerInstance bounds the catalogue. Relation count, not data volume, is
+                      what governs autovacuum sweep time, relcache memory and file-descriptor pressure,
+                      and it is the density limit tenants reach first.
+                    format: int32
+                    minimum: 1000
+                    type: integer
+                  maxStoragePerTenant:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      maxStoragePerTenant caps a single tenant's data size, excluding WAL and temporary
+                      files.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  maxTenantsPerInstance:
+                    default: 250
+                    description: maxTenantsPerInstance bounds tenant databases on
+                      one PostgreSQL instance.
+                    format: int32
+                    maximum: 5000
+                    minimum: 1
+                    type: integer
+                  maxTenantsPerPool:
+                    default: 1000
+                    description: |-
+                      maxTenantsPerPool bounds the pool's tenant ledger. Beyond roughly a thousand
+                      entries the cross-tenant scheduler's ordering pass needs re-analysis, so this is a
+                      hard stop rather than a slow degradation.
+                    format: int32
+                    maximum: 20000
+                    minimum: 1
+                    type: integer
+                type: object
+              description:
+                description: description is shown in `kubectl describe` and in the
+                  platform catalogue.
+                maxLength: 256
+                type: string
+              errorCodes:
+                description: |-
+                  errorCodes is the published mapping from an admission outcome to the SQLSTATE and
+                  retry hint a client sees. It is API surface, not an implementation detail: client
+                  retry logic can only distinguish "raise my ceiling" from "the pool is full" if the
+                  codes are stable and documented.
+                properties:
+                  admissionQueueTimeout:
+                    default:
+                      code: PGE1024
+                      retryAfter: 5s
+                      retryable: true
+                      sqlState: "53400"
+                    description: admissionQueueTimeout fires when a queued client
+                      exceeds admission.maxWait.
+                    properties:
+                      code:
+                        description: |-
+                          code is the pgelastic identifier carried in the error message. Changing it breaks
+                          client retry logic that matches on it.
+                        maxLength: 16
+                        pattern: ^PGE[0-9]{4}$
+                        type: string
+                      messageTemplate:
+                        description: |-
+                          messageTemplate overrides the client-facing message. The proxy substitutes only the
+                          documented placeholders and never interpolates tenant-supplied text.
+                        maxLength: 256
+                        type: string
+                      retryAfter:
+                        description: retryAfter is the delay published to clients
+                          and exporters for a retryable code.
+                        type: string
+                      retryable:
+                        default: false
+                        description: |-
+                          retryable advertises whether retrying the same request can succeed without a
+                          configuration change.
+                        type: boolean
+                      sqlState:
+                        description: |-
+                          sqlState is the five-character SQLSTATE sent in the ErrorResponse. It is overridable
+                          because some client frameworks key their retry policy on a fixed set of SQLSTATEs
+                          and cannot be taught new ones.
+                        maxLength: 5
+                        minLength: 5
+                        pattern: ^[0-9A-Z]{5}$
+                        type: string
+                    required:
+                    - code
+                    - sqlState
+                    type: object
+                  migrationCutover:
+                    default:
+                      code: PGE1613
+                      retryAfter: 1s
+                      retryable: true
+                      sqlState: 57P01
+                    description: |-
+                      migrationCutover fires on the sessions that cannot be queued through a tenant move.
+                      It uses the admin-shutdown SQLSTATE because every driver already treats that as
+                      "reconnect", which is exactly the required behaviour.
+                    properties:
+                      code:
+                        description: |-
+                          code is the pgelastic identifier carried in the error message. Changing it breaks
+                          client retry logic that matches on it.
+                        maxLength: 16
+                        pattern: ^PGE[0-9]{4}$
+                        type: string
+                      messageTemplate:
+                        description: |-
+                          messageTemplate overrides the client-facing message. The proxy substitutes only the
+                          documented placeholders and never interpolates tenant-supplied text.
+                        maxLength: 256
+                        type: string
+                      retryAfter:
+                        description: retryAfter is the delay published to clients
+                          and exporters for a retryable code.
+                        type: string
+                      retryable:
+                        default: false
+                        description: |-
+                          retryable advertises whether retrying the same request can succeed without a
+                          configuration change.
+                        type: boolean
+                      sqlState:
+                        description: |-
+                          sqlState is the five-character SQLSTATE sent in the ErrorResponse. It is overridable
+                          because some client frameworks key their retry policy on a fixed set of SQLSTATEs
+                          and cannot be taught new ones.
+                        maxLength: 5
+                        minLength: 5
+                        pattern: ^[0-9A-Z]{5}$
+                        type: string
+                    required:
+                    - code
+                    - sqlState
+                    type: object
+                  poolBusy:
+                    default:
+                      code: PGE1929
+                      retryAfter: 1s
+                      retryable: true
+                      sqlState: "53400"
+                    description: |-
+                      poolBusy fires when the request is within every configured limit but the pool cannot
+                      serve it right now. This is the only one of the three where retrying is the correct
+                      client behaviour.
+                    properties:
+                      code:
+                        description: |-
+                          code is the pgelastic identifier carried in the error message. Changing it breaks
+                          client retry logic that matches on it.
+                        maxLength: 16
+                        pattern: ^PGE[0-9]{4}$
+                        type: string
+                      messageTemplate:
+                        description: |-
+                          messageTemplate overrides the client-facing message. The proxy substitutes only the
+                          documented placeholders and never interpolates tenant-supplied text.
+                        maxLength: 256
+                        type: string
+                      retryAfter:
+                        description: retryAfter is the delay published to clients
+                          and exporters for a retryable code.
+                        type: string
+                      retryable:
+                        default: false
+                        description: |-
+                          retryable advertises whether retrying the same request can succeed without a
+                          configuration change.
+                        type: boolean
+                      sqlState:
+                        description: |-
+                          sqlState is the five-character SQLSTATE sent in the ErrorResponse. It is overridable
+                          because some client frameworks key their retry policy on a fixed set of SQLSTATEs
+                          and cannot be taught new ones.
+                        maxLength: 5
+                        minLength: 5
+                        pattern: ^[0-9A-Z]{5}$
+                        type: string
+                    required:
+                    - code
+                    - sqlState
+                    type: object
+                  poolCapacityExhausted:
+                    default:
+                      code: PGE1936
+                      retryAfter: 5s
+                      retryable: true
+                      sqlState: "53400"
+                    description: |-
+                      poolCapacityExhausted fires when the pool's whole budget is committed. The fix is to
+                      scale the pool.
+                    properties:
+                      code:
+                        description: |-
+                          code is the pgelastic identifier carried in the error message. Changing it breaks
+                          client retry logic that matches on it.
+                        maxLength: 16
+                        pattern: ^PGE[0-9]{4}$
+                        type: string
+                      messageTemplate:
+                        description: |-
+                          messageTemplate overrides the client-facing message. The proxy substitutes only the
+                          documented placeholders and never interpolates tenant-supplied text.
+                        maxLength: 256
+                        type: string
+                      retryAfter:
+                        description: retryAfter is the delay published to clients
+                          and exporters for a retryable code.
+                        type: string
+                      retryable:
+                        default: false
+                        description: |-
+                          retryable advertises whether retrying the same request can succeed without a
+                          configuration change.
+                        type: boolean
+                      sqlState:
+                        description: |-
+                          sqlState is the five-character SQLSTATE sent in the ErrorResponse. It is overridable
+                          because some client frameworks key their retry policy on a fixed set of SQLSTATEs
+                          and cannot be taught new ones.
+                        maxLength: 5
+                        minLength: 5
+                        pattern: ^[0-9A-Z]{5}$
+                        type: string
+                    required:
+                    - code
+                    - sqlState
+                    type: object
+                  storageQuotaExceeded:
+                    default:
+                      code: PGE0544
+                      retryable: false
+                      sqlState: "53100"
+                    description: |-
+                      storageQuotaExceeded fires on a write by a tenant at its storage quota. SELECT and
+                      DELETE keep working so the tenant can recover without operator involvement.
+                    properties:
+                      code:
+                        description: |-
+                          code is the pgelastic identifier carried in the error message. Changing it breaks
+                          client retry logic that matches on it.
+                        maxLength: 16
+                        pattern: ^PGE[0-9]{4}$
+                        type: string
+                      messageTemplate:
+                        description: |-
+                          messageTemplate overrides the client-facing message. The proxy substitutes only the
+                          documented placeholders and never interpolates tenant-supplied text.
+                        maxLength: 256
+                        type: string
+                      retryAfter:
+                        description: retryAfter is the delay published to clients
+                          and exporters for a retryable code.
+                        type: string
+                      retryable:
+                        default: false
+                        description: |-
+                          retryable advertises whether retrying the same request can succeed without a
+                          configuration change.
+                        type: boolean
+                      sqlState:
+                        description: |-
+                          sqlState is the five-character SQLSTATE sent in the ErrorResponse. It is overridable
+                          because some client frameworks key their retry policy on a fixed set of SQLSTATEs
+                          and cannot be taught new ones.
+                        maxLength: 5
+                        minLength: 5
+                        pattern: ^[0-9A-Z]{5}$
+                        type: string
+                    required:
+                    - code
+                    - sqlState
+                    type: object
+                  tenantCapReached:
+                    default:
+                      code: PGE1928
+                      retryable: false
+                      sqlState: "53300"
+                    description: |-
+                      tenantCapReached fires when a tenant is below the pool's ceiling but at its own.
+                      The fix is to raise the tenant's burstable, so retrying is pointless.
+                    properties:
+                      code:
+                        description: |-
+                          code is the pgelastic identifier carried in the error message. Changing it breaks
+                          client retry logic that matches on it.
+                        maxLength: 16
+                        pattern: ^PGE[0-9]{4}$
+                        type: string
+                      messageTemplate:
+                        description: |-
+                          messageTemplate overrides the client-facing message. The proxy substitutes only the
+                          documented placeholders and never interpolates tenant-supplied text.
+                        maxLength: 256
+                        type: string
+                      retryAfter:
+                        description: retryAfter is the delay published to clients
+                          and exporters for a retryable code.
+                        type: string
+                      retryable:
+                        default: false
+                        description: |-
+                          retryable advertises whether retrying the same request can succeed without a
+                          configuration change.
+                        type: boolean
+                      sqlState:
+                        description: |-
+                          sqlState is the five-character SQLSTATE sent in the ErrorResponse. It is overridable
+                          because some client frameworks key their retry policy on a fixed set of SQLSTATEs
+                          and cannot be taught new ones.
+                        maxLength: 5
+                        minLength: 5
+                        pattern: ^[0-9A-Z]{5}$
+                        type: string
+                    required:
+                    - code
+                    - sqlState
+                    type: object
+                type: object
+              governance:
+                description: |-
+                  governance publishes which limits are actually enforced and which are advisory.
+                  It is a deliberate API surface: an operator who mistakes tier 2 for enforcement
+                  will build a capacity plan on limits any client can SET away.
+                properties:
+                  storage:
+                    description: storage is a soft quota with a hard terminal action.
+                    properties:
+                      diskQuota:
+                        description: diskQuota is the soft quota implementation.
+                        properties:
+                          enabled:
+                            default: true
+                            description: enabled turns per-tenant storage accounting
+                              on.
+                            type: boolean
+                          hardAction:
+                            default: ReadOnly
+                            description: |-
+                              hardAction is taken at 100% of quota. ReadOnly sets
+                              default_transaction_read_only = on for the tenant, so writes fail while SELECT and
+                              DELETE keep working — a tenant over quota must be able to delete its way out.
+                            enum:
+                            - ReadOnly
+                            - WarnOnly
+                            type: string
+                          naptime:
+                            default: 2s
+                            description: |-
+                              naptime is the sampling interval, and therefore the overshoot bound. Shortening it
+                              tightens the bound at the cost of a catalogue scan per interval.
+                            type: string
+                          warnAtPercent:
+                            default: 90
+                            description: warnAtPercent raises the Throttled condition
+                              and an Event before writes stop.
+                            format: int32
+                            maximum: 100
+                            minimum: 1
+                            type: integer
+                        type: object
+                    type: object
+                  tier1Proxy:
+                    description: tier1Proxy is enforced by the proxy and is the only
+                      tier that can back a guarantee.
+                    properties:
+                      enforced:
+                        default:
+                        - MaxBackendConnections
+                        - GuaranteedFloor
+                        - AdmissionQueue
+                        - QueryDeadline
+                        - MaxResultBytes
+                        - TransactionRateLimit
+                        - ByteRateLimit
+                        - MaxClientConnections
+                        - CancelBurstCredit
+                        description: |-
+                          enforced controls are applied on the admission path before a backend connection is
+                          leased, so exceeding one is an error to the client rather than a debt to the pool.
+                        items:
+                          description: Tier1Control names a limit enforced by the
+                            proxy itself.
+                          enum:
+                          - MaxBackendConnections
+                          - GuaranteedFloor
+                          - AdmissionQueue
+                          - QueryDeadline
+                          - MaxResultBytes
+                          - TransactionRateLimit
+                          - ByteRateLimit
+                          - MaxClientConnections
+                          - CancelBurstCredit
+                          type: string
+                        maxItems: 16
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                  tier2Postgres:
+                    description: tier2Postgres is advisory only.
+                    properties:
+                      advisory:
+                        default:
+                        - StatementTimeout
+                        - IdleInTransactionSessionTimeout
+                        - IdleSessionTimeout
+                        - LockTimeout
+                        - TempFileLimit
+                        description: advisory controls are applied on connect and
+                          may be overridden by the client.
+                        items:
+                          description: Tier2Control names a PostgreSQL GUC applied
+                            with ALTER ROLE ... SET.
+                          enum:
+                          - StatementTimeout
+                          - IdleInTransactionSessionTimeout
+                          - IdleSessionTimeout
+                          - LockTimeout
+                          - TempFileLimit
+                          - WorkMem
+                          type: string
+                        maxItems: 16
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      reapplyOnCheckout:
+                        default: true
+                        description: |-
+                          reapplyOnCheckout re-issues the advisory SETs each time a pooled backend is handed
+                          to a client, which bounds how long a client's own override survives to one
+                          checkout.
+                        type: boolean
+                    type: object
+                  tier3OS:
+                    description: tier3OS is what the operating system can and cannot
+                      attribute to a tenant.
+                    properties:
+                      enforced:
+                        default:
+                        - CPUWeight
+                        - CPUMax
+                        description: enforced controls are written to the tenant's
+                          cgroup.
+                        items:
+                          description: Tier3Control names an operating-system control.
+                          enum:
+                          - CPUWeight
+                          - CPUMax
+                          - MemoryMax
+                          - MemoryHigh
+                          - IOMax
+                          - IOWeight
+                          type: string
+                        maxItems: 8
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      neverPerBackend:
+                        default:
+                        - MemoryMax
+                        - MemoryHigh
+                        - IOMax
+                        - IOWeight
+                        description: |-
+                          neverPerBackend controls are refused by design, and the refusal is published so
+                          nobody plans capacity around them.
+
+                          Memory: the page cache is charged to whichever backend first touches a page and is
+                          never re-charged, so a per-backend memory.max attributes shared data to an arbitrary
+                          tenant; an OOM kill inside a critical section crash-restarts the whole postmaster.
+
+                          IO: a per-backend io.max misses the checkpointer, bgwriter, walwriter and
+                          autovacuum, which are most of the write traffic. PG18's default io_method=worker
+                          additionally moves reads into shared IO workers, so read attribution is gone too.
+                          Restoring it would require io_method=io_uring behind a bespoke seccomp profile, so
+                          per-backend IO attribution is simply unavailable in v1 — which is consistent with a
+                          capacity model denominated in connections.
+                        items:
+                          description: Tier3Control names an operating-system control.
+                          enum:
+                          - CPUWeight
+                          - CPUMax
+                          - MemoryMax
+                          - MemoryHigh
+                          - IOMax
+                          - IOWeight
+                          type: string
+                        maxItems: 8
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                type: object
+              reclaimPolicy:
+                default: Retain
+                description: |-
+                  reclaimPolicy decides the fate of provisioned databases, volumes and backups when a
+                  pool of this class is deleted.
+                enum:
+                - Retain
+                - Delete
+                type: string
+              runtime:
+                description: runtime configures the proxy binary the controller deploys
+                  for pools of this class.
+                properties:
+                  imagePullPolicy:
+                    default: IfNotPresent
+                    description: imagePullPolicy for the proxy image.
+                    enum:
+                    - Always
+                    - Never
+                    - IfNotPresent
+                    type: string
+                  memoryBuffers:
+                    description: |-
+                      memoryBuffers sizes the proxy's per-connection and per-packet allocations, which
+                      together with the client connection cap determine its memory ceiling.
+                    properties:
+                      listenBacklog:
+                        default: 128
+                        description: listenBacklog is the accept queue depth.
+                        format: int32
+                        maximum: 65535
+                        minimum: 1
+                        type: integer
+                      maxPacketSize:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        default: 1Gi
+                        description: |-
+                          maxPacketSize rejects a single protocol message larger than this. PostgreSQL's own
+                          message length field is a signed 32-bit count, so 1Gi is the protocol ceiling.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      packetBufferSize:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        default: 4Ki
+                        description: packetBufferSize is the read buffer used per
+                          socket for message framing.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      perConnectionBufferLimit:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        default: 1Mi
+                        description: |-
+                          perConnectionBufferLimit is the backpressure high-water mark: once this much
+                          unwritten data is queued toward a peer, the proxy stops reading from the other side
+                          rather than buffering a slow client's result set into an OOM kill.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                  protocol:
+                    description: protocol is the wire-protocol posture offered to
+                      clients.
+                    properties:
+                      cancelKeySizeBytes:
+                        default: 32
+                        description: |-
+                          cancelKeySizeBytes is the length of the proxy-generated cancel key. Protocol 3.2
+                          allows 4 to 256 bytes, so the key is a byte string and never a 32-bit integer. The
+                          proxy embeds a routing identifier and a hop TTL in it, because with several proxy
+                          replicas behind one Service a CancelRequest arrives at an arbitrary pod that would
+                          otherwise have no way to find the query. Widening it later is a wire break, so it is
+                          sized generously on day one.
+                        format: int32
+                        maximum: 256
+                        minimum: 4
+                        type: integer
+                      channelBinding:
+                        default: Prefer
+                        description: |-
+                          channelBinding offers SCRAM-SHA-256-PLUS bound to the proxy's own certificate via
+                          tls-server-end-point. End-to-end binding to the backend's certificate is
+                          structurally impossible behind a TLS-terminating proxy; Require here means the
+                          client is bound to the proxy, and nothing more.
+                        enum:
+                        - Disable
+                        - Prefer
+                        - Require
+                        type: string
+                      directTLS:
+                        default: true
+                        description: |-
+                          directTLS accepts a TLS ClientHello as the first bytes on the socket, skipping the
+                          SSLRequest round trip. PostgreSQL 17 and later require ALPN "postgresql" on this
+                          path, and the proxy enforces it.
+                        type: boolean
+                      echoUnknownPqOptions:
+                        default: true
+                        description: |-
+                          echoUnknownPqOptions lists every unrecognised _pq_. startup option back in the
+                          NegotiateProtocolVersion reply, which the protocol requires. Erroring on them
+                          instead is what permanently burned protocol 3.1.
+                        type: boolean
+                      gssEncryption:
+                        default: false
+                        description: |-
+                          gssEncryption offers GSSAPI transport encryption. Disabled means the proxy answers
+                          a GSSENCRequest with 'N' and the client falls back, which every supported client
+                          does cleanly.
+                        type: boolean
+                      negotiateGrease:
+                        default: true
+                        description: |-
+                          negotiateGrease tolerates libpq's deliberately invalid protocol version probe
+                          (3.9999) by answering NegotiateProtocolVersion instead of erroring.
+                        type: boolean
+                      replicationConnections:
+                        default: true
+                        description: |-
+                          replicationConnections admits physical and logical replication connections. They are
+                          forced into session mode unconditionally regardless of the pool's mode, because a
+                          multiplexed replication stream corrupts silently.
+                        type: boolean
+                      startupPacketMaxBytes:
+                        default: 10000
+                        description: |-
+                          startupPacketMaxBytes caps the startup packet. PostgreSQL's own
+                          MAX_STARTUP_PACKET_LENGTH is 10000 and clients are built against it, so raising this
+                          admits packets no real server would accept.
+                        format: int32
+                        maximum: 10000
+                        minimum: 512
+                        type: integer
+                    type: object
+                  proxyImage:
+                    description: |-
+                      proxyImage overrides the controller's compiled-in proxy image. The controller
+                      refuses an image whose reported protocol capabilities do not cover this class's
+                      posture, rather than starting a fleet that will reject connections.
+                    maxLength: 512
+                    type: string
+                  workers:
+                    default: 2
+                    description: |-
+                      workers is the proxy's runtime thread count. It is deliberately not derived from
+                      the host CPU count: in a CPU-limited pod, spawning one worker per visible core makes
+                      the runtime consume its whole CFS quota in the first few milliseconds of each period
+                      and stall for the remainder.
+                    format: int32
+                    maximum: 64
+                    minimum: 1
+                    type: integer
+                type: object
+              tenancyModel:
+                default: SharedInstance
+                description: |-
+                  tenancyModel is immutable because changing it retroactively reinterprets the
+                  isolation promise made to every tenant already bound to a pool of this class.
+                enum:
+                - SharedInstance
+                - DedicatedInstance
+                type: string
+                x-kubernetes-validations:
+                - message: tenancyModel is immutable
+                  rule: self == oldSelf
+              tier:
+                default: GeneralPurpose
+                description: tier groups classes for reporting and chargeback.
+                enum:
+                - Development
+                - GeneralPurpose
+                - BusinessCritical
+                type: string
+            required:
+            - controllerName
+            type: object
+          status:
+            description: status defines the observed state of PgElasticClass
+            properties:
+              conditions:
+                description: conditions describe the current state of the PgElasticClass.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: observedGeneration is the spec generation the conditions
+                  below were computed from.
+                format: int64
+                type: integer
+              poolCount:
+                description: |-
+                  poolCount is how many pools reference this class. It is the value the
+                  pgelastic.io/pools-exist finalizer guards: deletion blocks while it is non-zero.
+                format: int32
+                minimum: 0
+                type: integer
+              supportedFeatures:
+                description: |-
+                  supportedFeatures is what the reconciling controller actually implements, so a pool
+                  author can detect a capability gap from the API instead of from a failed rollout.
+                items:
+                  description: |-
+                    ClassFeature is a capability name published in status so a client can detect what the
+                    running controller actually implements without inspecting its version.
+                  maxLength: 64
+                  type: string
+                maxItems: 64
+                type: array
+                x-kubernetes-list-type: atomic
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
