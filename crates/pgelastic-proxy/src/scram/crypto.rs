@@ -62,9 +62,9 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: NonZeroU32) -> Zeroiz
     out
 }
 
-/// Applies SASLprep (RFC 4013) the way `PostgreSQL` does.
+/// Applies `SASLprep` (RFC 4013) the way `PostgreSQL` does.
 ///
-/// A password that SASLprep rejects is passed through byte-for-byte rather than
+/// A password that `SASLprep` rejects is passed through byte-for-byte rather than
 /// erroring, which is what the server does and therefore the only behaviour
 /// that produces a matching verifier.
 pub fn saslprep(password: &str) -> Zeroizing<String> {
@@ -172,6 +172,68 @@ mod tests {
         let a = sha256(b"a");
         let b = sha256(b"b");
         assert_eq!(xor(&xor(&a, &b), &b), a);
+    }
+
+    #[test]
+    fn a_nonce_is_long_enough_and_contains_no_comma() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2000 {
+            let nonce = random_nonce().unwrap();
+            // 18 random bytes is 144 bits, base64 to 24 characters with no
+            // padding. A nonce shorter than the 128-bit floor makes replay
+            // across concurrent exchanges a live risk.
+            assert_eq!(nonce.len(), 24);
+            assert!(
+                nonce
+                    .bytes()
+                    .all(|b| (0x21..=0x7e).contains(&b) && b != b','),
+                "{nonce} is not a SCRAM printable string"
+            );
+            assert!(seen.insert(nonce));
+        }
+    }
+
+    /// PBKDF2 at the `PostgreSQL` default is milliseconds of solid CPU chosen
+    /// by an unauthenticated peer. On a runtime worker that stalls every other
+    /// connection sharing the thread, so this runs on a single-worker runtime
+    /// and requires an unrelated task to keep making progress throughout.
+    #[test]
+    fn hashing_does_not_block_the_runtime_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = Arc::clone(&ticks);
+            let ticker = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+
+            let pool = KdfPool::new(4);
+            let jobs: Vec<_> = (0..4)
+                .map(|_| {
+                    pool.salted_password(
+                        Zeroizing::new("pencil".to_owned()),
+                        b"saltsaltsaltsalt".to_vec(),
+                        NonZeroU32::new(300_000).unwrap(),
+                    )
+                })
+                .collect();
+            for job in jobs {
+                job.await.unwrap();
+            }
+
+            ticker.abort();
+            assert!(
+                ticks.load(std::sync::atomic::Ordering::Relaxed) > 5,
+                "the worker thread was blocked while hashing"
+            );
+        });
     }
 
     #[tokio::test]

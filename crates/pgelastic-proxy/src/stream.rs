@@ -26,6 +26,19 @@ impl<S> Prefixed<S> {
     pub fn get_ref(&self) -> &S {
         &self.inner
     }
+
+    /// Drops the replay buffer and returns the socket.
+    ///
+    /// Only sound where the prefix is known to be empty or deliberately
+    /// discarded; [`Prefixed::pending`] is the check.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+
+    /// Bytes still waiting to be replayed ahead of the socket.
+    pub fn pending(&self) -> usize {
+        self.prefix.len()
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
@@ -62,6 +75,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
+
+/// The client-facing socket.
+///
+/// The plain arm is [`Prefixed`] even when nothing was pushed back, so that the
+/// direct-TLS and `SSLRequest` paths hand rustls the same type.
+pub type ClientStream = MaybeTls<
+    Prefixed<tokio::net::TcpStream>,
+    tokio_rustls::server::TlsStream<Prefixed<tokio::net::TcpStream>>,
+>;
+
+/// The backend-facing socket.
+pub type BackendStream =
+    MaybeTls<tokio::net::TcpStream, tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 
 /// Either leg of a connection, before or after a TLS upgrade.
 #[derive(Debug)]

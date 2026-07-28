@@ -87,7 +87,11 @@ impl FrameRelay {
         self.buf.len()
     }
 
-    pub fn next(&mut self) -> Result<Relayed, WireError> {
+    /// The next unit of output, or [`Relayed::NeedMore`].
+    ///
+    /// Not `Iterator`: `NeedMore` is a legitimate non-terminal state, so an
+    /// iterator would have to conflate "nothing yet" with "nothing ever".
+    pub fn next_output(&mut self) -> Result<Relayed, WireError> {
         if self.streaming > 0 {
             if self.buf.is_empty() {
                 return Ok(Relayed::NeedMore);
@@ -142,7 +146,7 @@ mod tests {
     fn a_small_frame_arrives_whole_and_tagged() {
         let mut relay = FrameRelay::default();
         relay.extend_from_slice(&wire(b'Z', b"I"));
-        let Relayed::Frame(frame) = relay.next().unwrap() else {
+        let Relayed::Frame(frame) = relay.next_output().unwrap() else {
             panic!("expected a whole frame");
         };
         assert_eq!(frame.tag, b'Z');
@@ -156,10 +160,10 @@ mod tests {
         let mut relay = FrameRelay::default();
         for byte in &bytes[..bytes.len() - 1] {
             relay.extend_from_slice(&[*byte]);
-            assert_eq!(relay.next().unwrap(), Relayed::NeedMore);
+            assert_eq!(relay.next_output().unwrap(), Relayed::NeedMore);
         }
         relay.extend_from_slice(&bytes[bytes.len() - 1..]);
-        let Relayed::Frame(frame) = relay.next().unwrap() else {
+        let Relayed::Frame(frame) = relay.next_output().unwrap() else {
             panic!("expected a whole frame");
         };
         assert_eq!(frame.tag, b'Q');
@@ -177,7 +181,7 @@ mod tests {
             relay.extend_from_slice(chunk);
             peak = peak.max(relay.buffered());
             loop {
-                match relay.next().unwrap() {
+                match relay.next_output().unwrap() {
                     Relayed::Opaque(b) => out.extend_from_slice(&b),
                     Relayed::NeedMore => break,
                     Relayed::Frame(_) => panic!("an oversized frame must not be buffered whole"),
@@ -194,7 +198,7 @@ mod tests {
         let body = vec![1u8; 1024];
         let mut relay = FrameRelay::new(1024, DEFAULT_MAX_FRAME_BYTES);
         relay.extend_from_slice(&wire(b'D', &body));
-        let Relayed::Frame(frame) = relay.next().unwrap() else {
+        let Relayed::Frame(frame) = relay.next_output().unwrap() else {
             panic!("expected a whole frame");
         };
         assert_eq!(frame.body.len(), 1024);
@@ -212,7 +216,7 @@ mod tests {
         let mut tags = Vec::new();
         let mut opaque = 0usize;
         loop {
-            match relay.next().unwrap() {
+            match relay.next_output().unwrap() {
                 Relayed::Frame(f) => tags.push(f.tag),
                 Relayed::Opaque(b) => opaque += b.len(),
                 Relayed::NeedMore => break,
@@ -227,7 +231,7 @@ mod tests {
         let mut relay = FrameRelay::new(1024, 4096);
         relay.extend_from_slice(&[b'd', 0x3f, 0xff, 0xff, 0xff]);
         assert!(matches!(
-            relay.next(),
+            relay.next_output(),
             Err(WireError::FrameTooLarge { max: 4096, .. })
         ));
     }
@@ -236,6 +240,9 @@ mod tests {
     fn a_length_below_four_is_rejected() {
         let mut relay = FrameRelay::default();
         relay.extend_from_slice(&[b'Q', 0xff, 0xff, 0xff, 0xff]);
-        assert!(matches!(relay.next(), Err(WireError::InvalidLength(-1))));
+        assert!(matches!(
+            relay.next_output(),
+            Err(WireError::InvalidLength(-1))
+        ));
     }
 }

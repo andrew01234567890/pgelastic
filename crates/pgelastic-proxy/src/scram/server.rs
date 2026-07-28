@@ -143,8 +143,7 @@ mod tests {
         let client_first = client.client_first();
         let server_first = server.server_first(client_first.as_bytes())?;
         let parsed = ServerFirst::parse(&server_first)?;
-        let salted =
-            salted_password_blocking(password, &parsed.salt, parsed.iterations);
+        let salted = salted_password_blocking(password, &parsed.salt, parsed.iterations);
         let client_final = client.client_final(server_first.as_bytes(), &salted)?;
         server.finish(client_final.as_bytes())
     }
@@ -159,7 +158,10 @@ mod tests {
     #[test]
     fn the_wrong_password_is_rejected() {
         let verifier = ScramVerifier::generate("hunter2").unwrap();
-        assert_eq!(exchange(verifier, "hunter3").unwrap(), ScramOutcome::Rejected);
+        assert_eq!(
+            exchange(verifier, "hunter3").unwrap(),
+            ScramOutcome::Rejected
+        );
     }
 
     #[test]
@@ -181,11 +183,7 @@ mod tests {
         let server_first = server.server_first(b"n,,n=,r=client").unwrap();
         let parsed = ServerFirst::parse(&server_first).unwrap();
         // c=eSws is base64("y,,"), which is not the header the client sent.
-        let final_message = format!(
-            "c=eSws,r={},p={}",
-            parsed.nonce,
-            encode_b64(&[0u8; 32])
-        );
+        let final_message = format!("c=eSws,r={},p={}", parsed.nonce, encode_b64(&[0u8; 32]));
         assert_eq!(
             server.finish(final_message.as_bytes()),
             Err(ScramError::Malformed("channel-binding data was altered"))
@@ -197,8 +195,7 @@ mod tests {
         let verifier = ScramVerifier::generate("hunter2").unwrap();
         let mut server = ScramServer::new(verifier, "server-nonce-xyz".to_owned());
         server.server_first(b"n,,n=,r=client").unwrap();
-        let final_message =
-            format!("c=biws,r=someone-elses-nonce,p={}", encode_b64(&[0u8; 32]));
+        let final_message = format!("c=biws,r=someone-elses-nonce,p={}", encode_b64(&[0u8; 32]));
         assert_eq!(
             server.finish(final_message.as_bytes()),
             Err(ScramError::NonceMismatch)
@@ -236,7 +233,9 @@ mod tests {
         let parsed = ServerFirst::parse(&server_first).unwrap();
         let salted: Zeroizing<Key> =
             salted_password_blocking("hunter2", &parsed.salt, parsed.iterations);
-        let client_final = client.client_final(server_first.as_bytes(), &salted).unwrap();
+        let client_final = client
+            .client_final(server_first.as_bytes(), &salted)
+            .unwrap();
         let ScramOutcome::Verified(server_final) = server.finish(client_final.as_bytes()).unwrap()
         else {
             panic!("expected the exchange to verify");

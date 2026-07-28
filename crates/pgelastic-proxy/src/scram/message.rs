@@ -48,7 +48,9 @@ pub fn encode_b64(value: &[u8]) -> String {
 /// Splits `k=v` on the first `=` only: base64 values contain padding `=`.
 fn attribute(part: &str) -> Result<(char, &str)> {
     let mut chars = part.chars();
-    let key = chars.next().ok_or(ScramError::Malformed("empty attribute"))?;
+    let key = chars
+        .next()
+        .ok_or(ScramError::Malformed("empty attribute"))?;
     let rest = chars.as_str();
     let value = rest
         .strip_prefix('=')

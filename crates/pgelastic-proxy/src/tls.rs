@@ -44,10 +44,20 @@ pub fn server_acceptor(config: &ServerTlsConfig) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BackendTls {
     pub connector: TlsConnector,
     pub server_name: ServerName<'static>,
+}
+
+impl std::fmt::Debug for BackendTls {
+    /// Hand-written because `TlsConnector` has no `Debug`, and the only part
+    /// worth printing is the name the certificate is checked against.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendTls")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
 }
 
 pub fn backend_connector(
@@ -58,8 +68,8 @@ pub fn backend_connector(
         return Ok(None);
     }
 
-    let builder = ClientConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()?;
+    let builder =
+        ClientConfig::builder_with_provider(provider()).with_safe_default_protocol_versions()?;
 
     let client_config = match config.mode {
         BackendTlsMode::Disable => unreachable!("returned above"),
