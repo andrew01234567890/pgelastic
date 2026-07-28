@@ -69,6 +69,15 @@ pub enum ProxyError {
 
     #[error("timed out after {0:?}")]
     Timeout(std::time::Duration),
+
+    /// A capacity refusal. The SQLSTATE comes from the error taxonomy rather
+    /// than from this enum, because the taxonomy is API surface a client writes
+    /// retry logic against.
+    #[error("{message}")]
+    Admission {
+        sqlstate: &'static str,
+        message: String,
+    },
 }
 
 impl ProxyError {
@@ -87,6 +96,7 @@ impl ProxyError {
     /// The SQLSTATE to report to a client that is still able to receive one.
     pub fn sqlstate(&self) -> &'static str {
         match self {
+            Self::Admission { sqlstate, .. } => sqlstate,
             Self::AuthenticationFailed => sqlstate::INVALID_PASSWORD,
             Self::ConnectionLimit => sqlstate::TOO_MANY_CONNECTIONS,
             Self::ShuttingDown => sqlstate::ADMIN_SHUTDOWN,

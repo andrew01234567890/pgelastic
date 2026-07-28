@@ -104,6 +104,20 @@ impl Postgres {
     pub fn address(&self) -> String {
         format!("127.0.0.1:{}", self.port)
     }
+
+    /// A connection string that bypasses the proxy entirely.
+    ///
+    /// Used to observe the server's own view of how many backends the proxy is
+    /// holding, which is the only account that cannot be fooled by a bug in the
+    /// proxy's own bookkeeping. The `application_name` is what distinguishes the
+    /// observer from the connections it is counting.
+    pub fn direct_url(&self, application_name: &str) -> String {
+        format!(
+            "host=127.0.0.1 port={} user={BACKEND_USER} password={BACKEND_PASSWORD} \
+             dbname={BACKEND_DATABASE} application_name={application_name}",
+            self.port
+        )
+    }
 }
 
 /// Starts `postgres:18` with TLS enabled and SCRAM required on host connections.
@@ -231,10 +245,40 @@ pub async fn stack() -> Stack {
 
 impl Stack {
     pub fn url(&self) -> String {
+        self.url_for("tenant")
+    }
+
+    /// The proxy sees the startup `user` as the tenant, so two different values
+    /// here are two different tenants with two different pool keys.
+    pub fn url_for(&self, tenant: &str) -> String {
         format!(
-            "host=127.0.0.1 port={} user=tenant dbname={BACKEND_DATABASE}",
+            "host=127.0.0.1 port={} user={tenant} dbname={BACKEND_DATABASE}",
             self.proxy.port()
         )
+    }
+
+    pub async fn connect_as(&self, tenant: &str) -> tokio_postgres::Client {
+        self.connect_with(&self.url_for(tenant)).await
+    }
+
+    /// Connects, returning the driver error rather than panicking, so a refusal
+    /// can be asserted on.
+    pub async fn try_connect_as(
+        &self,
+        tenant: &str,
+    ) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+        let (client, connection) =
+            tokio_postgres::connect(&self.url_for(tenant), tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
+    }
+
+    /// Opens a connection straight to `PostgreSQL`, past the proxy.
+    pub async fn observer(&self, application_name: &str) -> tokio_postgres::Client {
+        self.connect_with(&self.pg.direct_url(application_name))
+            .await
     }
 
     /// Connects through the proxy without TLS, driving the connection task in
@@ -288,6 +332,13 @@ impl RawClient {
                     Bytes::from_static(b"database"),
                     Bytes::copy_from_slice(database.as_bytes()),
                 ),
+                // Startup parameters are part of the pool key, so a raw client
+                // that omits what `tokio-postgres` sends would land in a pool of
+                // its own and never share a backend with one.
+                (
+                    Bytes::from_static(b"client_encoding"),
+                    Bytes::from_static(b"UTF8"),
+                ),
             ],
         )
         .encode(&mut wire);
@@ -313,6 +364,30 @@ impl RawClient {
         pgelastic_proxy::wire_io::read_backend_message(&mut self.socket, &mut self.buf)
             .await
             .expect("reading from the proxy")
+    }
+
+    /// Reads until the proxy has nothing more to say, tolerating the close that
+    /// follows a `FATAL`.
+    pub async fn read_until_closed(&mut self) -> Vec<pgelastic_wire::BackendMessage> {
+        let mut messages = Vec::new();
+        while let Ok(message) =
+            pgelastic_proxy::wire_io::read_backend_message(&mut self.socket, &mut self.buf).await
+        {
+            let ready = matches!(message, pgelastic_wire::BackendMessage::ReadyForQuery(_));
+            messages.push(message);
+            if ready {
+                break;
+            }
+        }
+        messages
+    }
+
+    pub async fn query_until_closed(&mut self, sql: &str) -> Vec<pgelastic_wire::BackendMessage> {
+        self.send(&[pgelastic_wire::FrontendMessage::Query(
+            bytes::Bytes::copy_from_slice(sql.as_bytes()),
+        )])
+        .await;
+        self.read_until_closed().await
     }
 
     /// Reads to the next `ReadyForQuery`, returning what came before it and the

@@ -12,11 +12,12 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::backend;
-use crate::cancel::{CancelRegistry, CancelToken};
+use crate::cancel::{CancelRegistry, CancelRoute, CancelToken};
 use crate::config::Config;
 use crate::error::{ProxyError, Result};
 use crate::handshake::{self, Accepted, ClientAuth};
 use crate::metrics::{AuthOutcome, Metrics, RejectReason};
+use crate::pool::PoolManager;
 use crate::scram::{KdfPool, ScramVerifier};
 use crate::session::{self, Ending};
 use crate::stream::ClientStream;
@@ -31,6 +32,7 @@ pub struct Proxy {
     pub kdf: KdfPool,
     pub cancels: Arc<CancelRegistry>,
     pub metrics: Arc<Metrics>,
+    pub pools: Arc<PoolManager>,
     permits: Arc<Semaphore>,
 }
 
@@ -85,6 +87,8 @@ impl Proxy {
 
         let permits = Arc::new(Semaphore::new(config.listen.max_client_connections.max(1)));
         let kdf = KdfPool::new(config.auth.kdf_concurrency);
+        let pools = PoolManager::new(config.pool.clone(), Arc::clone(&metrics))?;
+        pools.publish_budget();
 
         Ok(Arc::new(Self {
             auth: Arc::new(ClientAuth::new(verifiers, iterations)?),
@@ -94,6 +98,7 @@ impl Proxy {
             kdf,
             cancels: CancelRegistry::new(),
             metrics,
+            pools,
             permits,
         }))
     }
@@ -240,6 +245,39 @@ async fn serve(
     }
     proxy.metrics.client_auth(AuthOutcome::Success);
 
+    let role = String::from_utf8_lossy(&user).into_owned();
+    let key = match crate::pool::pool_key(&proxy.config, &session.startup, &role) {
+        Ok(key) => key,
+        Err(error) => {
+            proxy.metrics.client_rejected(RejectReason::Handshake);
+            handshake::report(&mut session.stream, Some(&user), &error).await;
+            return Err(error);
+        }
+    };
+
+    // A replication connection is forced to session mode by the pool key
+    // itself: a walsender stream has no transaction boundaries to release on,
+    // and multiplexing one silently corrupts it.
+    let result = if key.mode() == pgelastic_pool::PoolMode::Transaction {
+        multiplexed(proxy, &mut session, &key, &role, &mut shutdown).await
+    } else {
+        bound(proxy, &mut session, &mut shutdown).await
+    };
+
+    if let Err(error) = &result
+        && !matches!(error, ProxyError::PeerGone | ProxyError::Io(_))
+    {
+        handshake::report(&mut session.stream, Some(&user), error).await;
+    }
+    result
+}
+
+/// Session mode: one client, one backend, for the client's whole life.
+async fn bound(
+    proxy: &Arc<Proxy>,
+    session: &mut handshake::ClientSession,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
     let mut link = match backend::connect(
         &proxy.config.backend,
         proxy.backend_tls.as_ref(),
@@ -252,13 +290,12 @@ async fn serve(
         Err(error) => {
             proxy.metrics.backend_auth(AuthOutcome::Failure);
             proxy.metrics.client_rejected(RejectReason::Backend);
-            handshake::report(&mut session.stream, Some(&user), &error).await;
             return Err(error);
         }
     };
     proxy.metrics.backend_auth(AuthOutcome::Success);
     proxy.metrics.backend_opened();
-    let result = relay(proxy, &mut session, &mut link, &mut shutdown).await;
+    let result = relay(proxy, session, &mut link, shutdown).await;
     proxy.metrics.backend_closed();
     result
 }
@@ -272,15 +309,12 @@ async fn relay(
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let token = CancelToken::mint(proxy.config.routing.cancel_routing_id)?;
-    let _registration = link.key_data.clone().map(|key_data| {
-        proxy.cancels.register(
-            token.clone(),
-            crate::cancel::CancelTarget {
-                address: proxy.config.backend.address.clone(),
-                key_data,
-            },
-        )
-    });
+    let route = CancelRoute::new();
+    route.set(Some(crate::cancel::CancelTarget {
+        address: proxy.config.backend.address.clone(),
+        key_data: link.key_data.clone(),
+    }));
+    let _registration = proxy.cancels.register(token.clone(), route);
 
     let mut greeting = vec![BackendMessage::Authentication(
         pgelastic_wire::Authentication::Ok,
@@ -300,10 +334,7 @@ async fn relay(
             from_client: &pending_from_client,
             from_backend: &pending_from_backend,
         },
-        session::Limits {
-            inline_frame_bytes: proxy.config.limits.inline_frame_bytes,
-            max_frame_bytes: proxy.config.limits.max_frame_bytes,
-        },
+        limits(proxy),
         &proxy.metrics,
         shutdown,
         proxy.config.drain.shutdown_timeout(),
@@ -329,11 +360,144 @@ async fn relay(
     }
 }
 
+/// Transaction mode: the client keeps its socket, the backend changes under it.
+async fn multiplexed(
+    proxy: &Arc<Proxy>,
+    session: &mut handshake::ClientSession,
+    key: &pgelastic_pool::PoolKey,
+    role: &str,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let tenant = proxy.pools.ensure_tenant(role).map_err(admission)?;
+    let client_id = proxy.pools.connect_client(&tenant).map_err(admission)?;
+    let _client = ClientRegistration {
+        pools: Arc::clone(&proxy.pools),
+        client: client_id,
+    };
+
+    let connector = crate::pool::Connector {
+        backend: &proxy.config.backend,
+        tls: proxy.backend_tls.as_ref(),
+        kdf: &proxy.kdf,
+        startup: &session.startup,
+    };
+
+    // The greeting is the first link's `ParameterStatus` set, cached per pool
+    // key: a client that arrives twentieth must not have to hold a backend just
+    // to be told the server's `TimeZone`.
+    let parameters = if let Some(cached) = proxy.pools.greeting(key) {
+        cached
+    } else {
+        let request = crate::pool::AcquireRequest {
+            key,
+            tenant: &tenant,
+            client: client_id,
+        };
+        let checkout = proxy
+            .pools
+            .acquire(&request, &connector, &mut session.stream)
+            .await
+            .map_err(admission)?;
+        proxy.pools.check_in(key, checkout);
+        proxy
+            .pools
+            .greeting(key)
+            .expect("opening a link caches the pool's greeting")
+    };
+
+    let mut client_vars = crate::vars::VariableCache::new();
+    for message in parameters.iter() {
+        if let BackendMessage::ParameterStatus(status) = message {
+            client_vars.observe(&status.name, &status.value);
+        }
+    }
+
+    let token = CancelToken::mint(proxy.config.routing.cancel_routing_id)?;
+    let route = CancelRoute::new();
+    let _registration = proxy.cancels.register(token.clone(), route.clone());
+
+    let mut greeting = vec![BackendMessage::Authentication(
+        pgelastic_wire::Authentication::Ok,
+    )];
+    greeting.extend(parameters.iter().cloned());
+    greeting.push(BackendMessage::BackendKeyData(token.key_data()?));
+    greeting.push(BackendMessage::ReadyForQuery(TransactionStatus::Idle));
+    crate::wire_io::write_backend(&mut session.stream, &greeting).await?;
+
+    let pending = session.buf.as_slice().to_vec();
+    let ending = crate::txn::run(
+        crate::txn::Session {
+            client: &mut session.stream,
+            manager: &proxy.pools,
+            connector,
+            key: key.clone(),
+            tenant,
+            client_id,
+            route,
+            metrics: &proxy.metrics,
+            limits: limits(proxy),
+            client_vars,
+            force_after: proxy.config.drain.shutdown_timeout(),
+        },
+        &pending,
+        shutdown,
+    )
+    .await;
+
+    match ending {
+        Ok(Ending::Drained | Ending::Forced) => {
+            let forced = matches!(ending, Ok(Ending::Forced));
+            proxy.metrics.drain_completed(forced);
+            session::close_for_drain(&mut session.stream, forced).await;
+            Ok(())
+        }
+        Ok(Ending::PeerClosed) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn limits(proxy: &Arc<Proxy>) -> session::Limits {
+    session::Limits {
+        inline_frame_bytes: proxy.config.limits.inline_frame_bytes,
+        max_frame_bytes: proxy.config.limits.max_frame_bytes,
+    }
+}
+
+fn admission(denial: crate::pool::Denial) -> ProxyError {
+    ProxyError::Admission {
+        sqlstate: denial.sqlstate,
+        message: denial.message,
+    }
+}
+
+/// Releases the client's place in the second currency however the session ends.
+struct ClientRegistration {
+    pools: Arc<PoolManager>,
+    client: pgelastic_capacity::ClientId,
+}
+
+impl Drop for ClientRegistration {
+    fn drop(&mut self) {
+        self.pools.disconnect_client(self.client);
+    }
+}
+
 async fn cancel(proxy: &Arc<Proxy>, request: &pgelastic_wire::CancelRequest) -> Result<()> {
     let token = CancelToken::from(request);
-    let Some(target) = proxy.cancels.lookup(&token) else {
+    // Resolved here rather than at registration: under transaction pooling the
+    // client's query is running on whichever backend it holds at this instant,
+    // and the one it held a moment ago now belongs to somebody else.
+    let Some(route) = proxy.cancels.lookup(&token) else {
         // Silently dropped, exactly as PostgreSQL does: answering would confirm
         // which keys exist and turn the cancel port into an oracle.
+        proxy.metrics.cancel(false);
+        return Ok(());
+    };
+    // Marked before the target is read and held until the request is on the
+    // wire: the session that owns the route must not release its backend inside
+    // that window, or the cancel arrives at somebody else's statement.
+    let _in_flight = route.dispatching();
+    let Some(target) = route.resolve() else {
         proxy.metrics.cancel(false);
         return Ok(());
     };

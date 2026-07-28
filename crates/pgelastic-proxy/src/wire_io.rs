@@ -106,12 +106,29 @@ pub async fn write_frontend<S: AsyncWrite + Unpin>(
 
 /// Builds a `FATAL` `ErrorResponse`.
 pub fn fatal(sqlstate: &str, message: &str) -> BackendMessage {
+    BackendMessage::ErrorResponse(fields(b"FATAL", sqlstate, message))
+}
+
+/// Builds an `ERROR` `ErrorResponse`, which a client may recover from.
+pub fn error(sqlstate: &str, message: &str) -> BackendMessage {
+    BackendMessage::ErrorResponse(fields(b"ERROR", sqlstate, message))
+}
+
+/// Builds a `NOTICE` `NoticeResponse`.
+///
+/// Legal at any point in the protocol, which is what lets a client that is
+/// still waiting in the admission queue be told why.
+pub fn notice(sqlstate: &str, message: &str) -> BackendMessage {
+    BackendMessage::NoticeResponse(fields(b"NOTICE", sqlstate, message))
+}
+
+fn fields(severity: &'static [u8], sqlstate: &str, message: &str) -> Fields {
     let mut fields = Fields::default();
-    fields.push(field::SEVERITY, Bytes::from_static(b"FATAL"));
-    fields.push(field::SEVERITY_NONLOCALIZED, Bytes::from_static(b"FATAL"));
+    fields.push(field::SEVERITY, Bytes::from_static(severity));
+    fields.push(field::SEVERITY_NONLOCALIZED, Bytes::from_static(severity));
     fields.push(field::CODE, Bytes::copy_from_slice(sqlstate.as_bytes()));
     fields.push(field::MESSAGE, Bytes::copy_from_slice(message.as_bytes()));
-    BackendMessage::ErrorResponse(fields)
+    fields
 }
 
 /// Best-effort delivery of a fatal error to a client that is about to be

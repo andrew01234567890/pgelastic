@@ -31,6 +31,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub pool: PoolConfig,
 }
 
 impl std::str::FromStr for Config {
@@ -261,6 +263,201 @@ pub struct RoutingConfig {
     pub cancel_routing_id: u16,
 }
 
+/// Pooling, capacity and per-tenant claims.
+///
+/// `poolSize` is deliberately absent and always will be. A held backend
+/// connection is one unit of work-in-progress, so the pool's capacity unit and
+/// `PgBouncer`'s `pool_size` are the same number; stacking two limiters is how
+/// a ceiling becomes unexplainable. Operators set `backendConnections` and
+/// per-tenant guaranteed/burstable, and everything else is derived.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PoolConfig {
+    #[serde(default)]
+    pub mode: PoolModeConfig,
+    /// The pool's whole capacity envelope, derived by the operator from
+    /// `max_connections − superuser_reserved_connections − replication slots −
+    /// overhead`. Never invented.
+    #[serde(default = "default_backend_connections")]
+    pub backend_connections: u32,
+    #[serde(default)]
+    pub headroom_percent: u8,
+    /// Client sockets the pool will hold. A second, independent currency: it is
+    /// bounded by file descriptors rather than by `max_connections`, which is
+    /// why it is not derived from `backendConnections`.
+    #[serde(default = "default_pool_max_client_connections")]
+    pub max_client_connections: u32,
+    #[serde(default)]
+    pub reset_policy: ResetPolicyConfig,
+    /// How long a client may wait in the admission queue before it is refused
+    /// with `PGE1024`.
+    #[serde(default = "default_query_wait_seconds")]
+    pub query_wait_seconds: u64,
+    /// When a queued client is sent a `NoticeResponse` telling it why it is
+    /// still waiting.
+    #[serde(default = "default_notify_after_seconds")]
+    pub notify_after_seconds: u64,
+    #[serde(default = "default_queue_depth_per_tenant")]
+    pub queue_depth_per_tenant: u32,
+    /// Prepared statements kept parsed on one backend link before the LRU
+    /// evicts. `PostgreSQL` has no server-side limit, so this is the proxy's.
+    #[serde(default = "default_max_server_statements")]
+    pub max_server_statements: usize,
+    /// How long a backend link may live before it is recycled, spread over a
+    /// jittered window so a pool does not recycle every link at once.
+    #[serde(default = "default_server_lifetime_seconds")]
+    pub server_lifetime_seconds: u64,
+    #[serde(default)]
+    pub tenants: Vec<TenantConfig>,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            mode: PoolModeConfig::default(),
+            backend_connections: default_backend_connections(),
+            headroom_percent: 0,
+            max_client_connections: default_pool_max_client_connections(),
+            reset_policy: ResetPolicyConfig::default(),
+            query_wait_seconds: default_query_wait_seconds(),
+            notify_after_seconds: default_notify_after_seconds(),
+            queue_depth_per_tenant: default_queue_depth_per_tenant(),
+            max_server_statements: default_max_server_statements(),
+            server_lifetime_seconds: default_server_lifetime_seconds(),
+            tenants: Vec::new(),
+        }
+    }
+}
+
+impl PoolConfig {
+    pub fn query_wait_timeout(&self) -> Duration {
+        Duration::from_secs(self.query_wait_seconds)
+    }
+
+    pub fn notify_after(&self) -> Duration {
+        Duration::from_secs(self.notify_after_seconds)
+    }
+
+    pub fn server_lifetime(&self) -> Duration {
+        Duration::from_secs(self.server_lifetime_seconds)
+    }
+}
+
+/// A tenant's effective claim, as the controller would have merged it from the
+/// workload class and the `PgTenant`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TenantConfig {
+    pub name: String,
+    #[serde(default)]
+    pub guaranteed: u32,
+    pub burstable: u32,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    #[serde(default = "default_tenant_max_client_connections")]
+    pub max_client_connections: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PoolModeConfig {
+    /// One backend per client for the client's whole life.
+    #[default]
+    Session,
+    /// A backend is released at every `ReadyForQuery` carrying `'I'`.
+    Transaction,
+}
+
+impl PoolModeConfig {
+    pub fn is_transaction(self) -> bool {
+        matches!(self, Self::Transaction)
+    }
+}
+
+impl From<PoolModeConfig> for pgelastic_pool::PoolMode {
+    fn from(mode: PoolModeConfig) -> Self {
+        match mode {
+            PoolModeConfig::Session => Self::Session,
+            PoolModeConfig::Transaction => Self::Transaction,
+        }
+    }
+}
+
+impl From<PoolModeConfig> for pgelastic_capacity::PoolMode {
+    fn from(mode: PoolModeConfig) -> Self {
+        match mode {
+            PoolModeConfig::Session => Self::Session,
+            PoolModeConfig::Transaction => Self::Transaction,
+        }
+    }
+}
+
+/// How hard a link is scrubbed before it may serve a different client.
+///
+/// The default is `discardAll` rather than `dirtyTracked`, and the reason is
+/// worth stating: taint is fed only by facts the *protocol* exposes — a
+/// `ParameterStatus` for a `GUC_REPORT`ed setting, a named `Parse`. `SET ROLE`
+/// reports nothing, `SELECT set_config(...)` reports nothing, and a
+/// `CommandComplete` tag is deliberately never sniffed because that heuristic
+/// misses all of them. So `dirtyTracked` is safe for exactly the state the
+/// protocol announces and no more, whereas cross-tenant session-state isolation
+/// has to hold unconditionally. `discardAll` costs one round trip per release
+/// and buys that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResetPolicyConfig {
+    None,
+    DirtyTracked,
+    SmartDiscard,
+    #[default]
+    DiscardAll,
+    Verified,
+}
+
+impl From<ResetPolicyConfig> for pgelastic_pool::ResetPolicy {
+    fn from(policy: ResetPolicyConfig) -> Self {
+        match policy {
+            ResetPolicyConfig::None => Self::None,
+            ResetPolicyConfig::DirtyTracked => Self::DirtyTracked,
+            ResetPolicyConfig::SmartDiscard => Self::SmartDiscard,
+            ResetPolicyConfig::DiscardAll => Self::DiscardAll,
+            ResetPolicyConfig::Verified => Self::Verified,
+        }
+    }
+}
+
+fn default_backend_connections() -> u32 {
+    20
+}
+fn default_query_wait_seconds() -> u64 {
+    120
+}
+fn default_notify_after_seconds() -> u64 {
+    5
+}
+fn default_queue_depth_per_tenant() -> u32 {
+    64
+}
+fn default_max_server_statements() -> usize {
+    64
+}
+fn default_server_lifetime_seconds() -> u64 {
+    3600
+}
+fn default_pool_max_client_connections() -> u32 {
+    10_000
+}
+fn default_weight() -> u32 {
+    100
+}
+fn default_priority() -> u32 {
+    1_000
+}
+fn default_tenant_max_client_connections() -> u32 {
+    200
+}
 fn default_max_client_connections() -> usize {
     1000
 }
