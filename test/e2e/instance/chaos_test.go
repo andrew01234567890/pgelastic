@@ -23,7 +23,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,7 +76,7 @@ func chaosMemberNames() []string {
 // superuser. It answers what PostgreSQL says, which is the only thing any of these specs
 // are allowed to believe.
 func chaosPsql(member, query string) (string, error) {
-	command := exec.Command("kubectl", "exec", "-n", chaosNamespace, member, "-c", "postgres", "--",
+	command := kubectlCommand("exec", "-n", chaosNamespace, member, "-c", "postgres", "--",
 		"psql", "-h", provision.SocketDir, "-U", "postgres", "-d", oracleDatabase, "-tAqc", query)
 	output, err := command.CombinedOutput()
 	return strings.TrimSpace(string(output)), err
@@ -259,7 +258,7 @@ func keepDown(member string, window time.Duration) {
 	deadline := time.Now().Add(window)
 	first := true
 	for time.Now().Before(deadline) {
-		output, err := exec.Command("kubectl", "delete", "pod", "-n", chaosNamespace,
+		output, err := kubectlCommand("delete", "pod", "-n", chaosNamespace,
 			member, "--grace-period=0", "--force", "--ignore-not-found").CombinedOutput()
 		if first {
 			Expect(err).NotTo(HaveOccurred(), string(output))
@@ -273,8 +272,66 @@ func keepDown(member string, window time.Duration) {
 	}
 }
 
+// heldDown remembers the nodes to make schedulable again.
+type heldDown struct {
+	cordoned []string
+	once     sync.Once
+}
+
+// holdMembersDown takes the named members away and keeps them away until release.
+//
+// Deleting them is not enough on its own. The operator recreates a deleted member at once,
+// and on a single-node cluster with the image cached and the data volume already bound it
+// is back and acknowledging commits within a few seconds - so a spec that asserts on their
+// absence for any useful window would be measuring Pod startup time rather than the
+// property it names. Cordoning first leaves every recreated Pod Pending, which is what a
+// node loss looks like from the instance's side and is exactly reversible. Every node is
+// cordoned, not merely the one the member was on, because the replacement Pod is free to
+// be scheduled anywhere.
+func holdMembersDown(members []string) *heldDown {
+	GinkgoHelper()
+	nodes := &corev1.NodeList{}
+	Expect(k8sClient.List(suiteCtx, nodes)).To(Succeed())
+
+	held := &heldDown{}
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if node.Spec.Unschedulable {
+			continue
+		}
+		patched := node.DeepCopy()
+		patched.Spec.Unschedulable = true
+		Expect(k8sClient.Update(suiteCtx, patched)).To(Succeed())
+		held.cordoned = append(held.cordoned, node.Name)
+	}
+	for _, member := range members {
+		output, err := kubectlCommand("delete", "pod", "-n", chaosNamespace, member,
+			"--grace-period=0", "--force", "--ignore-not-found").CombinedOutput()
+		Expect(err).NotTo(HaveOccurred(), string(output))
+	}
+	return held
+}
+
+// release makes the nodes schedulable again. It reports rather than asserts, because it
+// runs from a defer that a failing spec has already entered.
+func (h *heldDown) release() {
+	h.once.Do(func() {
+		for _, name := range h.cordoned {
+			node := &corev1.Node{}
+			if err := k8sClient.Get(suiteCtx, client.ObjectKey{Name: name}, node); err != nil {
+				AddReportEntry("could not re-read node "+name, err.Error())
+				continue
+			}
+			node.Spec.Unschedulable = false
+			if err := k8sClient.Update(suiteCtx, node); err != nil {
+				AddReportEntry("could not uncordon node "+name, err.Error())
+			}
+		}
+	})
+}
+
 func podLogs(name string) string {
-	output, err := exec.Command("kubectl", "logs", "-n", chaosNamespace, name).CombinedOutput()
+	output, err := kubectlCommand("logs", "-n", chaosNamespace, name).CombinedOutput()
 	if err != nil {
 		return string(output)
 	}
@@ -510,7 +567,7 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 
 		result := runScenario("sigkill", 90*time.Second, func() {
 			By("sending SIGKILL to the postmaster")
-			output, err := exec.Command("kubectl", "exec", "-n", chaosNamespace,
+			output, err := kubectlCommand("exec", "-n", chaosNamespace,
 				before.CurrentPrimary, "-c", "postgres", "--", "sh", "-c",
 				"kill -9 $(head -1 "+provision.DataDir+"/postmaster.pid)").CombinedOutput()
 			Expect(err).NotTo(HaveOccurred(), string(output))
@@ -561,38 +618,28 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 			"a blocked drain must not have moved the primary")
 	})
 
-	// PENDING: this scenario fails and the cause is not yet established. With
-	// synchronous_commit=on, ANY 1 over two standbys, and both standbys confirmed gone from
-	// pg_stat_replication, the INSERT returns instead of blocking. A plain postgres:18 with
-	// the same settings and no standbys blocks on the first write, so PostgreSQL is not the
-	// explanation.
-	//
-	// The leading hypothesis is that something in pgelastic terminates the waiting backend:
-	// pg_terminate_backend releases a sync-rep wait, the transaction commits locally, and psql
-	// still exits 0 with only a WARNING. That would turn the stall this spec demands into the
-	// silent degradation dataDurability Required exists to prevent, so it is a durability
-	// question and is tracked as one rather than being deleted or weakened.
-	PIt("stalls commits rather than degrading when the quorum is lost", func() {
+	It("stalls commits rather than degrading when the quorum is lost", func() {
 		primary := chaosCR().Status.CurrentPrimary
 		loadedBefore := mustChaosQuery(primary, "SHOW synchronous_standby_names")
 		Expect(loadedBefore).To(HavePrefix("ANY 1"))
 
 		mustChaosQuery(primary, "CREATE TABLE IF NOT EXISTS chaos_stall (id int primary key)")
 
-		By("taking both standbys down")
+		By("holding both standbys down for the whole of the stall window")
+		// A single delete is not enough. The operator recreates the member at once and it
+		// can be back and acknowledging commits within a couple of seconds, so a stall
+		// asserted against one delete measures Pod startup time rather than durability.
+		var standbys []string
 		for _, member := range chaosMemberNames() {
-			if member == primary {
-				continue
+			if member != primary {
+				standbys = append(standbys, member)
 			}
-			output, err := exec.Command("kubectl", "delete", "pod", "-n", chaosNamespace,
-				member, "--grace-period=0", "--force").CombinedOutput()
-			Expect(err).NotTo(HaveOccurred(), string(output))
 		}
+		held := holdMembersDown(standbys)
+		defer held.release()
 
-		// The commit has to be issued once the quorum is genuinely gone. A force-deleted Pod
-		// takes a few seconds to stop streaming, and a commit issued inside that window is
-		// acknowledged by a standby that is still there - which would make this spec pass or
-		// fail on timing rather than on durability.
+		// A deleted Pod takes a few seconds to stop streaming, and a commit issued inside
+		// that window is acknowledged by a standby that is still there.
 		By("waiting until no standby is streaming any more")
 		Eventually(func(g Gomega) {
 			streaming, err := chaosPsql(primary,
@@ -621,14 +668,25 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 			blocked <- err
 		}()
 
+		// The commit must not return, and the reason it must not return has to still hold
+		// at every sample. A commit that stayed blocked while a standby was quietly
+		// acknowledging it would prove nothing, so the quorum is re-checked alongside it.
 		Consistently(func() string {
 			select {
 			case err := <-blocked:
-				return fmt.Sprintf("the commit returned early: %v", err)
+				return fmt.Sprintf("the commit returned while the quorum was lost: %v", err)
 			default:
-				return ""
 			}
-		}, "30s", "3s").Should(BeEmpty(),
+			streaming, err := chaosPsql(primary,
+				"SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'")
+			if err != nil {
+				return fmt.Sprintf("the primary stopped answering: %v: %s", err, streaming)
+			}
+			if streaming != "0" {
+				return "a standby started streaming again, so the quorum was not lost: " + streaming
+			}
+			return ""
+		}, "60s", "3s").Should(BeEmpty(),
 			"dataDurability Required means the commit stalls; it must not be acknowledged (%s)",
 			atIssue)
 
@@ -642,7 +700,9 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 			g.Expect(condition.Status).To(Equal(metav1.ConditionTrue))
 		}, "3m", "5s").Should(Succeed(), "a stalled commit has to be alertable, not inexplicable")
 
-		By("letting a standby come back")
+		By("letting the standbys come back")
+		held.release()
+
 		var completed error
 		Eventually(blocked, "15m", "5s").Should(Receive(&completed),
 			"the blocked commit must complete once a standby can acknowledge it")
@@ -656,12 +716,12 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 		before := chaosCR().Status
 		standby := otherMember(before.CurrentPrimary)
 
-		By("taking one standby and then the primary down, leaving R = 1")
-		for _, member := range []string{standby, before.CurrentPrimary} {
-			output, err := exec.Command("kubectl", "delete", "pod", "-n", chaosNamespace,
-				member, "--grace-period=0", "--force").CombinedOutput()
-			Expect(err).NotTo(HaveOccurred(), string(output))
-		}
+		By("taking one standby and then the primary down, and holding them there, leaving R = 1")
+		// Both have to stay down for as long as the refusal is asserted. A member that is
+		// merely deleted is back within seconds, and a gate that was never asked to deny
+		// anything cannot be observed denying it.
+		held := holdMembersDown([]string{standby, before.CurrentPrimary})
+		defer held.release()
 
 		watch := watchForSplitBrain()
 		By("watching the operator refuse the failover it cannot prove is safe")
@@ -682,10 +742,12 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 		// The surviving member is a standby and must stay one. Promoting it is exactly the
 		// "replica promoted while behind" failure the gate prevents rather than detects.
 		survivor := remainingMember(before.CurrentPrimary, standby)
+		// A survivor that stops answering is not evidence that it stayed a standby, so the
+		// error is reported rather than read as "still in recovery".
 		Consistently(func() string {
 			output, err := chaosPsql(survivor, "SELECT pg_is_in_recovery()")
 			if err != nil {
-				return "t"
+				return fmt.Sprintf("%s did not answer: %v: %s", survivor, err, output)
 			}
 			return output
 		}, "45s", "5s").Should(Equal("t"),
@@ -697,6 +759,8 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 			"a denied failover must not bump the fence token")
 		watch.assertNoSplitBrain()
 
+		By("letting the members that were held down come back")
+		held.release()
 		awaitConverged()
 	})
 })
@@ -747,13 +811,13 @@ func dumpOnFailure() {
 	if !CurrentSpecReport().Failed() {
 		return
 	}
-	output, err := exec.Command("kubectl", "get", "pginstance", "-n", chaosNamespace,
+	output, err := kubectlCommand("get", "pginstance", "-n", chaosNamespace,
 		chaosInstance, "-o", "yaml").CombinedOutput()
 	if err == nil {
 		AddReportEntry("PgInstance at failure", string(output))
 	}
 	for _, member := range chaosMemberNames() {
-		logs, logErr := exec.Command("kubectl", "logs", "-n", chaosNamespace, member,
+		logs, logErr := kubectlCommand("logs", "-n", chaosNamespace, member,
 			"-c", "postgres", "--tail", "200").CombinedOutput()
 		if logErr == nil {
 			AddReportEntry(member+" at failure", string(logs))
