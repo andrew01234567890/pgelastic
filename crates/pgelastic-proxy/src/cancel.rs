@@ -154,8 +154,7 @@ pub async fn deliver(
     tls: Option<&crate::tls::BackendTls>,
     connect_timeout: std::time::Duration,
 ) -> Result<()> {
-    let mut stream =
-        crate::backend::connect_socket(&target.address, tls, connect_timeout).await?;
+    let mut stream = crate::backend::connect_socket(&target.address, tls, connect_timeout).await?;
 
     let mut wire = BytesMut::new();
     CancelRequest {

@@ -29,6 +29,14 @@ pub enum ProxyError {
     #[error("protocol error: {0}")]
     Wire(#[from] WireError),
 
+    /// A malformed or out-of-order SCRAM message on either leg.
+    ///
+    /// Distinct from [`AuthenticationFailed`](Self::AuthenticationFailed),
+    /// which is the credential verdict. Nothing here depends on whether the
+    /// user exists, so keeping the detail costs no enumeration surface.
+    #[error("SCRAM error: {0}")]
+    Scram(#[from] crate::scram::ScramError),
+
     #[error("tls error: {0}")]
     Tls(#[from] rustls::Error),
 
@@ -82,7 +90,9 @@ impl ProxyError {
             Self::AuthenticationFailed => sqlstate::INVALID_PASSWORD,
             Self::ConnectionLimit => sqlstate::TOO_MANY_CONNECTIONS,
             Self::ShuttingDown => sqlstate::ADMIN_SHUTDOWN,
-            Self::ClientProtocol(_) | Self::Wire(_) => sqlstate::PROTOCOL_VIOLATION,
+            Self::ClientProtocol(_) | Self::Wire(_) | Self::Scram(_) => {
+                sqlstate::PROTOCOL_VIOLATION
+            }
             _ => sqlstate::CONNECTION_FAILURE,
         }
     }

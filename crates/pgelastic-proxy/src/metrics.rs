@@ -5,7 +5,6 @@
 //! label is a memory leak with a hostile peer choosing its size.
 
 use std::fmt::Write as _;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -33,6 +32,14 @@ pub enum RejectReason {
     Handshake,
     Backend,
 }
+
+/// Every variant, so the exposition carries all four series even at zero.
+const REJECT_REASONS: [RejectReason; 4] = [
+    RejectReason::ConnectionLimit,
+    RejectReason::ShuttingDown,
+    RejectReason::Handshake,
+    RejectReason::Backend,
+];
 
 impl RejectReason {
     fn label(self) -> &'static str {
@@ -141,24 +148,16 @@ impl Metrics {
             &mut out,
             "pgelastic_proxy_client_connections_rejected_total",
             "Client connections refused before reaching a backend.",
-            &[
-                (
-                    "reason=\"connection_limit\"",
-                    load(&self.clients_rejected[RejectReason::ConnectionLimit as usize]),
-                ),
-                (
-                    "reason=\"shutting_down\"",
-                    load(&self.clients_rejected[RejectReason::ShuttingDown as usize]),
-                ),
-                (
-                    "reason=\"handshake\"",
-                    load(&self.clients_rejected[RejectReason::Handshake as usize]),
-                ),
-                (
-                    "reason=\"backend\"",
-                    load(&self.clients_rejected[RejectReason::Backend as usize]),
-                ),
-            ],
+            &REJECT_REASONS
+                .map(|reason| {
+                    (
+                        format!("reason=\"{}\"", reason.label()),
+                        load(&self.clients_rejected[reason as usize]),
+                    )
+                })
+                .iter()
+                .map(|(labels, value)| (labels.as_str(), *value))
+                .collect::<Vec<_>>(),
         );
         gauge(
             &mut out,
@@ -309,7 +308,10 @@ mod tests {
             "pgelastic_proxy_relayed_bytes_total",
             "pgelastic_proxy_session_drains_total",
         ] {
-            assert!(rendered.contains(&format!("# TYPE {name}")), "missing {name}");
+            assert!(
+                rendered.contains(&format!("# TYPE {name}")),
+                "missing {name}"
+            );
         }
     }
 
@@ -328,7 +330,11 @@ mod tests {
         assert!(rendered.contains("outcome=\"matched\"} 1"));
         assert!(rendered.contains("direction=\"to_client\"} 4096"));
         metrics.client_closed();
-        assert!(metrics.render().contains("pgelastic_proxy_client_connections 0"));
+        assert!(
+            metrics
+                .render()
+                .contains("pgelastic_proxy_client_connections 0")
+        );
     }
 
     #[test]

@@ -33,19 +33,22 @@ pub struct Config {
     pub routing: RoutingConfig,
 }
 
-impl Config {
-    pub fn from_str(source: &str) -> Result<Self> {
-        let config: Self =
-            toml::from_str(source).map_err(|e| ProxyError::config(e.to_string()))?;
+impl std::str::FromStr for Config {
+    type Err = ProxyError;
+
+    fn from_str(source: &str) -> Result<Self> {
+        let config: Self = toml::from_str(source).map_err(|e| ProxyError::config(e.to_string()))?;
         config.validate()?;
         Ok(config)
     }
+}
 
+impl Config {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let source = std::fs::read_to_string(path)
             .map_err(|e| ProxyError::config(format!("reading {}: {e}", path.display())))?;
-        Self::from_str(&source)
+        source.parse()
     }
 
     fn validate(&self) -> Result<()> {
@@ -301,6 +304,7 @@ pub fn resolve(address: &str) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr as _;
 
     const MINIMAL: &str = r#"
         [listen]
@@ -323,7 +327,9 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_refused_rather_than_ignored() {
-        let source = format!("{MINIMAL}\n[listen.tls]\ncertificateFile = \"x\"\nkeyFile = \"y\"\nnonsense = 1\n");
+        let source = format!(
+            "{MINIMAL}\n[listen.tls]\ncertificateFile = \"x\"\nkeyFile = \"y\"\nnonsense = 1\n"
+        );
         assert!(Config::from_str(&source).is_err());
     }
 

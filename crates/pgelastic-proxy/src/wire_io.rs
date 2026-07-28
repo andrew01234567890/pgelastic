@@ -5,13 +5,29 @@
 //! which never buffers a whole large frame.
 
 use bytes::{Bytes, BytesMut};
+use pgelastic_wire::types::field;
 use pgelastic_wire::{
     AuthState, BackendMessage, Fields, FrontendMessage, MessageBuffer, PreStartup,
-    PreStartupMachine, RawFrame, field,
+    PreStartupMachine, RawFrame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{ProxyError, Result};
+
+/// Spare capacity offered to a pre-startup read, mirroring `PostgreSQL`'s own
+/// 8 KiB `PqRecvBuffer`.
+///
+/// [`MessageBuffer::read_target`] sizes itself from the *next message's* needs,
+/// which during pre-startup is the five-byte frame header. A read that small
+/// leaves anything the peer pipelined behind an `SSLRequest` sitting in the
+/// socket instead of the buffer, where the CVE-2021-23214 check in
+/// [`negotiate`](crate::handshake::negotiate) cannot see it and rustls consumes
+/// it as a `ClientHello` prefix instead. Reading like the server does puts the
+/// smuggled bytes where they can be detected.
+///
+/// Bounded by the protocol, not by the peer: no legitimate pre-startup exchange
+/// exceeds `MAX_STARTUP_PACKET_LENGTH`.
+const PRE_STARTUP_READ_BYTES: usize = 8 * 1024;
 
 /// Reads until the pre-startup machine can decide.
 pub async fn read_pre_startup<S: AsyncRead + Unpin>(
@@ -23,7 +39,9 @@ pub async fn read_pre_startup<S: AsyncRead + Unpin>(
         if let Some(packet) = machine.step(buf)? {
             return Ok(packet);
         }
-        if io.read_buf(buf.read_target()).await? == 0 {
+        let target = buf.read_target();
+        target.reserve(PRE_STARTUP_READ_BYTES);
+        if io.read_buf(target).await? == 0 {
             return Err(ProxyError::PeerGone);
         }
     }

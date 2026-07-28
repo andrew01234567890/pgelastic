@@ -197,8 +197,8 @@ mod tests {
     #[test]
     fn a_non_scram_secret_is_refused() {
         assert_eq!(
-            ScramVerifier::parse("md5abcdef"),
-            Err(VerifierError::WrongMechanism)
+            ScramVerifier::parse("md5abcdef").unwrap_err(),
+            VerifierError::WrongMechanism
         );
     }
 
@@ -238,8 +238,8 @@ mod tests {
     fn a_zero_iteration_verifier_is_refused() {
         let secret = "SCRAM-SHA-256$0:YQ==$YQ==:YQ==";
         assert_eq!(
-            ScramVerifier::parse(secret),
-            Err(VerifierError::BadIterationCount(0))
+            ScramVerifier::parse(secret).unwrap_err(),
+            VerifierError::BadIterationCount(0)
         );
     }
 }

@@ -155,8 +155,7 @@ mod tests {
                 .decode("W22ZaJ0SNY7soEsUEjb6gQ==")
                 .unwrap()
         };
-        let salted =
-            salted_password_blocking("pencil", &salt, NonZeroU32::new(4096).unwrap());
+        let salted = salted_password_blocking("pencil", &salt, NonZeroU32::new(4096).unwrap());
         let final_message = client
             .client_final(server_first.as_bytes(), &salted)
             .unwrap();
