@@ -35,3 +35,7 @@ go.work
 
 # Durability oracle ledgers
 verify-ledger.log
+
+# Locally built helper binaries
+/verify
+/manager
