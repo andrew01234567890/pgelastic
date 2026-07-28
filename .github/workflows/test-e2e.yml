@@ -1,17 +1,56 @@
 name: E2E Tests
 
+# What runs where, and why.
+#
+# Every push to main and every PR runs `make test-e2e`, which is everything the Makefile
+# chains behind that target - the kubebuilder scaffold specs and each suite that stands up
+# real PostgreSQL 18 Pods and asserts on what PostgreSQL reports - minus the chaos specs.
+# That is the cheapest honest evidence that a change has not broken provisioning.
+#
+# The chaos specs are excluded there and run nightly instead. They cordon every node,
+# force-delete the primary with no grace period and drive a durability oracle for ~9
+# minutes; on a shared runner that is both the slowest part and the part most likely to
+# flake on timing, and a red build people learn to re-run is worth less than a nightly one
+# they read. workflow_dispatch takes a `chaos` input so the nightly job can be demanded on
+# a branch before merging anything that touches failover.
+#
+# The split is a Ginkgo label, not a spec-name regex: the chaos Describe carries
+# Label("chaos"), so a new chaos spec is nightly by construction rather than by remembering
+# to update a pattern here.
 on:
+  # Restricted to main on push because an unrestricted push trigger runs every PR branch
+  # twice; PRs still get the full job through pull_request.
   push:
+    branches: ["main"]
   pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      chaos:
+        description: "Also run the chaos specs on this ref"
+        type: boolean
+        default: false
 
 permissions: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  KIND_VERSION: v0.32.0
+
 jobs:
-  test-e2e:
+  provisioning:
+    # A scheduled run belongs to the chaos job, which runs these specs too; running both
+    # would build the images twice for a strict subset of the same assertions.
+    if: github.event_name != 'schedule'
     permissions:
       contents: read
-    name: Run on Ubuntu
+    name: kind e2e without chaos
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -23,16 +62,61 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      - name: Install kind
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          curl -fsSLo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-$(go env GOARCH)"
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
+          kind version
 
-      - name: Verify kind installation
-        run: kind version
+      - name: Download modules
+        run: go mod download
 
-      - name: Running Test e2e
+      # make test-e2e creates the kind cluster, runs the scaffold specs against it, then
+      # hands that same cluster to the suites it chains as E2E_CONTEXT=kind-<cluster>.
+      # Those targets build both images and kind-load them themselves.
+      - name: Run e2e without the chaos specs
+        run: make test-e2e E2E_LABEL_FILTER='!chaos'
+
+  chaos:
+    if: github.event_name == 'schedule' || inputs.chaos
+    permissions:
+      contents: read
+    name: instance chaos
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      KIND_CLUSTER: pgelastic-chaos
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
         run: |
-          go mod tidy
-          make test-e2e
+          curl -fsSLo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-$(go env GOARCH)"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Create the kind cluster
+        run: make setup-test-e2e
+
+      # No label filter, so this is the whole instance suite - provisioning specs included.
+      # Re-running them here costs a couple of minutes and means a chaos failure can be read
+      # against a run where the uneventful path was proven on the same cluster.
+      - name: Run the full instance suite
+        run: make test-e2e-instance E2E_CONTEXT="kind-${KIND_CLUSTER}"
+
+      - name: Tear down the kind cluster
+        if: always()
+        run: make cleanup-test-e2e

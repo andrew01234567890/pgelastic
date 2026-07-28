@@ -237,7 +237,7 @@ async fn wait_true(rx: &mut tokio::sync::watch::Receiver<bool>) {
 /// Splits a `DataRow` body into its columns. `None` is SQL `NULL`, which is not
 /// the same as an empty string — an unset GUC has to be distinguishable from
 /// one set to `""`.
-fn columns(body: &Bytes) -> Result<Vec<Option<Bytes>>> {
+pub(crate) fn columns(body: &Bytes) -> Result<Vec<Option<Bytes>>> {
     let mut cursor = body.clone();
     if cursor.remaining() < 2 {
         return Err(ProxyError::backend("a DataRow carried no column count"));

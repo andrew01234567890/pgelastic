@@ -35,6 +35,17 @@ pub struct Config {
     pub pool: PoolConfig,
     #[serde(default)]
     pub fence: FenceConfig,
+    #[serde(default)]
+    pub stall: StallConfig,
+    #[serde(default)]
+    pub control: ControlConfig,
+    /// The instances this proxy fronts.
+    ///
+    /// Empty means one implicit instance named [`DEFAULT_INSTANCE`] at
+    /// `backend.address`, which is the whole of the single-instance
+    /// configuration and keeps it meaning exactly what it did.
+    #[serde(default)]
+    pub instances: Vec<InstanceConfig>,
 }
 
 impl std::str::FromStr for Config {
@@ -97,7 +108,164 @@ impl Config {
                  required from a connection nobody asks",
             ));
         }
+        self.validate_fleet()?;
+        if self.control.max_lease_ttl_ms < self.control.default_lease_ttl_ms {
+            return Err(ProxyError::config(
+                "control.maxLeaseTtlMs must not be below control.defaultLeaseTtlMs",
+            ));
+        }
+        if self.control.default_lease_ttl_ms == 0 {
+            return Err(ProxyError::config(
+                "control.defaultLeaseTtlMs must be non-zero: a lease that has already \
+                 expired would quiesce a tenant nobody can resume",
+            ));
+        }
+        if self.stall.interval_ms == 0 || self.stall.confirmations == 0 {
+            return Err(ProxyError::config(
+                "stall.intervalMs and stall.confirmations must both be non-zero",
+            ));
+        }
         Ok(())
+    }
+
+    fn validate_fleet(&self) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for instance in &self.instances {
+            if instance.name.is_empty() {
+                return Err(ProxyError::config("an instance must have a name"));
+            }
+            if !seen.insert(instance.name.as_str()) {
+                return Err(ProxyError::config(format!(
+                    "instance {:?} is declared twice",
+                    instance.name
+                )));
+            }
+        }
+        let known = |name: &str| {
+            if self.instances.is_empty() {
+                name == DEFAULT_INSTANCE
+            } else {
+                seen.contains(name)
+            }
+        };
+        if let Some(default) = &self.routing.default_instance
+            && !known(default)
+        {
+            return Err(ProxyError::config(format!(
+                "routing.defaultInstance {default:?} is not a declared instance"
+            )));
+        }
+        for (tenant, instance) in &self.routing.tenants {
+            if !known(instance) {
+                return Err(ProxyError::config(format!(
+                    "tenant {tenant:?} is routed to {instance:?}, which is not a declared instance"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The name the single-instance configuration's implicit instance carries.
+pub const DEFAULT_INSTANCE: &str = "default";
+
+/// One `PgInstance` behind this proxy.
+///
+/// An instance is a capacity boundary as well as an address: its
+/// `backendConnections` is derived from *its own* `max_connections`, so two
+/// instances never draw on one budget and a tenant that saturates one cannot
+/// reach the other's.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstanceConfig {
+    pub name: String,
+    pub address: String,
+    /// Overrides `pool.backendConnections` for this instance.
+    #[serde(default)]
+    pub backend_connections: Option<u32>,
+}
+
+/// Proactive write-stall detection.
+///
+/// `dataDurability: Required` means a commit *stalls* when quorum is lost
+/// rather than degrading to asynchronous replication. That is the correct
+/// behaviour and it is invisible: the backend parks in `IPC.SyncRep` and the
+/// proxy sees a connection that is merely busy. Detecting it is what keeps one
+/// instance's quorum loss from consuming every pooled backend and cascading
+/// into tenants that are not on it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StallConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How often each instance is sampled.
+    #[serde(default = "default_stall_interval_ms")]
+    pub interval_ms: u64,
+    /// Consecutive samples agreeing before the verdict changes.
+    ///
+    /// One sample is enough to be *right*; two is what stops a standby
+    /// reconnecting inside one interval from flapping every tenant on the
+    /// instance through a refusal.
+    #[serde(default = "default_stall_confirmations")]
+    pub confirmations: u32,
+    /// Refuse a checkout onto a stalled instance instead of queueing it.
+    #[serde(default = "default_true")]
+    pub fail_fast: bool,
+}
+
+impl Default for StallConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_ms: default_stall_interval_ms(),
+            confirmations: default_stall_confirmations(),
+            fail_fast: true,
+        }
+    }
+}
+
+impl StallConfig {
+    pub fn interval(&self) -> Duration {
+        Duration::from_millis(self.interval_ms)
+    }
+}
+
+/// The lease-bound control API: quiesce, drain, route, resume, unquiesce.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ControlConfig {
+    /// Omitted means no control listener at all, and therefore no way to
+    /// quiesce a tenant.
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default = "default_lease_ttl_ms")]
+    pub default_lease_ttl_ms: u64,
+    /// The longest lease the API will grant.
+    ///
+    /// A quiesced tenant is holding client sockets open with nothing behind
+    /// them, so the ceiling on how long a dead operator can do that is a
+    /// configuration decision rather than the caller's.
+    #[serde(default = "default_max_lease_ttl_ms")]
+    pub max_lease_ttl_ms: u64,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            address: None,
+            default_lease_ttl_ms: default_lease_ttl_ms(),
+            max_lease_ttl_ms: default_max_lease_ttl_ms(),
+        }
+    }
+}
+
+impl ControlConfig {
+    pub fn default_lease_ttl(&self) -> Duration {
+        Duration::from_millis(self.default_lease_ttl_ms)
+    }
+
+    pub fn max_lease_ttl(&self) -> Duration {
+        Duration::from_millis(self.max_lease_ttl_ms)
     }
 }
 
@@ -331,6 +499,14 @@ pub struct RoutingConfig {
     /// break.
     #[serde(default)]
     pub cancel_routing_id: u16,
+    /// Where a tenant with no entry in [`tenants`](Self::tenants) is sent.
+    /// Omitted means the first declared instance.
+    #[serde(default)]
+    pub default_instance: Option<String>,
+    /// The tenant routing table's starting state. `setRoute` rewrites it at
+    /// run time; this is only where it begins.
+    #[serde(default)]
+    pub tenants: std::collections::BTreeMap<String, String>,
 }
 
 /// Pooling, capacity and per-tenant claims.
@@ -510,6 +686,18 @@ impl From<ResetPolicyConfig> for pgelastic_pool::ResetPolicy {
 
 fn default_true() -> bool {
     true
+}
+fn default_stall_interval_ms() -> u64 {
+    250
+}
+fn default_stall_confirmations() -> u32 {
+    2
+}
+fn default_lease_ttl_ms() -> u64 {
+    15_000
+}
+fn default_max_lease_ttl_ms() -> u64 {
+    120_000
 }
 fn default_backend_connections() -> u32 {
     20
@@ -696,6 +884,116 @@ mod tests {
         let watch = config.fence.watch.unwrap();
         assert_eq!(watch.namespace, "tenants");
         assert_eq!(watch.name, "shard-a");
+    }
+
+    #[test]
+    fn a_configuration_with_no_instances_still_names_the_implicit_one() {
+        let config = Config::from_str(MINIMAL).unwrap();
+        assert!(config.instances.is_empty());
+        assert!(config.routing.default_instance.is_none());
+        assert!(config.routing.tenants.is_empty());
+    }
+
+    #[test]
+    fn the_fleet_reads_its_instances_and_its_routing_table() {
+        let source = format!(
+            "{MINIMAL}\n\
+             [[instances]]\n\
+             name = \"inst-a\"\n\
+             address = \"10.0.0.1:5432\"\n\
+             \n\
+             [[instances]]\n\
+             name = \"inst-b\"\n\
+             address = \"10.0.0.2:5432\"\n\
+             backendConnections = 8\n\
+             \n\
+             [routing]\n\
+             defaultInstance = \"inst-a\"\n\
+             tenants = {{ beta = \"inst-b\" }}\n"
+        );
+        let config = Config::from_str(&source).unwrap();
+        assert_eq!(config.instances.len(), 2);
+        assert_eq!(config.instances[1].backend_connections, Some(8));
+        assert_eq!(config.routing.default_instance.as_deref(), Some("inst-a"));
+        assert_eq!(config.routing.tenants["beta"], "inst-b");
+    }
+
+    #[test]
+    fn an_instance_declared_twice_is_refused() {
+        let source = format!(
+            "{MINIMAL}\n\
+             [[instances]]\nname = \"inst-a\"\naddress = \"10.0.0.1:5432\"\n\
+             \n[[instances]]\nname = \"inst-a\"\naddress = \"10.0.0.2:5432\"\n"
+        );
+        let error = Config::from_str(&source).unwrap_err();
+        assert!(error.to_string().contains("declared twice"), "{error}");
+    }
+
+    #[test]
+    fn a_tenant_routed_to_an_instance_that_does_not_exist_is_refused_at_start_up() {
+        let source = format!(
+            "{MINIMAL}\n\
+             [[instances]]\nname = \"inst-a\"\naddress = \"10.0.0.1:5432\"\n\
+             \n[routing]\ntenants = {{ beta = \"inst-z\" }}\n"
+        );
+        let error = Config::from_str(&source).unwrap_err();
+        assert!(error.to_string().contains("inst-z"), "{error}");
+    }
+
+    #[test]
+    fn a_default_instance_that_does_not_exist_is_refused_at_start_up() {
+        let source = format!(
+            "{MINIMAL}\n\
+             [[instances]]\nname = \"inst-a\"\naddress = \"10.0.0.1:5432\"\n\
+             \n[routing]\ndefaultInstance = \"inst-z\"\n"
+        );
+        let error = Config::from_str(&source).unwrap_err();
+        assert!(error.to_string().contains("defaultInstance"), "{error}");
+    }
+
+    #[test]
+    fn the_single_instance_configuration_may_still_name_the_implicit_instance() {
+        let source = format!("{MINIMAL}\n[routing]\ndefaultInstance = \"default\"\n");
+        assert!(Config::from_str(&source).is_ok());
+    }
+
+    #[test]
+    fn write_stall_detection_is_on_by_default_and_fails_fast() {
+        let config = Config::from_str(MINIMAL).unwrap();
+        assert!(config.stall.enabled);
+        assert!(config.stall.fail_fast);
+        assert_eq!(config.stall.interval(), Duration::from_millis(250));
+        assert_eq!(config.stall.confirmations, 2);
+    }
+
+    #[test]
+    fn a_stall_probe_that_would_never_sample_is_refused() {
+        let source = format!("{MINIMAL}\n[stall]\nintervalMs = 0\n");
+        assert!(Config::from_str(&source).is_err());
+        let source = format!("{MINIMAL}\n[stall]\nconfirmations = 0\n");
+        assert!(Config::from_str(&source).is_err());
+    }
+
+    #[test]
+    fn there_is_no_control_listener_unless_one_is_configured() {
+        let config = Config::from_str(MINIMAL).unwrap();
+        assert!(config.control.address.is_none());
+        assert_eq!(config.control.default_lease_ttl(), Duration::from_secs(15));
+        assert_eq!(config.control.max_lease_ttl(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn a_lease_ceiling_below_the_default_is_refused_rather_than_silently_clamped() {
+        let source =
+            format!("{MINIMAL}\n[control]\ndefaultLeaseTtlMs = 30000\nmaxLeaseTtlMs = 1000\n");
+        let error = Config::from_str(&source).unwrap_err();
+        assert!(error.to_string().contains("maxLeaseTtlMs"), "{error}");
+    }
+
+    #[test]
+    fn a_lease_that_has_already_expired_is_refused() {
+        let source = format!("{MINIMAL}\n[control]\ndefaultLeaseTtlMs = 0\n");
+        assert!(Config::from_str(&source).is_err());
     }
 
     #[test]

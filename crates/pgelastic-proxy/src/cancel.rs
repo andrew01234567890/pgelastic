@@ -78,6 +78,20 @@ impl From<&CancelRequest> for CancelToken {
 pub struct CancelTarget {
     pub address: String,
     pub key_data: Option<BackendKeyData>,
+    /// Which instance the backend belongs to.
+    ///
+    /// Carried here rather than captured when the session started, because a
+    /// tenant that is migrated mid-session is holding a backend on the *new*
+    /// instance and its cancel credit has to be drawn from that instance's
+    /// allocator.
+    pub instance: crate::route::InstanceId,
+    /// Whose cancel credit this cancel is charged to, and `None` for a session
+    /// the allocator does not govern.
+    ///
+    /// Rewritten at every checkout for the same reason as `instance`: a client
+    /// id is issued by one instance's allocator and means nothing to another's,
+    /// so a migrated session's cancels must be charged to the id it holds now.
+    pub client: Option<pgelastic_capacity::ClientId>,
 }
 
 /// Where a client's cancel should currently be sent.
@@ -92,30 +106,11 @@ pub struct CancelTarget {
 pub struct CancelRoute {
     target: Arc<Mutex<Option<CancelTarget>>>,
     in_flight: Arc<AtomicUsize>,
-    client: Option<pgelastic_capacity::ClientId>,
 }
 
 impl CancelRoute {
-    /// A route for a session the allocator does not govern.
-    ///
-    /// Session mode only, where the client owns one backend for its whole life
-    /// and there is no pooled capacity for a cancel storm to eat into. Every
-    /// pooled session uses [`for_client`](Self::for_client) so its cancels are
-    /// admitted through the ladder like any other backend connection.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// A route whose cancels draw on `client`'s tenant cancel credit.
-    pub fn for_client(client: pgelastic_capacity::ClientId) -> Self {
-        Self {
-            client: Some(client),
-            ..Self::default()
-        }
-    }
-
-    pub fn client(&self) -> Option<pgelastic_capacity::ClientId> {
-        self.client
     }
 
     pub fn set(&self, target: Option<CancelTarget>) {
@@ -282,6 +277,8 @@ mod tests {
                 process_id,
                 key: CancelKey::new(Bytes::from_static(b"real")).unwrap(),
             }),
+            instance: crate::route::InstanceId::new("default"),
+            client: None,
         }
     }
 
@@ -386,14 +383,20 @@ mod tests {
 
     /// The credit pool exists to keep a cancel storm out of a *pooled* tenant's
     /// capacity. A session-mode client holds its one backend for its whole life
-    /// and takes nothing from the allocator, so its route names no client to
-    /// charge.
+    /// and takes nothing from the allocator, so its target names no client to
+    /// charge — and a pooled one names whichever client id the instance it is
+    /// on issued, which a migration replaces.
     #[test]
-    fn only_a_pooled_route_names_a_client_to_charge_a_cancel_to() {
-        assert!(CancelRoute::new().client().is_none());
+    fn the_client_a_cancel_is_charged_to_is_read_off_the_current_target() {
+        assert!(route(target()).resolve().unwrap().client.is_none());
 
         let client = pgelastic_capacity::ClientId(7);
-        assert_eq!(CancelRoute::for_client(client).client(), Some(client));
+        let route = route(target());
+        route.set(Some(CancelTarget {
+            client: Some(client),
+            ..target()
+        }));
+        assert_eq!(route.resolve().unwrap().client, Some(client));
     }
 
     #[test]

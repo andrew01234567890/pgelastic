@@ -34,6 +34,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -41,6 +42,8 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/controller"
 	"github.com/andrew01234567890/pgelastic/internal/index"
+	"github.com/andrew01234567890/pgelastic/internal/metering"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
 	webhookv1alpha1 "github.com/andrew01234567890/pgelastic/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
@@ -207,9 +210,20 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgworkloadclass")
 		os.Exit(1)
 	}
+	// One metering collector serves both the pool planner and the tenant placer, so the
+	// percentile a tenant is placed on and the percentile the plan packs on are the same
+	// number rather than two independently sampled ones.
+	meteringMetrics, err := metering.NewMetrics(metrics.Registry)
+	if err != nil {
+		setupLog.Error(err, "Failed to register metering metrics")
+		os.Exit(1)
+	}
+	meteringCollector := metering.NewCollector(metering.Options{}, meteringMetrics)
+
 	if err := (&controller.PgElasticPoolReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Metering: meteringCollector,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgelasticpool")
 		os.Exit(1)
@@ -222,17 +236,40 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.PgTenantReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Metering: meteringCollector,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgtenant")
 		os.Exit(1)
 	}
+	// Every migration statement runs as the bootstrap superuser over a member's Unix socket,
+	// because that superuser has no password and no TCP route by design. The exec transport
+	// is therefore not a fallback for a missing driver; it is the only way in.
+	migrationExec, err := migration.NewKubeExec(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "Failed to build the migration exec transport")
+		os.Exit(1)
+	}
+	migrationSQL := migration.PodSQL{
+		Runner:  migrationExec,
+		Members: migration.PrimaryResolver{Client: mgr.GetAPIReader()},
+	}
 	if err := (&controller.PgTenantMigrationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		SQL:    migrationSQL,
+		Shell:  migrationSQL,
+		Router: migration.BindingRouter{Client: mgr.GetClient(), Reader: mgr.GetAPIReader()},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgtenantmigration")
+		os.Exit(1)
+	}
+	if err := mgr.Add(&controller.MigrationSweeper{
+		Client: mgr.GetClient(),
+		SQL:    migrationSQL,
+	}); err != nil {
+		setupLog.Error(err, "Failed to add the migration orphan sweeper")
 		os.Exit(1)
 	}
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {

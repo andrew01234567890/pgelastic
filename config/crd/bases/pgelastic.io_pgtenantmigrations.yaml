@@ -88,7 +88,7 @@ spec:
                 minLength: 1
                 type: string
               cutoverTimeout:
-                default: 60s
+                default: 1m0s
                 description: |-
                   cutoverTimeout bounds the whole Cutover phase, including the final LSN wait,
                   sequence handling and verification. Exceeding it aborts back to the source, so it
@@ -99,6 +99,12 @@ spec:
                 description: |-
                   drainTimeout bounds how long Quiescing waits for in-flight transactions to finish
                   before the migration aborts back to the source.
+
+                  Every default on this type is spelled in Go's canonical duration form, and has to be:
+                  the spec is immutable by CEL, and a metav1.Duration serializes back out as
+                  time.Duration.String(). A default of "1h" would be stored verbatim at creation and
+                  re-serialized as "1h0m0s" on the next write, so the immutability rule would reject
+                  every subsequent update to the object - including adding a finalizer or an annotation.
                 type: string
               preflight:
                 description: preflight tunes the blocking gate run before anything
@@ -150,7 +156,7 @@ spec:
                     type: boolean
                 type: object
               rollbackWindow:
-                default: 1h
+                default: 1h0m0s
                 description: |-
                   rollbackWindow is how long the source database is kept intact and
                   connection-refusing after a successful cutover, during which routing can be flipped

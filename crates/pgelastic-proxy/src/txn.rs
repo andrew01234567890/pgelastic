@@ -43,7 +43,10 @@ use crate::epoch::{Epoch, FenceAction, TransactionWitness};
 use crate::error::{ProxyError, Result};
 use crate::metrics::Metrics;
 use crate::pool::{AcquireRequest, Checkout, Connector, Denial, PoolManager};
+use crate::quiesce::{InFlight, TenantGate};
 use crate::relay::{FrameRelay, Relayed};
+use crate::route::Instance;
+use crate::server::Proxy;
 use crate::session::{Ending, Limits};
 use crate::stream::ClientStream;
 use crate::vars::{self, VariableCache};
@@ -53,15 +56,105 @@ use crate::vars::{self, VariableCache};
 /// backend for the life of the pool.
 const CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// What a session is currently bound to.
+///
+/// Re-derived whenever the routing table moves the tenant, because every field
+/// here belongs to one instance: the pool key names its address, and the tenant
+/// and client ids are issued by *its* allocator and mean nothing to another's.
+#[derive(Debug)]
+pub struct Binding {
+    pub instance: Arc<Instance>,
+    pub key: PoolKey,
+    pub tenant: pgelastic_capacity::TenantId,
+    pub client: pgelastic_capacity::ClientId,
+}
+
+impl Binding {
+    /// Binds a session to whichever instance the routing table names now.
+    pub fn open(
+        proxy: &Arc<Proxy>,
+        startup: &pgelastic_wire::StartupMessage,
+        role: &str,
+    ) -> Result<Self> {
+        let instance = proxy.fleet.route(role);
+        let key = crate::pool::pool_key(&proxy.config, &instance.backend, startup, role)?;
+        let tenant = instance
+            .pools
+            .ensure_tenant(role)
+            .map_err(admission_error)?;
+        let client = instance
+            .pools
+            .connect_client(&tenant)
+            .map_err(admission_error)?;
+        Ok(Self {
+            instance,
+            key,
+            tenant,
+            client,
+        })
+    }
+
+    pub fn manager(&self) -> &Arc<PoolManager> {
+        &self.instance.pools
+    }
+}
+
+impl Drop for Binding {
+    /// Releases the client's place in the second currency, however the session
+    /// ends and whichever instance it ended on.
+    fn drop(&mut self) {
+        self.instance.pools.disconnect_client(self.client);
+    }
+}
+
+/// Opens the first link of a pool so its greeting can be cached.
+pub async fn bootstrap_greeting(
+    binding: &Binding,
+    kdf: &crate::scram::KdfPool,
+    startup: &pgelastic_wire::StartupMessage,
+    client: &mut ClientStream,
+    metrics: &Metrics,
+) -> Result<Arc<Vec<pgelastic_wire::BackendMessage>>> {
+    // A greeting costs a real backend on a real instance, so a stalled one
+    // refuses here too. It is the first checkout of a pool, not an exception
+    // to what a checkout is.
+    if let Some(health) = binding.instance.stall.must_refuse() {
+        metrics.write_stall_refused();
+        return Err(crate::server::write_stalled(&binding.instance.id, health));
+    }
+    let connector = Connector {
+        backend: &binding.instance.backend,
+        tls: binding.instance.tls.as_ref(),
+        kdf,
+        startup,
+    };
+    let request = AcquireRequest {
+        key: &binding.key,
+        tenant: &binding.tenant,
+        client: binding.client,
+    };
+    let checkout = binding
+        .manager()
+        .acquire(&request, &connector, client)
+        .await
+        .map_err(admission_error)?;
+    binding.manager().check_in(&binding.key, checkout);
+    Ok(binding
+        .manager()
+        .greeting(&binding.key)
+        .expect("opening a link caches the pool's greeting"))
+}
+
 /// Everything a transaction-mode session needs that outlives one message.
 #[derive(Debug)]
 pub struct Session<'a> {
     pub client: &'a mut ClientStream,
-    pub manager: &'a Arc<PoolManager>,
-    pub connector: Connector<'a>,
-    pub key: PoolKey,
-    pub tenant: pgelastic_capacity::TenantId,
-    pub client_id: pgelastic_capacity::ClientId,
+    pub proxy: &'a Arc<Proxy>,
+    pub startup: &'a pgelastic_wire::StartupMessage,
+    pub role: String,
+    /// This tenant's admission gate, closed for the length of a cutover.
+    pub gate: Arc<TenantGate>,
+    pub binding: Binding,
     pub route: CancelRoute,
     pub metrics: &'a Arc<Metrics>,
     pub limits: Limits,
@@ -87,6 +180,16 @@ struct Running<'a> {
     /// Set once the fence has fired on a read-only transaction: the outstanding
     /// statement is allowed to finish and nothing new is admitted.
     draining_fence: bool,
+    /// Held for exactly as long as `checkout` is, so `drainStatus` can say
+    /// whether the tenant still has work on its source.
+    holding: Option<InFlight>,
+    /// The bound instance's epoch fence.
+    ///
+    /// Resubscribed whenever the session follows its tenant elsewhere: two
+    /// instances have two independent promotion histories, and a session left
+    /// watching the one it has been moved off would sleep through the fence
+    /// that concerns it.
+    epochs: watch::Receiver<Epoch>,
 }
 
 /// What the client's last message asked the relay to do next.
@@ -104,7 +207,7 @@ pub async fn run(
 ) -> Result<Ending> {
     let limits = session.limits;
     let force_after = session.force_after;
-    let reset_policy = session.manager.config().reset_policy.into();
+    let reset_policy = session.binding.manager().config().reset_policy.into();
 
     let mut running = Running {
         from_client: FrameRelay::new(limits.inline_frame_bytes, limits.max_frame_bytes),
@@ -116,6 +219,8 @@ pub async fn run(
         client_streaming: 0,
         witness: TransactionWitness::new(),
         draining_fence: false,
+        holding: None,
+        epochs: epochs_of(&session),
         session,
     };
     running.from_client.extend_from_slice(pending_from_client);
@@ -139,8 +244,7 @@ impl Running<'_> {
                 .as_mut()
                 .reset(tokio::time::Instant::now() + force_after);
         }
-        let mut epochs = self.session.manager.fence().fence.subscribe();
-        epochs.mark_unchanged();
+        self.epochs.mark_unchanged();
 
         // Bytes the handshake already buffered can complete a whole message on
         // their own, so the first pump happens before the first read.
@@ -158,7 +262,7 @@ impl Running<'_> {
                 _ = shutdown.changed(), if !draining => Event::Drain,
                 // Ahead of every read: an epoch that has already moved must
                 // reach the policy before another client byte is forwarded.
-                _ = epochs.changed() => Event::EpochChanged,
+                _ = self.epochs.changed() => Event::EpochChanged,
                 () = &mut deadline, if draining => Event::Deadline,
                 read = self.session.client.read_buf(self.from_client.read_target()) => {
                     Event::FromClient(read)
@@ -213,7 +317,7 @@ impl Running<'_> {
     /// The epoch this session's backend was opened under, against the highest
     /// the proxy has ever seen.
     fn superseded(&self) -> bool {
-        let current = self.session.manager.fence().current();
+        let current = self.manager().fence().current();
         self.checkout
             .as_ref()
             .is_some_and(|checkout| checkout.conn.epoch < current)
@@ -238,7 +342,7 @@ impl Running<'_> {
             return Ok(());
         };
         let opened_under = checkout.conn.epoch;
-        let current = self.session.manager.fence().current();
+        let current = self.manager().fence().current();
         let status = checkout
             .conn
             .link
@@ -261,10 +365,10 @@ impl Running<'_> {
             // a backend that has been verified against the new epoch.
             FenceAction::Close => {
                 let pinned = checkout.conn.link.pin().is_some();
-                let checkout = self.checkout.take().expect("just observed");
+                let checkout = self.take_checkout().expect("just observed");
                 self.session.route.set(None);
-                self.session.manager.sever(checkout, action);
-                self.session.manager.publish_budget();
+                self.manager().sever(checkout, action);
+                self.manager().publish_budget();
                 if pinned {
                     return Err(superseded_error(opened_under, current));
                 }
@@ -277,17 +381,17 @@ impl Running<'_> {
                 Ok(())
             }
             FenceAction::ResetNow => {
-                let checkout = self.checkout.take().expect("just observed");
+                let checkout = self.take_checkout().expect("just observed");
                 self.session.route.set(None);
-                self.session.manager.sever(checkout, action);
-                self.session.manager.publish_budget();
+                self.manager().sever(checkout, action);
+                self.manager().publish_budget();
                 Err(superseded_error(opened_under, current))
             }
             FenceAction::ReportUnknown => {
                 let key = checkout
                     .conn
-                    .in_doubt_key(self.session.tenant.as_str(), opened_under);
-                let fence = self.session.manager.fence().fence.clone();
+                    .in_doubt_key(self.session.binding.tenant.as_str(), opened_under);
+                let fence = self.manager().fence().fence.clone();
                 fence
                     .in_doubt()
                     .record(key.clone(), self.witness.pending_sql());
@@ -298,10 +402,10 @@ impl Running<'_> {
                      it is neither reported as committed nor as rolled back"
                 );
 
-                let checkout = self.checkout.take().expect("just observed");
+                let checkout = self.take_checkout().expect("just observed");
                 self.session.route.set(None);
-                self.session.manager.sever(checkout, action);
-                self.session.manager.publish_budget();
+                self.manager().sever(checkout, action);
+                self.manager().publish_budget();
                 Err(ProxyError::OutcomeUnknown {
                     message: format!(
                         "the outcome of this transaction is UNKNOWN: its commit was forwarded to \
@@ -391,7 +495,7 @@ impl Running<'_> {
             self.apply_fence()?;
         }
         if self.draining_fence {
-            let current = self.session.manager.fence().current();
+            let current = self.manager().fence().current();
             let opened_under = self
                 .checkout
                 .as_ref()
@@ -464,7 +568,7 @@ impl Running<'_> {
             return;
         }
 
-        let statement = self.session.manager.intern_statement(StatementKey::new(
+        let statement = self.manager().intern_statement(StatementKey::new(
             parse.query.clone(),
             parse.param_types.clone(),
         ));
@@ -620,7 +724,7 @@ impl Running<'_> {
         // have caused split brain, the client has its answer, and now the
         // socket goes.
         if saw_ready && self.draining_fence && self.at_backend_frame_boundary() {
-            let current = self.session.manager.fence().current();
+            let current = self.manager().fence().current();
             let opened_under = self
                 .checkout
                 .as_ref()
@@ -639,10 +743,10 @@ impl Running<'_> {
 
     fn finish_fence_drain(&mut self, action: FenceAction) {
         self.draining_fence = false;
-        if let Some(checkout) = self.checkout.take() {
+        if let Some(checkout) = self.take_checkout() {
             self.session.route.set(None);
-            self.session.manager.sever(checkout, action);
-            self.session.manager.publish_budget();
+            self.manager().sever(checkout, action);
+            self.manager().publish_budget();
         }
     }
 
@@ -654,6 +758,45 @@ impl Running<'_> {
 
     // ---- checkout, check-in and the reset ladder ------------------------
 
+    fn manager(&self) -> &Arc<PoolManager> {
+        self.session.binding.manager()
+    }
+
+    /// Takes the held link back, releasing the tenant's in-flight count with it.
+    ///
+    /// The one place either of those two things happens, so a release path
+    /// added later cannot leave `drainStatus` reporting work that finished.
+    fn take_checkout(&mut self) -> Option<Checkout> {
+        self.holding = None;
+        self.checkout.take()
+    }
+
+    /// Rebinds this session if a cutover moved its tenant.
+    ///
+    /// Only ever called with no backend held, which is what makes it safe: the
+    /// instance changes at a transaction boundary and never underneath one.
+    fn follow_route(&mut self) -> Result<()> {
+        debug_assert!(self.checkout.is_none(), "a bound session must not be moved");
+        let routed = self.session.proxy.fleet.route_id(&self.session.role);
+        if routed == self.session.binding.instance.id {
+            return Ok(());
+        }
+        let binding = Binding::open(self.session.proxy, self.session.startup, &self.session.role)?;
+        debug!(
+            tenant = %self.session.role,
+            from = %self.session.binding.instance.id,
+            to = %binding.instance.id,
+            "this session follows its tenant to another instance"
+        );
+        self.session.binding = binding;
+        // The statement cache is per instance, so nothing this client prepared
+        // on the source is parsed on the target.
+        self.statements = ClientStatements::new();
+        self.epochs = epochs_of(&self.session);
+        self.epochs.mark_unchanged();
+        Ok(())
+    }
+
     async fn ensure_backend(&mut self) -> Result<()> {
         if self.checkout.is_some() {
             return Ok(());
@@ -663,24 +806,46 @@ impl Running<'_> {
         // the answer to the client's previous request.
         self.flush().await?;
 
-        let request = AcquireRequest {
-            key: &self.session.key,
-            tenant: &self.session.tenant,
-            client: self.session.client_id,
+        // The gate, then the route, then the stall check, in that order. A
+        // queued client has to read the routing table *after* it is released,
+        // because being released is precisely the moment a cutover has finished
+        // rewriting it. The baton is held until this client has its backend, so
+        // the queue drains in the order it filled.
+        let baton = self.session.gate.admit().await;
+        self.follow_route()?;
+        let instance = Arc::clone(&self.session.binding.instance);
+        if let Some(health) = instance.stall.must_refuse() {
+            self.session.metrics.write_stall_refused();
+            return Err(crate::server::write_stalled(&instance.id, health));
+        }
+
+        let connector = Connector {
+            backend: &instance.backend,
+            tls: instance.tls.as_ref(),
+            kdf: &self.session.proxy.kdf,
+            startup: self.session.startup,
         };
-        let checkout = self
-            .session
-            .manager
-            .acquire(&request, &self.session.connector, self.session.client)
+        let request = AcquireRequest {
+            key: &self.session.binding.key,
+            tenant: &self.session.binding.tenant,
+            client: self.session.binding.client,
+        };
+        let checkout = instance
+            .pools
+            .acquire(&request, &connector, self.session.client)
             .await
             .map_err(admission_error)?;
+        drop(baton);
 
         self.session.route.set(Some(CancelTarget {
             address: checkout.conn.address.clone(),
             key_data: checkout.conn.key_data.clone(),
+            instance: instance.id.clone(),
+            client: Some(self.session.binding.client),
         }));
+        self.holding = Some(self.session.gate.hold());
         self.checkout = Some(checkout);
-        self.session.manager.publish_budget();
+        self.manager().publish_budget();
 
         self.sync_variables().await
     }
@@ -788,10 +953,10 @@ impl Running<'_> {
             Ok(()) | Err(CheckInBlock::ResetRequired) => self.reset_and_release().await,
             Err(CheckInBlock::Disqualified(flags)) => {
                 debug!(?flags, "a link is disqualified from reuse and is closed");
-                let checkout = self.checkout.take().expect("just observed");
+                let checkout = self.take_checkout().expect("just observed");
                 self.session.route.set(None);
-                self.session.manager.discard(checkout);
-                self.session.manager.publish_budget();
+                self.manager().discard(checkout);
+                self.manager().publish_budget();
                 Ok(())
             }
             // Either the client is entitled to the state it created — a pinned
@@ -855,14 +1020,14 @@ impl Running<'_> {
             },
         );
         if plan.disposition() != ResetDisposition::Reuse {
-            let checkout = self.checkout.take().expect("just observed");
+            let checkout = self.take_checkout().expect("just observed");
             self.session.route.set(None);
-            self.session.manager.discard(checkout);
-            self.session.manager.publish_budget();
+            self.manager().discard(checkout);
+            self.manager().publish_budget();
             return Ok(());
         }
         if plan.is_empty() {
-            let checkout = self.checkout.take().expect("just observed");
+            let checkout = self.take_checkout().expect("just observed");
             self.hand_back(checkout);
             return Ok(());
         }
@@ -876,10 +1041,10 @@ impl Running<'_> {
         for step in &steps {
             if let Err(error) = self.run_internal(step.sql()).await {
                 debug!(%error, %step, "the reset ladder failed; the link is closed");
-                if let Some(checkout) = self.checkout.take() {
+                if let Some(checkout) = self.take_checkout() {
                     self.session.route.set(None);
-                    self.session.manager.discard(checkout);
-                    self.session.manager.publish_budget();
+                    self.manager().discard(checkout);
+                    self.manager().publish_budget();
                 }
                 return Ok(());
             }
@@ -898,15 +1063,15 @@ impl Running<'_> {
 
         match checkout.conn.link.can_check_in() {
             Ok(()) => {
-                let checkout = self.checkout.take().expect("just observed");
+                let checkout = self.take_checkout().expect("just observed");
                 self.hand_back(checkout);
             }
             Err(block) => {
                 debug!(%block, "a scrubbed link still cannot be checked in; closing it");
-                let checkout = self.checkout.take().expect("just observed");
+                let checkout = self.take_checkout().expect("just observed");
                 self.session.route.set(None);
-                self.session.manager.discard(checkout);
-                self.session.manager.publish_budget();
+                self.manager().discard(checkout);
+                self.manager().publish_budget();
             }
         }
         Ok(())
@@ -914,8 +1079,8 @@ impl Running<'_> {
 
     fn hand_back(&mut self, checkout: Checkout) {
         self.session.route.set(None);
-        self.session.manager.check_in(&self.session.key, checkout);
-        self.session.manager.publish_budget();
+        self.manager().check_in(&self.session.binding.key, checkout);
+        self.manager().publish_budget();
     }
 
     /// Records unscrubbable state and takes the link out of the elastic budget.
@@ -927,18 +1092,18 @@ impl Running<'_> {
             return;
         }
         checkout.conn.link.set_pin(reason);
-        self.session.manager.record_pin(reason);
+        self.manager().record_pin(reason);
         self.session.metrics.pinned(reason);
-        self.session.manager.publish_budget();
+        self.manager().publish_budget();
         debug!(%reason, "a tripwire pinned this client to its backend");
     }
 
     /// Gives up on a link that can no longer be trusted.
     fn abandon(&mut self) {
-        if let Some(checkout) = self.checkout.take() {
+        if let Some(checkout) = self.take_checkout() {
             self.session.route.set(None);
-            self.session.manager.discard(checkout);
-            self.session.manager.publish_budget();
+            self.manager().discard(checkout);
+            self.manager().publish_budget();
         }
     }
 
@@ -998,16 +1163,17 @@ impl Running<'_> {
         checkout.conn.statements.clear();
         checkout.conn.link.reset_completed();
         checkout.conn.link.clear_pin();
-        self.session.manager.release_pin(reason);
+        let manager = Arc::clone(self.session.binding.manager());
+        manager.release_pin(reason);
 
         match checkout.conn.link.can_check_in() {
             Ok(()) => {
-                let checkout = self.checkout.take().expect("just observed");
+                let checkout = self.take_checkout().expect("just observed");
                 self.hand_back(checkout);
             }
             Err(_) => self.abandon(),
         }
-        self.session.manager.publish_budget();
+        self.manager().publish_budget();
     }
 
     async fn flush(&mut self) -> Result<()> {
@@ -1055,6 +1221,11 @@ async fn read_backend(checkout: &mut Option<Checkout>) -> std::io::Result<usize>
         .stream
         .read_buf(checkout.conn.relay.read_target())
         .await
+}
+
+/// The bound instance's epoch channel.
+fn epochs_of(session: &Session<'_>) -> watch::Receiver<Epoch> {
+    session.binding.instance.fence.fence.subscribe()
 }
 
 /// The refusal a client gets when its connection was on a superseded epoch.

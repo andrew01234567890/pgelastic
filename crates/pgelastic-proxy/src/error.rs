@@ -24,6 +24,15 @@ pub mod sqlstate {
     /// standard says what pgelastic needs it to say: the outcome is unknown. A
     /// client SDK must treat it as `UNKNOWN` and must not retry.
     pub const STATEMENT_COMPLETION_UNKNOWN: &str = "40003";
+    /// `57P03 cannot_connect_now`
+    ///
+    /// Raised when a checkout is refused because the tenant's instance cannot
+    /// complete a commit: its loaded `synchronous_standby_names` names more
+    /// synchronous standbys than are streaming, so the next `COMMIT` would park
+    /// in `IPC.SyncRep` and never return. Nothing was forwarded, so this is a
+    /// definite refusal and a retry — ideally after the instance recovers or
+    /// the tenant is moved — is safe.
+    pub const CANNOT_CONNECT_NOW: &str = "57P03";
     /// `25006 read_only_sql_transaction`
     ///
     /// Raised when a write is refused *before* being forwarded because the
@@ -45,6 +54,7 @@ pub mod sqlstate {
             INVALID_AUTHORIZATION => INVALID_AUTHORIZATION,
             PROTOCOL_VIOLATION => PROTOCOL_VIOLATION,
             TOO_MANY_CONNECTIONS => TOO_MANY_CONNECTIONS,
+            CANNOT_CONNECT_NOW => CANNOT_CONNECT_NOW,
             ADMIN_SHUTDOWN => ADMIN_SHUTDOWN,
             STATEMENT_COMPLETION_UNKNOWN => STATEMENT_COMPLETION_UNKNOWN,
             READ_ONLY_SQL_TRANSACTION => READ_ONLY_SQL_TRANSACTION,
@@ -70,6 +80,13 @@ pub mod fence_code {
     /// would have used is on a superseded primary epoch. Definitely not
     /// applied, so it is safe to retry.
     pub const SUPERSEDED_EPOCH: &str = "PGE2506";
+    /// The tenant's instance cannot complete a commit, so no backend was taken.
+    ///
+    /// Distinguished from every capacity refusal on purpose: `PGE1024` means
+    /// *wait longer and you will be served*, and this means the opposite. A
+    /// client that retries into a write-stalled instance is doing the one thing
+    /// that makes the incident spread.
+    pub const WRITE_STALLED: &str = "PGE5703";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -145,6 +162,16 @@ pub enum ProxyError {
     /// superseded primary epoch.
     #[error("{}: {message}", fence_code::SUPERSEDED_EPOCH)]
     SupersededEpoch { message: String },
+
+    /// A checkout was refused because the tenant's instance is write-stalled.
+    ///
+    /// Its own variant rather than an `Admission` refusal, because the two mean
+    /// opposite things to a retrying client: an admission refusal clears when
+    /// the pool has room, and this one does not clear until quorum comes back
+    /// or the tenant is moved. Nothing was forwarded and no backend was taken,
+    /// so the transaction definitely did not happen.
+    #[error("{}: {message}", fence_code::WRITE_STALLED)]
+    WriteStalled { message: String },
 }
 
 impl ProxyError {
@@ -166,6 +193,7 @@ impl ProxyError {
             Self::Admission { sqlstate, .. } => sqlstate,
             Self::OutcomeUnknown { .. } => sqlstate::STATEMENT_COMPLETION_UNKNOWN,
             Self::SupersededEpoch { .. } => sqlstate::READ_ONLY_SQL_TRANSACTION,
+            Self::WriteStalled { .. } => sqlstate::CANNOT_CONNECT_NOW,
             Self::AuthenticationFailed => sqlstate::INVALID_PASSWORD,
             Self::ConnectionLimit => sqlstate::TOO_MANY_CONNECTIONS,
             Self::ShuttingDown => sqlstate::ADMIN_SHUTDOWN,

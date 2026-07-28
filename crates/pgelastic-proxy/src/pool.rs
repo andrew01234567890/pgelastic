@@ -42,6 +42,7 @@ use crate::epoch::{Epoch, EpochSource, FenceRuntime, InDoubtKey};
 use crate::error::{ProxyError, Result};
 use crate::metrics::{ConnectGateOutcome, Metrics};
 use crate::relay::FrameRelay;
+use crate::route::InstanceId;
 use crate::scram::KdfPool;
 use crate::stream::BackendStream;
 use crate::tls::BackendTls;
@@ -236,6 +237,12 @@ impl std::fmt::Debug for Connector<'_> {
 /// The map of pools, the capacity allocator and the pinning ledger.
 #[derive(Debug)]
 pub struct PoolManager {
+    /// The instance this manager's capacity belongs to.
+    ///
+    /// One manager per instance is what bounds a write stall: the backends a
+    /// stalled primary parks in `IPC.SyncRep` are drawn from this account and
+    /// no other, so a tenant on a different instance cannot be starved by them.
+    instance: InstanceId,
     inner: Mutex<Inner>,
     config: PoolConfig,
     fence: FenceRuntime,
@@ -245,6 +252,7 @@ pub struct PoolManager {
 
 impl PoolManager {
     pub fn new(
+        instance: InstanceId,
         config: PoolConfig,
         fence: FenceRuntime,
         metrics: Arc<Metrics>,
@@ -287,6 +295,7 @@ impl PoolManager {
         let ledger = pgelastic_pool::BudgetLedger::new(config.backend_connections);
         let login_retry = config.server_login_retry();
         Ok(Arc::new(Self {
+            instance,
             inner: Mutex::new(Inner {
                 allocator,
                 pools: HashMap::new(),
@@ -306,6 +315,10 @@ impl PoolManager {
 
     pub fn config(&self) -> &PoolConfig {
         &self.config
+    }
+
+    pub fn instance(&self) -> &InstanceId {
+        &self.instance
     }
 
     pub fn fence(&self) -> &FenceRuntime {
@@ -1080,8 +1093,12 @@ impl PoolManager {
     /// Refreshes the exported budget gauges from the ledger.
     pub fn publish_budget(&self) {
         let snapshot = self.ledger_snapshot();
-        self.metrics
-            .budget(snapshot.limit, snapshot.elastic, snapshot.elastic_limit);
+        self.metrics.budget(
+            &self.instance,
+            snapshot.limit,
+            snapshot.elastic,
+            snapshot.elastic_limit,
+        );
     }
 }
 
@@ -1094,6 +1111,7 @@ impl PoolManager {
 /// ladder can undo them.
 pub fn pool_key(
     config: &crate::config::Config,
+    backend: &crate::config::BackendConfig,
     startup: &StartupMessage,
     role: &str,
 ) -> Result<PoolKey> {
@@ -1120,9 +1138,8 @@ pub fn pool_key(
     )
     .map_err(|e| ProxyError::client(e.to_string()))?;
 
-    let address = crate::config::resolve(&config.backend.address)?;
-    let database = config
-        .backend
+    let address = crate::config::resolve(&backend.address)?;
+    let database = backend
         .database
         .clone()
         .or_else(|| text(startup.get(b"database")))
@@ -1132,9 +1149,9 @@ pub fn pool_key(
         tenant: TenantId::new(role),
         target: BackendTarget::new(address.ip().to_string(), address.port()),
         database: DatabaseName::new(database),
-        role: RoleName::new(&config.backend.user),
+        role: RoleName::new(&backend.user),
         fingerprint,
-        tls: match config.backend.tls.mode {
+        tls: match backend.tls.mode {
             crate::config::BackendTlsMode::Disable => TlsPosture::Plaintext,
             _ => TlsPosture::Tls,
         },
@@ -1339,7 +1356,13 @@ mod tests {
     use crate::config::{PoolModeConfig, TenantConfig};
 
     fn manager(config: PoolConfig) -> Arc<PoolManager> {
-        PoolManager::new(config, FenceRuntime::in_memory(), Metrics::new()).unwrap()
+        PoolManager::new(
+            InstanceId::new("default"),
+            config,
+            FenceRuntime::in_memory(),
+            Metrics::new(),
+        )
+        .unwrap()
     }
 
     fn transaction_config(backend_connections: u32) -> PoolConfig {
@@ -1375,7 +1398,15 @@ mod tests {
             }],
             ..PoolConfig::default()
         };
-        assert!(PoolManager::new(config, FenceRuntime::in_memory(), Metrics::new()).is_err());
+        assert!(
+            PoolManager::new(
+                InstanceId::new("default"),
+                config,
+                FenceRuntime::in_memory(),
+                Metrics::new(),
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

@@ -280,7 +280,9 @@ spec:
                     description: |-
                       autoActions is the set of change classes the planner may execute in Auto mode.
                       Everything not listed is planned and reported but never applied, so the list is opted
-                      into one class at a time.
+                      into one class at a time. Within one planning pass at most one class is executed, and
+                      the classes are considered in the order they are declared on AutoAction: cheapest and
+                      most reversible first, scale-in last.
                     items:
                       description: |-
                         AutoAction is one class of change the autoscaler may execute without human approval.
@@ -297,12 +299,103 @@ spec:
                     maxItems: 6
                     type: array
                     x-kubernetes-list-type: atomic
+                  blackoutWindows:
+                    description: |-
+                      blackoutWindows suspend every executed action, not only rebalancing. A pool that must
+                      not be touched during a change freeze must not be resized during it either.
+                    items:
+                      description: TimeWindow is a recurring window expressed as a
+                        cron start plus a duration.
+                      properties:
+                        duration:
+                          description: duration is how long the window stays open
+                            once started.
+                          type: string
+                        schedule:
+                          description: schedule is a standard five-field cron expression
+                            giving the window start.
+                          maxLength: 256
+                          type: string
+                        timeZone:
+                          default: UTC
+                          description: timeZone is an IANA zone name. Defaults to
+                            UTC.
+                          maxLength: 64
+                          type: string
+                      required:
+                      - duration
+                      - schedule
+                      type: object
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  consolidationDwellTime:
+                    default: 24h
+                    description: |-
+                      consolidationDwellTime is how long an instance must have been consolidatable before
+                      scale-in will act on it. It is separate from the scale-down stabilization window: the
+                      window says the surplus has persisted, the dwell time says the decision to reclaim a
+                      specific instance has persisted.
+                    type: string
                   maxInstances:
                     description: maxInstances is the ceiling on pool member count.
                     format: int32
                     maximum: 64
                     minimum: 1
                     type: integer
+                  migrationBudget:
+                    description: migrationBudget bounds how much tenant movement the
+                      planner may spend.
+                    properties:
+                      maxConcurrent:
+                        default: 1
+                        description: |-
+                          maxConcurrent caps simultaneous moves. Each one holds a replication slot and adds
+                          logical decoding load to its source.
+                        format: int32
+                        maximum: 16
+                        minimum: 0
+                        type: integer
+                      maxPerWindow:
+                        default: 4
+                        description: |-
+                          maxPerWindow caps how many moves may start inside one scheduling window, so a plan
+                          that wants to move fifty tenants spends its budget over days rather than in an hour.
+                        format: int32
+                        maximum: 1000
+                        minimum: 0
+                        type: integer
+                      windows:
+                        description: |-
+                          windows scope when moves may start. An empty list means any time, which is only a
+                          sane default because an Online move queues clients rather than dropping them.
+                        items:
+                          description: TimeWindow is a recurring window expressed
+                            as a cron start plus a duration.
+                          properties:
+                            duration:
+                              description: duration is how long the window stays open
+                                once started.
+                              type: string
+                            schedule:
+                              description: schedule is a standard five-field cron
+                                expression giving the window start.
+                              maxLength: 256
+                              type: string
+                            timeZone:
+                              default: UTC
+                              description: timeZone is an IANA zone name. Defaults
+                                to UTC.
+                              maxLength: 64
+                              type: string
+                          required:
+                          - duration
+                          - schedule
+                          type: object
+                        maxItems: 32
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
                   minInstances:
                     description: minInstances is the floor on pool member count.
                     format: int32
@@ -316,6 +409,13 @@ spec:
                     enum:
                     - Recommend
                     - Auto
+                    type: string
+                  scaleInEvidenceWindow:
+                    default: 168h
+                    description: |-
+                      scaleInEvidenceWindow is how much continuous per-tenant history must exist before an
+                      instance may be removed. Scale-in is the one action that cannot be undone in seconds,
+                      so it is gated on a week of evidence rather than on a stabilization window.
                     type: string
                   stabilizationWindow:
                     description: stabilizationWindow damps oscillation.
@@ -331,6 +431,49 @@ spec:
                           capacity is added.
                         type: string
                     type: object
+                  staleMetricPolicy:
+                    default: DoNothing
+                    description: staleMetricPolicy is what happens once that threshold
+                      is crossed.
+                    enum:
+                    - DoNothing
+                    - ScaleToMinimum
+                    type: string
+                  staleMetricThreshold:
+                    default: 5m
+                    description: |-
+                      staleMetricThreshold is how old the newest metering sample may be before the planner
+                      treats the pool as unmeasured.
+                    type: string
+                  storage:
+                    description: storage configures when a volume is grown.
+                    properties:
+                      expandAtPercent:
+                        default: 80
+                        description: expandAtPercent is the used-to-allocated ratio
+                          that triggers an expansion.
+                        format: int32
+                        maximum: 99
+                        minimum: 1
+                        type: integer
+                      expandToPercent:
+                        default: 60
+                        description: expandToPercent is the used-to-allocated ratio
+                          the expansion aims to restore.
+                        format: int32
+                        maximum: 99
+                        minimum: 1
+                        type: integer
+                      maxSize:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          maxSize caps how large a volume the planner may ask for, so a runaway table cannot
+                          spend an unbounded amount of somebody's money.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
                   targetUtilizationPercent:
                     default: 70
                     description: |-
@@ -339,6 +482,16 @@ spec:
                     format: int32
                     maximum: 100
                     minimum: 1
+                    type: integer
+                  tolerancePercent:
+                    default: 10
+                    description: |-
+                      tolerancePercent is the HPA-shaped dead band. A utilization within this much of the
+                      target proposes nothing at all, which is what stops a pool oscillating around a
+                      boundary it is already close enough to.
+                    format: int32
+                    maximum: 50
+                    minimum: 0
                     type: integer
                 type: object
                 x-kubernetes-validations:
@@ -10191,6 +10344,224 @@ spec:
           status:
             description: status defines the observed state of PgElasticPool
             properties:
+              autoscaling:
+                description: |-
+                  autoscaling is the whole capacity plan, published in every mode and executed only in
+                  the classes the pool has opted into.
+                properties:
+                  actions:
+                    description: |-
+                      actions is every change class the plan proposes, each carrying whether it is permitted
+                      to execute and, when it is not, which guardrail refused it.
+                    items:
+                      description: PlannedAction is one change class the plan proposes.
+                      properties:
+                        detail:
+                          description: detail spells out the change in the terms it
+                            would be applied in.
+                          maxLength: 1024
+                          type: string
+                        executedAt:
+                          description: |-
+                            executedAt is when this action class was last actually applied. An action that is
+                            permitted but never executed and one that executes every reconcile look identical
+                            without it.
+                          format: date-time
+                          type: string
+                        message:
+                          description: message explains the reason in the numbers
+                            it was decided on.
+                          maxLength: 1024
+                          type: string
+                        name:
+                          description: |-
+                            name is the action class. It is the list map key, so a plan carries at most one entry
+                            per class and a reader can address the one it cares about.
+                          enum:
+                          - TenantGucTune
+                          - StorageExpand
+                          - ScaleOut
+                          - Rebalance
+                          - VerticalResize
+                          - ScaleIn
+                          type: string
+                        permitted:
+                          description: permitted reports whether every guardrail allows
+                            this action to execute now.
+                          type: boolean
+                        reason:
+                          description: reason names the guardrail that refused, or
+                            records that none did.
+                          maxLength: 64
+                          type: string
+                        target:
+                          description: target names the object the action would change.
+                          maxLength: 253
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    maxItems: 6
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  computedAt:
+                    description: computedAt is when the plan was last recomputed.
+                    format: date-time
+                    type: string
+                  metricsStale:
+                    description: |-
+                      metricsStale reports that the readings the plan was computed from are older than the
+                      staleness threshold. Every action is refused while it is true.
+                    type: boolean
+                  mode:
+                    description: mode is the mode the plan was computed under.
+                    enum:
+                    - Recommend
+                    - Auto
+                    type: string
+                  moves:
+                    description: |-
+                      moves is the tenant movement the plan implies. Eviction and destination appear here
+                      together because they were decided together: a plan that said which tenant to evict
+                      without saying where it lands is not a plan, it is half of one.
+                    items:
+                      description: PlannedMove is one tenant relocation the plan implies.
+                      properties:
+                        blockedBy:
+                          description: blockedBy names the check that makes an ineligible
+                            move ineligible.
+                          maxLength: 256
+                          type: string
+                        eligible:
+                          description: |-
+                            eligible reports whether the tenant may actually be moved: cold enough, permitted by
+                            its workload class, and not sitting on a source that is too busy to decode for it.
+                          type: boolean
+                        expectedImprovementPercent:
+                          description: |-
+                            expectedImprovementPercent is how many percentage points of the source instance's
+                            utilization this move relieves. It is the number that justifies spending a live
+                            migration, and a move that cannot state one should not be made.
+                          format: int32
+                          type: integer
+                        from:
+                          description: from is the instance it leaves.
+                          maxLength: 253
+                          type: string
+                        name:
+                          description: name is the PgTenant being moved.
+                          maxLength: 253
+                          type: string
+                        reason:
+                          description: reason names why the move is proposed.
+                          maxLength: 256
+                          type: string
+                        to:
+                          description: to is the instance it lands on.
+                          maxLength: 253
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    maxItems: 128
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  observedInstances:
+                    description: observedInstances is how many instances the pool
+                      has now.
+                    format: int32
+                    type: integer
+                  observedUtilizationPercent:
+                    description: |-
+                      observedUtilizationPercent is connections in use over allocatable, across the ready
+                      instances.
+                    format: int32
+                    type: integer
+                  perInstance:
+                    description: perInstance is the per-instance target the plan would
+                      converge on.
+                    items:
+                      description: InstanceTarget is what one instance should look
+                        like once the plan is applied.
+                      properties:
+                        allocatableConnections:
+                          description: allocatableConnections is what the instance
+                            can hold.
+                          format: int32
+                          type: integer
+                        consolidatable:
+                          description: |-
+                            consolidatable reports that every tenant here could be rehomed onto the rest of the
+                            pool, which is the precondition for scale-in.
+                          type: boolean
+                        consolidatableSince:
+                          description: |-
+                            consolidatableSince is when this instance first became consolidatable, and the instant
+                            the dwell time is measured from. It lives in status rather than in the controller's
+                            memory so that an operator restart does not silently reset a day-long timer.
+                          format: date-time
+                          type: string
+                        name:
+                          description: name of the PgInstance.
+                          maxLength: 253
+                          type: string
+                        packedConnections:
+                          description: |-
+                            packedConnections is the sum, over the tenants the plan puts here, of each tenant's
+                            guarantee or trailing-window percentile, whichever is larger.
+                          format: int32
+                          type: integer
+                        recommendedStorage:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          description: |-
+                            recommendedStorage is the data volume size the plan would expand to. It is absent
+                            when no expansion is warranted, and never smaller than the current size: PVCs cannot
+                            shrink.
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        storageUsedPercent:
+                          description: storageUsedPercent is the data volume's used-to-allocated
+                            ratio.
+                          format: int32
+                          type: integer
+                        tenants:
+                          description: tenants is how many tenants the plan puts here.
+                          format: int32
+                          type: integer
+                        utilizationPercent:
+                          description: utilizationPercent is the instance's connections
+                            in use over allocatable.
+                          format: int32
+                          type: integer
+                      required:
+                      - name
+                      type: object
+                    maxItems: 64
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  recommendedInstances:
+                    description: recommendedInstances is how many it should have.
+                    format: int32
+                    type: integer
+                  summary:
+                    description: summary is a one-line human-readable explanation
+                      of the plan.
+                    maxLength: 1024
+                    type: string
+                  targetUtilizationPercent:
+                    description: targetUtilizationPercent is what the planner steers
+                      towards.
+                    format: int32
+                    type: integer
+                type: object
               capacity:
                 description: capacity is the reservation ledger.
                 properties:
