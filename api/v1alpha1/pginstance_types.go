@@ -553,6 +553,20 @@ type InstanceMemberStatus struct {
 	// +optional
 	LSN string `json:"lsn,omitempty"`
 
+	// receivedLSN is how far this member's WAL receiver has written, and replayLSN how far
+	// recovery has replayed. They are separate fields because candidate selection orders on
+	// both, received first: WAL that has been received is durable on this member whether or
+	// not it has been replayed yet, so the member holding more of it is the one that loses
+	// less on promotion.
+	// +kubebuilder:validation:MaxLength=32
+	// +optional
+	ReceivedLSN string `json:"receivedLSN,omitempty"`
+
+	// replayLSN is how far recovery has replayed.
+	// +kubebuilder:validation:MaxLength=32
+	// +optional
+	ReplayLSN string `json:"replayLSN,omitempty"`
+
 	// timeline is a first-class term in candidate selection, ordered ahead of LSN. Any
 	// member below the cluster's last known timeline is disqualified outright.
 	// +kubebuilder:validation:Minimum=0
@@ -574,6 +588,12 @@ type InstanceMemberStatus struct {
 	// member must have its receiver down before promotion may proceed.
 	// +optional
 	WALReceiverActive bool `json:"walReceiverActive,omitempty"`
+
+	// walVolumeFull refuses this member as a promotion candidate outright. A primary whose
+	// pg_wal cannot grow PANICs at its first checkpoint and takes every tenant on the
+	// instance with it, so a full WAL volume is a refusal rather than a degraded state.
+	// +optional
+	WALVolumeFull bool `json:"walVolumeFull,omitempty"`
 }
 
 // QuorumEvidence is written only by the member that is both currentPrimary and
@@ -593,11 +613,23 @@ type QuorumEvidence struct {
 	// +optional
 	NumSync int32 `json:"numSync,omitempty"`
 
-	// votingMembers is N in the R + W > N gate.
+	// votingMembers is N in the R + W > N gate. It is parsed out of the loaded clause, not
+	// out of pg_stat_replication: a member PostgreSQL never loaded as a voter is not a
+	// voter, however healthily it happens to be streaming.
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=8
 	// +optional
 	VotingMembers []string `json:"votingMembers,omitempty"`
+
+	// streamingMembers is the subset of the voters pg_stat_replication reported as actually
+	// streaming when this record was written. It carries two meanings: fewer of them than
+	// numSync means commits are stalling right now, and membership is the proof that a
+	// candidate had an active WAL receiver at detection time, since PostgreSQL counts a
+	// standby towards the quorum only while it is streaming.
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=8
+	// +optional
+	StreamingMembers []string `json:"streamingMembers,omitempty"`
 
 	// reportedBy is the member that wrote this record.
 	// +kubebuilder:validation:MaxLength=253

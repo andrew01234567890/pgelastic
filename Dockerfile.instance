@@ -20,7 +20,14 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -a -o pgelastic-instance ./cmd/instance
 
+# The durability oracle travels in the same image for the same reason the agent does: it
+# has to run inside the cluster, against the read-write Service, so that a failover moves
+# the endpoint underneath it the way it moves underneath a tenant.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -a -o pgelastic-verify ./cmd/verify
+
 FROM busybox:1.37
 COPY --from=builder /workspace/pgelastic-instance /pgelastic-instance
+COPY --from=builder /workspace/pgelastic-verify /pgelastic-verify
 USER 65532:65532
 ENTRYPOINT ["/pgelastic-instance"]

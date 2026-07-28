@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgtool"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
@@ -46,11 +47,18 @@ const observeInterval = 2 * time.Second
 // signal path.
 type Command int
 
-// CommandRestart restarts the postmaster in place, without a Pod restart. That is the
-// whole reason the postmaster is a child process rather than something the agent exec'd
-// into: a Pod restart would also restart the agent, and with it every probe the control
-// plane is using to decide what to do next.
-const CommandRestart Command = iota
+const (
+	// CommandRestart restarts the postmaster in place, without a Pod restart. That is the
+	// whole reason the postmaster is a child process rather than something the agent exec'd
+	// into: a Pod restart would also restart the agent, and with it every probe the control
+	// plane is using to decide what to do next.
+	CommandRestart Command = iota
+	// CommandFence stops the postmaster because this member must stop being the primary:
+	// it has provably lost the promotion Lease, or the operator has named somebody else. It
+	// does not restart in place - the member has to rejoin, and rejoining begins with the
+	// bootstrap path deciding between a rewind and a re-clone.
+	CommandFence
+)
 
 // Options is everything the agent was told by the Pod it is running in.
 type Options struct {
@@ -70,6 +78,8 @@ type Options struct {
 	ReplicationPassword string
 	// OpsPassword authenticates the control plane's non-superuser role.
 	OpsPassword string
+	// RewindPassword authenticates pg_rewind against the member it is rewinding from.
+	RewindPassword string
 	// Client is the agent's API server connection, used to report member status.
 	Client client.Client
 	// Timeouts bound the shutdown ladder.
@@ -85,6 +95,19 @@ type Supervisor struct {
 
 	mutex sync.RWMutex
 	state ProbeState
+	// lease is this member's hold on the promotion Lease, created on first use because a
+	// member that never becomes a primary never needs one.
+	lease *LeaseManager
+	// leaseUnverifiedSince records when renewals started failing to reach the API server.
+	// It is reported rather than acted on: failing to verify the lease is not losing it.
+	leaseUnverifiedSince time.Time
+	// promoting admits one promotion at a time, because a promotion outlives the observe
+	// tick that started it, and promotionRefusedAt paces the retries after a refusal.
+	promoting          bool
+	promotionRefusedAt time.Time
+	// promotedEpoch is the fence token this member was promoted at, which every later
+	// configuration rewrite has to keep publishing.
+	promotedEpoch int64
 	// postmasterPID is the child the reaper must never wait on.
 	postmasterPID int
 	// restartedFor records the configuration hashes an in-place restart has already been
@@ -134,6 +157,11 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		return err
 	}
 	if err := EnsureIncludes(s.options.DataDir); err != nil {
+		return err
+	}
+	// A container that restarted in place does not re-run its init containers, so the check
+	// that keeps a demoted primary from starting as a primary again has to happen here too.
+	if err := PrepareToFollow(ctx, s.options, s.tools); err != nil {
 		return err
 	}
 
@@ -199,7 +227,12 @@ func (s *Supervisor) runPostmaster(ctx context.Context, signals chan os.Signal) 
 			s.stop(context.WithoutCancel(ctx), CauseKubelet)
 			<-exited
 			return false, nil
-		case <-s.commands:
+		case command := <-s.commands:
+			if command == CommandFence {
+				s.stop(context.WithoutCancel(ctx), CauseFence)
+				<-exited
+				return false, nil
+			}
 			s.stop(ctx, CauseSwitchover)
 			<-exited
 			return true, nil
@@ -272,7 +305,16 @@ func (s *Supervisor) observe(ctx context.Context) {
 	log := logf.FromContext(ctx)
 
 	ping := s.tools.IsReady(ctx, s.options.SocketDir, provision.PostgresPort)
-	s.update(func(state *ProbeState) { state.LastPing = ping })
+	// The WAL volume is measured from the filesystem rather than from PostgreSQL so that
+	// the answer survives a postmaster that has already stopped, which is precisely the
+	// state a candidate is in when the veto has to be evaluated.
+	usage, usageErr := MeasureVolume(s.options.WALDir)
+	s.update(func(state *ProbeState) {
+		state.LastPing = ping
+		if usageErr == nil {
+			state.WALVolumeFull = usage.Full()
+		}
+	})
 	if ping != pgtool.PingOK {
 		return
 	}
@@ -291,9 +333,12 @@ func (s *Supervisor) observe(ctx context.Context) {
 		log.V(1).Info("could not observe the local postmaster", "error", err)
 		return
 	}
+	observation.WALVolumeFull = usageErr == nil && usage.Full()
 	s.update(func(state *ProbeState) {
 		state.Role = observation.Role
 		state.ReplayLag = observation.ReplayLag
+		state.Observation = observation
+		state.Observed = true
 	})
 
 	var contract *Contract
@@ -306,7 +351,10 @@ func (s *Supervisor) observe(ctx context.Context) {
 		}
 	}
 	s.requestRestartIfPending(ctx, observation)
-	s.report(ctx, observation, contract)
+	instance := s.fetchInstance(ctx)
+	s.report(ctx, observation)
+	s.publishPrimaryState(ctx, instance, observation, contract)
+	s.reconcileRole(ctx, observation, instance)
 }
 
 // requestRestartIfPending asks for one in-place restart per configuration.
@@ -334,18 +382,48 @@ func (s *Supervisor) requestRestartIfPending(ctx context.Context, observation Me
 	}
 }
 
-func (s *Supervisor) report(ctx context.Context, observation MemberObservation, contract *Contract) {
+func (s *Supervisor) report(ctx context.Context, observation MemberObservation) {
 	if s.options.Client == nil {
 		return
 	}
-	reporter := Reporter{
+	if err := s.reporter().Report(ctx, observation, true); err != nil {
+		logf.FromContext(ctx).Error(err, "could not report member status")
+	}
+}
+
+// publishPrimaryState refreshes the instance-wide record the quorum gate is evaluated
+// against. Only the member holding the role writes it, and it claims the role itself only
+// when nobody holds it - which is the bootstrap case, where the first member has to publish
+// itself so the others have something to clone from.
+func (s *Supervisor) publishPrimaryState(
+	ctx context.Context,
+	instance *pgelasticv1alpha1.PgInstance,
+	observation MemberObservation,
+	contract *Contract,
+) {
+	if s.options.Client == nil || instance == nil || observation.Role != RolePrimary {
+		return
+	}
+	if current := instance.Status.CurrentPrimary; current != "" && current != s.options.Member {
+		return
+	}
+	state := PrimaryState{
+		ClaimRole:   instance.Status.CurrentPrimary == "",
+		Epoch:       s.publishedEpoch(),
+		Observation: observation,
+		Contract:    contract,
+	}
+	if err := s.reporter().PublishPrimaryState(ctx, state); err != nil {
+		logf.FromContext(ctx).Error(err, "could not publish the primary's view of the instance")
+	}
+}
+
+func (s *Supervisor) reporter() Reporter {
+	return Reporter{
 		Client:    s.options.Client,
 		Namespace: s.options.Namespace,
 		Instance:  s.options.Instance,
 		Member:    s.options.Member,
-	}
-	if err := reporter.Report(ctx, observation, true, contract); err != nil {
-		logf.FromContext(ctx).Error(err, "could not report member status")
 	}
 }
 
@@ -356,8 +434,17 @@ func (s *Supervisor) report(ctx context.Context, observation MemberObservation, 
 // fixed "ANY 1" the growing direction is all that is exercised at bootstrap, and it is the
 // direction that matters: naming a standby that has not connected yet would block every
 // commit under dataDurability Required, bootstrap included.
+//
+// The shrinking direction is where the dangerous mistake lives. Under Required, dropping a
+// standby out of the clause the moment it stops streaming would silently convert a stalled
+// commit into an asynchronous one - the instance would keep serving writes nobody has
+// acknowledged, which is exactly the durability the setting was chosen to buy. So under
+// Required the set only ever grows.
 func (s *Supervisor) convergeSynchronousStandbys(ctx context.Context, observation MemberObservation) error {
-	desired := SynchronousStandbyNames(s.options.Config.Quorum, observation.StreamingStandbys)
+	members := s.memberNames()
+	desiredMembers := ConvergeSyncMembers(observation.VotingMembers, observation.StreamingStandbys,
+		members, s.durabilityRequired())
+	desired := SynchronousStandbyNames(s.options.Config.Quorum, desiredMembers)
 	if desired == observation.SyncStandbyNames {
 		return nil
 	}
@@ -365,7 +452,7 @@ func (s *Supervisor) convergeSynchronousStandbys(ctx context.Context, observatio
 	for _, standby := range observation.StreamingStandbys {
 		slots = append(slots, provision.ReplicationSlotName(standby))
 	}
-	replication := s.currentReplicationConfig()
+	replication := CurrentReplicationConfig(s.options.DataDir)
 	replication.SynchronousStandbyNames = desired
 	// Without synchronized_standby_slots a subscriber can consume changes a standby has
 	// not flushed. After a promotion the synced slot is then behind the subscriber, and
@@ -379,10 +466,25 @@ func (s *Supervisor) convergeSynchronousStandbys(ctx context.Context, observatio
 	return s.tools.Reload(ctx)
 }
 
+// memberNames is every member name this instance is allowed to have, which is what bounds
+// the growing quorum set: a member the operator has retired stops being a legitimate voter
+// even though the loaded clause still names it.
+func (s *Supervisor) memberNames() []string {
+	names := make([]string, 0, s.options.Config.Replicas)
+	for serial := int32(1); serial <= s.options.Config.Replicas; serial++ {
+		names = append(names, provision.MemberName(s.options.Instance, serial))
+	}
+	return names
+}
+
+func (s *Supervisor) durabilityRequired() bool {
+	return s.options.Config.DataDurability != string(pgelasticv1alpha1.DataDurabilityPreferred)
+}
+
 // writeConfig renders the configuration files, raising the five enforced parameters to the
 // floor this member's own control file reports.
 func (s *Supervisor) writeConfig(ctx context.Context, replication *pgconf.ReplicationConfig) error {
-	current := s.currentReplicationConfig()
+	current := CurrentReplicationConfig(s.options.DataDir)
 	if replication != nil {
 		current = *replication
 	}
@@ -390,27 +492,10 @@ func (s *Supervisor) writeConfig(ctx context.Context, replication *pgconf.Replic
 	if data, err := s.tools.ControlData(ctx, s.options.DataDir); err == nil {
 		controlData = &data
 	}
-	_, err := WriteConfig(s.options.Config, s.options.Member, current, s.options.DataDir, controlData)
+	config := s.options.Config
+	config.Postgres.PrimaryEpoch = s.publishedEpoch()
+	_, err := WriteConfig(config, s.options.Member, current, s.options.DataDir, controlData)
 	return err
-}
-
-// currentReplicationConfig reads back the override.conf this member is already running
-// with, so that rewriting the file for one reason does not silently discard the rest of
-// it. The file is replaced wholesale by design; that only works if the whole of it is
-// known.
-func (s *Supervisor) currentReplicationConfig() pgconf.ReplicationConfig {
-	contents, err := os.ReadFile(filepath.Join(s.options.DataDir, pgconf.OverrideConfFile))
-	if err != nil {
-		return pgconf.ReplicationConfig{}
-	}
-	values := pgconf.ParseSettings(string(contents))
-	return pgconf.ReplicationConfig{
-		PrimaryConnInfo:          values["primary_conninfo"],
-		PrimarySlotName:          values["primary_slot_name"],
-		SynchronousStandbyNames:  values["synchronous_standby_names"],
-		SynchronizedStandbySlots: values["synchronized_standby_slots"],
-		RestoreCommand:           values["restore_command"],
-	}
 }
 
 // prepareLogFIFO creates the FIFO the logging collector writes into, and starts draining

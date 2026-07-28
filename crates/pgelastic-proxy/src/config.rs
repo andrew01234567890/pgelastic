@@ -33,6 +33,8 @@ pub struct Config {
     pub routing: RoutingConfig,
     #[serde(default)]
     pub pool: PoolConfig,
+    #[serde(default)]
+    pub fence: FenceConfig,
 }
 
 impl std::str::FromStr for Config {
@@ -85,8 +87,76 @@ impl Config {
                 )));
             }
         }
+        self.fence
+            .lease
+            .validate()
+            .map_err(|e| ProxyError::config(format!("fence.lease: {e}")))?;
+        if self.fence.require_epoch && !self.fence.verify_at_checkout {
+            return Err(ProxyError::config(
+                "fence.requireEpoch needs fence.verifyAtCheckout: the epoch cannot be \
+                 required from a connection nobody asks",
+            ));
+        }
         Ok(())
     }
+}
+
+/// The primary-epoch fence.
+///
+/// The lease parameters and the fence's reaction deadline are one decision and
+/// live in one struct — see [`FenceTiming`](crate::epoch::FenceTiming).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FenceConfig {
+    #[serde(default)]
+    pub lease: crate::epoch::FenceTiming,
+    /// Read the epoch off every backend connection at checkout.
+    ///
+    /// This is the pull/verify path, and it is the only one that survives a
+    /// partition. Turning it off leaves the fence depending on reachability,
+    /// which is exactly the assumption the fence exists to remove.
+    #[serde(default = "default_true")]
+    pub verify_at_checkout: bool,
+    /// Refuse a checkout whose backend carries no `pgelastic.primary_epoch`.
+    ///
+    /// Off by default so the proxy can front a `PostgreSQL` that pgelastic did
+    /// not provision. On, a backend that cannot prove which epoch it is serving
+    /// is not handed to a client — a stalled tenant is recoverable, a write to
+    /// a demoted primary is not.
+    #[serde(default)]
+    pub require_epoch: bool,
+    /// Where the durable in-doubt log is kept. Omitted keeps it in memory, so
+    /// it does not survive a restart.
+    #[serde(default)]
+    pub in_doubt_log: Option<PathBuf>,
+    /// Listen address for the push endpoint the promoting agent calls. Omitted
+    /// means no push path.
+    #[serde(default)]
+    pub push_address: Option<String>,
+    /// The `PgInstance` whose `status.primaryEpoch` is watched. Omitted means
+    /// no watch path.
+    #[serde(default)]
+    pub watch: Option<FenceWatchConfig>,
+}
+
+impl Default for FenceConfig {
+    fn default() -> Self {
+        Self {
+            lease: crate::epoch::FenceTiming::default(),
+            verify_at_checkout: true,
+            require_epoch: false,
+            in_doubt_log: None,
+            push_address: None,
+            watch: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FenceWatchConfig {
+    pub namespace: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -438,6 +508,9 @@ impl From<ResetPolicyConfig> for pgelastic_pool::ResetPolicy {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
 fn default_backend_connections() -> u32 {
     20
 }
@@ -575,6 +648,54 @@ mod tests {
         assert_eq!(config.auth.users.len(), 2);
         assert_eq!(config.auth.users[0].password.as_deref(), Some("s3cret"));
         assert!(config.auth.users[1].verifier.is_some());
+    }
+
+    #[test]
+    fn the_fence_defaults_to_cnpgs_lease_with_the_partition_safe_path_on() {
+        let config = Config::from_str(MINIMAL).unwrap();
+        assert_eq!(config.fence.lease, crate::epoch::FenceTiming::default());
+        assert!(config.fence.verify_at_checkout);
+        assert!(!config.fence.require_epoch);
+        assert!(config.fence.push_address.is_none());
+        assert!(config.fence.watch.is_none());
+    }
+
+    #[test]
+    fn a_lease_whose_relationship_does_not_hold_is_refused_before_the_proxy_binds() {
+        let source = format!(
+            "{MINIMAL}\n[fence.lease]\n\
+             leaseDurationMs = 1000\nrenewDeadlineMs = 900\nretryPeriodMs = 800\n"
+        );
+        let error = Config::from_str(&source).unwrap_err();
+        assert!(error.to_string().contains("fence.lease"), "{error}");
+    }
+
+    #[test]
+    fn requiring_the_epoch_without_asking_any_backend_for_it_is_refused() {
+        let source = format!("{MINIMAL}\n[fence]\nrequireEpoch = true\nverifyAtCheckout = false\n");
+        let error = Config::from_str(&source).unwrap_err();
+        assert!(error.to_string().contains("requireEpoch"), "{error}");
+    }
+
+    #[test]
+    fn the_fence_reads_its_three_paths_out_of_one_table() {
+        let source = format!(
+            "{MINIMAL}\n[fence]\n\
+             requireEpoch = true\n\
+             inDoubtLog = \"/var/lib/pgelastic/in-doubt.jsonl\"\n\
+             pushAddress = \"127.0.0.1:9099\"\n\
+             \n[fence.watch]\nnamespace = \"tenants\"\nname = \"shard-a\"\n"
+        );
+        let config = Config::from_str(&source).unwrap();
+        assert!(config.fence.require_epoch);
+        assert_eq!(
+            config.fence.in_doubt_log.as_deref(),
+            Some(Path::new("/var/lib/pgelastic/in-doubt.jsonl"))
+        );
+        assert_eq!(config.fence.push_address.as_deref(), Some("127.0.0.1:9099"));
+        let watch = config.fence.watch.unwrap();
+        assert_eq!(watch.namespace, "tenants");
+        assert_eq!(watch.name, "shard-a");
     }
 
     #[test]

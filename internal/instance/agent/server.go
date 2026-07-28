@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/instance/pgtool"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 )
 
@@ -48,33 +49,56 @@ type StatusServer struct {
 // Handler builds the mux.
 func (s *StatusServer) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /startup", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("GET "+provision.StatusPathStartup, func(writer http.ResponseWriter, request *http.Request) {
 		respond(writer, StartupProbe(s.Supervisor.ProbeState()))
 	})
-	mux.HandleFunc("GET /readiness", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("GET "+provision.StatusPathReadiness, func(writer http.ResponseWriter, request *http.Request) {
 		respond(writer, ReadinessProbe(s.Supervisor.ProbeState(), s.Readiness))
 	})
-	mux.HandleFunc("GET /liveness", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("GET "+provision.StatusPathLiveness, func(writer http.ResponseWriter, request *http.Request) {
 		state := s.Supervisor.ProbeState()
 		respond(writer, LivenessProbe(state.Role, s.isolationView(request.Context(), state.Role)))
 	})
 	// The failsafe endpoint answers unconditionally. Its whole purpose is to prove that
 	// this node's network still works, so making it conditional on anything - including
 	// PostgreSQL - would defeat it.
-	mux.HandleFunc("GET /peer", func(writer http.ResponseWriter, request *http.Request) {
+	mux.HandleFunc("GET "+provision.StatusPathPeer, func(writer http.ResponseWriter, request *http.Request) {
 		respond(writer, probeOK("reachable"))
 	})
-	mux.HandleFunc("GET /status", func(writer http.ResponseWriter, request *http.Request) {
-		state := s.Supervisor.ProbeState()
+	mux.HandleFunc("GET "+provision.StatusPathStatus, func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(writer).Encode(map[string]any{
-			"member":    s.Options.Member,
-			"role":      string(state.Role),
-			"canCheck":  state.CanCheck,
-			"replayLag": state.ReplayLag.String(),
-		})
+		_ = json.NewEncoder(writer).Encode(MemberReportOf(s.Options.Member, s.Supervisor.ProbeState()))
 	})
 	return mux
+}
+
+// MemberReportOf renders the operator's view of this member from the supervisor's last
+// reading.
+//
+// Healthy is the probe state's CanCheck and Observed taken together, and not the HTTP
+// status: an agent that answers while its postmaster does not is a distinct state from an
+// agent that does not answer at all, and collapsing the two would make a member that is
+// merely starting up look identical to one that has gone.
+func MemberReportOf(member string, state ProbeState) provision.MemberReport {
+	observation := state.Observation
+	return provision.MemberReport{
+		Member:                  member,
+		Role:                    string(state.Role),
+		InRecovery:              state.Role == RoleReplica,
+		Healthy:                 state.CanCheck && state.Observed && state.LastPing == pgtool.PingOK,
+		Timeline:                observation.Timeline,
+		LSN:                     observation.LSN,
+		ReceivedLSN:             observation.ReceivedLSN,
+		ReplayLSN:               observation.ReplayLSN,
+		ReplayLagSeconds:        state.ReplayLag.Seconds(),
+		WALReceiverActive:       observation.WALReceiverActive,
+		WALVolumeFull:           state.WALVolumeFull,
+		SynchronousStandbyNames: observation.SyncStandbyNames,
+		NumSync:                 observation.NumSync,
+		VotingMembers:           observation.VotingMembers,
+		StreamingMembers:        observation.SyncStandbys,
+		PrimaryEpoch:            observation.PrimaryEpoch,
+	}
 }
 
 // Serve runs the status server until the context is cancelled.
@@ -149,7 +173,7 @@ type httpPeerChecker struct{}
 func (httpPeerChecker) Reachable(ctx context.Context, endpoint string) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, peerProbeTimeout)
 	defer cancel()
-	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+endpoint+"/peer", nil)
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+endpoint+provision.StatusPathPeer, nil)
 	if err != nil {
 		return false
 	}

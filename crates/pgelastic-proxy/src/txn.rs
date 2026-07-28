@@ -36,9 +36,10 @@ use pgelastic_wire::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::cancel::{CancelRoute, CancelTarget};
+use crate::epoch::{Epoch, FenceAction, TransactionWitness};
 use crate::error::{ProxyError, Result};
 use crate::metrics::Metrics;
 use crate::pool::{AcquireRequest, Checkout, Connector, Denial, PoolManager};
@@ -80,6 +81,12 @@ struct Running<'a> {
     reset_policy: ResetPolicy,
     /// Bytes still to come of an oversized client frame the relay is streaming.
     client_streaming: usize,
+    /// What the held link has been asked to do, so the fence can classify it
+    /// without reading the SQL a second time at the moment it fires.
+    witness: TransactionWitness,
+    /// Set once the fence has fired on a read-only transaction: the outstanding
+    /// statement is allowed to finish and nothing new is admitted.
+    draining_fence: bool,
 }
 
 /// What the client's last message asked the relay to do next.
@@ -107,6 +114,8 @@ pub async fn run(
         statements: ClientStatements::new(),
         reset_policy,
         client_streaming: 0,
+        witness: TransactionWitness::new(),
+        draining_fence: false,
         session,
     };
     running.from_client.extend_from_slice(pending_from_client);
@@ -130,6 +139,8 @@ impl Running<'_> {
                 .as_mut()
                 .reset(tokio::time::Instant::now() + force_after);
         }
+        let mut epochs = self.session.manager.fence().fence.subscribe();
+        epochs.mark_unchanged();
 
         // Bytes the handshake already buffered can complete a whole message on
         // their own, so the first pump happens before the first read.
@@ -145,6 +156,9 @@ impl Running<'_> {
             let event = tokio::select! {
                 biased;
                 _ = shutdown.changed(), if !draining => Event::Drain,
+                // Ahead of every read: an epoch that has already moved must
+                // reach the policy before another client byte is forwarded.
+                _ = epochs.changed() => Event::EpochChanged,
                 () = &mut deadline, if draining => Event::Deadline,
                 read = self.session.client.read_buf(self.from_client.read_target()) => {
                     Event::FromClient(read)
@@ -155,6 +169,7 @@ impl Running<'_> {
             };
 
             match event {
+                Event::EpochChanged => self.on_epoch_change()?,
                 Event::Drain => {
                     draining = true;
                     deadline
@@ -191,6 +206,112 @@ impl Running<'_> {
             && self.from_client.at_frame_boundary()
             && self.to_client.is_empty()
             && self.to_backend.is_empty()
+    }
+
+    // ---- the primary-epoch fence ----------------------------------------
+
+    /// The epoch this session's backend was opened under, against the highest
+    /// the proxy has ever seen.
+    fn superseded(&self) -> bool {
+        let current = self.session.manager.fence().current();
+        self.checkout
+            .as_ref()
+            .is_some_and(|checkout| checkout.conn.epoch < current)
+    }
+
+    fn on_epoch_change(&mut self) -> Result<()> {
+        if self.superseded() {
+            self.apply_fence()?;
+        }
+        Ok(())
+    }
+
+    /// Applies the in-flight transaction policy to the held link.
+    ///
+    /// The matrix lives in `epoch::policy` and is not re-derived here. What
+    /// this does is carry out the verdict: `Ok(())` means the session may go
+    /// on — either because the link was released without loss or because a
+    /// read is being allowed to finish — and an error means the session is over
+    /// and the client is being told which kind of over it is.
+    fn apply_fence(&mut self) -> Result<()> {
+        let Some(checkout) = self.checkout.as_ref() else {
+            return Ok(());
+        };
+        let opened_under = checkout.conn.epoch;
+        let current = self.session.manager.fence().current();
+        let status = checkout
+            .conn
+            .link
+            .tx_status()
+            .unwrap_or(TransactionStatus::Idle);
+        let state = self.witness.state(status);
+        let action = crate::epoch::action(state);
+        debug!(
+            %opened_under,
+            %current,
+            ?state,
+            ?action,
+            "the primary epoch moved under a held backend"
+        );
+
+        match action {
+            // Nothing is outstanding. A pinned link carries session state that
+            // died with the primary, so its client has to be told; an unpinned
+            // one is simply given back and the client's next statement lands on
+            // a backend that has been verified against the new epoch.
+            FenceAction::Close => {
+                let pinned = checkout.conn.link.pin().is_some();
+                let checkout = self.checkout.take().expect("just observed");
+                self.session.route.set(None);
+                self.session.manager.sever(checkout, action);
+                self.session.manager.publish_budget();
+                if pinned {
+                    return Err(superseded_error(opened_under, current));
+                }
+                Ok(())
+            }
+            // A read cannot cause split brain, so killing it would fail a query
+            // that was going to be correct. Nothing new is admitted from here.
+            FenceAction::DrainThenClose => {
+                self.draining_fence = true;
+                Ok(())
+            }
+            FenceAction::ResetNow => {
+                let checkout = self.checkout.take().expect("just observed");
+                self.session.route.set(None);
+                self.session.manager.sever(checkout, action);
+                self.session.manager.publish_budget();
+                Err(superseded_error(opened_under, current))
+            }
+            FenceAction::ReportUnknown => {
+                let key = checkout
+                    .conn
+                    .in_doubt_key(self.session.tenant.as_str(), opened_under);
+                let fence = self.session.manager.fence().fence.clone();
+                fence
+                    .in_doubt()
+                    .record(key.clone(), self.witness.pending_sql());
+                self.session.metrics.in_doubt(fence.in_doubt().len());
+                warn!(
+                    %key,
+                    "a commit was forwarded and its outcome was never observed; \
+                     it is neither reported as committed nor as rolled back"
+                );
+
+                let checkout = self.checkout.take().expect("just observed");
+                self.session.route.set(None);
+                self.session.manager.sever(checkout, action);
+                self.session.manager.publish_budget();
+                Err(ProxyError::OutcomeUnknown {
+                    message: format!(
+                        "the outcome of this transaction is UNKNOWN: its commit was forwarded to \
+                         a backend serving primary epoch {opened_under}, the cluster reached \
+                         {current} before the commit was answered, and the proxy did not observe \
+                         whether it took effect. Do not retry. Recorded as {key}"
+                    ),
+                })
+            }
+        }
     }
 
     // ---- the client leg ------------------------------------------------
@@ -236,6 +357,9 @@ impl Running<'_> {
     /// Forwarding an unrewritten `Bind` would put one client's statement name on
     /// a shared link.
     async fn on_client_opaque(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.superseded() {
+            self.apply_fence()?;
+        }
         self.ensure_backend().await?;
         if self.client_streaming == 0 {
             let tag = bytes[0];
@@ -259,6 +383,23 @@ impl Running<'_> {
     }
 
     async fn on_frontend(&mut self, message: FrontendMessage) -> Result<()> {
+        // The write admission gate. Nothing reaches the backend on a superseded
+        // epoch — not a `Query`, not a `Parse`, not a `Bind`, not an `Execute`
+        // — and the check happens before the message is looked at rather than
+        // per message kind, so a message kind added later cannot slip past it.
+        if self.superseded() {
+            self.apply_fence()?;
+        }
+        if self.draining_fence {
+            let current = self.session.manager.fence().current();
+            let opened_under = self
+                .checkout
+                .as_ref()
+                .map_or(current, |checkout| checkout.conn.epoch);
+            self.finish_fence_drain(FenceAction::DrainThenClose);
+            return Err(superseded_error(opened_under, current));
+        }
+
         if matches!(message, FrontendMessage::Flush) {
             // Draws no response and retires no request, so it never needs a
             // backend of its own — but it does need one to be sent to.
@@ -419,6 +560,10 @@ impl Running<'_> {
         let faked = matches!(relay, Relay::Fake(_));
         checkout.conn.link.observe_frontend(message, relay);
         if !faked {
+            // Only what actually goes out: a request the pool answers from its
+            // own cache executes nothing, so it can be neither a write nor an
+            // undecidable commit.
+            self.witness.observe_frontend(message);
             message.encode(&mut self.to_backend);
         }
         for response in checkout.conn.link.take_ready_fakes() {
@@ -457,6 +602,7 @@ impl Running<'_> {
                         }
                     }
                     if reaction.disposition.forwards() {
+                        self.witness.observe_backend(&message);
                         put_frame(&mut self.to_client, &frame);
                     }
                     for response in checkout.conn.link.take_ready_fakes() {
@@ -470,6 +616,18 @@ impl Running<'_> {
         }
 
         self.flush().await?;
+        // The read the fence was waiting on has been delivered. It could not
+        // have caused split brain, the client has its answer, and now the
+        // socket goes.
+        if saw_ready && self.draining_fence && self.at_backend_frame_boundary() {
+            let current = self.session.manager.fence().current();
+            let opened_under = self
+                .checkout
+                .as_ref()
+                .map_or(current, |checkout| checkout.conn.epoch);
+            self.finish_fence_drain(FenceAction::DrainThenClose);
+            return Err(superseded_error(opened_under, current));
+        }
         // Only once the whole read has been drained: a release taken with bytes
         // still buffered would run the reset ladder over the tail of the
         // client's own answer.
@@ -477,6 +635,15 @@ impl Running<'_> {
             self.try_release().await?;
         }
         Ok(())
+    }
+
+    fn finish_fence_drain(&mut self, action: FenceAction) {
+        self.draining_fence = false;
+        if let Some(checkout) = self.checkout.take() {
+            self.session.route.set(None);
+            self.session.manager.sever(checkout, action);
+            self.session.manager.publish_budget();
+        }
     }
 
     fn at_backend_frame_boundary(&self) -> bool {
@@ -872,6 +1039,7 @@ impl Running<'_> {
 enum Event {
     Drain,
     Deadline,
+    EpochChanged,
     FromClient(std::io::Result<usize>),
     FromBackend(std::io::Result<usize>),
 }
@@ -887,6 +1055,22 @@ async fn read_backend(checkout: &mut Option<Checkout>) -> std::io::Result<usize>
         .stream
         .read_buf(checkout.conn.relay.read_target())
         .await
+}
+
+/// The refusal a client gets when its connection was on a superseded epoch.
+///
+/// A definite failure: nothing further was forwarded, so the transaction is
+/// aborted and a retry on a fresh connection is safe. That is precisely what
+/// separates it from [`ProxyError::OutcomeUnknown`], which is not a failure at
+/// all.
+fn superseded_error(opened_under: Epoch, current: Epoch) -> ProxyError {
+    ProxyError::SupersededEpoch {
+        message: format!(
+            "this connection was serving primary epoch {opened_under} and the cluster has \
+             reached {current}; the transaction was aborted rather than committed to a \
+             primary that is about to be rewound. Reconnect and retry"
+        ),
+    }
 }
 
 fn admission_error(denial: Denial) -> ProxyError {

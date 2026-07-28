@@ -25,9 +25,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -52,6 +55,7 @@ const usage = `pgelastic-instance — the pgelastic instance manager
   initdb       create a new data directory with every flag pinned
   join         clone this member from the current primary
   promote      promote this member out of recovery
+  status       print what this member's own status endpoint reports about it
   wal-archive  archive one WAL segment (archive_command)
   wal-restore  restore one WAL segment (restore_command)
 `
@@ -90,6 +94,8 @@ func run(args []string) int {
 		err = runBootstrap(ctx)
 	case "promote":
 		err = runPromote(ctx)
+	case "status":
+		err = runStatus(ctx, os.Stdout)
 	case "wal-archive":
 		err = runWALArchive(ctx, args[1:])
 	case "wal-restore":
@@ -138,6 +144,7 @@ func options(ctx context.Context, needClient bool) (agent.Options, error) {
 		PeerService:         envOr(provision.EnvPeerService, config.PeerService),
 		ReplicationPassword: os.Getenv(provision.EnvReplPassword),
 		OpsPassword:         os.Getenv(provision.EnvOpsPassword),
+		RewindPassword:      os.Getenv(provision.EnvRewindPassword),
 		Timeouts:            agent.DefaultStopTimeouts(),
 	}
 	if built.Member == "" {
@@ -192,12 +199,39 @@ func runBootstrap(ctx context.Context) error {
 	return agent.Bootstrap(ctx, built)
 }
 
+// runPromote runs the whole gated promotion sequence, never the local half on its own.
+// There is deliberately no way to reach pg_ctl promote from the command line without the
+// Lease and the quorum gate: a promotion that can be triggered locally is a promotion that
+// can happen without the evidence that makes it safe.
 func runPromote(ctx context.Context) error {
 	built, err := options(ctx, true)
 	if err != nil {
 		return err
 	}
-	return agent.Promote(ctx, built)
+	_, err = agent.Promote(ctx, built)
+	return err
+}
+
+// runStatus prints this member's own report, read from the status server over the pod's
+// loopback address.
+//
+// It exists because "what does this member think it is" is the first question asked when a
+// failover has not happened, and the PostgreSQL image carries no HTTP client to ask with.
+// Going through the status server rather than opening a database connection is deliberate:
+// the answer has to be available precisely when PostgreSQL is not.
+func runStatus(ctx context.Context, out io.Writer) error {
+	built, err := options(ctx, false)
+	if err != nil {
+		return err
+	}
+	report, err := provision.FetchMemberReport(ctx,
+		net.JoinHostPort("127.0.0.1", strconv.Itoa(int(built.StatusPort))))
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(out)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(report)
 }
 
 // runWALArchive is archive_command. It is a subcommand of the same binary so that the

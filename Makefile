@@ -95,20 +95,33 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 	$(MAKE) cleanup-test-e2e
 
 # The instance e2e provisions a real three-node PostgreSQL 18 instance and asserts on what
-# PostgreSQL reports, not on what the operator believes. It needs a Kind cluster with the
-# CRDs installed; E2E_KIND_CLUSTER defaults to the repo's development cluster.
+# PostgreSQL reports, not on what the operator believes.
+#
+# E2E_CONTEXT selects the cluster. docker-desktop is the default because it shares the
+# local Docker daemon, so a locally built image is already present on the node and the
+# load step is a no-op; it is also visible in the Docker Desktop UI. Kind needs an
+# explicit `kind load` because its nodes run their own containerd.
+E2E_CONTEXT ?= docker-desktop
 E2E_KIND_CLUSTER ?= pgelastic-dev
-E2E_TIMEOUT ?= 30m
+E2E_TIMEOUT ?= 60m
 
 .PHONY: test-e2e-instance
-test-e2e-instance: manifests generate install kind-load-instance-images ## Provision a real 3-node PostgreSQL 18 instance in Kind and assert on it.
-	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) \
+test-e2e-instance: manifests generate install-e2e load-instance-images ## Provision a real 3-node PostgreSQL 18 instance and assert on it.
+	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
 	go test -tags=e2e ./test/e2e/instance/ -v -ginkgo.v -timeout $(E2E_TIMEOUT)
 
-.PHONY: kind-load-instance-images
-kind-load-instance-images: docker-build-instance docker-build-postgres ## Load the instance and Postgres images into Kind.
-	$(KIND) load docker-image $(INSTANCE_IMG) --name $(E2E_KIND_CLUSTER)
-	$(KIND) load docker-image $(PG_IMG) --name $(E2E_KIND_CLUSTER)
+.PHONY: install-e2e
+install-e2e: manifests kustomize ## Install CRDs into E2E_CONTEXT.
+	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
+	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" --context=$(E2E_CONTEXT) apply --server-side --force-conflicts -f -; fi
+
+.PHONY: load-instance-images
+load-instance-images: docker-build-instance docker-build-postgres ## Make the images reachable from E2E_CONTEXT.
+	@case "$(E2E_CONTEXT)" in \
+	  kind-*) "$(KIND)" load docker-image $(INSTANCE_IMG) --name $${E2E_CONTEXT#kind-}; \
+	          "$(KIND)" load docker-image $(PG_IMG) --name $${E2E_CONTEXT#kind-} ;; \
+	  *) echo "$(E2E_CONTEXT) shares the local Docker daemon; images already reachable" ;; \
+	esac
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests

@@ -130,10 +130,14 @@ type BaseBackupOptions struct {
 	Host string
 	Port int32
 	User string
-	// SlotName is the persistent slot the standby will keep streaming from. It is created
-	// as part of the backup so that the WAL the clone needs cannot be recycled between
-	// the backup finishing and the standby connecting.
+	// SlotName is the persistent slot the standby will keep streaming from.
 	SlotName string
+	// CreateSlot asks pg_basebackup to create the slot as part of the backup, so the WAL
+	// the clone needs cannot be recycled between the backup finishing and the standby
+	// connecting. It is false when the slot already exists - which it does after a
+	// promotion, because the new primary creates one for every other member before it
+	// accepts writes - and pg_basebackup refuses to create a slot that is already there.
+	CreateSlot bool
 }
 
 // BaseBackup clones a replica.
@@ -143,12 +147,16 @@ type BaseBackupOptions struct {
 // product exists to keep responsive. -X stream takes the WAL concurrently, and note that
 // --max-rate would throttle only the data transfer and not that concurrent stream.
 func (t Toolchain) BaseBackup(ctx context.Context, options BaseBackupOptions) error {
-	return t.Run(ctx, "pg_basebackup",
+	arguments := []string{
 		"--pgdata", t.DataDir,
 		"--waldir", t.WALDir,
 		"--wal-method", "stream",
-		"--create-slot",
 		"--slot", options.SlotName,
+	}
+	if options.CreateSlot {
+		arguments = append(arguments, "--create-slot")
+	}
+	arguments = append(arguments,
 		"--host", options.Host,
 		"--port", strconv.Itoa(int(options.Port)),
 		"--username", options.User,
@@ -156,6 +164,7 @@ func (t Toolchain) BaseBackup(ctx context.Context, options BaseBackupOptions) er
 		"--progress",
 		"--verbose",
 	)
+	return t.Run(ctx, "pg_basebackup", arguments...)
 }
 
 // StopMode is the shutdown mode passed to pg_ctl.
@@ -235,4 +244,24 @@ func (t Toolchain) IsReady(ctx context.Context, socketDir string, port int32) Pi
 func DataDirectoryInitialised(dataDir string) bool {
 	_, err := os.Stat(filepath.Join(dataDir, "global", "pg_control"))
 	return err == nil
+}
+
+// Rewind rewinds a diverged data directory back to its common ancestor with the source.
+//
+// The target must have been shut down cleanly first - pg_rewind refuses otherwise, and
+// EnsureCleanShutdown exists for exactly that. --progress goes to stderr, which the agent
+// folds into the pod log so a rewind that is merely slow can be told apart from one that
+// has hung.
+func (t Toolchain) Rewind(ctx context.Context, sourceConnInfo string) error {
+	return t.Run(ctx, "pg_rewind",
+		"--target-pgdata", t.DataDir,
+		"--source-server", sourceConnInfo,
+		"--progress",
+	)
+}
+
+// ClusterStateShutDown reports whether a control file says the cluster stopped cleanly, in
+// either of the two states pg_rewind accepts.
+func ClusterStateShutDown(state string) bool {
+	return state == "shut down" || state == "shut down in recovery"
 }

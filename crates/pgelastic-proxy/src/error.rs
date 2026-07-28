@@ -18,6 +18,19 @@ pub mod sqlstate {
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
     /// `57P01 admin_shutdown`
     pub const ADMIN_SHUTDOWN: &str = "57P01";
+    /// `40003 statement_completion_unknown`
+    ///
+    /// The commit was forwarded and its completion was never observed. The
+    /// standard says what pgelastic needs it to say: the outcome is unknown. A
+    /// client SDK must treat it as `UNKNOWN` and must not retry.
+    pub const STATEMENT_COMPLETION_UNKNOWN: &str = "40003";
+    /// `25006 read_only_sql_transaction`
+    ///
+    /// Raised when a write is refused *before* being forwarded because the
+    /// backend it would have gone to is on a superseded primary epoch. Unlike
+    /// [`STATEMENT_COMPLETION_UNKNOWN`] this is a definite failure: nothing
+    /// reached the server, so retrying on a fresh connection is safe.
+    pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
 
     /// Puts a SQLSTATE that has been through an owned `String` back on the
     /// static set.
@@ -33,9 +46,30 @@ pub mod sqlstate {
             PROTOCOL_VIOLATION => PROTOCOL_VIOLATION,
             TOO_MANY_CONNECTIONS => TOO_MANY_CONNECTIONS,
             ADMIN_SHUTDOWN => ADMIN_SHUTDOWN,
+            STATEMENT_COMPLETION_UNKNOWN => STATEMENT_COMPLETION_UNKNOWN,
+            READ_ONLY_SQL_TRANSACTION => READ_ONLY_SQL_TRANSACTION,
             _ => CONNECTION_FAILURE,
         }
     }
+}
+
+/// The two codes the primary-epoch fence raises on its own behalf.
+///
+/// They lead the message text, exactly as the capacity taxonomy's do, so a
+/// client that cannot read SQLSTATE still has a stable token to match on. The
+/// difference between them is the whole point of the fence's asymmetry: one is
+/// a definite failure, the other is not an outcome at all.
+pub mod fence_code {
+    /// The outcome of a forwarded commit was never observed.
+    ///
+    /// **Never a failure and never a success.** A client SDK must surface it as
+    /// `UNKNOWN` and must not retry: the transaction may have committed on a
+    /// primary that is about to be rewound, or it may not have.
+    pub const OUTCOME_UNKNOWN: &str = "PGE4003";
+    /// A write was refused before it was forwarded, because the connection it
+    /// would have used is on a superseded primary epoch. Definitely not
+    /// applied, so it is safe to retry.
+    pub const SUPERSEDED_EPOCH: &str = "PGE2506";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +130,21 @@ pub enum ProxyError {
         sqlstate: &'static str,
         message: String,
     },
+
+    /// The outcome of a commit the proxy forwarded was never observed, because
+    /// the primary epoch changed underneath it.
+    ///
+    /// Deliberately its own variant rather than an `Admission` with a different
+    /// code: everything that handles a `ProxyError` has to be unable to
+    /// accidentally treat this as a refusal. The transaction is recorded in the
+    /// durable in-doubt log before this is constructed.
+    #[error("{}: {message}", fence_code::OUTCOME_UNKNOWN)]
+    OutcomeUnknown { message: String },
+
+    /// A write was refused before being forwarded because its backend is on a
+    /// superseded primary epoch.
+    #[error("{}: {message}", fence_code::SUPERSEDED_EPOCH)]
+    SupersededEpoch { message: String },
 }
 
 impl ProxyError {
@@ -115,6 +164,8 @@ impl ProxyError {
     pub fn sqlstate(&self) -> &'static str {
         match self {
             Self::Admission { sqlstate, .. } => sqlstate,
+            Self::OutcomeUnknown { .. } => sqlstate::STATEMENT_COMPLETION_UNKNOWN,
+            Self::SupersededEpoch { .. } => sqlstate::READ_ONLY_SQL_TRANSACTION,
             Self::AuthenticationFailed => sqlstate::INVALID_PASSWORD,
             Self::ConnectionLimit => sqlstate::TOO_MANY_CONNECTIONS,
             Self::ShuttingDown => sqlstate::ADMIN_SHUTDOWN,

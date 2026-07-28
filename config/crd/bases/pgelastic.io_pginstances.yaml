@@ -732,6 +732,19 @@ spec:
                       maxLength: 253
                       minLength: 1
                       type: string
+                    receivedLSN:
+                      description: |-
+                        receivedLSN is how far this member's WAL receiver has written, and replayLSN how far
+                        recovery has replayed. They are separate fields because candidate selection orders on
+                        both, received first: WAL that has been received is durable on this member whether or
+                        not it has been replayed yet, so the member holding more of it is the one that loses
+                        less on promotion.
+                      maxLength: 32
+                      type: string
+                    replayLSN:
+                      description: replayLSN is how far recovery has replayed.
+                      maxLength: 32
+                      type: string
                     role:
                       default: unknown
                       description: |-
@@ -755,6 +768,12 @@ spec:
                         walReceiverActive is checked at two distinct instants with two distinct meanings: a
                         candidate must have had an active receiver when the failure was detected, and every
                         member must have its receiver down before promotion may proceed.
+                      type: boolean
+                    walVolumeFull:
+                      description: |-
+                        walVolumeFull refuses this member as a promotion candidate outright. A primary whose
+                        pg_wal cannot grow PANICs at its first checkpoint and takes every tenant on the
+                        instance with it, so a full WAL volume is a refusal rather than a degraded state.
                       type: boolean
                   required:
                   - name
@@ -878,12 +897,27 @@ spec:
                     description: reportedBy is the member that wrote this record.
                     maxLength: 253
                     type: string
+                  streamingMembers:
+                    description: |-
+                      streamingMembers is the subset of the voters pg_stat_replication reported as actually
+                      streaming when this record was written. It carries two meanings: fewer of them than
+                      numSync means commits are stalling right now, and membership is the proof that a
+                      candidate had an active WAL receiver at detection time, since PostgreSQL counts a
+                      standby towards the quorum only while it is streaming.
+                    items:
+                      type: string
+                    maxItems: 8
+                    type: array
+                    x-kubernetes-list-type: atomic
                   synchronousStandbyNames:
                     description: synchronousStandbyNames is the loaded value, verbatim.
                     maxLength: 1024
                     type: string
                   votingMembers:
-                    description: votingMembers is N in the R + W > N gate.
+                    description: |-
+                      votingMembers is N in the R + W > N gate. It is parsed out of the loaded clause, not
+                      out of pg_stat_replication: a member PostgreSQL never loaded as a voter is not a
+                      voter, however healthily it happens to be streaming.
                     items:
                       type: string
                     maxItems: 8

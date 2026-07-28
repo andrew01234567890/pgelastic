@@ -79,7 +79,49 @@ pub struct Limits {
     pub max_frame_bytes: usize,
 }
 
-/// Relays until one side closes or a drain completes.
+/// The primary-epoch fence as a bound session sees it.
+///
+/// Session mode never goes through the pool manager, so the sweep that severs
+/// parked links cannot reach this connection: without this it would be the one
+/// place in the proxy where a demoted primary keeps serving writes. Replication
+/// connections are forced into session mode, which makes it the *last* place
+/// that may be left unfenced.
+#[derive(Debug)]
+pub struct Fenced<'a> {
+    pub runtime: &'a crate::epoch::FenceRuntime,
+    /// The epoch this backend proved it was serving when it was opened.
+    pub opened_under: crate::epoch::Epoch,
+    pub tenant: String,
+    pub backend_pid: Option<i32>,
+    pub lsn: Option<String>,
+}
+
+impl Fenced<'_> {
+    fn superseded(&self) -> bool {
+        self.opened_under < self.runtime.current()
+    }
+
+    fn key(&self) -> crate::epoch::InDoubtKey {
+        crate::epoch::InDoubtKey::new(
+            self.tenant.clone(),
+            self.opened_under,
+            self.backend_pid,
+            self.lsn.clone(),
+        )
+    }
+}
+
+/// Everything a bound session needs that is not one of its two sockets.
+#[derive(Debug)]
+pub struct Context<'a> {
+    pub pending: Pending<'a>,
+    pub limits: Limits,
+    pub metrics: &'a Arc<Metrics>,
+    pub force_after: Duration,
+    pub fence: &'a Fenced<'a>,
+}
+
+/// Relays until one side closes, a drain completes, or the primary epoch moves.
 ///
 /// # Cancel safety
 ///
@@ -92,22 +134,21 @@ pub struct Limits {
 pub async fn run(
     client: &mut ClientStream,
     backend: &mut BackendStream,
-    pending: Pending<'_>,
-    limits: Limits,
-    metrics: &Arc<Metrics>,
+    context: Context<'_>,
     shutdown: &mut watch::Receiver<bool>,
-    force_after: Duration,
 ) -> Result<Ending> {
-    let mut to_backend = FrameRelay::new(limits.inline_frame_bytes, limits.max_frame_bytes);
-    let mut to_client = FrameRelay::new(limits.inline_frame_bytes, limits.max_frame_bytes);
-    to_backend.extend_from_slice(pending.from_client);
-    to_client.extend_from_slice(pending.from_backend);
+    let Context {
+        pending,
+        limits,
+        metrics,
+        force_after,
+        fence,
+    } = context;
 
-    let mut boundary = Boundary::new();
-    if !pending.from_client.is_empty() {
-        boundary.saw_client_bytes();
-    }
+    let mut state = State::new(limits, pending);
     let mut draining = *shutdown.borrow_and_update();
+    let mut epochs = fence.runtime.fence.subscribe();
+    let mut draining_fence = false;
 
     let deadline = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(deadline);
@@ -118,17 +159,19 @@ pub async fn run(
     }
 
     // Bytes the handshake already buffered can complete a frame on their own.
-    let mut wrote = pump(&mut to_backend, backend, |_| {}).await?;
-    metrics.relayed_to_backend(wrote);
-    wrote = pump(&mut to_client, client, |frame| {
-        boundary.saw_backend_frame(frame);
-    })
-    .await?;
-    metrics.relayed_to_client(wrote);
+    state.flush_to_backend(backend, metrics).await?;
+    state.flush_to_client(client, metrics).await?;
 
     loop {
-        if draining && boundary.is_closable(&to_backend, &to_client) {
-            return Ok(Ending::Drained);
+        if state.is_closable() {
+            if draining {
+                return Ok(Ending::Drained);
+            }
+            // The read the fence was waiting on has been delivered; now the
+            // socket goes.
+            if draining_fence {
+                return Err(drained_fence(backend, fence, metrics, &state.witness));
+            }
         }
 
         // Nothing in a branch handler touches a relay: the read futures hold
@@ -137,12 +180,20 @@ pub async fn run(
         let event = tokio::select! {
             biased;
             _ = shutdown.changed(), if !draining => Event::Drain,
+            _ = epochs.changed() => Event::EpochChanged,
             () = &mut deadline, if draining => Event::Deadline,
-            read = client.read_buf(to_backend.read_target()) => Event::FromClient(read),
-            read = backend.read_buf(to_client.read_target()) => Event::FromBackend(read),
+            read = client.read_buf(state.to_backend.read_target()) => Event::FromClient(read),
+            read = backend.read_buf(state.to_client.read_target()) => Event::FromBackend(read),
         };
 
         match event {
+            Event::EpochChanged => {
+                if let Some(error) =
+                    apply_fence(backend, fence, metrics, &state.witness, &mut draining_fence)
+                {
+                    return Err(error);
+                }
+            }
             // The watch only ever moves false -> true, and a dropped sender
             // means the supervisor is gone, which is also a reason to drain.
             Event::Drain => {
@@ -156,21 +207,191 @@ pub async fn run(
                 if read? == 0 {
                     return Ok(Ending::PeerClosed);
                 }
-                boundary.saw_client_bytes();
-                let bytes = pump(&mut to_backend, backend, |_| {}).await?;
-                metrics.relayed_to_backend(bytes);
+                // The write admission gate: nothing the client sent may reach a
+                // backend on a superseded epoch.
+                if let Some(error) =
+                    apply_fence(backend, fence, metrics, &state.witness, &mut draining_fence)
+                {
+                    return Err(error);
+                }
+                if draining_fence {
+                    return Err(drained_fence(backend, fence, metrics, &state.witness));
+                }
+                state.boundary.saw_client_bytes();
+                state.flush_to_backend(backend, metrics).await?;
             }
             Event::FromBackend(read) => {
                 if read? == 0 {
                     return Ok(Ending::PeerClosed);
                 }
-                let bytes = pump(&mut to_client, client, |frame| {
-                    boundary.saw_backend_frame(frame);
-                })
-                .await?;
-                metrics.relayed_to_client(bytes);
+                state.flush_to_client(client, metrics).await?;
             }
         }
+    }
+}
+
+/// The two relays, the drain boundary and the fence's witness.
+///
+/// One struct because all four are advanced by the same two operations, and a
+/// relay pumped without its witness being fed is a session the fence would
+/// mis-classify.
+#[derive(Debug)]
+struct State {
+    to_backend: FrameRelay,
+    to_client: FrameRelay,
+    boundary: Boundary,
+    witness: crate::epoch::TransactionWitness,
+}
+
+impl State {
+    fn new(limits: Limits, pending: Pending<'_>) -> Self {
+        let mut to_backend = FrameRelay::new(limits.inline_frame_bytes, limits.max_frame_bytes);
+        let mut to_client = FrameRelay::new(limits.inline_frame_bytes, limits.max_frame_bytes);
+        to_backend.extend_from_slice(pending.from_client);
+        to_client.extend_from_slice(pending.from_backend);
+        let mut boundary = Boundary::new();
+        if !pending.from_client.is_empty() {
+            boundary.saw_client_bytes();
+        }
+        Self {
+            to_backend,
+            to_client,
+            boundary,
+            witness: crate::epoch::TransactionWitness::new(),
+        }
+    }
+
+    fn is_closable(&self) -> bool {
+        self.boundary.is_closable(&self.to_backend, &self.to_client)
+    }
+
+    async fn flush_to_backend(
+        &mut self,
+        backend: &mut BackendStream,
+        metrics: &Arc<Metrics>,
+    ) -> Result<()> {
+        let witness = &mut self.witness;
+        let bytes = pump(&mut self.to_backend, backend, |frame| {
+            observe_frontend(witness, frame);
+        })
+        .await?;
+        metrics.relayed_to_backend(bytes);
+        Ok(())
+    }
+
+    async fn flush_to_client(
+        &mut self,
+        client: &mut ClientStream,
+        metrics: &Arc<Metrics>,
+    ) -> Result<()> {
+        let witness = &mut self.witness;
+        let boundary = &mut self.boundary;
+        let bytes = pump(&mut self.to_client, client, |frame| {
+            boundary.saw_backend_frame(frame);
+            observe_backend(witness, frame);
+        })
+        .await?;
+        metrics.relayed_to_client(bytes);
+        Ok(())
+    }
+}
+
+fn drained_fence(
+    backend: &BackendStream,
+    fence: &Fenced<'_>,
+    metrics: &Arc<Metrics>,
+    witness: &crate::epoch::TransactionWitness,
+) -> crate::error::ProxyError {
+    sever(
+        backend,
+        fence,
+        metrics,
+        crate::epoch::FenceAction::DrainThenClose,
+        witness,
+    )
+}
+
+/// Feeds the witness a frame on its way to the backend.
+///
+/// A frame that will not decode is left to the witness's own conservative
+/// default rather than being skipped: the alternative is to conclude a session
+/// is idle because the proxy could not read what it just forwarded.
+fn observe_frontend(witness: &mut crate::epoch::TransactionWitness, frame: &RawFrame) {
+    if let Ok(message) =
+        pgelastic_wire::FrontendMessage::decode(frame, pgelastic_wire::AuthState::Password)
+    {
+        witness.observe_frontend(&message);
+    }
+}
+
+fn observe_backend(witness: &mut crate::epoch::TransactionWitness, frame: &RawFrame) {
+    if let Ok(message) = pgelastic_wire::BackendMessage::decode(frame) {
+        witness.observe_backend(&message);
+    }
+}
+
+/// Carries out the in-flight policy on a bound session.
+///
+/// Returns `None` only for the read-only row, which is allowed to finish; every
+/// other row ends the session, and `draining_fence` records which case is
+/// still owed an answer.
+fn apply_fence(
+    backend: &BackendStream,
+    fence: &Fenced<'_>,
+    metrics: &Arc<Metrics>,
+    witness: &crate::epoch::TransactionWitness,
+    draining_fence: &mut bool,
+) -> Option<crate::error::ProxyError> {
+    if !fence.superseded() {
+        return None;
+    }
+    let state = witness.state(TransactionStatus::Idle);
+    let action = crate::epoch::action(state);
+    if action == crate::epoch::FenceAction::DrainThenClose {
+        *draining_fence = true;
+        return None;
+    }
+    Some(sever(backend, fence, metrics, action, witness))
+}
+
+/// Arms the backend socket for an RST and builds the error the client is given.
+fn sever(
+    backend: &BackendStream,
+    fence: &Fenced<'_>,
+    metrics: &Arc<Metrics>,
+    action: crate::epoch::FenceAction,
+    witness: &crate::epoch::TransactionWitness,
+) -> crate::error::ProxyError {
+    backend.arm_reset();
+    metrics.backend_severed(action);
+
+    let opened_under = fence.opened_under;
+    let current = fence.runtime.current();
+    if action != crate::epoch::FenceAction::ReportUnknown {
+        return crate::error::ProxyError::SupersededEpoch {
+            message: format!(
+                "this connection was serving primary epoch {opened_under} and the cluster has \
+                 reached {current}; it was severed rather than left writing to a primary that \
+                 is about to be rewound. Reconnect and retry"
+            ),
+        };
+    }
+
+    let key = fence.key();
+    let log = fence.runtime.fence.in_doubt();
+    log.record(key.clone(), witness.pending_sql());
+    metrics.in_doubt(log.len());
+    tracing::warn!(
+        %key,
+        "a commit was forwarded on a bound session and its outcome was never observed"
+    );
+    crate::error::ProxyError::OutcomeUnknown {
+        message: format!(
+            "the outcome of this transaction is UNKNOWN: its commit was forwarded to a backend \
+             serving primary epoch {opened_under}, the cluster reached {current} before the \
+             commit was answered, and the proxy did not observe whether it took effect. \
+             Do not retry. Recorded as {key}"
+        ),
     }
 }
 
@@ -178,6 +399,7 @@ pub async fn run(
 enum Event {
     Drain,
     Deadline,
+    EpochChanged,
     FromClient(std::io::Result<usize>),
     FromBackend(std::io::Result<usize>),
 }

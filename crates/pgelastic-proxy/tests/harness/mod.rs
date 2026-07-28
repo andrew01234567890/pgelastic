@@ -126,6 +126,17 @@ impl Postgres {
 /// the script runs as the `postgres` user, so the key ends up owned by the user
 /// the server runs as, which is the only ownership `PostgreSQL` accepts.
 pub async fn start_postgres() -> Postgres {
+    start_postgres_with("").await
+}
+
+/// As [`start_postgres`], with `extra_conf` appended to `postgresql.conf`.
+///
+/// How the epoch tests bind `pgelastic.primary_epoch` into a postmaster: a
+/// dotted parameter name is a *placeholder* GUC, so `PostgreSQL` accepts it
+/// from the configuration file without an extension having defined it, and
+/// `current_setting()` reads it back off any backend connection — which is
+/// exactly the property the fence's pull path depends on.
+pub async fn start_postgres_with(extra_conf: &str) -> Postgres {
     let certificates = Certificates::generate();
     let script = format!(
         "set -e\n\
@@ -136,6 +147,7 @@ pub async fn start_postgres() -> Postgres {
          ssl = on\n\
          ssl_cert_file = 'server.crt'\n\
          ssl_key_file = 'server.key'\n\
+         {extra_conf}\n\
          CONFEOF\n",
         cert = certificates.cert_pem,
         key = certificates.key_pem,
@@ -217,6 +229,12 @@ pub fn config_for(pg: &Postgres, extra: &str) -> String {
 
 /// As [`config_for`], with `listen_extra` folded into the `[listen]` table.
 pub fn config_for_listener(pg: &Postgres, listen_extra: &str, extra: &str) -> String {
+    config_for_address(&pg.address(), listen_extra, extra)
+}
+
+/// As [`config_for_listener`], against an arbitrary backend address — a
+/// [`Switch`], for the tests that move the backend under the proxy.
+pub fn config_for_address(address: &str, listen_extra: &str, extra: &str) -> String {
     format!(
         "[listen]\n\
          address = \"127.0.0.1:0\"\n\
@@ -224,18 +242,75 @@ pub fn config_for_listener(pg: &Postgres, listen_extra: &str, extra: &str) -> St
          \n\
          [backend]\n\
          address = \"{address}\"\n\
-         user = \"{user}\"\n\
-         password = \"{password}\"\n\
-         database = \"{database}\"\n\
+         user = \"{BACKEND_USER}\"\n\
+         password = \"{BACKEND_PASSWORD}\"\n\
+         database = \"{BACKEND_DATABASE}\"\n\
          \n\
          [drain]\n\
          shutdownSeconds = 30\n\
          {extra}\n",
-        address = pg.address(),
-        user = BACKEND_USER,
-        password = BACKEND_PASSWORD,
-        database = BACKEND_DATABASE,
     )
+}
+
+/// A TCP forwarder whose destination can be changed while it is running.
+///
+/// It stands in for the Kubernetes Service in front of an instance, including
+/// the property the whole epoch fence exists because of: repointing it does
+/// **nothing** to the connections already established through it. Only new
+/// connections follow the new target, exactly as kube-proxy behaves — it never
+/// touches `ESTABLISHED` conntrack entries.
+pub struct Switch {
+    pub address: SocketAddr,
+    target: Arc<std::sync::Mutex<SocketAddr>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Switch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Switch {
+    pub async fn to(pg: &Postgres) -> Self {
+        let target = Arc::new(std::sync::Mutex::new(
+            pg.address().parse().expect("a container address parses"),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding the switch");
+        let address = listener.local_addr().expect("the switch's address");
+
+        let forward = Arc::clone(&target);
+        let task = tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let to = *forward.lock().expect("the switch is never poisoned");
+                tokio::spawn(async move {
+                    let Ok(mut server) = tokio::net::TcpStream::connect(to).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                });
+            }
+        });
+
+        Self {
+            address,
+            target,
+            task,
+        }
+    }
+
+    /// Points new connections at another container. Established ones are left
+    /// exactly where they are.
+    pub fn point_at(&self, pg: &Postgres) {
+        *self.target.lock().expect("the switch is never poisoned") =
+            pg.address().parse().expect("a container address parses");
+    }
+
+    pub fn address(&self) -> String {
+        self.address.to_string()
+    }
 }
 
 pub async fn start_proxy(source: &str) -> ProxyUnderTest {

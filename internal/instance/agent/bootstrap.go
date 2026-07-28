@@ -22,12 +22,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/ha"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgtool"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
@@ -53,7 +55,7 @@ func Bootstrap(ctx context.Context, options Options) error {
 	if pgtool.DataDirectoryInitialised(options.DataDir) {
 		if _, err := tools.ControlData(ctx, options.DataDir); err == nil {
 			log.Info("adopting an existing data directory", "dataDir", options.DataDir)
-			return nil
+			return PrepareToFollow(ctx, options, tools)
 		}
 	}
 
@@ -65,6 +67,50 @@ func Bootstrap(ctx context.Context, options Options) error {
 		return initialise(ctx, options, tools)
 	}
 	return join(ctx, options, tools, primary)
+}
+
+// PrepareToFollow makes an existing data directory consistent with whoever the instance's
+// primary is now, before any postmaster is started.
+//
+// It runs from the init container and again from the agent's own start-up, because those
+// are two different events: a Pod recreated after a node loss re-runs its init containers,
+// while a container that merely restarted in place does not. A member that came back as a
+// primary after somebody else was promoted, and started its postmaster anyway, is the split
+// brain the whole design exists to prevent.
+func PrepareToFollow(ctx context.Context, options Options, tools pgtool.Toolchain) error {
+	log := logf.FromContext(ctx)
+	if options.Client == nil || !pgtool.DataDirectoryInitialised(options.DataDir) {
+		return nil
+	}
+	instance := &pgelasticv1alpha1.PgInstance{}
+	key := types.NamespacedName{Namespace: options.Namespace, Name: options.Instance}
+	if err := options.Client.Get(ctx, key, instance); err != nil {
+		// Not knowing who the primary is, is not evidence that it is somebody else. The
+		// startup probe keeps this member out of every Service until it can answer, and the
+		// agent's own loop fences it the moment the API server comes back and disagrees.
+		log.Info("could not read the instance; leaving the data directory alone", "error", err.Error())
+		return nil
+	}
+
+	_, inRecovery := os.Stat(filepath.Join(options.DataDir, StandbySignal))
+	holder, err := LeaseManagerFor(options).Snapshot(ctx)
+	if err != nil {
+		log.Info("could not read the promotion lease", "error", err.Error())
+	}
+
+	action := ha.StartupDecision(options.Member, inRecovery == nil,
+		instance.Status.CurrentPrimary, instance.Status.TargetPrimary, holder.Holder)
+	if action.Follow == "" {
+		return nil
+	}
+
+	host := PeerHost(action.Follow, options.PeerService, options.Namespace)
+	if !action.Rejoin {
+		return followPrimary(options, host)
+	}
+	log.Info("this member is out of recovery and is not the primary; rejoining",
+		"member", options.Member, "primary", action.Follow, "reason", action.Reason)
+	return Rejoin(ctx, options, tools, action.Follow)
 }
 
 // designatedPrimary decides what this member is bootstrapping as.
@@ -158,7 +204,7 @@ func runBootstrapSQL(ctx context.Context, options Options) error {
 	defer func() { _ = conn.Close(ctx) }()
 
 	log.Info("creating the replication and ops roles")
-	return BootstrapRoles(ctx, conn, options.ReplicationPassword, options.OpsPassword)
+	return BootstrapRoles(ctx, conn, options.ReplicationPassword, options.OpsPassword, options.RewindPassword)
 }
 
 // join clones this member from the current primary.
@@ -182,14 +228,7 @@ func join(ctx context.Context, options Options, tools pgtool.Toolchain, primary 
 	slot := provision.ReplicationSlotName(options.Member)
 	log.Info("cloning from the primary", "primary", primary, "slot", slot)
 	tools.Stdout = os.Stdout
-	if err := runWithPassword(ctx, options.ReplicationPassword, func(ctx context.Context) error {
-		return tools.BaseBackup(ctx, pgtool.BaseBackupOptions{
-			Host:     host,
-			Port:     provision.PostgresPort,
-			User:     provision.ReplicationRole,
-			SlotName: slot,
-		})
-	}); err != nil {
+	if err := cloneWithSlot(ctx, options, tools, host, slot); err != nil {
 		return err
 	}
 
@@ -206,6 +245,39 @@ func join(ctx context.Context, options Options, tools pgtool.Toolchain, primary 
 		return err
 	}
 	return SetStandbySignal(options.DataDir, true)
+}
+
+// cloneWithSlot takes the base backup, creating the replication slot as part of it when the
+// primary does not already have one for this member.
+//
+// Both cases are real. A member joining a brand new instance needs the slot created; a
+// member re-cloning after a failover finds one waiting, because the promotion creates a slot
+// for every other member before it accepts any write. pg_basebackup refuses to create a slot
+// that already exists, so trying and falling back is what covers both without asking the
+// joining member to hold a credential that can create slots on somebody else's server.
+func cloneWithSlot(
+	ctx context.Context,
+	options Options,
+	tools pgtool.Toolchain,
+	host, slot string,
+) error {
+	clone := func(createSlot bool) error {
+		return runWithPassword(ctx, options.ReplicationPassword, func(ctx context.Context) error {
+			return tools.BaseBackup(ctx, pgtool.BaseBackupOptions{
+				Host:       host,
+				Port:       provision.PostgresPort,
+				User:       provision.ReplicationRole,
+				SlotName:   slot,
+				CreateSlot: createSlot,
+			})
+		})
+	}
+	err := clone(true)
+	if err != nil && strings.Contains(err.Error(), "already exists") {
+		logf.FromContext(ctx).Info("the primary already holds this member's slot", "slot", slot)
+		return clone(false)
+	}
+	return err
 }
 
 // PeerHost is a member's stable per-pod DNS name under the headless Service.

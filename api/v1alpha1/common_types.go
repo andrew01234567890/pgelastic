@@ -40,6 +40,37 @@ const (
 	ConditionThrottled = "Throttled"
 	// ConditionMigrating reports whether a tenant move is in flight.
 	ConditionMigrating = "Migrating"
+	// ConditionFailingOver reports whether a failover is in progress, which is exactly the
+	// condition targetPrimary != currentPrimary encodes.
+	ConditionFailingOver = "FailingOver"
+	// ConditionSplitBrain reports two members simultaneously out of recovery. It is a
+	// dedicated alarm, never a tiebreak: while it is true, every automated remediation is
+	// refused, because silent recovery from split brain hides the data loss.
+	ConditionSplitBrain = "SplitBrain"
+	// ConditionWriteStalled reports that fewer standbys are streaming than the loaded
+	// synchronous_standby_names waits for, so commits are blocking. Under dataDurability
+	// Required that is correct behaviour, but it has to be first-class and alertable rather
+	// than an inexplicable hang.
+	ConditionWriteStalled = "WriteStalled"
+)
+
+// The four named failover vetoes, each its own condition type and its own metric label,
+// because "why did it not fail over" is the question asked at three in the morning and a
+// single generic condition answers it uselessly. Each is True while that veto is holding a
+// failover back.
+const (
+	// ConditionOperatorIsolated is veto (a): no member the kubelet calls Ready will answer
+	// the operator, which means the operator is the partitioned party. It requeues and
+	// never fails over.
+	ConditionOperatorIsolated = "OperatorIsolated"
+	// ConditionPrimaryUnobservable is veto (b): the primary's Pod is Ready but its status
+	// endpoint is failing. The kubelet is closer to the truth, so this defers.
+	ConditionPrimaryUnobservable = "PrimaryUnobservable"
+	// ConditionCandidateNotReady is veto (c): the candidate answers over HTTP but its Pod
+	// is not Ready, so promoting it would hand the role to a Pod no Service selects.
+	ConditionCandidateNotReady = "CandidateNotReady"
+	// ConditionCandidateWALVolumeFull is veto (d): the candidate's WAL volume is full.
+	ConditionCandidateWALVolumeFull = "CandidateWALVolumeFull"
 )
 
 // Condition reasons. Every reason a controller can set is enumerated here so the set
@@ -68,6 +99,26 @@ const (
 	ReasonPreflightFailed     = "PreflightFailed"
 	ReasonCutoverComplete     = "CutoverComplete"
 	ReasonRolledBack          = "RolledBack"
+
+	// Failover state machine reasons. They mirror the phases of the two-phase sentinel so
+	// that the CR alone records which state a stalled failover is stuck in.
+	ReasonPrimaryHealthy       = "PrimaryHealthy"
+	ReasonDebouncing           = "Debouncing"
+	ReasonSentinelWritten      = "SentinelWritten"
+	ReasonWaitingWALReceivers  = "WaitingForWALReceivers"
+	ReasonCandidateSelected    = "CandidateSelected"
+	ReasonAwaitingPromotion    = "AwaitingPromotion"
+	ReasonNoEligibleCandidate  = "NoEligibleCandidate"
+	ReasonQuorumEvidenceStale  = "QuorumEvidenceStale"
+	ReasonQuorumNotProven      = "QuorumNotProven"
+	ReasonOperatorIsolated     = "OperatorIsolated"
+	ReasonPrimaryUnobservable  = "PrimaryUnobservable"
+	ReasonCandidateNotReady    = "CandidateNotReady"
+	ReasonCandidateWALFull     = "CandidateWALVolumeFull"
+	ReasonTwoPrimariesObserved = "TwoPrimariesObserved"
+	ReasonNotFailingOver       = "NotFailingOver"
+	ReasonNoVeto               = "NoVeto"
+	ReasonWritesFlowing        = "WritesFlowing"
 )
 
 // QoSClass is derived by the controller from the relationship between a tenant's
