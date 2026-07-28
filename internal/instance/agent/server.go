@@ -93,6 +93,7 @@ func MemberReportOf(member string, state ProbeState) provision.MemberReport {
 		ReplayLagSeconds:        state.ReplayLag.Seconds(),
 		WALReceiverActive:       observation.WALReceiverActive,
 		WALVolumeFull:           state.WALVolumeFull,
+		Rejoining:               string(state.Rejoin),
 		SynchronousStandbyNames: observation.SyncStandbyNames,
 		NumSync:                 observation.NumSync,
 		VotingMembers:           observation.VotingMembers,

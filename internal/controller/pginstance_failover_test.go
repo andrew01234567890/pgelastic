@@ -372,6 +372,66 @@ var _ = Describe("PgInstance failover state machine", func() {
 		Expect(stalled.Reason).To(Equal(pgelasticv1alpha1.ReasonWriteStalled))
 	})
 
+	It("keeps the read-write Service on a primary that is still serving under the sentinel", func() {
+		bringUp("failover-serving")
+		// Phase one has already run: the sentinel is written and the label is gone. The
+		// primary's status endpoint is failing while the kubelet still calls its Pod Ready,
+		// which is the veto that defers rather than promotes - and the state the instance
+		// sits in for as long as the endpoint stays quiet.
+		setTargetPrimary(instance, pgelasticv1alpha1.TargetPrimaryPending)
+		stripPrimaryLabel(members[0])
+		prober.silence(members[0])
+
+		reconcileNow(reconciler, instance)
+
+		Expect(conditionOf(refetch(instance).Status.Conditions,
+			pgelasticv1alpha1.ConditionPrimaryUnobservable).Status).To(Equal(metav1.ConditionTrue))
+		Expect(labelsOfMember(members[0])).To(HaveKeyWithValue(provision.LabelRole,
+			string(pgelasticv1alpha1.InstanceRolePrimary)),
+			"an endpoint-less read-write Service refuses every connection the primary is "+
+				"still answering on its own socket")
+	})
+
+	It("takes the read-write Service off the old primary the moment a successor is named", func() {
+		bringUp("failover-demote")
+		Expect(labelsOfMember(members[0])).To(HaveKey(provision.LabelRole))
+
+		setTargetPrimary(instance, members[2])
+		reconcileNow(reconciler, instance)
+
+		Expect(labelsOfMember(members[0])).NotTo(HaveKey(provision.LabelRole),
+			"a member being demoted must stop being selected before its successor writes")
+		Expect(labelsOfMember(members[2])).NotTo(HaveKeyWithValue(provision.LabelRole,
+			string(pgelasticv1alpha1.InstanceRolePrimary)),
+			"a candidate is not the primary until it has finished promoting")
+	})
+
+	It("stops publishing headroom while a member is rebuilding itself", func() {
+		bringUp("failover-recloning")
+		// The published headroom is derived from the phase the previous pass published, so
+		// both readings settle one reconcile after the state they describe.
+		Eventually(func(g Gomega) {
+			reconcileNow(reconciler, instance)
+			status := refetch(instance).Status
+			g.Expect(status.Phase).To(Equal(pgelasticv1alpha1.InstancePhaseReady))
+			g.Expect(status.Capacity.Allocatable).To(BeNumerically(">", 0))
+		}).Should(Succeed())
+
+		setRejoining(instance, members[1], "recloning")
+
+		Eventually(func(g Gomega) {
+			reconcileNow(reconciler, instance)
+			status := refetch(instance).Status
+			g.Expect(status.Phase).To(Equal(pgelasticv1alpha1.InstancePhaseRecloning))
+			g.Expect(status.Capacity.Allocatable).To(BeZero(),
+				"a member re-cloning leaves the instance one failure from having no quorum at all")
+			progressing := conditionOf(status.Conditions, pgelasticv1alpha1.ConditionProgressing)
+			g.Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+			g.Expect(progressing.Reason).To(Equal(pgelasticv1alpha1.ReasonRecloning))
+			g.Expect(progressing.Message).To(ContainSubstring(members[1]))
+		}).Should(Succeed())
+	})
+
 	It("clears the debounce when the primary comes back inside the delay", func() {
 		bringUp("failover-recovered")
 		prober.silence(members[0])
@@ -445,6 +505,38 @@ func clearQuorumEvidence(instance *pgelasticv1alpha1.PgInstance) {
 	fetched := refetch(instance)
 	fetched.Status.QuorumEvidence = nil
 	Expect(k8sClient.Status().Update(ctx, fetched)).To(Succeed())
+}
+
+func setTargetPrimary(instance *pgelasticv1alpha1.PgInstance, target string) {
+	GinkgoHelper()
+	fetched := refetch(instance)
+	fetched.Status.TargetPrimary = target
+	Expect(k8sClient.Status().Update(ctx, fetched)).To(Succeed())
+}
+
+// setRejoining writes what a member's own agent writes while it is rebuilding itself onto
+// the primary's history.
+func setRejoining(instance *pgelasticv1alpha1.PgInstance, member, method string) {
+	GinkgoHelper()
+	fetched := refetch(instance)
+	fetched.Status.Instances = []pgelasticv1alpha1.InstanceMemberStatus{
+		{Name: member, Role: pgelasticv1alpha1.InstanceRoleReplica, Rejoining: method},
+	}
+	Expect(k8sClient.Status().Update(ctx, fetched)).To(Succeed())
+}
+
+func stripPrimaryLabel(member string) {
+	GinkgoHelper()
+	pod := refetch(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: member, Namespace: failoverNamespace}})
+	delete(pod.Labels, provision.LabelRole)
+	Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+}
+
+func labelsOfMember(member string) map[string]string {
+	GinkgoHelper()
+	return refetch(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: member, Namespace: failoverNamespace}}).Labels
 }
 
 // backdateFailingSince moves the persisted debounce origin well past the failover delay,

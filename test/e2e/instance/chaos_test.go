@@ -32,7 +32,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -171,6 +173,137 @@ func (w *splitBrainWatch) assertNoSplitBrain() {
 		"two members reported pg_is_in_recovery() = false at once: %v", w.worstNames)
 }
 
+// readWriteEndpoints counts the ready addresses behind the read-write Service.
+//
+// It reads EndpointSlices rather than the Service, because a Service exists whether or not
+// anything is behind it: an endpoint-less <instance>-rw refuses every connection with the
+// same "connection refused" a missing Service would give, and only the slices can tell the
+// two apart.
+func readWriteEndpoints() (int, error) {
+	endpointSlices := &discoveryv1.EndpointSliceList{}
+	err := k8sClient.List(suiteCtx, endpointSlices, client.InNamespace(chaosNamespace),
+		client.MatchingLabels{discoveryv1.LabelServiceName: provision.PrimaryServiceName(chaosInstance)})
+	if err != nil {
+		return 0, err
+	}
+	ready := 0
+	for _, slice := range endpointSlices.Items {
+		for _, endpoint := range slice.Endpoints {
+			if endpoint.Conditions.Ready == nil || *endpoint.Conditions.Ready {
+				ready += len(endpoint.Addresses)
+			}
+		}
+	}
+	return ready, nil
+}
+
+// leaseHolder is the member holding the promotion Lease, read straight from the API server.
+func leaseHolder() string {
+	lease := &coordinationv1.Lease{}
+	if err := k8sClient.Get(suiteCtx,
+		client.ObjectKey{Namespace: chaosNamespace, Name: chaosInstance}, lease); err != nil {
+		return ""
+	}
+	if lease.Spec.HolderIdentity == nil {
+		return ""
+	}
+	return *lease.Spec.HolderIdentity
+}
+
+// endpointGrace is how long the read-write Service is allowed to be endpoint-less while a
+// member is demonstrably serving.
+//
+// It is not zero because a promotion legitimately has an instant with no endpoint - the old
+// primary's label is gone and the new one's has not landed - and a label the operator has
+// just written takes a moment to reach the EndpointSlice controller. It is far below the
+// half-minute the two-phase sentinel used to freeze the label for, which is the failure
+// this exists to catch.
+const endpointGrace = 10 * time.Second
+
+// endpointWatch samples the invariant "a member that is out of recovery and holds the
+// promotion Lease is a member the read-write Service must be able to reach".
+//
+// The lease is the independent half. Asserting only on what the member says about itself
+// would be asserting the operator's own view back at it; the lease is held by the member's
+// agent, so the two together say "this member is serving and is entitled to".
+type endpointWatch struct {
+	mutex     sync.Mutex
+	worst     time.Duration
+	worstNote string
+	violating time.Time
+	samples   int
+	stop      chan struct{}
+	done      chan struct{}
+}
+
+func watchReadWriteEndpoints() *endpointWatch {
+	watch := &endpointWatch{stop: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(watch.done)
+		for {
+			watch.sample()
+			select {
+			case <-watch.stop:
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}()
+	return watch
+}
+
+func (w *endpointWatch) sample() {
+	holder := leaseHolder()
+	if holder == "" {
+		w.clear()
+		return
+	}
+	recovery, err := chaosPsql(holder, "SELECT pg_is_in_recovery()")
+	if err != nil || recovery != "f" {
+		w.clear()
+		return
+	}
+	ready, err := readWriteEndpoints()
+	if err != nil {
+		w.clear()
+		return
+	}
+
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	w.samples++
+	if ready > 0 {
+		w.violating = time.Time{}
+		return
+	}
+	if w.violating.IsZero() {
+		w.violating = time.Now()
+	}
+	if elapsed := time.Since(w.violating); elapsed > w.worst {
+		w.worst = elapsed
+		w.worstNote = fmt.Sprintf("%s reports pg_is_in_recovery() = false and holds the lease", holder)
+	}
+}
+
+func (w *endpointWatch) clear() {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	w.violating = time.Time{}
+}
+
+func (w *endpointWatch) assertServiceFollowedTheServingMember() {
+	GinkgoHelper()
+	close(w.stop)
+	<-w.done
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	Expect(w.samples).To(BeNumerically(">", 5),
+		"the invariant has to be sampled while the primary was moving, not only afterwards")
+	Expect(w.worst).To(BeNumerically("<", endpointGrace),
+		"%s was left with no endpoints for %s: %s",
+		provision.PrimaryServiceName(chaosInstance), w.worst.Truncate(time.Second), w.worstNote)
+}
+
 // oracleReport is what one chaos scenario proved.
 type oracleReport struct {
 	Report   verify.Report
@@ -271,6 +404,29 @@ func keepDown(member string, window time.Duration) {
 		}
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// losePrimary takes the named primary away for longer than the failover delay and waits
+// until somebody else holds the role.
+func losePrimary(primary string) {
+	GinkgoHelper()
+	keepDown(primary, 75*time.Second)
+	Eventually(func(g Gomega) {
+		g.Expect(chaosCR().Status.CurrentPrimary).NotTo(Equal(primary),
+			"the instance has to elect somebody else")
+	}, "10m", "5s").Should(Succeed())
+}
+
+// memberTimeline is the timeline a member holds WAL for, which for a standby is the one its
+// WAL receiver is streaming rather than the one its last replayed checkpoint was on.
+func memberTimeline(member string) int {
+	GinkgoHelper()
+	output := mustChaosQuery(member, `SELECT GREATEST(
+		(SELECT timeline_id FROM pg_control_checkpoint()),
+		COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0))`)
+	timeline, err := strconv.Atoi(output)
+	Expect(err).NotTo(HaveOccurred(), output)
+	return timeline
 }
 
 // heldDown remembers the nodes to make schedulable again.
@@ -413,6 +569,14 @@ func assertOraclePassed(scenario string, result oracleReport) {
 	AddReportEntry(scenario+" oracle", result.Report)
 }
 
+// quorumMembersQuery names the standbys PostgreSQL itself reports as streaming quorum
+// members, which is a stronger statement than counting rows: a member that is merely
+// connected is not redundancy. Under "ANY 1" an instance whose second standby is streaming
+// but not counted is still one failure away from stalling every commit.
+const quorumMembersQuery = `SELECT COALESCE(string_agg(application_name, ',' ORDER BY application_name), '')
+	FROM pg_stat_replication
+	WHERE state = 'streaming' AND sync_state IN ('sync', 'quorum')`
+
 // awaitConverged waits until the instance is whole again: three members, one primary, both
 // standbys streaming as quorum members, and every member on the same timeline.
 func awaitConverged() {
@@ -425,10 +589,21 @@ func awaitConverged() {
 			"targetPrimary != currentPrimary means a failover is still in progress")
 
 		primary := status.CurrentPrimary
-		streaming, err := chaosPsql(primary,
-			"SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'")
-		g.Expect(err).NotTo(HaveOccurred(), streaming)
-		g.Expect(streaming).To(Equal(strconv.Itoa(chaosReplicas-1)), "both standbys must be back")
+		quorum, err := chaosPsql(primary, quorumMembersQuery)
+		g.Expect(err).NotTo(HaveOccurred(), quorum)
+		g.Expect(quorum).To(Equal(strings.Join(standbysOf(primary), ",")),
+			"both standbys must be streaming and counted towards the quorum, not merely present")
+
+		inSyncSet := map[string]bool{}
+		for _, member := range status.Instances {
+			inSyncSet[member.Name] = member.InSyncSet
+		}
+		for _, standby := range standbysOf(primary) {
+			g.Expect(inSyncSet).To(HaveKeyWithValue(standby, true),
+				"the instance has to record %s as a voter, or the failover gate cannot count it", standby)
+		}
+		g.Expect(status.Phase).To(Equal(pgelasticv1alpha1.InstancePhaseReady),
+			"a member still rebuilding itself leaves the instance short of redundancy")
 	}, "15m", "5s").Should(Succeed())
 
 	primaries, answered := primariesNow()
@@ -715,6 +890,56 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 		awaitConverged()
 	})
 
+	It("brings every member back after a double failover forks a third timeline", func() {
+		before := chaosCR().Status
+		beforeTimeline := memberTimeline(before.CurrentPrimary)
+
+		endpoints := watchReadWriteEndpoints()
+		result := runScenario("doublefailover", 240*time.Second, func() {
+			By("losing the primary once")
+			losePrimary(before.CurrentPrimary)
+
+			// The second failover has to wait for all three members to answer, because the
+			// quorum gate needs two of them reachable to prove a promotion is safe at all -
+			// but not for the returning member to have caught up. A member still short of
+			// the position the next timeline forks at is exactly the one that cannot rejoin
+			// by streaming afterwards, and it is what this scenario exists to produce.
+			By("waiting for all three members to answer before breaking it again")
+			Eventually(func(g Gomega) {
+				_, answered := primariesNow()
+				g.Expect(answered).To(Equal(chaosReplicas))
+			}, "10m", "3s").Should(Succeed())
+
+			By("losing the newly promoted primary too, which forks a third timeline")
+			losePrimary(chaosCR().Status.CurrentPrimary)
+		})
+
+		awaitConverged()
+		endpoints.assertServiceFollowedTheServingMember()
+		assertOraclePassed("doublefailover", result)
+
+		after := chaosCR().Status
+		Expect(after.PrimaryEpoch).To(BeNumerically(">", before.PrimaryEpoch+1),
+			"two promotions must bump the fence token twice")
+		Expect(memberTimeline(after.CurrentPrimary)).To(BeNumerically(">", beforeTimeline+1),
+			"two promotions must fork two timelines")
+	})
+
+	It("keeps the read-write Service on whichever member is serving", func() {
+		primary := chaosCR().Status.CurrentPrimary
+		Expect(mustChaosQuery(primary, "SELECT pg_is_in_recovery()")).To(Equal("f"))
+
+		watch := watchReadWriteEndpoints()
+		// Nothing is broken here on purpose. The failure this catches is a healthy primary
+		// left unlabelled because the operator was merely considering a failover, and the
+		// only way to see it is to keep asking while nothing is wrong.
+		time.Sleep(30 * time.Second)
+		watch.assertServiceFollowedTheServingMember()
+
+		Expect(leaseHolder()).To(Equal(primary),
+			"the member serving writes has to be the one holding the promotion lease")
+	})
+
 	It("refuses to promote when the quorum gate cannot be satisfied", func() {
 		before := chaosCR().Status
 		standby := otherMember(before.CurrentPrimary)
@@ -784,6 +1009,19 @@ func otherMember(primary string) string {
 		}
 	}
 	return ""
+}
+
+// standbysOf is every member that is not the named primary, sorted, which is the order
+// pg_stat_replication is aggregated in.
+func standbysOf(primary string) []string {
+	standbys := make([]string, 0, chaosReplicas-1)
+	for _, member := range chaosMemberNames() {
+		if member != primary {
+			standbys = append(standbys, member)
+		}
+	}
+	slices.Sort(standbys)
+	return standbys
 }
 
 func remainingMember(taken ...string) string {

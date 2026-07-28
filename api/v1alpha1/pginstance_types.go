@@ -594,6 +594,18 @@ type InstanceMemberStatus struct {
 	// instance with it, so a full WAL volume is a refusal rather than a degraded state.
 	// +optional
 	WALVolumeFull bool `json:"walVolumeFull,omitempty"`
+
+	// rejoining names the path this member is taking back onto the primary's history after
+	// its own diverged: "rewinding" for pg_rewind, "recloning" for the pg_basebackup
+	// fallback. It is empty the rest of the time.
+	//
+	// It is reported rather than merely logged because a re-clone runs for minutes to
+	// hours, holds a connection and a replication slot for all of them, and leaves the
+	// instance at reduced redundancy - during which quorum-gated failover is impossible.
+	// The instance's burst headroom must not be counted as available while it is set.
+	// +kubebuilder:validation:Enum=rewinding;recloning
+	// +optional
+	Rejoining string `json:"rejoining,omitempty"`
 }
 
 // QuorumEvidence is written only by the member that is both currentPrimary and

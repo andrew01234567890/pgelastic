@@ -78,6 +78,12 @@ type MemberReport struct {
 	WALReceiverActive bool `json:"walReceiverActive"`
 	// WALVolumeFull refuses this member as a candidate outright.
 	WALVolumeFull bool `json:"walVolumeFull"`
+	// Rejoining names the path a member is taking back onto the primary's history -
+	// rewinding or recloning - and is empty the rest of the time. A member rebuilding
+	// itself has to be visible: it takes minutes to hours, it leaves the instance at
+	// reduced redundancy for all of them, and its burst headroom must not be counted as
+	// available while it does.
+	Rejoining string `json:"rejoining,omitempty"`
 	// SynchronousStandbyNames is the clause this member's postmaster actually loaded, and
 	// NumSync and VotingMembers are parsed out of it. On a standby the clause is inert, but
 	// it is still reported: a standby whose loaded clause disagrees with the primary's is a

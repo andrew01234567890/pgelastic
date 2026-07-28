@@ -40,6 +40,13 @@ type ControlData struct {
 	ClusterState string
 	// TimelineID is a first-class term in candidate selection, ordered ahead of LSN.
 	TimelineID int32
+	// MinRecoveryEnd and MinRecoveryEndTimeline are how far a standby had replayed when it
+	// last flushed, and on which timeline. They are the only durable record of a stopped
+	// standby's position: the latest checkpoint's timeline lags a timeline switch by a whole
+	// restartpoint, so a member that had already followed a new history looks, from the
+	// checkpoint alone, as though it were still on the old one.
+	MinRecoveryEnd         string
+	MinRecoveryEndTimeline int32
 	// WALSegmentSize is part of the collation contract: two instances that disagree
 	// cannot exchange a physical backup.
 	WALSegmentSize int64
@@ -93,6 +100,14 @@ func ParseControlData(output string) (ControlData, error) {
 				return ControlData{}, fmt.Errorf("pg_controldata %q: %w", label, err)
 			}
 			data.TimelineID = int32(number)
+		case "Minimum recovery ending location":
+			data.MinRecoveryEnd = value
+		case "Min recovery ending loc's timeline":
+			number, err := strconv.ParseInt(value, 10, 32)
+			if err != nil {
+				return ControlData{}, fmt.Errorf("pg_controldata %q: %w", label, err)
+			}
+			data.MinRecoveryEndTimeline = int32(number)
 		case "Bytes per WAL segment":
 			number, err := strconv.ParseInt(value, 10, 64)
 			if err != nil {
