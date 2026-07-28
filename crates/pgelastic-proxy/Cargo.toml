@@ -14,6 +14,8 @@ clap = { version = "4.6.4", features = ["derive"] }
 http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server", "http1"] }
+pgelastic-capacity = { version = "0.1.0", path = "../pgelastic-capacity" }
+pgelastic-pool = { version = "0.1.0", path = "../pgelastic-pool" }
 pgelastic-wire = { version = "0.1.0", path = "../pgelastic-wire" }
 rustls = { version = "0.23.42", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
 rustls-pemfile = "2.2.0"

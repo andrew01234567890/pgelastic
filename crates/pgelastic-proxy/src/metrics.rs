@@ -52,6 +52,10 @@ impl RejectReason {
     }
 }
 
+/// Every code in the capacity taxonomy, so the exposition carries all six even
+/// when nothing has been refused.
+const ERROR_CODES: [pgelastic_capacity::ErrorCode; 6] = pgelastic_capacity::ErrorCode::ALL;
+
 #[derive(Debug, Default)]
 pub struct Metrics {
     clients_accepted: AtomicU64,
@@ -66,6 +70,15 @@ pub struct Metrics {
     bytes_to_client: AtomicU64,
     drains_completed: AtomicU64,
     drains_forced: AtomicU64,
+    checkouts_reused: AtomicU64,
+    checkouts_opened: AtomicU64,
+    check_ins: AtomicU64,
+    admission_queued: AtomicU64,
+    admission_dequeued: AtomicU64,
+    admission_denied: [AtomicU64; ERROR_CODES.len()],
+    pins: [AtomicU64; pgelastic_pool::PinReason::ALL.len()],
+    /// The elastic/pinned split, refreshed from the pool manager's ledger.
+    budget: [AtomicI64; 3],
 }
 
 impl Metrics {
@@ -132,6 +145,55 @@ impl Metrics {
 
     pub fn active_clients(&self) -> i64 {
         self.clients_active.load(Ordering::Relaxed)
+    }
+
+    pub fn checkout(&self, reused: bool) {
+        if reused {
+            &self.checkouts_reused
+        } else {
+            &self.checkouts_opened
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn check_in(&self) {
+        self.check_ins.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_queued(&self) {
+        self.admission_queued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_dequeued(&self) {
+        self.admission_dequeued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_denied(&self, code: pgelastic_capacity::ErrorCode) {
+        let index = ERROR_CODES
+            .iter()
+            .position(|known| *known == code)
+            .unwrap_or(0);
+        self.admission_denied[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn pinned(&self, reason: pgelastic_pool::PinReason) {
+        let index = pgelastic_pool::PinReason::ALL
+            .iter()
+            .position(|known| *known == reason)
+            .unwrap_or(0);
+        self.pins[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publishes the pool manager's elastic/pinned split.
+    ///
+    /// Pinned connections are counted apart from the elastic ones on purpose:
+    /// they still occupy a backend connection, so the reusable pool's ceiling
+    /// drops by exactly this many, and a ceiling that drops without an
+    /// attributable cause is the thing nobody can explain.
+    pub fn budget(&self, limit: u32, elastic: u32, elastic_limit: u32) {
+        self.budget[0].store(i64::from(limit), Ordering::Relaxed);
+        self.budget[1].store(i64::from(elastic), Ordering::Relaxed);
+        self.budget[2].store(i64::from(elastic_limit), Ordering::Relaxed);
     }
 
     pub fn render(&self) -> String {
@@ -221,8 +283,96 @@ impl Metrics {
                 ("outcome=\"forced\"", load(&self.drains_forced)),
             ],
         );
+        self.render_pooling(&mut out);
         out
     }
+
+    /// The pooling half of the exposition.
+    fn render_pooling(&self, out: &mut String) {
+        let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        counter(
+            out,
+            "pgelastic_proxy_checkouts_total",
+            "Backend checkouts, by whether a parked link was reused.",
+            &[
+                ("source=\"reused\"", load(&self.checkouts_reused)),
+                ("source=\"opened\"", load(&self.checkouts_opened)),
+            ],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_check_ins_total",
+            "Backend links returned to the pool through the release gate.",
+            &[("", load(&self.check_ins))],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_admission_queued_total",
+            "Checkouts that had to wait, and those that were then served.",
+            &[
+                ("outcome=\"enqueued\"", load(&self.admission_queued)),
+                ("outcome=\"granted\"", load(&self.admission_dequeued)),
+            ],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_admission_denied_total",
+            "Checkouts refused, by the code the client was given.",
+            &labelled(&ERROR_CODES.map(|code| {
+                (
+                    format!("code=\"{code}\",sqlstate=\"{}\"", code.sqlstate()),
+                    load(
+                        &self.admission_denied[ERROR_CODES
+                            .iter()
+                            .position(|known| *known == code)
+                            .unwrap_or(0)],
+                    ),
+                )
+            })),
+        );
+        counter(
+            out,
+            "pgelastic_proxy_pins_total",
+            "Links pinned to one client because a tripwire found unscrubbable state.",
+            &labelled(&pgelastic_pool::PinReason::ALL.map(|reason| {
+                (
+                    format!("reason=\"{}\"", reason.as_str()),
+                    load(
+                        &self.pins[pgelastic_pool::PinReason::ALL
+                            .iter()
+                            .position(|known| *known == reason)
+                            .unwrap_or(0)],
+                    ),
+                )
+            })),
+        );
+        gauge(
+            out,
+            "pgelastic_proxy_backend_budget",
+            "The pool's total backend connection budget.",
+            self.budget[0].load(Ordering::Relaxed),
+        );
+        gauge(
+            out,
+            "pgelastic_proxy_backend_elastic_connections",
+            "Reusable backend connections currently open.",
+            self.budget[1].load(Ordering::Relaxed),
+        );
+        gauge(
+            out,
+            "pgelastic_proxy_backend_elastic_limit",
+            "The ceiling the reusable pool can reach, which is the budget less \
+             every pinned connection.",
+            self.budget[2].load(Ordering::Relaxed),
+        );
+    }
+}
+
+fn labelled<const N: usize>(series: &[(String, u64); N]) -> Vec<(&str, u64)> {
+    series
+        .iter()
+        .map(|(labels, value)| (labels.as_str(), *value))
+        .collect()
 }
 
 fn counter(out: &mut String, name: &str, help: &str, series: &[(&str, u64)]) {

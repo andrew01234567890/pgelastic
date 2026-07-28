@@ -106,6 +106,43 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
 
+##@ Verification
+
+# The durability oracle. VERIFY_DSN should normally point at the proxy; point it at
+# PostgreSQL directly only to calibrate the oracle itself.
+VERIFY_DSN ?=
+VERIFY_LEDGER ?= verify-ledger.log
+VERIFY_TABLE ?= set
+VERIFY_WRITERS ?= 8
+VERIFY_DURATION ?= 60s
+
+.PHONY: build-verify
+build-verify: ## Build the pgelastic-verify durability oracle.
+	go build -o bin/pgelastic-verify ./cmd/verify
+
+.PHONY: verify
+verify: build-verify ## Run the durability oracle against VERIFY_DSN, then check it. Exits 1 on a lost commit.
+	@test -n "$(VERIFY_DSN)" || { echo "Set VERIFY_DSN, e.g. VERIFY_DSN=postgres://user:pw@host:5432/db"; exit 3; }
+	bin/pgelastic-verify run \
+		--dsn "$(VERIFY_DSN)" \
+		--ledger "$(VERIFY_LEDGER)" \
+		--table "$(VERIFY_TABLE)" \
+		--writers $(VERIFY_WRITERS) \
+		--duration $(VERIFY_DURATION) \
+		--check
+
+.PHONY: verify-check
+verify-check: build-verify ## Check an existing ledger against VERIFY_DSN without writing anything.
+	@test -n "$(VERIFY_DSN)" || { echo "Set VERIFY_DSN, e.g. VERIFY_DSN=postgres://user:pw@host:5432/db"; exit 3; }
+	bin/pgelastic-verify check \
+		--dsn "$(VERIFY_DSN)" \
+		--ledger "$(VERIFY_LEDGER)" \
+		--table "$(VERIFY_TABLE)"
+
+.PHONY: test-verify
+test-verify: ## Run the durability oracle's own tests. Needs a container runtime for the integration specs.
+	go test ./cmd/verify/... ./internal/verify/...
+
 ##@ Build
 
 .PHONY: build

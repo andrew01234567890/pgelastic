@@ -1672,6 +1672,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "pgelastic-capacity",
+ "pgelastic-pool",
  "pgelastic-wire",
  "rcgen",
  "rustls",

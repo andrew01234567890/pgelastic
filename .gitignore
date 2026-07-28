@@ -32,3 +32,6 @@ go.work
 # Rust
 /target/
 **/*.rs.bk
+
+# Durability oracle ledgers
+verify-ledger.log

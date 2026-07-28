@@ -12,6 +12,7 @@
 //! the socket immediately — so it can never travel on a pooled link.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
@@ -76,12 +77,80 @@ impl From<&CancelRequest> for CancelToken {
 #[derive(Debug, Clone)]
 pub struct CancelTarget {
     pub address: String,
-    pub key_data: BackendKeyData,
+    pub key_data: Option<BackendKeyData>,
+}
+
+/// Where a client's cancel should currently be sent.
+///
+/// In transaction pooling the answer changes with every checkout: the query the
+/// client wants cancelled is running on whichever backend it holds *now*, and a
+/// cancel delivered to the backend it held a moment ago would cancel a different
+/// tenant's statement. So the route is a shared cell the session rewrites at
+/// every checkout and clears at every release, and the cancel path reads it at
+/// send time rather than at registration time.
+#[derive(Debug, Clone, Default)]
+pub struct CancelRoute {
+    target: Arc<Mutex<Option<CancelTarget>>>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl CancelRoute {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, target: Option<CancelTarget>) {
+        *self
+            .target
+            .lock()
+            .expect("a cancel route is never poisoned") = target;
+    }
+
+    /// The current target, read at the moment of sending.
+    pub fn resolve(&self) -> Option<CancelTarget> {
+        self.target
+            .lock()
+            .expect("a cancel route is never poisoned")
+            .clone()
+    }
+
+    /// Cancels aimed at this client that have been picked up but not yet
+    /// delivered.
+    ///
+    /// A release taken inside that window hands the backend to the next client
+    /// and the cancel then lands on *that* client's statement, which is a
+    /// cross-tenant cancel. It is a condition of the release gate for exactly
+    /// that reason.
+    pub fn cancels_in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Marks a cancel as under way, clearing the mark when the guard drops.
+    pub fn dispatching(&self) -> CancelInFlight {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        CancelInFlight {
+            in_flight: Arc::clone(&self.in_flight),
+        }
+    }
+}
+
+/// Holds a cancel open for as long as it is being delivered.
+#[derive(Debug)]
+pub struct CancelInFlight {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for CancelInFlight {
+    fn drop(&mut self) {
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct CancelRegistry {
-    entries: Mutex<HashMap<CancelToken, CancelTarget>>,
+    entries: Mutex<HashMap<CancelToken, CancelRoute>>,
 }
 
 impl CancelRegistry {
@@ -97,19 +166,21 @@ impl CancelRegistry {
     pub fn register(
         self: &Arc<Self>,
         token: CancelToken,
-        target: CancelTarget,
+        route: CancelRoute,
     ) -> CancelRegistration {
         self.entries
             .lock()
             .expect("cancel registry is never poisoned")
-            .insert(token.clone(), target);
+            .insert(token.clone(), route);
         CancelRegistration {
             registry: Arc::clone(self),
             token,
         }
     }
 
-    pub fn lookup(&self, token: &CancelToken) -> Option<CancelTarget> {
+    /// The route registered for a token, if any. Resolving it to an address is
+    /// deliberately a separate step, taken at send time.
+    pub fn lookup(&self, token: &CancelToken) -> Option<CancelRoute> {
         self.entries
             .lock()
             .expect("cancel registry is never poisoned")
@@ -149,17 +220,24 @@ impl Drop for CancelRegistration {
 }
 
 /// Opens a fresh connection to the backend and delivers the real cancel key.
+///
+/// The connection is fresh and unauthenticated because the protocol requires it:
+/// a `CancelRequest` carries no startup packet and the server closes the socket
+/// as soon as it has read one, so it can never travel on a pooled link.
 pub async fn deliver(
     target: &CancelTarget,
     tls: Option<&crate::tls::BackendTls>,
     connect_timeout: std::time::Duration,
 ) -> Result<()> {
+    let Some(key_data) = target.key_data.clone() else {
+        return Ok(());
+    };
     let mut stream = crate::backend::connect_socket(&target.address, tls, connect_timeout).await?;
 
     let mut wire = BytesMut::new();
     CancelRequest {
-        process_id: target.key_data.process_id,
-        key: target.key_data.key.clone(),
+        process_id: key_data.process_id,
+        key: key_data.key,
     }
     .encode(&mut wire);
     stream.write_all(&wire).await?;
@@ -175,13 +253,23 @@ mod tests {
     use super::*;
 
     fn target() -> CancelTarget {
+        target_for(4242)
+    }
+
+    fn target_for(process_id: i32) -> CancelTarget {
         CancelTarget {
             address: "127.0.0.1:5432".to_owned(),
-            key_data: BackendKeyData {
-                process_id: 4242,
+            key_data: Some(BackendKeyData {
+                process_id,
                 key: CancelKey::new(Bytes::from_static(b"real")).unwrap(),
-            },
+            }),
         }
+    }
+
+    fn route(target: CancelTarget) -> CancelRoute {
+        let route = CancelRoute::new();
+        route.set(Some(target));
+        route
     }
 
     #[test]
@@ -218,17 +306,69 @@ mod tests {
         let registry = CancelRegistry::new();
         let token = CancelToken::mint(0).unwrap();
         {
-            let _guard = registry.register(token.clone(), target());
-            assert_eq!(registry.lookup(&token).unwrap().key_data.process_id, 4242);
+            let _guard = registry.register(token.clone(), route(target()));
+            assert_eq!(
+                registry
+                    .lookup(&token)
+                    .unwrap()
+                    .resolve()
+                    .unwrap()
+                    .key_data
+                    .unwrap()
+                    .process_id,
+                4242
+            );
         }
         assert!(registry.lookup(&token).is_none());
         assert!(registry.is_empty());
     }
 
+    /// The property transaction pooling depends on: the same token must resolve
+    /// to whichever backend is running the client's query *now*, not to the one
+    /// it was running when the token was registered.
+    #[test]
+    fn a_route_resolves_to_the_backend_the_client_holds_at_send_time() {
+        let registry = CancelRegistry::new();
+        let token = CancelToken::mint(0).unwrap();
+        let route = CancelRoute::new();
+        let _guard = registry.register(token.clone(), route.clone());
+
+        route.set(Some(target_for(1)));
+        assert_eq!(
+            registry
+                .lookup(&token)
+                .unwrap()
+                .resolve()
+                .unwrap()
+                .key_data
+                .unwrap()
+                .process_id,
+            1
+        );
+
+        route.set(Some(target_for(2)));
+        assert_eq!(
+            registry
+                .lookup(&token)
+                .unwrap()
+                .resolve()
+                .unwrap()
+                .key_data
+                .unwrap()
+                .process_id,
+            2
+        );
+
+        // Between transactions the client holds nothing, so there is nothing to
+        // cancel and nobody else's query is cancelled in its place.
+        route.set(None);
+        assert!(registry.lookup(&token).unwrap().resolve().is_none());
+    }
+
     #[test]
     fn an_unknown_token_resolves_to_nothing() {
         let registry = CancelRegistry::new();
-        let _guard = registry.register(CancelToken::mint(0).unwrap(), target());
+        let _guard = registry.register(CancelToken::mint(0).unwrap(), route(target()));
         let other = CancelToken {
             process_id: 1,
             key: Bytes::from_static(b"nope"),

@@ -210,6 +210,15 @@ impl ServerLink {
         &self.outstanding
     }
 
+    /// Synthesised responses that have reached the head of the queue.
+    ///
+    /// See [`OutstandingQueue::take_ready_fakes`]; call after every
+    /// [`observe_frontend`](Self::observe_frontend) and
+    /// [`observe_backend`](Self::observe_backend).
+    pub fn take_ready_fakes(&mut self) -> Vec<BackendMessage> {
+        self.outstanding.take_ready_fakes()
+    }
+
     pub fn copy(&self) -> CopyState {
         self.copy
     }

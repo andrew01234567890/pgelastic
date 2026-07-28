@@ -1,0 +1,1018 @@
+//! The pool manager: pool keys, checkout, check-in, and the admission ladder.
+//!
+//! Three separate accounts meet here, and keeping them distinct is what makes
+//! the pool's ceiling explainable.
+//!
+//! - [`Allocator`] owns *capacity*. Every checkout goes through
+//!   [`Allocator::try_lease`] and nothing else decides whether a client may hold
+//!   a backend. A slot is fungible.
+//! - [`Pool`] owns *physical links*, keyed by [`PoolKey`]. A link is not
+//!   fungible: two clients whose keys differ may never touch the same socket,
+//!   so a capacity slot whose parked link belongs to another key is honoured by
+//!   closing that link and opening a new one, never by reusing it.
+//! - [`BudgetLedger`] owns the *split* between reusable and pinned. A pinned
+//!   link still occupies a backend connection but has left the elastic pool, and
+//!   without this account the effective ceiling silently drops with no way to
+//!   say why.
+//!
+//! Release is decided by [`ServerLink::can_check_in`] and by nothing else. There
+//! is no second predicate in this file, and no caller is allowed to write one.
+
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
+
+use bytes::Bytes;
+use pgelastic_capacity::{
+    Admission, Allocator, ClientId, ConnectRejection, DenialReason, Disposition, Grant, Lease,
+    RequestKind, TenantId as CapacityTenant, TenantSpec, TicketId,
+};
+use pgelastic_pool::{
+    GlobalStatementCache, PinReason, PoolKey, Priority, ServerLink, ServerStatements, WaitQueue,
+    Waiter, jittered_lifetime,
+};
+use pgelastic_wire::{BackendKeyData, BackendMessage, StartupMessage};
+use tokio::io::AsyncWrite;
+use tracing::{debug, warn};
+
+use crate::config::PoolConfig;
+use crate::error::{ProxyError, Result};
+use crate::metrics::Metrics;
+use crate::relay::FrameRelay;
+use crate::scram::KdfPool;
+use crate::stream::BackendStream;
+use crate::tls::BackendTls;
+use crate::vars::VariableCache;
+
+/// Spread applied to `serverLifetime` so a pool opened in one second does not
+/// recycle every link in one second an hour later.
+const LIFETIME_JITTER_PERCENT: u32 = 10;
+
+/// A refusal on its way to a client, already in wire terms.
+///
+/// The taxonomy is API surface, not diagnostics: the message leads with the
+/// `PGE` code so a client that cannot read SQLSTATE still gets a stable token
+/// to match on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Denial {
+    pub sqlstate: &'static str,
+    pub message: String,
+}
+
+impl Denial {
+    fn from_reason(reason: &DenialReason) -> Self {
+        Self {
+            sqlstate: reason.sqlstate(),
+            message: format!("{}: {reason}", reason.code()),
+        }
+    }
+
+    fn backend(message: impl Into<String>) -> Self {
+        Self {
+            sqlstate: crate::error::sqlstate::CONNECTION_FAILURE,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Denial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.sqlstate)
+    }
+}
+
+/// One physical backend link and everything the pool knows about it.
+#[derive(Debug)]
+pub struct BackendConn {
+    pub stream: BackendStream,
+    /// The single buffer on this socket. The handshake's [`MessageBuffer`]
+    /// residue is folded in here at hand-over, because two buffers over one
+    /// stream lose whichever bytes land in the one nobody is reading.
+    pub relay: FrameRelay,
+    pub link: ServerLink,
+    pub statements: ServerStatements,
+    pub vars: VariableCache,
+    /// The backend's real cancel key. Never handed to a client.
+    pub key_data: Option<BackendKeyData>,
+    pub address: String,
+}
+
+impl BackendConn {
+    /// Best-effort `Terminate`, so the server logs a logout rather than an
+    /// unexpected EOF.
+    pub async fn close(mut self) {
+        crate::session::terminate_backend(&mut self.stream).await;
+    }
+}
+
+/// A backend held by a client, with the lease that entitles it to hold it.
+#[derive(Debug)]
+pub struct Checkout {
+    pub server: pgelastic_capacity::ServerId,
+    pub conn: BackendConn,
+    lease: Lease,
+}
+
+/// The per-`PoolKey` view: which links exist under this identity.
+#[derive(Debug, Default)]
+struct Pool {
+    idle: BTreeSet<pgelastic_capacity::ServerId>,
+    active: BTreeSet<pgelastic_capacity::ServerId>,
+    /// The `ParameterStatus` set a new client of this pool is greeted with.
+    ///
+    /// Cached from the first link opened under the key so that the twentieth
+    /// client does not have to hold a backend just to learn the server's
+    /// `TimeZone`.
+    greeting: Option<Arc<Vec<BackendMessage>>>,
+}
+
+/// A link parked between clients, under the key it may be reused for.
+#[derive(Debug)]
+struct Parked {
+    key: PoolKey,
+    conn: BackendConn,
+}
+
+#[derive(Debug)]
+struct Inner {
+    allocator: Allocator,
+    pools: HashMap<PoolKey, Pool>,
+    parked: HashMap<pgelastic_capacity::ServerId, Parked>,
+    waits: HashMap<CapacityTenant, Arc<WaitQueue<Grant>>>,
+    ledger: pgelastic_pool::BudgetLedger,
+    statements: GlobalStatementCache,
+    tenants: BTreeSet<CapacityTenant>,
+}
+
+/// Everything a checkout needs to open a link it could not find parked.
+pub struct Connector<'a> {
+    pub backend: &'a crate::config::BackendConfig,
+    pub tls: Option<&'a BackendTls>,
+    pub kdf: &'a KdfPool,
+    pub startup: &'a StartupMessage,
+}
+
+impl std::fmt::Debug for Connector<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connector")
+            .field("address", &self.backend.address)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The map of pools, the capacity allocator and the pinning ledger.
+#[derive(Debug)]
+pub struct PoolManager {
+    inner: Mutex<Inner>,
+    config: PoolConfig,
+    metrics: Arc<Metrics>,
+    next_link_id: AtomicU64,
+}
+
+impl PoolManager {
+    pub fn new(config: PoolConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>> {
+        let pool_spec = pgelastic_capacity::PoolSpec {
+            backend_connections: config.backend_connections,
+            headroom_percent: config.headroom_percent,
+            max_client_connections: config.max_client_connections,
+            max_oversubscription: None,
+            mode: config.mode.into(),
+            fd_budget: None,
+        };
+        let admission = pgelastic_capacity::AdmissionSpec {
+            strategy: pgelastic_capacity::AdmissionStrategy::WeightedDeficit,
+            queue_depth_per_tenant: config.queue_depth_per_tenant,
+            max_wait: config.query_wait_timeout(),
+        };
+        let mut allocator = Allocator::new(pool_spec, admission)
+            .map_err(|e| ProxyError::config(format!("pool capacity: {e}")))?;
+
+        let mut tenants = BTreeSet::new();
+        for tenant in &config.tenants {
+            let id = CapacityTenant::new(tenant.name.as_str());
+            allocator
+                .add_tenant(
+                    id.clone(),
+                    TenantSpec {
+                        guaranteed: tenant.guaranteed,
+                        burstable: tenant.burstable,
+                        weight: tenant.weight,
+                        priority: tenant.priority,
+                        max_client_connections: tenant.max_client_connections,
+                        storage_bytes: u64::MAX,
+                    },
+                )
+                .map_err(|e| ProxyError::config(format!("tenant {}: {e}", tenant.name)))?;
+            tenants.insert(id);
+        }
+
+        let ledger = pgelastic_pool::BudgetLedger::new(config.backend_connections);
+        Ok(Arc::new(Self {
+            inner: Mutex::new(Inner {
+                allocator,
+                pools: HashMap::new(),
+                parked: HashMap::new(),
+                waits: HashMap::new(),
+                ledger,
+                statements: GlobalStatementCache::new(),
+                tenants,
+            }),
+            config,
+            metrics,
+            next_link_id: AtomicU64::new(1),
+        }))
+    }
+
+    pub fn config(&self) -> &PoolConfig {
+        &self.config
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .expect("the pool manager is never poisoned")
+    }
+
+    /// Binds a tenant seen for the first time.
+    ///
+    /// An unconfigured tenant is `BestEffort` — no guarantee — and has **no
+    /// ceiling of its own**, so the pool's ceiling is the only one it can meet.
+    /// The distinction is not cosmetic: a tenant that has hit its own ceiling is
+    /// told `PGE1928 raise burstable`, and telling that to a tenant whose
+    /// `burstable` was never set would name a knob that does not exist. A tenant
+    /// nobody has given a claim to waits for the pool instead.
+    ///
+    /// A tenant whose guarantee could not be honoured is rejected rather than
+    /// silently degraded, which is why this can fail.
+    pub fn ensure_tenant(&self, name: &str) -> Result<CapacityTenant, Denial> {
+        let id = CapacityTenant::new(name);
+        let mut inner = self.lock();
+        if inner.tenants.contains(&id) {
+            return Ok(id);
+        }
+        let spec = TenantSpec {
+            guaranteed: 0,
+            burstable: u32::MAX,
+            weight: 100,
+            priority: 1_000,
+            max_client_connections: u32::MAX,
+            storage_bytes: u64::MAX,
+        };
+        inner.allocator.add_tenant(id.clone(), spec).map_err(|e| {
+            Denial::backend(format!(
+                "tenant {name} cannot be admitted to this pool: {e}"
+            ))
+        })?;
+        inner.tenants.insert(id.clone());
+        Ok(id)
+    }
+
+    pub fn connect_client(&self, tenant: &CapacityTenant) -> std::result::Result<ClientId, Denial> {
+        self.lock()
+            .allocator
+            .connect_client(tenant)
+            .map_err(|rejection| match rejection {
+                ConnectRejection::Denied(reason) => Denial::from_reason(&reason),
+                ConnectRejection::UnknownTenant(tenant) => {
+                    Denial::backend(format!("no tenant {tenant} is bound to this pool"))
+                }
+            })
+    }
+
+    pub fn disconnect_client(&self, client: ClientId) {
+        let mut inner = self.lock();
+        let grants = inner.allocator.disconnect_client(client);
+        inner.dispatch(grants);
+    }
+
+    /// The cached greeting for a pool, if any link has ever been opened under
+    /// this key.
+    pub fn greeting(&self, key: &PoolKey) -> Option<Arc<Vec<BackendMessage>>> {
+        self.lock().pools.get(key)?.greeting.clone()
+    }
+
+    pub fn intern_statement(
+        &self,
+        key: pgelastic_pool::StatementKey,
+    ) -> Arc<pgelastic_pool::PreparedStatement> {
+        self.lock().statements.intern(key)
+    }
+
+    /// Reports the elastic/pinned split for the metrics exposition.
+    pub fn ledger_snapshot(&self) -> LedgerSnapshot {
+        let inner = self.lock();
+        LedgerSnapshot {
+            limit: inner.ledger.limit(),
+            elastic: inner.ledger.elastic(),
+            elastic_limit: inner.ledger.elastic_limit(),
+            pinned: PinReason::ALL.map(|reason| (reason, inner.ledger.pinned_for(reason))),
+        }
+    }
+
+    /// Moves a link out of the elastic pool and into the pinned account.
+    ///
+    /// The connection is still a real backend connection and still counts
+    /// against the pool's total; what it has left is the *reusable* pool, and
+    /// [`BudgetLedger::elastic_limit`](pgelastic_pool::BudgetLedger::elastic_limit)
+    /// is the ceiling that drops as a result. Without this split the drop has no
+    /// attributable cause.
+    pub fn record_pin(&self, reason: PinReason) {
+        let mut inner = self.lock();
+        if let Err(error) = inner.ledger.pin(reason) {
+            warn!(%error, %reason, "pinning a link the ledger does not know about");
+        }
+    }
+
+    /// Returns a pinned link to the elastic pool, once the client that dirtied
+    /// it has gone and the scrub that removes the state has run.
+    pub fn release_pin(&self, reason: PinReason) {
+        let mut inner = self.lock();
+        if let Err(error) = inner.ledger.unpin(reason) {
+            warn!(%error, %reason, "unpinning a link the ledger does not know about");
+        }
+    }
+
+    fn record_unpin(inner: &mut Inner, pin: Option<PinReason>) {
+        match pin {
+            Some(reason) => {
+                if inner.ledger.close_pinned(reason).is_err() {
+                    let _ = inner.ledger.close();
+                }
+            }
+            None => {
+                let _ = inner.ledger.close();
+            }
+        }
+    }
+
+    /// The whole checkout path: admission, then a link.
+    ///
+    /// `client` is written to only while the request is queued, and only with a
+    /// `NoticeResponse` naming the limit it is waiting on.
+    pub async fn acquire<W: AsyncWrite + Unpin>(
+        &self,
+        request: &AcquireRequest<'_>,
+        connector: &Connector<'_>,
+        client: &mut W,
+    ) -> std::result::Result<Checkout, Denial> {
+        let admission = {
+            let mut inner = self.lock();
+            let admission = inner
+                .allocator
+                .try_lease(request.client, RequestKind::Normal);
+            match admission {
+                Admission::Queued {
+                    ticket, blocked_by, ..
+                } => {
+                    let queue = inner.wait_queue(request.tenant);
+                    let waiter = queue
+                        .enqueue(Priority::Normal, Instant::now())
+                        .map_err(|_| Denial::backend("the pool is shutting down"))?;
+                    Waiting::Queued(waiter, ticket, blocked_by)
+                }
+                Admission::Granted(lease) => Waiting::Granted(lease),
+                Admission::Denied(reason) => Waiting::Denied(reason),
+                Admission::Stale => Waiting::Denied(DenialReason::PoolCapacity {
+                    live: 0,
+                    total: self.config.backend_connections,
+                }),
+            }
+        };
+
+        let lease = match admission {
+            Waiting::Granted(lease) => lease,
+            Waiting::Denied(reason) => {
+                self.metrics.admission_denied(reason.code());
+                return Err(Denial::from_reason(&reason));
+            }
+            Waiting::Queued(waiter, ticket, blocked_by) => {
+                self.await_grant(request, waiter, ticket, &blocked_by, client)
+                    .await?
+                    .lease
+            }
+        };
+
+        self.attach(request, connector, lease).await
+    }
+
+    /// Waits for the queue to reach this client, emitting the notice threshold
+    /// on the way and refusing with `PGE1024` at the deadline.
+    async fn await_grant<W: AsyncWrite + Unpin>(
+        &self,
+        request: &AcquireRequest<'_>,
+        waiter: Waiter<Grant>,
+        ticket: TicketId,
+        blocked_by: &DenialReason,
+        client: &mut W,
+    ) -> std::result::Result<Grant, Denial> {
+        self.metrics.admission_queued();
+        let started = Instant::now();
+        let mut ticket = TicketGuard {
+            manager: self,
+            tenant: request.tenant.clone(),
+            ticket,
+            settled: false,
+        };
+        tokio::pin!(waiter);
+
+        let notice = tokio::time::sleep(self.config.notify_after());
+        tokio::pin!(notice);
+        let deadline = tokio::time::sleep(self.config.query_wait_timeout());
+        tokio::pin!(deadline);
+        let mut notified = false;
+
+        loop {
+            tokio::select! {
+                grant = &mut waiter => {
+                    ticket.settled = true;
+                    self.metrics.admission_dequeued();
+                    return grant.map_err(|_| Denial::backend("the pool is shutting down"));
+                }
+                () = &mut notice, if !notified => {
+                    notified = true;
+                    let code = blocked_by.code();
+                    let text = format!(
+                        "{code}: waiting for a backend connection ({blocked_by}); \
+                         waited {:?} of {:?}",
+                        started.elapsed(),
+                        self.config.query_wait_timeout(),
+                    );
+                    let _ = crate::wire_io::write_backend(
+                        client,
+                        &[crate::wire_io::notice(blocked_by.sqlstate(), &text)],
+                    )
+                    .await;
+                }
+                () = &mut deadline => {
+                    let reason = DenialReason::AdmissionTimeout {
+                        tenant: request.tenant.clone(),
+                        waited: started.elapsed(),
+                    };
+                    self.metrics.admission_denied(reason.code());
+                    return Err(Denial::from_reason(&reason));
+                }
+            }
+        }
+    }
+
+    /// Turns a capacity slot into a physical link under `request.key`.
+    async fn attach(
+        &self,
+        request: &AcquireRequest<'_>,
+        connector: &Connector<'_>,
+        lease: Lease,
+    ) -> std::result::Result<Checkout, Denial> {
+        let server = lease.server;
+        let (parked, stale) = {
+            let mut inner = self.lock();
+            inner.claim(server, request.key)
+        };
+        if let Some(stale) = stale {
+            self.metrics.backend_closed();
+            tokio::spawn(stale.close());
+        }
+
+        if let Some(mut conn) = parked {
+            if conn
+                .link
+                .apply(pgelastic_pool::ServerEvent::Assigned)
+                .is_ok()
+            {
+                conn.link.check_lifetime(Instant::now());
+                self.metrics.checkout(true);
+                return Ok(Checkout {
+                    server,
+                    conn,
+                    lease,
+                });
+            }
+            // The link is in a state a client can no longer be handed, so it is
+            // dropped and replaced rather than repaired.
+            {
+                let mut inner = self.lock();
+                let _ = inner.ledger.close();
+                if let Some(pool) = inner.pools.get_mut(request.key) {
+                    pool.active.remove(&server);
+                }
+            }
+            self.metrics.backend_closed();
+            tokio::spawn(conn.close());
+        }
+
+        match self.open(request, connector, server).await {
+            Ok(conn) => {
+                self.metrics.checkout(false);
+                Ok(Checkout {
+                    server,
+                    conn,
+                    lease,
+                })
+            }
+            Err(error) => {
+                let mut inner = self.lock();
+                let grants = inner.allocator.backend_died(server);
+                inner.dispatch(grants);
+                Err(Denial::backend(format!(
+                    "opening a backend connection failed: {error}"
+                )))
+            }
+        }
+    }
+
+    async fn open(
+        &self,
+        request: &AcquireRequest<'_>,
+        connector: &Connector<'_>,
+        server: pgelastic_capacity::ServerId,
+    ) -> Result<BackendConn> {
+        {
+            let mut inner = self.lock();
+            inner
+                .ledger
+                .open()
+                .map_err(|e| ProxyError::backend(format!("backend budget: {e}")))?;
+        }
+
+        let session = match crate::backend::connect(
+            connector.backend,
+            connector.tls,
+            connector.kdf,
+            connector.startup,
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                let mut inner = self.lock();
+                let _ = inner.ledger.close();
+                return Err(error);
+            }
+        };
+        self.metrics
+            .backend_auth(crate::metrics::AuthOutcome::Success);
+        self.metrics.backend_opened();
+
+        let id = pgelastic_pool::ServerId::new(self.next_link_id.fetch_add(1, Ordering::Relaxed));
+        let mut link = ServerLink::new(id, request.key.clone());
+        // Recorded while the link is still in `login`, where the queue is
+        // deliberately not fed, so the release gate has a transaction status to
+        // read without a request ever having been made.
+        link.observe_backend(&BackendMessage::ReadyForQuery(
+            pgelastic_wire::TransactionStatus::Idle,
+        ))
+        .map_err(|e| ProxyError::backend(e.to_string()))?;
+        link.apply(pgelastic_pool::ServerEvent::LoginSucceeded)
+            .map_err(|e| ProxyError::backend(e.to_string()))?;
+        link.apply(pgelastic_pool::ServerEvent::Assigned)
+            .map_err(|e| ProxyError::backend(e.to_string()))?;
+        link.set_deadline(
+            Instant::now()
+                + jittered_lifetime(
+                    self.config.server_lifetime(),
+                    LIFETIME_JITTER_PERCENT,
+                    server.0,
+                ),
+        );
+
+        let mut vars = VariableCache::new();
+        for message in &session.parameters {
+            if let BackendMessage::ParameterStatus(status) = message {
+                vars.observe(&status.name, &status.value);
+            }
+        }
+
+        let mut relay = FrameRelay::new(
+            crate::relay::DEFAULT_INLINE_FRAME_BYTES,
+            crate::relay::DEFAULT_MAX_FRAME_BYTES,
+        );
+        relay.extend_from_slice(session.buf.as_slice());
+
+        let mut inner = self.lock();
+        let pool = inner.pools.entry(request.key.clone()).or_default();
+        pool.active.insert(server);
+        if pool.greeting.is_none() {
+            pool.greeting = Some(Arc::new(session.parameters.clone()));
+        }
+        drop(inner);
+
+        Ok(BackendConn {
+            stream: session.stream,
+            relay,
+            link,
+            statements: ServerStatements::new(self.config.max_server_statements),
+            vars,
+            key_data: session.key_data,
+            address: connector.backend.address.clone(),
+        })
+    }
+
+    /// Returns a link to the pool. The caller has already run the reset ladder
+    /// and has already had `Ok(())` from [`ServerLink::can_check_in`].
+    pub fn check_in(&self, key: &PoolKey, checkout: Checkout) {
+        let Checkout {
+            server,
+            mut conn,
+            lease,
+        } = checkout;
+        // Asserted before the state moves, because the gate's first condition
+        // is that the link is in a state a release can be reached from, and
+        // `idle` — where the link is about to land — is not one of them.
+        debug_assert_eq!(
+            conn.link.can_check_in(),
+            Ok(()),
+            "a link may only be checked in through the release gate"
+        );
+        let _ = match conn.link.state() {
+            pgelastic_pool::ServerState::Active => {
+                conn.link.apply(pgelastic_pool::ServerEvent::Released)
+            }
+            pgelastic_pool::ServerState::Tested => {
+                conn.link.apply(pgelastic_pool::ServerEvent::ResetSucceeded)
+            }
+            _ => Ok(conn.link.state()),
+        };
+
+        let mut inner = self.lock();
+        inner.park(server, key.clone(), conn);
+        let outcome = inner.allocator.release(lease);
+        let closing = match outcome.disposition {
+            Disposition::Idle(_) => None,
+            // `close_needed` set by a revocation, a cancel connection, or a
+            // lease that no longer refers to a live checkout: the slot is gone
+            // and the link goes with it.
+            Disposition::Closed(_) | Disposition::Stale | Disposition::Pinned(_) => {
+                inner.unpark(server)
+            }
+        };
+        inner.dispatch(outcome.grants);
+        drop(inner);
+
+        self.metrics.check_in();
+        if let Some(conn) = closing {
+            self.metrics.backend_closed();
+            tokio::spawn(conn.close());
+        }
+    }
+
+    /// Drops a link without returning it: it failed, expired, or carries state
+    /// no reset can remove.
+    ///
+    /// The capacity slot is released all the same. A slot is fungible, so the
+    /// next client to be granted it simply opens a new link — which is the whole
+    /// reason the physical account and the capacity account are separate.
+    pub fn discard(&self, checkout: Checkout) {
+        let Checkout {
+            server,
+            conn,
+            lease,
+        } = checkout;
+        let pin = conn.link.pin();
+        let key = conn.link.key().clone();
+
+        let mut inner = self.lock();
+        if let Some(pool) = inner.pools.get_mut(&key) {
+            pool.active.remove(&server);
+            pool.idle.remove(&server);
+        }
+        Self::record_unpin(&mut inner, pin);
+        let outcome = inner.allocator.release(lease);
+        inner.dispatch(outcome.grants);
+        drop(inner);
+
+        self.metrics.backend_closed();
+        tokio::spawn(conn.close());
+    }
+
+    /// Refreshes the exported budget gauges from the ledger.
+    pub fn publish_budget(&self) {
+        let snapshot = self.ledger_snapshot();
+        self.metrics
+            .budget(snapshot.limit, snapshot.elastic, snapshot.elastic_limit);
+    }
+}
+
+/// Builds the identity a link opened for this client may ever be reused under.
+///
+/// Every axis along which two sessions can differ observably is a field, so
+/// "could this link leak state across a boundary?" reduces to "are the keys
+/// equal?". `RESET ALL` restores GUCs to their *session-start* values, so the
+/// startup parameters are part of identity rather than of state and no reset
+/// ladder can undo them.
+pub fn pool_key(
+    config: &crate::config::Config,
+    startup: &StartupMessage,
+    role: &str,
+) -> Result<PoolKey> {
+    use pgelastic_pool::{
+        BackendTarget, CredentialGeneration, DatabaseName, FingerprintPolicy, PoolKeySpec,
+        ReplicationKind, RoleName, StartupFingerprint, TenantId, TlsPosture,
+    };
+
+    let text =
+        |value: Option<&Bytes>| value.map(|value| String::from_utf8_lossy(value).into_owned());
+    let replication = text(startup.get(b"replication"))
+        .as_deref()
+        .map_or(ReplicationKind::None, |value| {
+            ReplicationKind::from_startup_value(value).unwrap_or(ReplicationKind::None)
+        });
+
+    let fingerprint = StartupFingerprint::build(
+        startup.parameters.iter().filter_map(|(name, value)| {
+            let name = String::from_utf8_lossy(name).into_owned();
+            (!name.starts_with("_pq_."))
+                .then(|| (name, String::from_utf8_lossy(value).into_owned()))
+        }),
+        &FingerprintPolicy::default(),
+    )
+    .map_err(|e| ProxyError::client(e.to_string()))?;
+
+    let address = crate::config::resolve(&config.backend.address)?;
+    let database = config
+        .backend
+        .database
+        .clone()
+        .or_else(|| text(startup.get(b"database")))
+        .unwrap_or_else(|| role.to_owned());
+
+    Ok(PoolKey::new(PoolKeySpec {
+        tenant: TenantId::new(role),
+        target: BackendTarget::new(address.ip().to_string(), address.port()),
+        database: DatabaseName::new(database),
+        role: RoleName::new(&config.backend.user),
+        fingerprint,
+        tls: match config.backend.tls.mode {
+            crate::config::BackendTlsMode::Disable => TlsPosture::Plaintext,
+            _ => TlsPosture::Tls,
+        },
+        replication,
+        configured_mode: config.pool.mode.into(),
+        credentials: CredentialGeneration::new(0),
+    }))
+}
+
+/// What the ladder produced, before any awaiting happens.
+enum Waiting {
+    Granted(Lease),
+    Queued(Waiter<Grant>, TicketId, DenialReason),
+    Denied(DenialReason),
+}
+
+/// Removes an admission ticket however the wait ends.
+///
+/// The `Waiter`'s own `Drop` deregisters it from the wait queue; this
+/// deregisters the matching ticket from the allocator. Both queues are strict
+/// FIFO within a tenant and both lose the same entry, so their heads stay in
+/// lockstep — which is what lets a grant be delivered to the head of the wait
+/// queue without carrying a client identity through the handoff.
+struct TicketGuard<'a> {
+    manager: &'a PoolManager,
+    tenant: CapacityTenant,
+    ticket: TicketId,
+    settled: bool,
+}
+
+impl Drop for TicketGuard<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let mut inner = self.manager.lock();
+        inner.allocator.cancel_ticket(&self.tenant, self.ticket);
+    }
+}
+
+/// The identity a checkout is made under.
+#[derive(Debug)]
+pub struct AcquireRequest<'a> {
+    pub key: &'a PoolKey,
+    pub tenant: &'a CapacityTenant,
+    pub client: ClientId,
+}
+
+/// The elastic/pinned split, for the metrics exposition.
+#[derive(Debug, Clone)]
+pub struct LedgerSnapshot {
+    pub limit: u32,
+    pub elastic: u32,
+    pub elastic_limit: u32,
+    pub pinned: [(PinReason, u32); PinReason::ALL.len()],
+}
+
+impl Inner {
+    fn wait_queue(&mut self, tenant: &CapacityTenant) -> Arc<WaitQueue<Grant>> {
+        Arc::clone(
+            self.waits
+                .entry(tenant.clone())
+                .or_insert_with(|| Arc::new(WaitQueue::new())),
+        )
+    }
+
+    /// Takes the link parked in `server`'s slot if it may be reused under `key`.
+    ///
+    /// A slot is fungible and a link is not. A parked link opened under a
+    /// different key is returned as the second element for the caller to close:
+    /// reusing it would hand one identity's session to another, which is the one
+    /// thing the pool key exists to prevent.
+    fn claim(
+        &mut self,
+        server: pgelastic_capacity::ServerId,
+        key: &PoolKey,
+    ) -> (Option<BackendConn>, Option<BackendConn>) {
+        let Some(parked) = self.parked.remove(&server) else {
+            return (None, None);
+        };
+        if let Some(pool) = self.pools.get_mut(&parked.key) {
+            pool.idle.remove(&server);
+        }
+        if &parked.key == key {
+            self.pools
+                .entry(parked.key)
+                .or_default()
+                .active
+                .insert(server);
+            return (Some(parked.conn), None);
+        }
+        let _ = self.ledger.close();
+        debug!(%server, "a capacity slot changed pool key; its link is closed rather than reused");
+        (None, Some(parked.conn))
+    }
+
+    fn park(&mut self, server: pgelastic_capacity::ServerId, key: PoolKey, conn: BackendConn) {
+        let pool = self.pools.entry(key.clone()).or_default();
+        pool.active.remove(&server);
+        pool.idle.insert(server);
+        self.parked.insert(server, Parked { key, conn });
+    }
+
+    fn unpark(&mut self, server: pgelastic_capacity::ServerId) -> Option<BackendConn> {
+        let parked = self.parked.remove(&server)?;
+        if let Some(pool) = self.pools.get_mut(&parked.key) {
+            pool.idle.remove(&server);
+            pool.active.remove(&server);
+        }
+        PoolManager::record_unpin(self, parked.conn.link.pin());
+        Some(parked.conn)
+    }
+
+    /// Hands each grant to the head of its tenant's wait queue.
+    ///
+    /// Strictly in the order the allocator produced them: within a tenant both
+    /// queues are FIFO and both lose the same entries, so the *n*th grant
+    /// belongs to the *n*th waiter. Handing them out in any other order would
+    /// give one client's lease to another, and the lease is what a later
+    /// disconnect uses to find the connection to retire.
+    ///
+    /// A grant nobody is waiting for is released again rather than dropped;
+    /// releasing pops another ticket, so the allocator's queue strictly shrinks
+    /// and the loop terminates.
+    fn dispatch(&mut self, grants: Vec<Grant>) {
+        let mut pending = std::collections::VecDeque::from(grants);
+        while let Some(grant) = pending.pop_front() {
+            let queue = self.wait_queue(&grant.tenant);
+            if let Err(orphan) = queue.hand_off(grant) {
+                let outcome = self.allocator.release(orphan.lease);
+                pending.extend(outcome.grants);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::config::{PoolModeConfig, TenantConfig};
+
+    fn manager(config: PoolConfig) -> Arc<PoolManager> {
+        PoolManager::new(config, Metrics::new()).unwrap()
+    }
+
+    fn transaction_config(backend_connections: u32) -> PoolConfig {
+        PoolConfig {
+            mode: PoolModeConfig::Transaction,
+            backend_connections,
+            ..PoolConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_unconfigured_tenant_is_bound_on_first_sight_with_no_guarantee() {
+        let manager = manager(transaction_config(4));
+        let tenant = manager.ensure_tenant("acme").unwrap();
+        assert_eq!(tenant.as_str(), "acme");
+        // Idempotent: a second client of the same tenant must not re-add it.
+        assert_eq!(manager.ensure_tenant("acme").unwrap(), tenant);
+    }
+
+    #[test]
+    fn a_guarantee_that_cannot_be_honoured_is_refused_at_construction() {
+        let config = PoolConfig {
+            mode: PoolModeConfig::Transaction,
+            backend_connections: 4,
+            headroom_percent: 50,
+            tenants: vec![TenantConfig {
+                name: "greedy".to_owned(),
+                guaranteed: 4,
+                burstable: 4,
+                weight: 100,
+                priority: 1_000,
+                max_client_connections: 10,
+            }],
+            ..PoolConfig::default()
+        };
+        assert!(PoolManager::new(config, Metrics::new()).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_ladder_denies_a_tenant_at_its_own_ceiling_with_pge1928() {
+        let config = PoolConfig {
+            mode: PoolModeConfig::Transaction,
+            backend_connections: 8,
+            tenants: vec![TenantConfig {
+                name: "small".to_owned(),
+                guaranteed: 0,
+                burstable: 1,
+                weight: 100,
+                priority: 1_000,
+                max_client_connections: 10,
+            }],
+            ..PoolConfig::default()
+        };
+        let manager = manager(config);
+        let tenant = manager.ensure_tenant("small").unwrap();
+
+        let first = manager.connect_client(&tenant).unwrap();
+        let second = manager.connect_client(&tenant).unwrap();
+
+        let mut inner = manager.lock();
+        assert!(matches!(
+            inner.allocator.try_lease(first, RequestKind::Normal),
+            Admission::Granted(_)
+        ));
+        let Admission::Denied(reason) = inner.allocator.try_lease(second, RequestKind::Normal)
+        else {
+            panic!("the second checkout must exceed the tenant ceiling");
+        };
+        assert_eq!(Denial::from_reason(&reason).sqlstate, "53300");
+        assert!(Denial::from_reason(&reason).message.starts_with("PGE1928"));
+    }
+
+    #[tokio::test]
+    async fn a_full_pool_queues_rather_than_denying_and_reports_pge1936_as_the_cause() {
+        let manager = manager(transaction_config(1));
+        let tenant = manager.ensure_tenant("acme").unwrap();
+        let holder = manager.connect_client(&tenant).unwrap();
+        let waiter = manager.connect_client(&tenant).unwrap();
+
+        let mut inner = manager.lock();
+        assert!(matches!(
+            inner.allocator.try_lease(holder, RequestKind::Normal),
+            Admission::Granted(_)
+        ));
+        let Admission::Queued { blocked_by, .. } =
+            inner.allocator.try_lease(waiter, RequestKind::Normal)
+        else {
+            panic!("a full pool must queue");
+        };
+        let denial = Denial::from_reason(&blocked_by);
+        assert_eq!(denial.sqlstate, "53400");
+        assert!(denial.message.starts_with("PGE1936"));
+    }
+
+    #[test]
+    fn an_admission_timeout_is_pge1024() {
+        let denial = Denial::from_reason(&DenialReason::AdmissionTimeout {
+            tenant: CapacityTenant::new("acme"),
+            waited: Duration::from_secs(120),
+        });
+        assert_eq!(denial.sqlstate, "53400");
+        assert!(denial.message.starts_with("PGE1024"));
+    }
+
+    #[test]
+    fn a_pinned_link_lowers_the_elastic_ceiling_and_is_counted_under_its_reason() {
+        let manager = manager(transaction_config(4));
+        {
+            let mut inner = manager.lock();
+            inner.ledger.open().unwrap();
+            inner.ledger.open().unwrap();
+        }
+        manager.record_pin(PinReason::Listen);
+
+        let snapshot = manager.ledger_snapshot();
+        assert_eq!(snapshot.limit, 4);
+        assert_eq!(snapshot.elastic, 1);
+        assert_eq!(snapshot.elastic_limit, 3);
+        assert_eq!(
+            snapshot
+                .pinned
+                .iter()
+                .find(|(reason, _)| *reason == PinReason::Listen)
+                .unwrap()
+                .1,
+            1
+        );
+    }
+}
