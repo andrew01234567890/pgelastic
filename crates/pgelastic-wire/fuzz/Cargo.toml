@@ -1,0 +1,38 @@
+[workspace]
+
+[package]
+name = "pgelastic-wire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1.4.2", features = ["derive"] }
+libfuzzer-sys = "0.4"
+
+[dependencies.pgelastic-wire]
+path = ".."
+
+[[bin]]
+name = "frame_decoder"
+path = "fuzz_targets/frame_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "prestartup"
+path = "fuzz_targets/prestartup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked_frames"
+path = "fuzz_targets/chunked_frames.rs"
+test = false
+doc = false
+bench = false

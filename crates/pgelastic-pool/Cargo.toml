@@ -1,0 +1,22 @@
+[package]
+name = "pgelastic-pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arc-swap = "1.9.2"
+bytes = "1.12.1"
+parking_lot = "0.12.5"
+pgelastic-wire = { version = "0.1.0", path = "../pgelastic-wire" }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1.44"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"

@@ -1,0 +1,506 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgtenants.pgelastic.io
+spec:
+  group: pgelastic.io
+  names:
+    categories:
+    - pgelastic
+    kind: PgTenant
+    listKind: PgTenantList
+    plural: pgtenants
+    shortNames:
+    - pgt
+    singular: pgtenant
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.poolRef.name
+      name: Pool
+      type: string
+    - jsonPath: .spec.databaseName
+      name: Database
+      type: string
+    - jsonPath: .status.qosClass
+      name: QoS
+      type: string
+    - jsonPath: .status.binding.instanceRef.name
+      name: Instance
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          PgTenant is one tenant's claim on a PgElasticPool: one PostgreSQL DATABASE and one
+          ROLE. It is the only object an application team owns, and a working spec is a pool
+          reference plus a database name.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of PgTenant
+            properties:
+              auth:
+                description: auth overrides the pool's authentication posture for
+                  this tenant.
+                properties:
+                  credentialsSecretRef:
+                    description: |-
+                      credentialsSecretRef names a Secret holding the tenant role's password. pgelastic
+                      owns password provisioning end to end because ScramPassthrough requires the salt
+                      and iteration count to match the backend verifier byte for byte.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  mode:
+                    description: |-
+                      mode selects how the proxy authenticates this tenant's clients. Defaults to the
+                      pool's auth.mode.
+                    enum:
+                    - ScramPassthrough
+                    - BackendServiceAccount
+                    - AuthQuery
+                    type: string
+                type: object
+              capacity:
+                description: capacity overrides the workload class's capacity triple
+                  for this tenant alone.
+                properties:
+                  burstable:
+                    description: |-
+                      burstable is the ceiling on concurrently held backend connections. It is a cap and
+                      explicitly not a guarantee; exceeding it yields PGE1928 rather than a queue slot.
+                    format: int32
+                    maximum: 10000
+                    minimum: 1
+                    type: integer
+                  guaranteed:
+                    description: |-
+                      guaranteed is the number of backend connections reserved for this tenant. The
+                      reservation is a credit, not a pre-warmed connection, and it is strictly
+                      non-work-conserving: an idle tenant's unused guarantee is not lent to others.
+                      Zero means the tenant draws only from burst credit, which derives qosClass
+                      BestEffort.
+                    format: int32
+                    maximum: 10000
+                    minimum: 0
+                    type: integer
+                  storage:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      storage caps the tenant's database size. WAL and temporary files are excluded, so
+                      the enforced number is not the tenant's total disk footprint.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                type: object
+                x-kubernetes-validations:
+                - message: guaranteed must not exceed burstable
+                  rule: '!has(self.guaranteed) || !has(self.burstable) || self.guaranteed
+                    <= self.burstable'
+              databaseName:
+                description: |-
+                  databaseName is the PostgreSQL DATABASE created for this tenant. It is immutable
+                  because renaming would invalidate every issued connection string and every backup
+                  path keyed on it.
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-z_][a-z0-9_]*$
+                type: string
+                x-kubernetes-validations:
+                - message: databaseName is immutable
+                  rule: self == oldSelf
+              extensions:
+                description: |-
+                  extensions requests PostgreSQL extensions in the tenant's database. Entries must
+                  come from the pool's curated allowlist and are installed at identical versions on
+                  every instance in the pool: a version skew between a migration's source and target
+                  silently produces a divergent schema. Large objects are forbidden product-wide and
+                  no extension can re-enable them, because they have no representation in logical
+                  replication and would permanently strand the tenant on the offline migration path.
+                items:
+                  maxLength: 63
+                  pattern: ^[a-z_][a-z0-9_]*$
+                  type: string
+                maxItems: 32
+                type: array
+                x-kubernetes-list-type: atomic
+              owner:
+                description: owner is the PostgreSQL role owning the database. Defaults
+                  to databaseName.
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-z_][a-z0-9_]*$
+                type: string
+              placement:
+                description: placement constrains where the tenant may be hosted.
+                properties:
+                  antiAffinityLabelKeys:
+                    description: |-
+                      antiAffinityLabelKeys names label keys on this PgTenant whose values must not be
+                      shared with co-located tenants. Correlated workloads defeat the oversubscription
+                      bet that the whole capacity model rests on.
+                    items:
+                      maxLength: 317
+                      type: string
+                    maxItems: 8
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  instanceRef:
+                    description: |-
+                      instanceRef pins the tenant to one PgInstance. Omit to let the placement scheduler
+                      choose. Pinning removes the tenant from rebalancing and can make a pool
+                      unschedulable, so it is an escape hatch rather than a tuning knob.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                type: object
+              poolRef:
+                description: |-
+                  poolRef names the PgElasticPool in this namespace that supplies the capacity
+                  budget. Changing it would mean moving the data to a different capacity boundary,
+                  which is what PgTenantMigration exists for.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+                x-kubernetes-validations:
+                - message: poolRef is immutable
+                  rule: self == oldSelf
+              reclaimPolicy:
+                default: Retain
+                description: reclaimPolicy decides the fate of the database when this
+                  object is deleted.
+                enum:
+                - Retain
+                - Delete
+                type: string
+              workloadClassName:
+                description: |-
+                  workloadClassName selects the PgWorkloadClass supplying the capacity triple, limits
+                  and SLO. Changing this one string is the entire tier-change operation. Defaults to
+                  the pool's admission.defaultWorkloadClassName.
+                maxLength: 253
+                type: string
+            required:
+            - databaseName
+            - poolRef
+            type: object
+          status:
+            description: status defines the observed state of PgTenant
+            properties:
+              binding:
+                description: binding records which instance hosts the tenant's database.
+                properties:
+                  boundAt:
+                    description: boundAt is when the current binding was established.
+                    format: date-time
+                    type: string
+                  databaseOid:
+                    description: |-
+                      databaseOid is the PostgreSQL OID of the created database. It disambiguates a
+                      recreated database that reuses the same name.
+                    format: int64
+                    maximum: 4294967295
+                    minimum: 0
+                    type: integer
+                  instanceRef:
+                    description: instanceRef names the PgInstance currently hosting
+                      the database.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                type: object
+              conditions:
+                description: conditions represent the current state of the PgTenant
+                  resource.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              effective:
+                description: effective publishes the limits actually being enforced.
+                properties:
+                  burstable:
+                    description: burstable is the backend-connection ceiling in force.
+                    format: int32
+                    type: integer
+                  guaranteed:
+                    description: guaranteed is the reserved backend-connection floor
+                      in force.
+                    format: int32
+                    type: integer
+                  statementTimeout:
+                    description: |-
+                      statementTimeout is the deadline the proxy enforces. The matching GUC is set on the
+                      role as defense in depth only; being PGC_USERSET a client can SET it back, so this
+                      value is the authoritative one.
+                    type: string
+                  tempFileLimit:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      tempFileLimit is the per-process temporary file cap in force. PostgreSQL applies it
+                      per backend process, so a session with parallel workers can consume a multiple of it.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  weight:
+                    description: weight is this tenant's share of contended surplus
+                      in the cross-tenant scheduler.
+                    format: int32
+                    type: integer
+                type: object
+              observedGeneration:
+                description: observedGeneration is the metadata.generation this status
+                  was computed from.
+                format: int64
+                type: integer
+              phase:
+                default: Pending
+                description: |-
+                  phase summarises the conditions for kubectl output and carries no semantics of its
+                  own.
+                enum:
+                - Pending
+                - Binding
+                - Ready
+                - Throttled
+                - Migrating
+                - Degraded
+                - Terminating
+                type: string
+              qosClass:
+                description: |-
+                  qosClass is DERIVED by the controller from the effective guaranteed-to-burstable
+                  relationship, exactly as the kubelet derives Pod QoS. It is never declared by a
+                  user and never accepted from a spec field: guaranteed == burstable and both
+                  non-zero is Guaranteed, 0 < guaranteed < burstable is Burstable, guaranteed == 0 is
+                  BestEffort. Writing it anywhere but here is a bug.
+                enum:
+                - Guaranteed
+                - Burstable
+                - BestEffort
+                type: string
+              throttle:
+                description: throttle reports recent admission rejections.
+                properties:
+                  last24h:
+                    description: last24h counts rejections over a trailing 24-hour
+                      window.
+                    properties:
+                      PGE0544:
+                        description: PGE0544 counts write rejections against the storage
+                          quota.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      PGE1024:
+                        description: PGE1024 counts admission queue timeouts.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      PGE1613:
+                        description: PGE1613 counts connections ended by a migration
+                          cutover.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      PGE1928:
+                        description: PGE1928 counts rejections at the tenant's own
+                          burstable ceiling.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      PGE1929:
+                        description: PGE1929 counts retryable rejections while within
+                          every limit.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      PGE1936:
+                        description: PGE1936 counts rejections because the pool budget
+                          was exhausted.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                    type: object
+                  lastEvent:
+                    description: lastEvent is the most recent rejection.
+                    properties:
+                      at:
+                        description: at is when the rejection happened.
+                        format: date-time
+                        type: string
+                      code:
+                        description: code identifies which limit rejected the request.
+                        enum:
+                        - PGE1928
+                        - PGE1936
+                        - PGE1929
+                        - PGE0544
+                        - PGE1024
+                        - PGE1613
+                        type: string
+                    type: object
+                type: object
+              utilization:
+                description: utilization reports observed consumption.
+                properties:
+                  backendConnections:
+                    description: backendConnections reports connection usage against
+                      the tenant's ceiling.
+                    properties:
+                      current:
+                        description: current is the live count of held backend connections.
+                        format: int32
+                        type: integer
+                      p95_7d:
+                        description: p95_7d is the 95th percentile over a trailing
+                          7-day window.
+                        format: int32
+                        type: integer
+                      peak_7d:
+                        description: peak_7d is the maximum observed over a trailing
+                          7-day window.
+                        format: int32
+                        type: integer
+                    type: object
+                  isCold:
+                    description: |-
+                      isCold reports whether utilization has stayed below the pool's
+                      hotTenantUtilizationThresholdPercent for the whole observation window. Only cold
+                      tenants are eligible for rebalancing: moving a hot tenant consumes exactly the
+                      resource that is scarce when rebalancing is worth doing.
+                    type: boolean
+                  storageBytes:
+                    description: |-
+                      storageBytes is the database's allocated size. Scale-down decisions read allocated
+                      rather than used space, because unused space inside the database is not reclaimable
+                      without a rewrite.
+                    format: int64
+                    type: integer
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

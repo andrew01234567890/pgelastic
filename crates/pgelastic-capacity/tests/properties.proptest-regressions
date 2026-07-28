@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 604b43ad34864e49bc1a72d8e552d5a532c9dfcf01aeedc06c620eb1b61d0ecd # shrinks to total = 10, headroom = 0, ops = [TenantArrives { idx: 0, guaranteed: 0, burstable: 1, weight: 1, priority: 0 }, TenantArrives { idx: 3, guaranteed: 0, burstable: 1, weight: 1, priority: 0 }, TenantArrives { idx: 2, guaranteed: 0, burstable: 3, weight: 1, priority: 0 }, ClientConnects { idx: 1 }, ClientConnects { idx: 3 }, Checkout { pick: 0, cancel: false }, TenantArrives { idx: 0, guaranteed: 0, burstable: 1, weight: 1, priority: 0 }, Checkout { pick: 0, cancel: false }, Checkout { pick: 0, cancel: false }, ClientConnects { idx: 1 }, ClientConnects { idx: 1 }, Checkout { pick: 0, cancel: false }, Checkout { pick: 0, cancel: false }, Checkout { pick: 0, cancel: true }, TenantArrives { idx: 0, guaranteed: 0, burstable: 1, weight: 1, priority: 0 }, ClientConnects { idx: 1 }, ClientConnects { idx: 2 }, Checkout { pick: 1, cancel: true }, Checkout { pick: 0, cancel: false }, Checkout { pick: 11, cancel: true }, TenantArrives { idx: 0, guaranteed: 0, burstable: 1, weight: 1, priority: 0 }, Checkout { pick: 65, cancel: true }, ConfigChange { idx: 2, guaranteed: 0, burstable: 1 }]

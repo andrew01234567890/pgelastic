@@ -1,0 +1,382 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgworkloadclasses.pgelastic.io
+spec:
+  group: pgelastic.io
+  names:
+    categories:
+    - pgelastic
+    kind: PgWorkloadClass
+    listKind: PgWorkloadClassList
+    plural: pgworkloadclasses
+    shortNames:
+    - pgwc
+    singular: pgworkloadclass
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.priority
+      name: Priority
+      type: integer
+    - jsonPath: .spec.capacity.guaranteed
+      name: Guaranteed
+      type: integer
+    - jsonPath: .spec.capacity.burstable
+      name: Burstable
+      type: integer
+    - jsonPath: .spec.capacity.weight
+      name: Weight
+      type: integer
+    - jsonPath: .spec.global
+      name: Global
+      type: boolean
+    - jsonPath: .status.tenantCount
+      name: Tenants
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: "PgWorkloadClass is the PriorityClass analogue for tenant workloads:
+          a named,\ncluster-scoped bundle of priority, capacity, limits and SLO that
+          a tenant adopts by\nnaming it in one mutable string. Changing tier is editing
+          that string.\n\nThe class never declares a QoS class. The controller derives
+          status.qosClass on each\nPgTenant from the guaranteed-versus-burstable relationship
+          of that tenant's effective\ncapacity, exactly as the kubelet derives Pod
+          QoS:\n\n\tguaranteed == burstable, both > 0   ->  Guaranteed\n\t0 < guaranteed
+          < burstable          ->  Burstable\n\tguaranteed == 0                     ->
+          \ BestEffort\n\nDeriving rather than declaring means the QoS class cannot
+          contradict the numbers that\nactually drive admission, and a per-tenant
+          capacity override re-derives it for free."
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of PgWorkloadClass
+            properties:
+              admission:
+                description: admission gates how tenants of this class enter a pool.
+                properties:
+                  quarantine:
+                    description: quarantine requires an observation period before
+                      a new tenant's capacity is trusted.
+                    properties:
+                      duration:
+                        default: 168h
+                        description: |-
+                          duration is the observation window. Promotion is driven off a high percentile of
+                          the tenant's usage over this window, never off the mean.
+                        type: string
+                      required:
+                        default: false
+                        description: |-
+                          required forces new tenants of this class through an observation period in the
+                          pool's quarantine class before their declared capacity takes effect.
+                        type: boolean
+                    type: object
+                type: object
+              autoPause:
+                description: autoPause is RESERVED and unimplemented in v1. See AutoPausePolicy.
+                properties:
+                  delay:
+                    description: delay is the inactivity period before a tenant is
+                      paused. Negative disables.
+                    type: string
+                type: object
+              capacity:
+                description: capacity is the guaranteed/burstable/weight triple tenants
+                  of this class inherit.
+                properties:
+                  burstable:
+                    description: |-
+                      burstable is the per-tenant ceiling of backend connections. It is a cap, never a
+                      guarantee: the sum of burstable across a pool's tenants may exceed the pool budget,
+                      and that oversubscription ratio is the product.
+                    format: int32
+                    maximum: 100000
+                    minimum: 1
+                    type: integer
+                  guaranteed:
+                    default: 0
+                    description: |-
+                      guaranteed is the per-tenant floor of backend connections, honoured as a strict
+                      non-work-conserving reservation: an idle tenant's unused guarantee is not lent out,
+                      otherwise the guarantee decays into a promise plus eviction latency. Zero means the
+                      tenant draws only from burst credit, which is what BestEffort is.
+                    format: int32
+                    maximum: 100000
+                    minimum: 0
+                    type: integer
+                  maxClientConnections:
+                    description: |-
+                      maxClientConnections caps client-side connections, a currency independent of
+                      backend connections and bounded by file descriptors rather than max_connections.
+                      In Session pool mode the two currencies collapse and this is clamped to burstable.
+                    format: int32
+                    maximum: 1000000
+                    minimum: 1
+                    type: integer
+                  storage:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      storage caps the tenant database's allocated size. WAL and temporary files are
+                      excluded, so the effective disk footprint is larger than this number.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  weight:
+                    default: 100
+                    description: |-
+                      weight orders tenants of equal guarantee deficit when the pool budget is exhausted,
+                      as a share of the contended surplus.
+                    format: int32
+                    maximum: 10000
+                    minimum: 1
+                    type: integer
+                required:
+                - burstable
+                type: object
+                x-kubernetes-validations:
+                - message: capacity.guaranteed must not exceed capacity.burstable
+                  rule: self.guaranteed <= self.burstable
+              description:
+                description: description is free text shown to the tenant owner choosing
+                  a class.
+                maxLength: 512
+                type: string
+              global:
+                default: false
+                description: |-
+                  global marks this class as the one applied to tenants that name no class and whose
+                  pool sets no default. At most one PgWorkloadClass cluster-wide may set it; the
+                  constraint spans objects, so it is enforced by the validating webhook rather than
+                  by CEL, and a second global class is rejected at admission.
+                type: boolean
+              limits:
+                description: |-
+                  limits are the per-tenant guardrails. Only the proxy-enforced deadline and byte
+                  caps are hard; the GUC-backed entries are advisory because a client can SET them
+                  back.
+                properties:
+                  idleInTransactionSessionTimeout:
+                    description: idleInTransactionSessionTimeout bounds how long a
+                      transaction may sit idle.
+                    type: string
+                  idleSessionTimeout:
+                    description: idleSessionTimeout bounds how long a session may
+                      sit idle outside a transaction.
+                    type: string
+                  lockTimeout:
+                    description: lockTimeout bounds how long a statement waits for
+                      a lock.
+                    type: string
+                  maxResultBytes:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: maxResultBytes caps the bytes the proxy will relay
+                      for a single result set.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  rateLimit:
+                    description: rateLimit caps the tenant's request and byte rate
+                      at the proxy.
+                    properties:
+                      bytesPerSecond:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: bytesPerSecond caps bytes relayed to the client
+                          per second.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      transactionsPerSecond:
+                        description: transactionsPerSecond caps committed and rolled-back
+                          transactions per second.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
+                  statementTimeout:
+                    description: statementTimeout bounds a single statement.
+                    type: string
+                  tempFileLimit:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      tempFileLimit caps temporary file bytes. Note this is enforced per PostgreSQL
+                      process, so a session using parallel workers can consume a multiple of it.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                type: object
+              migration:
+                description: migration governs automatic tenant moves for this class.
+                properties:
+                  allowAutomatic:
+                    default: true
+                    description: |-
+                      allowAutomatic lets the rebalancer emit PgTenantMigration objects for tenants of
+                      this class without a human asking.
+                    type: boolean
+                  requireApproval:
+                    default: false
+                    description: |-
+                      requireApproval holds every migration of a tenant of this class at the preflight
+                      phase until a human approves it, including migrations a human started.
+                    type: boolean
+                type: object
+              onBudgetExhaustion:
+                default: Throttle
+                description: |-
+                  onBudgetExhaustion selects the behaviour when the pool budget is fully committed
+                  and no credit can be revoked.
+                enum:
+                - Throttle
+                - Reject
+                - Evict
+                type: string
+              preemptionPolicy:
+                default: Never
+                description: |-
+                  preemptionPolicy decides whether higher priority may revoke credit already held by
+                  lower-priority tenants, or only jump the queue for credit that frees up naturally.
+                enum:
+                - Never
+                - PreemptLowerPriority
+                type: string
+              priority:
+                description: |-
+                  priority orders admission across tenants of different classes, in the same sense as
+                  a Kubernetes PriorityClass value: larger wins.
+                format: int32
+                maximum: 1000000
+                minimum: 0
+                type: integer
+              slo:
+                description: slo publishes the service level tenants of this class
+                  are held to.
+                properties:
+                  admissionErrorBudgetPercent:
+                    description: |-
+                      admissionErrorBudgetPercent is the tolerated share of checkouts denied or timed
+                      out, as a decimal string so fractions below one percent are expressible.
+                    maxLength: 16
+                    pattern: ^(100(\.0+)?|[0-9]{1,2}(\.[0-9]+)?)$
+                    type: string
+                  checkoutWaitP99:
+                    description: checkoutWaitP99 is the target 99th-percentile wait
+                      to obtain a backend connection.
+                    type: string
+                type: object
+            required:
+            - capacity
+            - priority
+            type: object
+          status:
+            description: status defines the observed state of PgWorkloadClass
+            properties:
+              conditions:
+                description: conditions report whether the class is accepted and usable
+                  by tenants.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 8
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: observedGeneration is the spec generation the controller
+                  last reconciled.
+                format: int64
+                type: integer
+              tenantCount:
+                description: |-
+                  tenantCount is how many PgTenant objects cluster-wide currently resolve to this
+                  class. It is the blast radius of editing the spec.
+                format: int32
+                minimum: 0
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

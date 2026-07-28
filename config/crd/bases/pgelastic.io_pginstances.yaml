@@ -1,0 +1,945 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pginstances.pgelastic.io
+spec:
+  group: pgelastic.io
+  names:
+    categories:
+    - pgelastic
+    kind: PgInstance
+    listKind: PgInstanceList
+    plural: pginstances
+    shortNames:
+    - pgi
+    singular: pginstance
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.currentPrimary
+      name: Primary
+      type: string
+    - jsonPath: .status.primaryEpoch
+      name: Epoch
+      type: integer
+    - jsonPath: .status.tenants
+      name: Tenants
+      type: integer
+    - jsonPath: .status.capacity.allocatable
+      name: Allocatable
+      type: integer
+    - jsonPath: .status.capacity.inUse
+      name: In-Use
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.targetPrimary
+      name: Target
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          PgInstance is one provisioned PostgreSQL instance and its replica set: HA topology,
+          storage, backup, rated capacity and cordon/drain state.
+
+          The object carries the finalizer pgelastic.io/drain-tenants
+          (PgInstanceDrainTenantsFinalizer), which blocks deletion until every bound tenant has
+          been migrated away or released.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of PgInstance
+            properties:
+              admission:
+                default: {}
+                description: admission controls whether the placement scheduler may
+                  bind new tenants here.
+                properties:
+                  cordoned:
+                    default: false
+                    description: |-
+                      cordoned blocks new bindings while leaving existing tenants in place, mirroring
+                      kubectl cordon. The operator also sets this itself while the instance is re-cloning
+                      or its archive is degraded.
+                    type: boolean
+                  schedulable:
+                    default: true
+                    description: schedulable allows the placement scheduler to bind
+                      new tenants here.
+                    type: boolean
+                type: object
+              backup:
+                description: |-
+                  backup configures physical backup and WAL archiving, both executed by shelling out
+                  to pgBackRest.
+                properties:
+                  backupStandby:
+                    default: true
+                    description: |-
+                      backupStandby takes the backup from a standby so the primary's connection budget and
+                      I/O stay untouched. For a product selling connection guarantees this is the cheapest
+                      large win available, which is why it defaults on.
+                    type: boolean
+                  objectStore:
+                    description: |-
+                      objectStore locates the repository. The stanza path underneath it is keyed on the
+                      PostgreSQL system identifier rather than the instance name, so an instance recreated
+                      under a reused name cannot interleave its WAL into a predecessor's archive.
+                    properties:
+                      credentialsSecretRef:
+                        description: credentialsSecretRef names a Secret holding the
+                          object-store credentials.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      endpointURL:
+                        description: endpointURL overrides the provider's default
+                          endpoint, for S3-compatible stores.
+                        maxLength: 2048
+                        type: string
+                      path:
+                        description: path is the destination URL, for example s3://bucket/prefix.
+                        maxLength: 2048
+                        minLength: 1
+                        type: string
+                      region:
+                        description: region for providers that require one.
+                        maxLength: 63
+                        type: string
+                    required:
+                    - credentialsSecretRef
+                    - path
+                    type: object
+                  retention:
+                    default: {}
+                    description: retention bounds full-backup and WAL history.
+                    properties:
+                      full:
+                        default: 30d
+                        description: full is how long full backups are kept.
+                        type: string
+                      wal:
+                        default: 30d
+                        description: wal is how long archived WAL is kept.
+                        type: string
+                    type: object
+                  schedule:
+                    default: 0 2 * * *
+                    description: schedule is a five-field cron expression for the
+                      full backup.
+                    maxLength: 256
+                    minLength: 1
+                    type: string
+                required:
+                - objectStore
+                type: object
+              class:
+                description: |-
+                  class names the PgElasticClass sizing tier. It is immutable because max_connections
+                  is derived from it and is PGC_POSTMASTER; changing tiers is an instance-add plus a
+                  tenant migration, not an edit.
+                maxLength: 63
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: class is immutable
+                  rule: self == oldSelf
+              drain:
+                default: {}
+                description: drain requests evacuation of every tenant bound to this
+                  instance.
+                properties:
+                  mode:
+                    default: Never
+                    description: |-
+                      mode set to Requested cordons the instance and emits a PgTenantMigration per bound
+                      tenant, subject to the pool's concurrency limit and blackout windows.
+                    enum:
+                    - Never
+                    - Requested
+                    type: string
+                type: object
+              highAvailability:
+                default: {}
+                description: |-
+                  highAvailability configures the replica set, the synchronous quorum and the
+                  promotion lease.
+                properties:
+                  dataDurability:
+                    default: Required
+                    description: dataDurability selects stall-on-quorum-loss versus
+                      degrade-to-async.
+                    enum:
+                    - Required
+                    - Preferred
+                    type: string
+                  failoverDelay:
+                    default: 10s
+                    description: |-
+                      failoverDelay debounces an unhealthy primary before an unplanned failover starts,
+                      and is deliberately non-zero. A spurious failover costs a timeline bump, a rewind or
+                      full re-clone, a window at 2/3 redundancy during which failover is impossible, and a
+                      connection reset for every tenant on the instance. All of that is far more expensive
+                      than ten extra seconds of downtime. The debounce origin is persisted in
+                      status.currentPrimaryFailingSince so it survives an operator restart.
+                    type: string
+                  failoverQuorum:
+                    default: true
+                    description: |-
+                      failoverQuorum gates automatic promotion on quorum evidence read out of the live
+                      postmaster rather than out of this spec. Turning it off permits promoting a standby
+                      that cannot be proven to hold the last acknowledged commit.
+                    type: boolean
+                  primaryLease:
+                    default: {}
+                    description: |-
+                      primaryLease tunes the coordination.k8s.io Lease that provides mutual exclusion
+                      between primaries.
+                    properties:
+                      leaseDuration:
+                        default: 15s
+                        description: |-
+                          leaseDuration is how long a lease stays valid without renewal. Take-over compares
+                          RenewTime for equality only, never ordering, so the previous holder's clock is never
+                          trusted.
+                        type: string
+                      releasedLeaseDuration:
+                        default: 1s
+                        description: |-
+                          releasedLeaseDuration is the short validity stamped on a lease released
+                          cooperatively, so a planned switchover does not wait out a full leaseDuration.
+                        type: string
+                      renewDeadline:
+                        default: 10s
+                        description: |-
+                          renewDeadline is how long the holder keeps trying to renew before treating the loss
+                          as terminal and stopping its postmaster.
+                        type: string
+                      retryPeriod:
+                        default: 2s
+                        description: |-
+                          retryPeriod is the interval between renewal and acquisition attempts. Per-attempt
+                          acquire timeout is leaseDuration + 3 * retryPeriod.
+                        type: string
+                    type: object
+                    x-kubernetes-validations:
+                    - message: leaseDuration must be greater than renewDeadline
+                      rule: '!has(self.leaseDuration) || !has(self.renewDeadline)
+                        || duration(self.leaseDuration) > duration(self.renewDeadline)'
+                    - message: 5 * renewDeadline must be greater than 6 * retryPeriod
+                      rule: '!has(self.renewDeadline) || !has(self.retryPeriod) ||
+                        duration(self.renewDeadline).getMilliseconds() * 5 > duration(self.retryPeriod).getMilliseconds()
+                        * 6'
+                  quorum:
+                    default: ANY 1
+                    description: |-
+                      quorum is the leading clause of synchronous_standby_names, for example "ANY 1".
+                      The member list is appended by the operator and rewritten using Patroni's ordering
+                      rule: grow the quorum set before numsync, shrink numsync before the quorum set,
+                      never both in one reload.
+                    maxLength: 256
+                    minLength: 1
+                    type: string
+                  replicas:
+                    default: 3
+                    description: |-
+                      replicas is the total member count including the primary. Three is the only
+                      topology the quorum gate is designed around: with quorum "ANY 1" the failover gate
+                      R + W > N needs both standbys reachable.
+                    format: int32
+                    maximum: 5
+                    minimum: 3
+                    type: integer
+                  switchoverTimeout:
+                    default: 60s
+                    description: switchoverTimeout bounds a planned, operator-initiated
+                      role change end to end.
+                    type: string
+                  synchronousCommit:
+                    default: "on"
+                    description: synchronousCommit is applied instance-wide.
+                    enum:
+                    - "on"
+                    - remote_apply
+                    - remote_write
+                    type: string
+                type: object
+              parameters:
+                additionalProperties:
+                  description: GUCValue is a PostgreSQL parameter value as written
+                    to custom.conf.
+                  maxLength: 1024
+                  type: string
+                description: |-
+                  parameters carries user-settable PostgreSQL GUCs only.
+
+                  The operator maintains two lists derived from pg_settings.context at build time:
+                  FIXED parameters, whose value the operator computes, and BLOCKED parameters, which
+                  must stay at the operator's value. Naming either here is rejected by the validating
+                  webhook and additionally dropped by the config generator, so a stale object cannot
+                  poison a pod that reads it later.
+                maxProperties: 64
+                type: object
+              perTenantLogicalBackup:
+                description: |-
+                  perTenantLogicalBackup configures the nightly per-database pg_dump that covers the
+                  "a tenant deleted their own data" case, which physical backup cannot address at
+                  tenant granularity without a scratch instance.
+                properties:
+                  dumpTimeout:
+                    default: 2h
+                    description: |-
+                      dumpTimeout aborts and reschedules an overrunning dump rather than letting it hold
+                      the xmin horizon open indefinitely.
+                    type: string
+                  enabled:
+                    default: true
+                    description: enabled turns the nightly dump sweep on.
+                    type: boolean
+                  maxConcurrentDumps:
+                    default: 4
+                    description: |-
+                      maxConcurrentDumps caps simultaneous dumps on this instance. Each open dump holds
+                      back the instance-wide xmin horizon, which blocks vacuum for every tenant on the
+                      instance, not just the one being dumped. Dump connections are additionally charged to
+                      a reserved pool held outside every tenant's guarantee and burst budget.
+                    format: int32
+                    maximum: 16
+                    minimum: 1
+                    type: integer
+                  retention:
+                    default: 14d
+                    description: retention is how long dumps are kept.
+                    maxLength: 32
+                    type: string
+                  schedule:
+                    default: 0 4 * * *
+                    description: schedule is a five-field cron expression for the
+                      sweep.
+                    maxLength: 256
+                    minLength: 1
+                    type: string
+                type: object
+              poolRef:
+                description: |-
+                  poolRef names the PgElasticPool in the same namespace that owns this instance.
+                  It is immutable: the pool holds the reservation ledger that this instance's
+                  allocatable capacity feeds, and reparenting would silently invalidate both sides.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+                x-kubernetes-validations:
+                - message: poolRef is immutable
+                  rule: self == oldSelf
+              postgresVersion:
+                default: "18"
+                description: |-
+                  postgresVersion is pinned to 18 for the whole of v1. There is no major-version
+                  upgrade path, so the field exists only to make the assumption explicit and to leave
+                  room for one later.
+                enum:
+                - "18"
+                type: string
+                x-kubernetes-validations:
+                - message: postgresVersion is immutable
+                  rule: self == oldSelf
+              resources:
+                description: resources is applied to the postgres container of every
+                  member pod.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This field depends on the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
+              storage:
+                description: storage configures the two mandatory PVC roles, PG_DATA
+                  and PG_WAL.
+                properties:
+                  className:
+                    description: |-
+                      className is the StorageClass for PG_DATA. Certified storage is network block
+                      (EBS / PD / Azure Disk) with ReadWriteOncePod. NFS and network filesystems are
+                      unsupported: their fsync honesty cannot be validated by the operator and a lie
+                      surfaces only as corruption after a node loss.
+                    maxLength: 253
+                    type: string
+                  size:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      size is the PG_DATA volume size. It may only grow: the underlying StorageClass must
+                      have allowVolumeExpansion, and PGDATA growth is a legitimate autoscaling input.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  walVolume:
+                    description: |-
+                      walVolume is MANDATORY, not optional, and is why this field is not a pointer.
+                      pgelastic sells connection availability; a full pg_wal PANICs the primary and
+                      vaporizes every tenant's guarantee on that instance at once. Keeping WAL on its own
+                      volume also lets it be resized on its own trigger, because pg_wal growth means
+                      archive backlog and auto-expanding it would hide the fault rather than surface it.
+                    properties:
+                      className:
+                        description: className is the StorageClass for PG_WAL.
+                        maxLength: 253
+                        type: string
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          size bounds max_slot_wal_keep_size, which the operator derives from it so that
+                          slot retention plus wal_keep_size plus archive backlog plus checkpoint headroom stay
+                          under 70 percent of the volume. Losing a replication slot costs a bounded replica
+                          rebuild; losing the primary costs every tenant's guarantee.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    required:
+                    - size
+                    type: object
+                    x-kubernetes-validations:
+                    - message: walVolume size cannot be decreased
+                      rule: quantity(self.size).compareTo(quantity(oldSelf.size))
+                        >= 0
+                required:
+                - size
+                - walVolume
+                type: object
+                x-kubernetes-validations:
+                - message: storage size cannot be decreased
+                  rule: quantity(self.size).compareTo(quantity(oldSelf.size)) >= 0
+            required:
+            - class
+            - poolRef
+            - storage
+            type: object
+          status:
+            description: status defines the observed state of PgInstance
+            properties:
+              archiveHealth:
+                description: |-
+                  archiveHealth drives operator behaviour, not just dashboards: a degraded archive
+                  stops new tenant admission and blocks migrations into this instance. Archiving is
+                  never auto-disabled to relieve pressure; archive-push-queue-max makes that decision
+                  explicit and recorded instead.
+                properties:
+                  failedCount:
+                    description: failedCount is pg_stat_archiver.failed_count.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  healthy:
+                    description: healthy is the summary the admission and migration
+                      gates read.
+                    type: boolean
+                  lastArchivedAt:
+                    description: lastArchivedAt is when that push completed.
+                    format: date-time
+                    type: string
+                  lastArchivedWAL:
+                    description: lastArchivedWAL is the last segment successfully
+                      pushed.
+                    maxLength: 64
+                    type: string
+                  lastFailureAt:
+                    description: lastFailureAt is when archiving last failed.
+                    format: date-time
+                    type: string
+                  lastFailureMessage:
+                    description: lastFailureMessage is the truncated error from the
+                      last failed push.
+                    maxLength: 1024
+                    type: string
+                  readyBacklog:
+                    description: readyBacklog counts segments waiting in pg_wal/archive_status.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+              capacity:
+                description: capacity is this instance's contribution to the pool's
+                  connection budget.
+                properties:
+                  allocatable:
+                    description: |-
+                      allocatable is what tenants may draw on. A re-cloning instance publishes zero here:
+                      its headroom must not count as available while quorum-gated failover is impossible.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  inUse:
+                    description: inUse is the observed backend connection count against
+                      allocatable.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  maxConnections:
+                    description: maxConnections is the value PostgreSQL is actually
+                      running with.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  replicationSlots:
+                    description: replicationSlots covers streaming standbys plus operator-owned
+                      migration slots.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  reservedForAdmin:
+                    description: reservedForAdmin covers superuser_reserved_connections
+                      plus reserved_connections.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+              collationContract:
+                description: |-
+                  collationContract is the instance's text-handling and on-disk identity, recorded at
+                  bootstrap. Any migration or pool-join whose contract differs is refused: restoring
+                  under a different collation produces indexes silently inconsistent with their heap
+                  ordering, which yields wrong results and no error.
+                properties:
+                  collate:
+                    description: collate is the datcollate value.
+                    type: string
+                  ctype:
+                    description: ctype is the datctype value.
+                    type: string
+                  dataChecksums:
+                    description: dataChecksums reports whether page checksums are
+                      enabled. Always true.
+                    type: boolean
+                  encoding:
+                    description: encoding is the database encoding, always UTF8.
+                    type: string
+                  icuRules:
+                    description: icuRules is the daticurules value, empty under the
+                      builtin provider.
+                    type: string
+                  locale:
+                    description: locale is the datlocale value, pinned to C.UTF-8.
+                    type: string
+                  localeProvider:
+                    description: |-
+                      localeProvider is the datlocprovider value. pgelastic pins this to "builtin" so
+                      neither ICU nor glibc version drift can differ between instances in a pool.
+                    type: string
+                  systemIdentifier:
+                    description: |-
+                      systemIdentifier is the PostgreSQL system identifier. Archive and backup paths are
+                      keyed on this rather than on an instance name, so a recreated instance reusing a
+                      name cannot interleave its WAL into a predecessor's archive.
+                    type: string
+                  walSegmentSize:
+                    description: walSegmentSize in bytes, fixed at initdb.
+                    format: int64
+                    type: integer
+                type: object
+              conditions:
+                description: conditions represent the current state of the PgInstance.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              currentPrimary:
+                description: |-
+                  currentPrimary is the member that has actually completed promotion. It is written by
+                  the promoted pod itself, last in the promotion sequence, after the checkpoint, the
+                  synchronous_standby_names rewrite and the epoch bump.
+                maxLength: 253
+                type: string
+              currentPrimaryFailingSince:
+                description: |-
+                  currentPrimaryFailingSince is when the primary was first observed unhealthy. It is
+                  persisted so the failoverDelay debounce is not reset by an operator restart.
+                format: date-time
+                type: string
+              instances:
+                description: instances reports every member pod.
+                items:
+                  description: InstanceMemberStatus reports one member pod, as seen
+                    by that pod's own agent.
+                  properties:
+                    healthy:
+                      description: |-
+                        healthy reports whether the member's status endpoint answered and its postmaster is
+                        accepting connections.
+                      type: boolean
+                    inSyncSet:
+                      description: |-
+                        inSyncSet reports whether the primary counts this member towards the synchronous
+                        quorum. Members outside the recorded sync set are disqualified as candidates.
+                      type: boolean
+                    lsn:
+                      description: lsn is the member's latest WAL position.
+                      maxLength: 32
+                      type: string
+                    name:
+                      description: name is the member pod name.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                    role:
+                      default: unknown
+                      description: |-
+                        role is the observed role. Two members simultaneously reporting primary is a
+                        dedicated alarm that freezes write admission and refuses all automated remediation,
+                        never a tiebreak input: silent recovery from split brain hides the data loss.
+                      enum:
+                      - primary
+                      - replica
+                      - unknown
+                      type: string
+                    timeline:
+                      description: |-
+                        timeline is a first-class term in candidate selection, ordered ahead of LSN. Any
+                        member below the cluster's last known timeline is disqualified outright.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    walReceiverActive:
+                      description: |-
+                        walReceiverActive is checked at two distinct instants with two distinct meanings: a
+                        candidate must have had an active receiver when the failure was detected, and every
+                        member must have its receiver down before promotion may proceed.
+                      type: boolean
+                  required:
+                  - name
+                  type: object
+                maxItems: 8
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              lastBackup:
+                description: lastBackup summarises the most recent successful physical
+                  backup.
+                properties:
+                  at:
+                    description: at is when the backup completed.
+                    format: date-time
+                    type: string
+                  sizeBytes:
+                    description: sizeBytes is the repository size of this backup after
+                      block-incremental and bundling.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  sourceMaxConnections:
+                    description: |-
+                      sourceMaxConnections is the max_connections recorded in the backup catalog. Recovery
+                      FATALs unless the restore target's enforced parameters are at least the source's, so
+                      a restore target must be sized before it is provisioned.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  type:
+                    description: type distinguishes full, differential and incremental.
+                    enum:
+                    - Full
+                    - Differential
+                    - Incremental
+                    type: string
+                  verified:
+                    description: |-
+                      verified reports whether pgbackrest verify has validated this backup's content.
+                      Verification is part of the backup, not an afterthought.
+                    type: boolean
+                type: object
+              lastRestoreRehearsal:
+                description: |-
+                  lastRestoreRehearsal records the most recent end-to-end restore into a throwaway
+                  namespace. A backup pipeline never exercised end to end has an unknown success rate,
+                  not a good one.
+                properties:
+                  at:
+                    description: |-
+                      at is when the rehearsal last succeeded end to end, including pg_verifybackup and a
+                      smoke query.
+                    format: date-time
+                    type: string
+                  durationSeconds:
+                    description: durationSeconds is the measured RTO for a whole-instance
+                      restore.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                type: object
+              observedGeneration:
+                description: observedGeneration is the metadata.generation this status
+                  was computed from.
+                format: int64
+                minimum: 0
+                type: integer
+              phase:
+                default: Pending
+                description: phase is a display-only pure function of the conditions.
+                enum:
+                - Pending
+                - Bootstrapping
+                - Ready
+                - FailingOver
+                - Recloning
+                - Degraded
+                - Draining
+                - Terminating
+                type: string
+              primaryEpoch:
+                description: |-
+                  primaryEpoch is the fence token.
+
+                  It is a monotonic counter derived from the promotion Lease's LeaderTransitions field
+                  and published into the custom GUC pgelastic.primary_epoch, which makes it readable
+                  with a plain SHOW over any backend connection and unable to drift from the running
+                  postmaster. Every bump must accompany a timeline bump, cross-checked against
+                  pg_control_checkpoint().timeline_id.
+
+                  The Rust proxy consumes it because Kubernetes Services do not tear down established
+                  TCP connections: kube-proxy never touches ESTABLISHED conntrack entries, so a demoted
+                  primary keeps serving writes that pg_rewind is about to discard. Every client socket
+                  terminates at the proxy and every backend socket originates from it, so the proxy can
+                  sever rather than merely deregister. It learns the epoch by three independent paths,
+                  acting on whichever fires first: a watch on this field, a push from the promoting
+                  agent, and - the only path that is safe under partition, and therefore mandatory - a
+                  GUC_REPORT ParameterStatus carried on every backend connection. The proxy's in-memory
+                  epoch never decreases: observing a lower one is a fence trigger, not new information.
+                format: int64
+                minimum: 0
+                type: integer
+              quorumEvidence:
+                description: quorumEvidence records what PostgreSQL actually loaded,
+                  not what the spec asked for.
+                properties:
+                  numSync:
+                    description: numSync is W in the R + W > N gate.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  observedAt:
+                    description: |-
+                      observedAt is when the value was read from the postmaster. Stale evidence is treated
+                      as missing evidence.
+                    format: date-time
+                    type: string
+                  reportedBy:
+                    description: reportedBy is the member that wrote this record.
+                    maxLength: 253
+                    type: string
+                  synchronousStandbyNames:
+                    description: synchronousStandbyNames is the loaded value, verbatim.
+                    maxLength: 1024
+                    type: string
+                  votingMembers:
+                    description: votingMembers is N in the R + W > N gate.
+                    items:
+                      type: string
+                    maxItems: 8
+                    type: array
+                    x-kubernetes-list-type: atomic
+                type: object
+              storage:
+                description: storage reports allocated and used bytes for both volumes.
+                properties:
+                  allocated:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: allocated is the requested PG_DATA volume size.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  used:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: used is the PG_DATA filesystem usage.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  walUsed:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      walUsed is PG_WAL filesystem usage. Growth here means archive backlog, so it is an
+                      alerting input rather than an autoscaling one.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                type: object
+              targetPrimary:
+                description: |-
+                  targetPrimary is the operator's decision, written before any promotion begins.
+
+                  On detecting an unhealthy primary the operator first writes the reserved sentinel
+                  "pending" (TargetPrimaryPending) and strips the role label so Services stop selecting
+                  the old primary; only once every non-primary member reports its WAL receiver down
+                  does it write a real candidate name. Because the sentinel is never a member name,
+                  targetPrimary != currentPrimary is a total signal meaning "failover in progress,
+                  freeze everything", decidable with one comparison.
+                maxLength: 253
+                type: string
+              tenants:
+                description: tenants is the number of tenant databases currently bound
+                  here.
+                format: int32
+                minimum: 0
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

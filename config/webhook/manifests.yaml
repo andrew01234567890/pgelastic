@@ -1,0 +1,66 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-pgelastic-io-v1alpha1-pgelasticpool
+  failurePolicy: Fail
+  name: vpgelasticpool-v1alpha1.kb.io
+  rules:
+  - apiGroups:
+    - pgelastic.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - pgelasticpools
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-pgelastic-io-v1alpha1-pgtenant
+  failurePolicy: Fail
+  name: vpgtenant-v1alpha1.kb.io
+  rules:
+  - apiGroups:
+    - pgelastic.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - pgtenants
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-pgelastic-io-v1alpha1-pgworkloadclass
+  failurePolicy: Fail
+  name: vpgworkloadclass-v1alpha1.kb.io
+  rules:
+  - apiGroups:
+    - pgelastic.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - pgworkloadclasses
+  sideEffects: None

@@ -1,0 +1,17 @@
+[package]
+name = "pgelastic-capacity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = "2.0.19"
+tracing = "0.1.44"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"

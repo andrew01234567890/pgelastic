@@ -1,0 +1,195 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1alpha1
+
+import (
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+)
+
+var _ = Describe("the PgTenant reservation ledger", Ordered, func() {
+	const (
+		namespace = "wh-ledger"
+		poolName  = "wh-ledger-pool"
+		half      = "wh-guaranteed-50"
+		quarter   = "wh-guaranteed-25"
+		single    = "wh-guaranteed-1"
+	)
+
+	BeforeAll(func() {
+		ensureNamespace(namespace, nil)
+		elasticClass := makeElasticClass("wh-ledger-class")
+		mustCreate(elasticClass)
+		mustCreate(makeWorkloadClass(half, 50, 50), makeWorkloadClass(quarter, 25, 25),
+			makeWorkloadClass(single, 1, 1))
+		mustCreate(makePool(namespace, poolName, elasticClass.Name))
+	})
+
+	It("admits a guarantee that fits inside allocatable capacity", func() {
+		tenant := makeTenant(namespace, "wh-ledger-first", poolName, "ledger_first", half)
+
+		mustCreate(tenant)
+	})
+
+	It("admits a guarantee that fits exactly, leaving nothing over", func() {
+		tenant := makeTenant(namespace, "wh-ledger-boundary", poolName, "ledger_boundary", quarter)
+
+		mustCreate(tenant)
+	})
+
+	It("refuses the guarantee that would take the pool past what it can honour", func() {
+		tenant := makeTenant(namespace, "wh-ledger-overcommit", poolName, "ledger_overcommit", single)
+
+		err := k8sClient.Create(ctx, tenant)
+
+		Expect(err).To(MatchError(ContainSubstring("reserved 75")))
+		Expect(err).To(MatchError(ContainSubstring("available 0")))
+		Expect(err).To(MatchError(ContainSubstring("allocatable 75")))
+	})
+
+	It("admits a best-effort tenant into a fully reserved pool, because it reserves nothing", func() {
+		mustCreate(makeWorkloadClass("wh-besteffort", 0, 8))
+		tenant := makeTenant(namespace, "wh-ledger-besteffort", poolName, "ledger_besteffort", "wh-besteffort")
+
+		mustCreate(tenant)
+	})
+})
+
+var _ = Describe("PgTenant admission", func() {
+	It("refuses a tenant naming a pool that does not exist", func() {
+		ensureNamespace("wh-dangling", nil)
+		tenant := makeTenant("wh-dangling", "wh-dangling-tenant", "wh-absent-pool", "dangling", "")
+
+		err := k8sClient.Create(ctx, tenant)
+
+		Expect(err).To(MatchError(ContainSubstring("no PgElasticPool of that name exists")))
+	})
+
+	It("refuses a workload class the pool's allowlist does not carry", func() {
+		const namespace = "wh-allowlist"
+		ensureNamespace(namespace, nil)
+		elasticClass := makeElasticClass("wh-allowlist-class")
+		mustCreate(elasticClass)
+		mustCreate(makeWorkloadClass("wh-allowlist-permitted", 0, 8),
+			makeWorkloadClass("wh-allowlist-forbidden", 0, 8))
+		pool := makePool(namespace, "wh-allowlist-pool", elasticClass.Name)
+		pool.Spec.Admission = &pgelasticv1alpha1.PoolAdmission{
+			DefaultWorkloadClassName:  "wh-allowlist-permitted",
+			AllowedWorkloadClassNames: []string{"wh-allowlist-permitted"},
+		}
+		mustCreate(pool)
+
+		err := k8sClient.Create(ctx, makeTenant(namespace, "wh-allowlist-tenant", pool.Name,
+			"allowlist", "wh-allowlist-forbidden"))
+
+		Expect(err).To(MatchError(ContainSubstring("wh-allowlist-forbidden")))
+		Expect(err).To(MatchError(ContainSubstring("supported values")))
+	})
+
+	It("refuses a tenant when no class names it, no default applies and no class is global", func() {
+		const namespace = "wh-no-class"
+		ensureNamespace(namespace, nil)
+		elasticClass := makeElasticClass("wh-no-class-class")
+		mustCreate(elasticClass)
+		mustCreate(makePool(namespace, "wh-no-class-pool", elasticClass.Name))
+
+		err := k8sClient.Create(ctx, makeTenant(namespace, "wh-no-class-tenant", "wh-no-class-pool",
+			"no_class", ""))
+
+		Expect(err).To(MatchError(ContainSubstring("no PgWorkloadClass is global")))
+	})
+})
+
+var _ = Describe("bidirectional namespace consent", func() {
+	const (
+		goldLabel = "pgelastic.io/tier"
+		goldTier  = "gold"
+	)
+
+	It("refuses a tenant whose namespace the pool's own selector does not admit", func() {
+		const namespace = "wh-pool-consent"
+		ensureNamespace(namespace, nil)
+		elasticClass := makeElasticClass("wh-pool-consent-class")
+		mustCreate(elasticClass, makeWorkloadClass("wh-pool-consent-workload", 0, 8))
+		pool := makePool(namespace, "wh-pool-consent-pool", elasticClass.Name)
+		pool.Spec.Admission = &pgelasticv1alpha1.PoolAdmission{
+			DefaultWorkloadClassName: "wh-pool-consent-workload",
+			AdmittedNamespaces: &pgelasticv1alpha1.NamespaceAdmission{
+				From:     pgelasticv1alpha1.NamespaceFromSelector,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{goldLabel: goldTier}},
+			},
+		}
+		mustCreate(pool)
+
+		err := k8sClient.Create(ctx, makeTenant(namespace, "wh-pool-consent-tenant", pool.Name, "pool_consent", ""))
+
+		Expect(err).To(MatchError(ContainSubstring("PgElasticPool \"wh-pool-consent-pool\" does not admit")))
+	})
+
+	It("refuses a tenant the pool admits but the class no longer does", func() {
+		const namespace = "wh-class-consent"
+		ensureNamespace(namespace, nil)
+		elasticClass := makeElasticClass("wh-class-consent-class")
+		elasticClass.Spec.AdmittedNamespaces = &pgelasticv1alpha1.NamespaceAdmission{
+			From: pgelasticv1alpha1.NamespaceFromAll,
+		}
+		mustCreate(elasticClass, makeWorkloadClass("wh-class-consent-workload", 0, 8))
+		pool := makePool(namespace, "wh-class-consent-pool", elasticClass.Name)
+		pool.Spec.Admission = &pgelasticv1alpha1.PoolAdmission{
+			DefaultWorkloadClassName: "wh-class-consent-workload",
+			AdmittedNamespaces:       &pgelasticv1alpha1.NamespaceAdmission{From: pgelasticv1alpha1.NamespaceFromAll},
+		}
+		mustCreate(pool)
+
+		By("tightening the class after the pool already exists")
+		elasticClass.Spec.AdmittedNamespaces = &pgelasticv1alpha1.NamespaceAdmission{
+			From:     pgelasticv1alpha1.NamespaceFromSelector,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{goldLabel: "platinum"}},
+		}
+		Expect(k8sClient.Update(ctx, elasticClass)).To(Succeed())
+
+		err := k8sClient.Create(ctx, makeTenant(namespace, "wh-class-consent-tenant", pool.Name, "class_consent", ""))
+
+		Expect(err).To(MatchError(ContainSubstring("PgElasticClass \"wh-class-consent-class\" does not admit")))
+	})
+
+	It("admits a tenant both the pool and the class select", func() {
+		const namespace = "wh-both-consent"
+		ensureNamespace(namespace, map[string]string{goldLabel: goldTier})
+		elasticClass := makeElasticClass("wh-both-consent-class")
+		elasticClass.Spec.AdmittedNamespaces = &pgelasticv1alpha1.NamespaceAdmission{
+			From:     pgelasticv1alpha1.NamespaceFromSelector,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{goldLabel: goldTier}},
+		}
+		mustCreate(elasticClass, makeWorkloadClass("wh-both-consent-workload", 0, 8))
+		pool := makePool(namespace, "wh-both-consent-pool", elasticClass.Name)
+		pool.Spec.Admission = &pgelasticv1alpha1.PoolAdmission{
+			DefaultWorkloadClassName: "wh-both-consent-workload",
+			AdmittedNamespaces: &pgelasticv1alpha1.NamespaceAdmission{
+				From:     pgelasticv1alpha1.NamespaceFromSelector,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{goldLabel: goldTier}},
+			},
+		}
+		mustCreate(pool)
+
+		mustCreate(makeTenant(namespace, "wh-both-consent-tenant", pool.Name, "both_consent", ""))
+	})
+})

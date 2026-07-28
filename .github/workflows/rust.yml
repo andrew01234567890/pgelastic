@@ -1,0 +1,63 @@
+name: Rust
+
+on:
+  push:
+    branches: ["main"]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
+  pull_request:
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      - name: test
+        run: cargo test --workspace --all-features
+
+  deny:
+    name: licence and advisory audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources advisories
+
+  fuzz-smoke:
+    name: codec fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: run each target briefly
+        # A smoke run only. The long fuzzing campaigns run nightly, not per-PR.
+        run: |
+          if [ -d crates/pgelastic-wire/fuzz ]; then
+            for t in $(cargo fuzz list --fuzz-dir crates/pgelastic-wire/fuzz); do
+              cargo fuzz run --fuzz-dir crates/pgelastic-wire/fuzz "$t" -- -max_total_time=60
+            done
+          else
+            echo "no fuzz targets yet"
+          fi

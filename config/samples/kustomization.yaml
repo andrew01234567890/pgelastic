@@ -1,0 +1,9 @@
+## Append samples of your project ##
+resources:
+- pgelastic_v1alpha1_pgelasticclass.yaml
+- pgelastic_v1alpha1_pgworkloadclass.yaml
+- pgelastic_v1alpha1_pgelasticpool.yaml
+- pgelastic_v1alpha1_pginstance.yaml
+- pgelastic_v1alpha1_pgtenant.yaml
+- pgelastic_v1alpha1_pgtenantmigration.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
