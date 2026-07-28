@@ -20,7 +20,6 @@ package instance
 
 import (
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 
@@ -56,7 +55,7 @@ const (
 // password at all, and peer authentication over a socket in an emptyDir is the only way
 // to reach it, which is exactly the property the design intends.
 func psql(member, query string) (string, error) {
-	command := exec.Command("kubectl", "exec", "-n", e2eNamespace, member, "-c", "postgres", "--",
+	command := kubectlCommand("exec", "-n", e2eNamespace, member, "-c", "postgres", "--",
 		"psql", "-h", provision.SocketDir, "-U", "postgres", "-d", "postgres", "-tAqc", query)
 	output, err := command.CombinedOutput()
 	return strings.TrimSpace(string(output)), err
@@ -175,20 +174,30 @@ var _ = Describe("Provisioning a three-node PostgreSQL 18 instance", Ordered, fu
 	})
 
 	It("publishes the quorum evidence PostgreSQL actually loaded", func() {
+		// The two halves are settled by different writers a reconcile apart: the primary
+		// publishes the clause it read back out of its own postmaster, and the operator
+		// derives inSyncSet from that record afterwards. Asserting the second outside the
+		// wait for the first passes only while the operator happens to be quick.
 		Eventually(func(g Gomega) {
-			evidence := fetchInstance().Status.QuorumEvidence
+			instance := fetchInstance()
+			evidence := instance.Status.QuorumEvidence
 			g.Expect(evidence).NotTo(BeNil())
 			g.Expect(evidence.NumSync).To(Equal(int32(1)))
 			g.Expect(evidence.VotingMembers).To(HaveLen(2))
 			g.Expect(evidence.SynchronousStandbyNames).To(HavePrefix("ANY 1"))
-		}).Should(Succeed())
 
-		for _, member := range fetchInstance().Status.Instances {
-			if member.Role == pgelasticv1alpha1.InstanceRoleReplica {
-				Expect(member.InSyncSet).To(BeTrue(),
+			var replicas int
+			for _, member := range instance.Status.Instances {
+				if member.Role != pgelasticv1alpha1.InstanceRoleReplica {
+					continue
+				}
+				replicas++
+				g.Expect(member.InSyncSet).To(BeTrue(),
 					"%s is streaming and must count towards the quorum", member.Name)
 			}
-		}
+			g.Expect(replicas).To(Equal(e2eReplicas-1),
+				"every standby has to be reported, or the check above proves nothing")
+		}).Should(Succeed())
 	})
 
 	It("records the collation contract initdb was pinned to", func() {
@@ -308,7 +317,7 @@ var _ = Describe("Provisioning a three-node PostgreSQL 18 instance", Ordered, fu
 		// that wrong costs nothing visible: replication still streams, while every standby
 		// loops on an authentication FATAL and the synchronised slots never advance.
 		for _, member := range memberNames() {
-			logs := exec.Command("kubectl", "logs", "-n", e2eNamespace, member, "-c", "postgres")
+			logs := kubectlCommand("logs", "-n", e2eNamespace, member, "-c", "postgres")
 			output, err := logs.CombinedOutput()
 			Expect(err).NotTo(HaveOccurred(), string(output))
 			Expect(string(output)).NotTo(ContainSubstring("pg_hba.conf rejects connection"),
@@ -337,7 +346,7 @@ var _ = Describe("Provisioning a three-node PostgreSQL 18 instance", Ordered, fu
 		// pg_wal really is on the WAL volume rather than inside PGDATA, which is the whole
 		// reason the second volume is mandatory.
 		for _, member := range memberNames() {
-			command := exec.Command("kubectl", "exec", "-n", e2eNamespace, member, "-c", "postgres",
+			command := kubectlCommand("exec", "-n", e2eNamespace, member, "-c", "postgres",
 				"--", "readlink", provision.DataDir+"/pg_wal")
 			output, err := command.CombinedOutput()
 			Expect(err).NotTo(HaveOccurred(), string(output))

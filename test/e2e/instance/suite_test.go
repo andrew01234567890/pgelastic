@@ -68,12 +68,9 @@ func (kubectlProber) Probe(
 	defer cancel()
 
 	namespace := probeNamespace.Load()
-	args := []string{"exec", "-n", namespace, member, "-c", "postgres", "--",
-		provision.AgentBinary, "status"}
-	if kubeContext := os.Getenv("E2E_CONTEXT"); kubeContext != "" {
-		args = append([]string{"--context=" + kubeContext}, args...)
-	}
-	command := exec.CommandContext(probeCtx, "kubectl", args...)
+	command := exec.CommandContext(probeCtx, "kubectl", kubectlArgs(
+		"exec", "-n", namespace, member, "-c", "postgres", "--",
+		provision.AgentBinary, "status")...)
 	output, err := command.Output()
 	if err != nil {
 		return provision.MemberReport{}, err
@@ -83,6 +80,25 @@ func (kubectlProber) Probe(
 		return provision.MemberReport{}, err
 	}
 	return report, nil
+}
+
+// kubectlArgs names the cluster under test on every kubectl invocation.
+//
+// The suite's own client is built from E2E_CONTEXT, so a kubectl left to pick the
+// kubeconfig's current context reads a different cluster from the one being driven. The
+// failure that produces is silent and misleading: the specs still run, and every question
+// they ask PostgreSQL is answered by whatever happens to be current, or by nothing at all.
+func kubectlArgs(args ...string) []string {
+	if kubeContext := os.Getenv("E2E_CONTEXT"); kubeContext != "" {
+		return append([]string{"--context=" + kubeContext}, args...)
+	}
+	return args
+}
+
+// kubectlCommand is kubectlArgs plus the exec.Cmd, for the many call sites that want
+// nothing else.
+func kubectlCommand(args ...string) *exec.Cmd {
+	return exec.Command("kubectl", kubectlArgs(args...)...)
 }
 
 // probeNamespace is set by whichever suite is currently driving an instance. The operator
@@ -150,7 +166,12 @@ var _ = BeforeSuite(func() {
 	}()
 
 	Expect(manager.GetCache().WaitForCacheSync(suiteCtx)).To(BeTrue())
-	k8sClient = manager.GetClient()
+	// The specs read through a client of their own, straight to the API server. The
+	// manager's client is served from the operator's informer cache, so a spec sharing it
+	// would be asserting on what the operator currently believes - and would fail outright
+	// on a create it has not seen the watch event for yet.
+	k8sClient, err = client.New(config, client.Options{Scheme: scheme.Scheme})
+	Expect(err).NotTo(HaveOccurred())
 
 	SetDefaultEventuallyTimeout(10 * time.Minute)
 	SetDefaultEventuallyPollingInterval(3 * time.Second)
