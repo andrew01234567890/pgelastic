@@ -215,6 +215,12 @@ type PgTenantMigrationSpec struct {
 
 	// drainTimeout bounds how long Quiescing waits for in-flight transactions to finish
 	// before the migration aborts back to the source.
+	//
+	// Every default on this type is spelled in Go's canonical duration form, and has to be:
+	// the spec is immutable by CEL, and a metav1.Duration serializes back out as
+	// time.Duration.String(). A default of "1h" would be stored verbatim at creation and
+	// re-serialized as "1h0m0s" on the next write, so the immutability rule would reject
+	// every subsequent update to the object - including adding a finalizer or an annotation.
 	// +kubebuilder:default="30s"
 	// +optional
 	DrainTimeout *metav1.Duration `json:"drainTimeout,omitempty"`
@@ -222,14 +228,14 @@ type PgTenantMigrationSpec struct {
 	// cutoverTimeout bounds the whole Cutover phase, including the final LSN wait,
 	// sequence handling and verification. Exceeding it aborts back to the source, so it
 	// is the upper bound on the pause clients can observe.
-	// +kubebuilder:default="60s"
+	// +kubebuilder:default="1m0s"
 	// +optional
 	CutoverTimeout *metav1.Duration `json:"cutoverTimeout,omitempty"`
 
 	// rollbackWindow is how long the source database is kept intact and
 	// connection-refusing after a successful cutover, during which routing can be flipped
 	// back without restoring a backup. It is dropped once the window closes.
-	// +kubebuilder:default="1h"
+	// +kubebuilder:default="1h0m0s"
 	// +optional
 	RollbackWindow *metav1.Duration `json:"rollbackWindow,omitempty"`
 

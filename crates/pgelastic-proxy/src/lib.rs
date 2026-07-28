@@ -21,6 +21,14 @@
 //! - [`pool`] and [`txn`] are the wiring: the map of pools, and the loop that
 //!   drives checkout and check-in from the gate rather than from a second copy
 //!   of it.
+//! - [`route`] owns the fleet. An instance is a capacity boundary as well as
+//!   an address, so each one has its own pool manager, its own epoch fence and
+//!   its own [`stall`] monitor — which is what keeps one instance's quorum loss
+//!   off every other instance's tenants.
+//! - [`stall`] owns proactive write-stall detection, and [`quiesce`] plus
+//!   [`control`] own the lease-bound cutover API a live tenant migration
+//!   drives. Clients are queued rather than dropped, which is the whole
+//!   difference between this and an elastic-pool move that relies on retry.
 //! - [`epoch`] owns the primary-epoch fence. Kubernetes Services cannot tear
 //!   down an established TCP connection, so a demoted primary keeps serving
 //!   writes that `pg_rewind` is about to discard. Every backend socket
@@ -32,15 +40,19 @@
 pub mod backend;
 pub mod cancel;
 pub mod config;
+pub mod control;
 pub mod epoch;
 pub mod error;
 pub mod handshake;
 pub mod metrics;
 pub mod pool;
+pub mod quiesce;
 pub mod relay;
+pub mod route;
 pub mod scram;
 pub mod server;
 pub mod session;
+pub mod stall;
 pub mod stream;
 pub mod tls;
 pub mod tripwire;

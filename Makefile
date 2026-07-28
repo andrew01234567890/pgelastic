@@ -91,7 +91,8 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
-	$(MAKE) test-e2e-instance E2E_KIND_CLUSTER=$(KIND_CLUSTER)
+	$(MAKE) test-e2e-instance E2E_CONTEXT=kind-$(KIND_CLUSTER)
+	$(MAKE) test-e2e-migration E2E_CONTEXT=kind-$(KIND_CLUSTER)
 	$(MAKE) cleanup-test-e2e
 
 # The instance e2e provisions a real three-node PostgreSQL 18 instance and asserts on what
@@ -100,20 +101,42 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 # E2E_CONTEXT selects the cluster. docker-desktop is the default because it shares the
 # local Docker daemon, so a locally built image is already present on the node and the
 # load step is a no-op; it is also visible in the Docker Desktop UI. Kind needs an
-# explicit `kind load` because its nodes run their own containerd.
+# explicit `kind load` because its nodes run their own containerd. kind names its context
+# kind-<cluster>, which is how test-e2e hands over the cluster it just created.
 E2E_CONTEXT ?= docker-desktop
-E2E_KIND_CLUSTER ?= pgelastic-dev
 E2E_TIMEOUT ?= 60m
+# Ginkgo label filter for the instance suite; empty runs everything. The chaos specs carry
+# the `chaos` label, so CI's per-push job passes '!chaos' and the nightly job passes none.
+E2E_LABEL_FILTER ?=
 
 .PHONY: test-e2e-instance
 test-e2e-instance: manifests generate install-e2e load-instance-images ## Provision a real 3-node PostgreSQL 18 instance and assert on it.
 	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
-	go test -tags=e2e ./test/e2e/instance/ -v -ginkgo.v -timeout $(E2E_TIMEOUT)
+	go test -tags=e2e ./test/e2e/instance/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
+		$(if $(E2E_LABEL_FILTER),-ginkgo.label-filter='$(E2E_LABEL_FILTER)')
+
+# The migration e2e moves a tenant between two real three-node instances, by logical
+# replication and by dump and restore, and measures the pause rather than asserting it.
+.PHONY: test-e2e-migration
+test-e2e-migration: manifests generate install-e2e load-instance-images ## Move a tenant between two real PostgreSQL 18 instances.
+	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
+	go test -tags=e2e ./test/e2e/migration/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
+		$(if $(E2E_LABEL_FILTER),-ginkgo.label-filter='$(E2E_LABEL_FILTER)')
+
+# The placement e2e drives the placement and capacity-planning loops against a real API
+# server. It provisions no PostgreSQL: what placement consumes from a member instance is
+# exactly what that instance publishes in status, and the provisioning path has its own
+# suite. What this one proves that envtest cannot is that the whole plan survives a real
+# CRD, where a pruned status field is indistinguishable from a decision not to write one.
+.PHONY: test-e2e-placement
+test-e2e-placement: manifests generate install-e2e ## Place a tenant population across a pool and assert the plan.
+	E2E_CONTEXT=$(E2E_CONTEXT) \
+	go test -tags=e2e ./test/e2e/placement/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
+		$(if $(E2E_LABEL_FILTER),-ginkgo.label-filter='$(E2E_LABEL_FILTER)')
 
 .PHONY: install-e2e
 install-e2e: manifests kustomize ## Install CRDs into E2E_CONTEXT.
-	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
-	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" --context=$(E2E_CONTEXT) apply --server-side --force-conflicts -f -; fi
+	"$(KUSTOMIZE)" build config/crd | "$(KUBECTL)" --context=$(E2E_CONTEXT) apply --server-side --force-conflicts -f -
 
 .PHONY: load-instance-images
 load-instance-images: docker-build-instance docker-build-postgres ## Make the images reachable from E2E_CONTEXT.

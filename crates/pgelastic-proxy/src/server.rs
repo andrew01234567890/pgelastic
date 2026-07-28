@@ -14,27 +14,27 @@ use tracing::{debug, info, warn};
 use crate::backend;
 use crate::cancel::{CancelRegistry, CancelRoute, CancelToken};
 use crate::config::Config;
-use crate::epoch::FenceRuntime;
 use crate::error::{ProxyError, Result};
 use crate::handshake::{self, Accepted, ClientAuth};
 use crate::metrics::{AuthOutcome, Metrics, RejectReason};
-use crate::pool::PoolManager;
+use crate::quiesce::QuiesceRegistry;
+use crate::route::{Fleet, Instance};
 use crate::scram::{KdfPool, ScramVerifier};
 use crate::session::{self, Ending};
 use crate::stream::ClientStream;
-use crate::tls::BackendTls;
 
 /// Everything a connection task needs, shared by `Arc`.
 pub struct Proxy {
     pub config: Config,
     pub acceptor: Option<TlsAcceptor>,
-    pub backend_tls: Option<BackendTls>,
     pub auth: Arc<ClientAuth>,
     pub kdf: KdfPool,
     pub cancels: Arc<CancelRegistry>,
     pub metrics: Arc<Metrics>,
-    pub pools: Arc<PoolManager>,
-    pub fence: FenceRuntime,
+    /// The instances this proxy fronts, and which tenant is on which.
+    pub fleet: Arc<Fleet>,
+    /// Every tenant's admission gate, for the migration cutover.
+    pub quiesce: Arc<QuiesceRegistry>,
     permits: Arc<Semaphore>,
 }
 
@@ -57,13 +57,6 @@ impl Proxy {
             .as_ref()
             .map(crate::tls::server_acceptor)
             .transpose()?;
-        let backend_host = config
-            .backend
-            .address
-            .rsplit_once(':')
-            .map_or(config.backend.address.as_str(), |(host, _)| host);
-        let backend_tls = crate::tls::backend_connector(&config.backend.tls, backend_host)?;
-
         let iterations = NonZeroU32::new(config.auth.scram_iterations)
             .ok_or_else(|| ProxyError::config("auth.scramIterations must be non-zero"))?;
         let mut verifiers = HashMap::new();
@@ -89,23 +82,30 @@ impl Proxy {
 
         let permits = Arc::new(Semaphore::new(config.listen.max_client_connections.max(1)));
         let kdf = KdfPool::new(config.auth.kdf_concurrency);
-        let fence = FenceRuntime::from(&config.fence);
-        let pools = PoolManager::new(config.pool.clone(), fence.clone(), Arc::clone(&metrics))?;
-        pools.publish_budget();
-        metrics.in_doubt(fence.fence.in_doubt().len());
+        let fleet = Fleet::build(&config, &metrics)?;
+        metrics.in_doubt(fleet.default_instance().fence.fence.in_doubt().len());
 
         Ok(Arc::new(Self {
             auth: Arc::new(ClientAuth::new(verifiers, iterations)?),
             config,
             acceptor,
-            backend_tls,
             kdf,
             cancels: CancelRegistry::new(),
             metrics,
-            pools,
-            fence,
+            fleet,
+            quiesce: QuiesceRegistry::new(),
             permits,
         }))
+    }
+
+    /// The control-plane facade over this proxy's fleet.
+    pub fn control(&self) -> crate::control::Control {
+        crate::control::Control {
+            fleet: Arc::clone(&self.fleet),
+            quiesce: Arc::clone(&self.quiesce),
+            metrics: Arc::clone(&self.metrics),
+            config: self.config.control.clone(),
+        }
     }
 }
 
@@ -153,6 +153,7 @@ pub async fn spawn(proxy: Arc<Proxy>, shutdown: watch::Sender<bool>) -> Result<R
     let (alive, idle) = mpsc::channel::<std::convert::Infallible>(1);
     let receiver = shutdown.subscribe();
     spawn_fence_paths(&proxy, &shutdown).await?;
+    spawn_availability_paths(&proxy, &shutdown).await?;
     let accept = tokio::spawn(accept_loop(proxy, listener, receiver, alive));
 
     info!(%address, "proxy listening");
@@ -171,32 +172,37 @@ pub async fn spawn(proxy: Arc<Proxy>, shutdown: watch::Sender<bool>) -> Result<R
 /// The verify path needs nothing started: it runs inside every checkout, which
 /// is what makes it the one that survives a partition.
 async fn spawn_fence_paths(proxy: &Arc<Proxy>, shutdown: &watch::Sender<bool>) -> Result<()> {
-    tokio::spawn(sweep_loop(
-        Arc::clone(&proxy.pools),
-        proxy.fence.clone(),
-        Arc::clone(&proxy.metrics),
-        shutdown.subscribe(),
-    ));
-
-    if proxy.config.fence.verify_at_checkout {
-        tokio::spawn(crate::epoch::verify::probe_loop(
-            crate::epoch::verify::Prober {
-                backend: proxy.config.backend.clone(),
-                tls: proxy.backend_tls.clone(),
-                kdf: proxy.kdf.clone(),
-                fence: Arc::clone(&proxy.fence.fence),
-                metrics: Arc::clone(&proxy.metrics),
-            },
+    for instance in proxy.fleet.instances() {
+        tokio::spawn(sweep_loop(
+            Arc::clone(instance),
+            Arc::clone(&proxy.metrics),
             shutdown.subscribe(),
         ));
+
+        if proxy.config.fence.verify_at_checkout {
+            tokio::spawn(crate::epoch::verify::probe_loop(
+                crate::epoch::verify::Prober {
+                    backend: instance.backend.clone(),
+                    tls: instance.tls.clone(),
+                    kdf: proxy.kdf.clone(),
+                    fence: Arc::clone(&instance.fence.fence),
+                    metrics: Arc::clone(&proxy.metrics),
+                },
+                shutdown.subscribe(),
+            ));
+        }
     }
 
+    // Push and watch address a single `PgInstance`, so they are wired to the
+    // default one. A fleet learns the other instances' epochs over the pull
+    // path, which is the one that has to work regardless.
+    let default = proxy.fleet.default_instance();
     if let Some(address) = &proxy.config.fence.push_address {
         let listener = TcpListener::bind(crate::config::resolve(address)?).await?;
         info!(address = %listener.local_addr()?, "epoch push endpoint listening");
         tokio::spawn(crate::epoch::admin::serve(
             listener,
-            Arc::clone(&proxy.fence.fence),
+            Arc::clone(&default.fence.fence),
             shutdown.subscribe(),
         ));
     }
@@ -207,12 +213,68 @@ async fn spawn_fence_paths(proxy: &Arc<Proxy>, shutdown: &watch::Sender<bool>) -
                 namespace: watch.namespace.clone(),
                 name: watch.name.clone(),
             },
-            Arc::clone(&proxy.fence.fence),
+            Arc::clone(&default.fence.fence),
             shutdown.subscribe(),
         ));
     }
     Ok(())
 }
+
+/// Starts write-stall detection and the control API.
+///
+/// The stall probe runs per instance and the control listener is one for the
+/// proxy: a stall is a property of a primary, and a cutover is a property of
+/// the routing table that spans them.
+async fn spawn_availability_paths(
+    proxy: &Arc<Proxy>,
+    shutdown: &watch::Sender<bool>,
+) -> Result<()> {
+    if proxy.config.stall.enabled {
+        for instance in proxy.fleet.instances() {
+            tokio::spawn(crate::stall::probe_loop(
+                crate::stall::StallProbe {
+                    backend: instance.backend.clone(),
+                    tls: instance.tls.clone(),
+                    kdf: proxy.kdf.clone(),
+                    monitor: Arc::clone(&instance.stall),
+                    metrics: Arc::clone(&proxy.metrics),
+                },
+                proxy.config.stall.interval(),
+                shutdown.subscribe(),
+            ));
+        }
+    }
+
+    let control = proxy.control();
+    // Swept far more often than a lease lasts: the deadline a killed operator
+    // is held to has to be the lease, not the lease plus however coarse the
+    // sweep happens to be. Capped as well as floored, so a long default TTL
+    // cannot stretch the sweep past the shortest lease a caller may ask for.
+    let sweep = (proxy.config.control.default_lease_ttl() / 20).clamp(REAP_FLOOR, REAP_CEILING);
+    tokio::spawn(crate::control::reap_loop(
+        control.clone(),
+        sweep,
+        shutdown.subscribe(),
+    ));
+
+    if let Some(address) = &proxy.config.control.address {
+        let listener = TcpListener::bind(crate::config::resolve(address)?).await?;
+        info!(address = %listener.local_addr()?, "control endpoint listening");
+        tokio::spawn(crate::control::serve(
+            listener,
+            control,
+            shutdown.subscribe(),
+        ));
+    }
+    Ok(())
+}
+
+/// The shortest lease sweep interval, so a very short TTL cannot turn the
+/// sweeper into a spin loop.
+const REAP_FLOOR: std::time::Duration = std::time::Duration::from_millis(10);
+/// The longest one, so how late an expiry is noticed is bounded by this rather
+/// than by whatever the default TTL happens to be.
+const REAP_CEILING: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Severs superseded parked sockets the moment the epoch moves.
 ///
@@ -220,11 +282,12 @@ async fn spawn_fence_paths(proxy: &Arc<Proxy>, shutdown: &watch::Sender<bool>) -
 /// is what makes it prompt on an idle pool, where the next checkout might be
 /// minutes away and the sockets would sit there ESTABLISHED in the meantime.
 async fn sweep_loop(
-    pools: Arc<PoolManager>,
-    fence: FenceRuntime,
+    instance: Arc<Instance>,
     metrics: Arc<Metrics>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let fence = instance.fence.clone();
+    let pools = Arc::clone(&instance.pools);
     let mut epochs = fence.fence.subscribe();
     loop {
         tokio::select! {
@@ -340,7 +403,12 @@ async fn serve(
     proxy.metrics.client_auth(AuthOutcome::Success);
 
     let role = String::from_utf8_lossy(&user).into_owned();
-    let key = match crate::pool::pool_key(&proxy.config, &session.startup, &role) {
+    // The route is read here only to decide the pool key's shape and to serve a
+    // session-mode client. A transaction-mode client re-reads it at every
+    // checkout, which is what lets a cutover move it without it reconnecting.
+    let instance = proxy.fleet.route(&role);
+    let key = match crate::pool::pool_key(&proxy.config, &instance.backend, &session.startup, &role)
+    {
         Ok(key) => key,
         Err(error) => {
             proxy.metrics.client_rejected(RejectReason::Handshake);
@@ -353,9 +421,9 @@ async fn serve(
     // itself: a walsender stream has no transaction boundaries to release on,
     // and multiplexing one silently corrupts it.
     let result = if key.mode() == pgelastic_pool::PoolMode::Transaction {
-        multiplexed(proxy, &mut session, &key, &role, &mut shutdown).await
+        multiplexed(proxy, &mut session, &role, &mut shutdown).await
     } else {
-        bound(proxy, &mut session, &role, &mut shutdown).await
+        bound(proxy, &mut session, &instance, &role, &mut shutdown).await
     };
 
     if let Err(error) = &result
@@ -370,12 +438,32 @@ async fn serve(
 async fn bound(
     proxy: &Arc<Proxy>,
     session: &mut handshake::ClientSession,
+    instance: &Arc<Instance>,
     role: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
+    // A session-mode client holds one backend for its whole life, so refusing
+    // it here is the only chance the stall detector gets: once it is connected
+    // there is no boundary at which to take the connection back.
+    //
+    // A replication connection is exempt, and the exemption is not a courtesy:
+    // a walsender is how a standby rejoins, and rejoining is what ends the
+    // stall. Refusing it would make the proxy the reason the instance cannot
+    // recover.
+    let replication = session.startup.get(b"replication").is_some();
+    if !replication && let Some(health) = instance.stall.must_refuse() {
+        proxy.metrics.write_stall_refused();
+        proxy.metrics.client_rejected(RejectReason::Backend);
+        return Err(write_stalled(&instance.id, health));
+    }
+    // A session-mode client never reaches an idle boundary, so it counts as
+    // permanently in flight: a cutover must not believe a tenant has drained
+    // while one of its sessions is still writing to the source.
+    let _holding = proxy.quiesce.gate(role).hold();
+
     let mut link = match backend::connect(
-        &proxy.config.backend,
-        proxy.backend_tls.as_ref(),
+        &instance.backend,
+        instance.tls.as_ref(),
         &proxy.kdf,
         &session.startup,
     )
@@ -391,7 +479,7 @@ async fn bound(
     proxy.metrics.backend_auth(AuthOutcome::Success);
     proxy.metrics.backend_opened();
 
-    let fenced = match verify_bound(proxy, session, &mut link, role).await {
+    let fenced = match verify_bound(proxy, instance, session, &mut link, role).await {
         Ok(fenced) => fenced,
         Err(error) => {
             proxy.metrics.client_rejected(RejectReason::Backend);
@@ -404,9 +492,21 @@ async fn bound(
         }
     };
 
-    let result = relay(proxy, session, &mut link, &fenced, shutdown).await;
+    let result = relay(proxy, instance, session, &mut link, &fenced, shutdown).await;
     proxy.metrics.backend_closed();
     result
+}
+
+/// The refusal a client gets when its instance cannot complete a commit.
+pub(crate) fn write_stalled(
+    instance: &crate::route::InstanceId,
+    health: crate::stall::WriteHealth,
+) -> ProxyError {
+    ProxyError::WriteStalled {
+        message: format!(
+            "instance {instance} is {health}, so a COMMIT there would block indefinitely.              No backend was taken and nothing was forwarded, so this transaction did not              happen. Retrying will not help until quorum returns or this tenant is moved"
+        ),
+    }
 }
 
 /// Tags a bound link with the epoch it proved it was serving.
@@ -418,14 +518,15 @@ async fn bound(
 /// replication stream to a demoted primary is exactly as dangerous as a client
 /// one.
 async fn verify_bound<'a>(
-    proxy: &'a Arc<Proxy>,
+    proxy: &Arc<Proxy>,
+    instance: &'a Arc<Instance>,
     session: &handshake::ClientSession,
     link: &mut backend::BackendSession,
     role: &str,
 ) -> Result<session::Fenced<'a>> {
     let mut fenced = session::Fenced {
-        runtime: &proxy.fence,
-        opened_under: proxy.fence.current(),
+        runtime: &instance.fence,
+        opened_under: instance.fence.current(),
         tenant: role.to_owned(),
         backend_pid: link.key_data.as_ref().map(|data| data.process_id),
         lsn: None,
@@ -434,7 +535,7 @@ async fn verify_bound<'a>(
     for message in &link.parameters {
         if let BackendMessage::ParameterStatus(status) = message
             && let Some((epoch, observation)) =
-                crate::epoch::verify::observe_parameter_status(&proxy.fence.fence, status)
+                crate::epoch::verify::observe_parameter_status(&instance.fence.fence, status)
         {
             proxy
                 .metrics
@@ -454,7 +555,7 @@ async fn verify_bound<'a>(
         fenced.lsn = probe.lsn;
         match probe.epoch {
             Some(epoch) => {
-                let observation = proxy
+                let observation = instance
                     .fence
                     .fence
                     .observe(crate::epoch::EpochSource::Verify, epoch);
@@ -473,14 +574,14 @@ async fn verify_bound<'a>(
             None => {}
         }
     }
-    proxy.metrics.primary_epoch(proxy.fence.current());
+    proxy.metrics.primary_epoch(instance.fence.current());
 
-    if fenced.opened_under < proxy.fence.current() {
+    if fenced.opened_under < instance.fence.current() {
         return Err(ProxyError::SupersededEpoch {
             message: format!(
                 "this backend is serving primary epoch {} and the cluster has reached {}",
                 fenced.opened_under,
-                proxy.fence.current()
+                instance.fence.current()
             ),
         });
     }
@@ -491,6 +592,7 @@ async fn verify_bound<'a>(
 /// session ends.
 async fn relay(
     proxy: &Arc<Proxy>,
+    instance: &Arc<Instance>,
     session: &mut handshake::ClientSession,
     link: &mut backend::BackendSession,
     fenced: &session::Fenced<'_>,
@@ -499,8 +601,12 @@ async fn relay(
     let token = CancelToken::mint(proxy.config.routing.cancel_routing_id)?;
     let route = CancelRoute::new();
     route.set(Some(crate::cancel::CancelTarget {
-        address: proxy.config.backend.address.clone(),
+        address: instance.backend.address.clone(),
         key_data: link.key_data.clone(),
+        instance: instance.id.clone(),
+        // Session mode: the client owns its one backend for life and takes
+        // nothing from the allocator, so there is no credit to charge.
+        client: None,
     }));
     let _registration = proxy.cancels.register(token.clone(), route);
 
@@ -561,45 +667,34 @@ async fn relay(
 async fn multiplexed(
     proxy: &Arc<Proxy>,
     session: &mut handshake::ClientSession,
-    key: &pgelastic_pool::PoolKey,
     role: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let tenant = proxy.pools.ensure_tenant(role).map_err(admission)?;
-    let client_id = proxy.pools.connect_client(&tenant).map_err(admission)?;
-    let _client = ClientRegistration {
-        pools: Arc::clone(&proxy.pools),
-        client: client_id,
-    };
-
-    let connector = crate::pool::Connector {
-        backend: &proxy.config.backend,
-        tls: proxy.backend_tls.as_ref(),
-        kdf: &proxy.kdf,
-        startup: &session.startup,
-    };
+    let gate = proxy.quiesce.gate(role);
+    let binding = crate::txn::Binding::open(proxy, &session.startup, role)?;
 
     // The greeting is the first link's `ParameterStatus` set, cached per pool
     // key: a client that arrives twentieth must not have to hold a backend just
     // to be told the server's `TimeZone`.
-    let parameters = if let Some(cached) = proxy.pools.greeting(key) {
+    let parameters = if let Some(cached) = binding.instance.pools.greeting(&binding.key) {
         cached
     } else {
-        let request = crate::pool::AcquireRequest {
-            key,
-            tenant: &tenant,
-            client: client_id,
-        };
-        let checkout = proxy
-            .pools
-            .acquire(&request, &connector, &mut session.stream)
-            .await
-            .map_err(admission)?;
-        proxy.pools.check_in(key, checkout);
-        proxy
-            .pools
-            .greeting(key)
-            .expect("opening a link caches the pool's greeting")
+        // Opening the first link of a pool is a checkout like any other, so it
+        // waits at the tenant's gate: a client that connects during a cutover
+        // must not open a backend on the source the cutover is trying to drain.
+        let baton = gate.admit().await;
+        let held = gate.hold();
+        let parameters = crate::txn::bootstrap_greeting(
+            &binding,
+            &proxy.kdf,
+            &session.startup,
+            &mut session.stream,
+            &proxy.metrics,
+        )
+        .await;
+        drop(held);
+        drop(baton);
+        parameters?
     };
 
     let mut client_vars = crate::vars::VariableCache::new();
@@ -610,7 +705,7 @@ async fn multiplexed(
     }
 
     let token = CancelToken::mint(proxy.config.routing.cancel_routing_id)?;
-    let route = CancelRoute::for_client(client_id);
+    let route = CancelRoute::new();
     let _registration = proxy.cancels.register(token.clone(), route.clone());
 
     let mut greeting = vec![BackendMessage::Authentication(
@@ -625,11 +720,11 @@ async fn multiplexed(
     let ending = crate::txn::run(
         crate::txn::Session {
             client: &mut session.stream,
-            manager: &proxy.pools,
-            connector,
-            key: key.clone(),
-            tenant,
-            client_id,
+            proxy,
+            startup: &session.startup,
+            role: role.to_owned(),
+            gate,
+            binding,
             route,
             metrics: &proxy.metrics,
             limits: limits(proxy),
@@ -660,25 +755,6 @@ fn limits(proxy: &Arc<Proxy>) -> session::Limits {
     }
 }
 
-fn admission(denial: crate::pool::Denial) -> ProxyError {
-    ProxyError::Admission {
-        sqlstate: denial.sqlstate,
-        message: denial.message,
-    }
-}
-
-/// Releases the client's place in the second currency however the session ends.
-struct ClientRegistration {
-    pools: Arc<PoolManager>,
-    client: pgelastic_capacity::ClientId,
-}
-
-impl Drop for ClientRegistration {
-    fn drop(&mut self) {
-        self.pools.disconnect_client(self.client);
-    }
-}
-
 async fn cancel(proxy: &Arc<Proxy>, request: &pgelastic_wire::CancelRequest) -> Result<()> {
     let token = CancelToken::from(request);
     // Resolved here rather than at registration: under transaction pooling the
@@ -698,12 +774,19 @@ async fn cancel(proxy: &Arc<Proxy>, request: &pgelastic_wire::CancelRequest) -> 
         proxy.metrics.cancel(false);
         return Ok(());
     };
+    // The instance comes off the target rather than off the session, because a
+    // tenant migrated mid-session is holding a backend on the new one and its
+    // credit has to be drawn from that instance's allocator.
+    let Some(instance) = proxy.fleet.get(&target.instance).map(Arc::clone) else {
+        proxy.metrics.cancel(false);
+        return Ok(());
+    };
     // Step 0 of the admission ladder. A cancel opens a real backend socket, so
     // it is admitted like one — but from its own bounded credit pool, which is
     // both why a cancel storm cannot eat the tenant's capacity and why a tenant
     // pinned at its burst ceiling can still cancel.
-    let _credit = match route.client() {
-        Some(client) => match proxy.pools.lease_cancel(client) {
+    let _credit = match target.client {
+        Some(client) => match instance.pools.lease_cancel(client) {
             Ok(credit) => Some(credit),
             Err(denial) => {
                 proxy.metrics.cancel_refused();
@@ -716,8 +799,8 @@ async fn cancel(proxy: &Arc<Proxy>, request: &pgelastic_wire::CancelRequest) -> 
     proxy.metrics.cancel(true);
     if let Err(error) = crate::cancel::deliver(
         &target,
-        proxy.backend_tls.as_ref(),
-        proxy.config.backend.connect_timeout(),
+        instance.tls.as_ref(),
+        instance.backend.connect_timeout(),
     )
     .await
     {

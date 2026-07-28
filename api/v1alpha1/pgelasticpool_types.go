@@ -162,6 +162,20 @@ const (
 	AutoActionScaleIn        AutoAction = "ScaleIn"
 )
 
+// StaleMetricPolicy selects what the planner does when the metrics it would act on are
+// older than the pool's staleness threshold.
+//
+// DoNothing is the default and is the KEDA-shaped answer: acting on a stale reading is how
+// an autoscaler amplifies an incident, because the reading most likely to be stale is the
+// one taken while the thing being measured was already failing.
+// +kubebuilder:validation:Enum=DoNothing;ScaleToMinimum
+type StaleMetricPolicy string
+
+const (
+	StaleMetricDoNothing      StaleMetricPolicy = "DoNothing"
+	StaleMetricScaleToMinimum StaleMetricPolicy = "ScaleToMinimum"
+)
+
 // TenantDiscriminator is one input the proxy uses to decide which tenant a new client
 // connection belongs to.
 // +kubebuilder:validation:Enum=SNI;StartupOptions;DatabaseName
@@ -749,11 +763,115 @@ type PoolAutoscaling struct {
 
 	// autoActions is the set of change classes the planner may execute in Auto mode.
 	// Everything not listed is planned and reported but never applied, so the list is opted
-	// into one class at a time.
+	// into one class at a time. Within one planning pass at most one class is executed, and
+	// the classes are considered in the order they are declared on AutoAction: cheapest and
+	// most reversible first, scale-in last.
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=6
 	// +optional
 	AutoActions []AutoAction `json:"autoActions,omitempty"`
+
+	// tolerancePercent is the HPA-shaped dead band. A utilization within this much of the
+	// target proposes nothing at all, which is what stops a pool oscillating around a
+	// boundary it is already close enough to.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=50
+	// +kubebuilder:default=10
+	// +optional
+	TolerancePercent *int32 `json:"tolerancePercent,omitempty"`
+
+	// staleMetricThreshold is how old the newest metering sample may be before the planner
+	// treats the pool as unmeasured.
+	// +kubebuilder:default="5m"
+	// +optional
+	StaleMetricThreshold *metav1.Duration `json:"staleMetricThreshold,omitempty"`
+
+	// staleMetricPolicy is what happens once that threshold is crossed.
+	// +kubebuilder:default=DoNothing
+	// +optional
+	StaleMetricPolicy StaleMetricPolicy `json:"staleMetricPolicy,omitempty"`
+
+	// consolidationDwellTime is how long an instance must have been consolidatable before
+	// scale-in will act on it. It is separate from the scale-down stabilization window: the
+	// window says the surplus has persisted, the dwell time says the decision to reclaim a
+	// specific instance has persisted.
+	// +kubebuilder:default="24h"
+	// +optional
+	ConsolidationDwellTime *metav1.Duration `json:"consolidationDwellTime,omitempty"`
+
+	// scaleInEvidenceWindow is how much continuous per-tenant history must exist before an
+	// instance may be removed. Scale-in is the one action that cannot be undone in seconds,
+	// so it is gated on a week of evidence rather than on a stabilization window.
+	// +kubebuilder:default="168h"
+	// +optional
+	ScaleInEvidenceWindow *metav1.Duration `json:"scaleInEvidenceWindow,omitempty"`
+
+	// migrationBudget bounds how much tenant movement the planner may spend.
+	// +optional
+	MigrationBudget *MigrationBudget `json:"migrationBudget,omitempty"`
+
+	// blackoutWindows suspend every executed action, not only rebalancing. A pool that must
+	// not be touched during a change freeze must not be resized during it either.
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	BlackoutWindows []TimeWindow `json:"blackoutWindows,omitempty"`
+
+	// storage configures when a volume is grown.
+	// +optional
+	Storage *StorageAutoscaling `json:"storage,omitempty"`
+}
+
+// MigrationBudget bounds tenant movement, in the shape of a Karpenter disruption budget:
+// a concurrency cap, a rate cap, and cron-scoped windows outside which the budget is zero.
+type MigrationBudget struct {
+	// maxConcurrent caps simultaneous moves. Each one holds a replication slot and adds
+	// logical decoding load to its source.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=16
+	// +kubebuilder:default=1
+	// +optional
+	MaxConcurrent *int32 `json:"maxConcurrent,omitempty"`
+
+	// maxPerWindow caps how many moves may start inside one scheduling window, so a plan
+	// that wants to move fifty tenants spends its budget over days rather than in an hour.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1000
+	// +kubebuilder:default=4
+	// +optional
+	MaxPerWindow *int32 `json:"maxPerWindow,omitempty"`
+
+	// windows scope when moves may start. An empty list means any time, which is only a
+	// sane default because an Online move queues clients rather than dropping them.
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	Windows []TimeWindow `json:"windows,omitempty"`
+}
+
+// StorageAutoscaling configures volume expansion, the one action the planner executes even
+// in Recommend mode. It is online, it is the only remedy for a full volume, and it is the
+// only scaling action a database survives without noticing. Shrinking is impossible, which
+// is why the trigger is deliberately late and the target deliberately generous.
+type StorageAutoscaling struct {
+	// expandAtPercent is the used-to-allocated ratio that triggers an expansion.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=99
+	// +kubebuilder:default=80
+	// +optional
+	ExpandAtPercent *int32 `json:"expandAtPercent,omitempty"`
+
+	// expandToPercent is the used-to-allocated ratio the expansion aims to restore.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=99
+	// +kubebuilder:default=60
+	// +optional
+	ExpandToPercent *int32 `json:"expandToPercent,omitempty"`
+
+	// maxSize caps how large a volume the planner may ask for, so a runaway table cannot
+	// spend an unbounded amount of somebody's money.
+	// +optional
+	MaxSize *resource.Quantity `json:"maxSize,omitempty"`
 }
 
 // PoolStabilizationWindow is the asymmetric damping applied to scaling decisions. Scale-up
@@ -1329,6 +1447,197 @@ type PoolTenantCounts struct {
 	ByQosClass *QoSClassCounts `json:"byQosClass,omitempty"`
 }
 
+// AutoscalingPlan is the whole capacity plan, computed every reconcile and published
+// whether or not any of it will be executed.
+//
+// Publishing the plan in Recommend mode is the point of Recommend mode: an operator can read
+// exactly what would have happened, argue with it, and opt one action class into Auto once
+// the plan has been boring for a while. A plan that only existed when it was about to be
+// executed would give nobody that evidence.
+type AutoscalingPlan struct {
+	// mode is the mode the plan was computed under.
+	// +optional
+	Mode AutoscalingMode `json:"mode,omitempty"`
+
+	// computedAt is when the plan was last recomputed.
+	// +optional
+	ComputedAt *metav1.Time `json:"computedAt,omitempty"`
+
+	// metricsStale reports that the readings the plan was computed from are older than the
+	// staleness threshold. Every action is refused while it is true.
+	// +optional
+	MetricsStale bool `json:"metricsStale,omitempty"`
+
+	// observedInstances is how many instances the pool has now.
+	// +optional
+	ObservedInstances int32 `json:"observedInstances,omitempty"`
+
+	// recommendedInstances is how many it should have.
+	// +optional
+	RecommendedInstances int32 `json:"recommendedInstances,omitempty"`
+
+	// observedUtilizationPercent is connections in use over allocatable, across the ready
+	// instances.
+	// +optional
+	ObservedUtilizationPercent int32 `json:"observedUtilizationPercent,omitempty"`
+
+	// targetUtilizationPercent is what the planner steers towards.
+	// +optional
+	TargetUtilizationPercent int32 `json:"targetUtilizationPercent,omitempty"`
+
+	// summary is a one-line human-readable explanation of the plan.
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	Summary string `json:"summary,omitempty"`
+
+	// perInstance is the per-instance target the plan would converge on.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=64
+	// +optional
+	PerInstance []InstanceTarget `json:"perInstance,omitempty"`
+
+	// moves is the tenant movement the plan implies. Eviction and destination appear here
+	// together because they were decided together: a plan that said which tenant to evict
+	// without saying where it lands is not a plan, it is half of one.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=128
+	// +optional
+	Moves []PlannedMove `json:"moves,omitempty"`
+
+	// actions is every change class the plan proposes, each carrying whether it is permitted
+	// to execute and, when it is not, which guardrail refused it.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=6
+	// +optional
+	Actions []PlannedAction `json:"actions,omitempty"`
+}
+
+// InstanceTarget is what one instance should look like once the plan is applied.
+type InstanceTarget struct {
+	// name of the PgInstance.
+	// +kubebuilder:validation:MaxLength=253
+	// +required
+	Name string `json:"name"`
+
+	// utilizationPercent is the instance's connections in use over allocatable.
+	// +optional
+	UtilizationPercent int32 `json:"utilizationPercent,omitempty"`
+
+	// packedConnections is the sum, over the tenants the plan puts here, of each tenant's
+	// guarantee or trailing-window percentile, whichever is larger.
+	// +optional
+	PackedConnections int32 `json:"packedConnections,omitempty"`
+
+	// allocatableConnections is what the instance can hold.
+	// +optional
+	AllocatableConnections int32 `json:"allocatableConnections,omitempty"`
+
+	// tenants is how many tenants the plan puts here.
+	// +optional
+	Tenants int32 `json:"tenants,omitempty"`
+
+	// storageUsedPercent is the data volume's used-to-allocated ratio.
+	// +optional
+	StorageUsedPercent int32 `json:"storageUsedPercent,omitempty"`
+
+	// recommendedStorage is the data volume size the plan would expand to. It is absent
+	// when no expansion is warranted, and never smaller than the current size: PVCs cannot
+	// shrink.
+	// +optional
+	RecommendedStorage *resource.Quantity `json:"recommendedStorage,omitempty"`
+
+	// consolidatable reports that every tenant here could be rehomed onto the rest of the
+	// pool, which is the precondition for scale-in.
+	// +optional
+	Consolidatable bool `json:"consolidatable,omitempty"`
+
+	// consolidatableSince is when this instance first became consolidatable, and the instant
+	// the dwell time is measured from. It lives in status rather than in the controller's
+	// memory so that an operator restart does not silently reset a day-long timer.
+	// +optional
+	ConsolidatableSince *metav1.Time `json:"consolidatableSince,omitempty"`
+}
+
+// PlannedMove is one tenant relocation the plan implies.
+type PlannedMove struct {
+	// name is the PgTenant being moved.
+	// +kubebuilder:validation:MaxLength=253
+	// +required
+	Name string `json:"name"`
+
+	// from is the instance it leaves.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	From string `json:"from,omitempty"`
+
+	// to is the instance it lands on.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	To string `json:"to,omitempty"`
+
+	// expectedImprovementPercent is how many percentage points of the source instance's
+	// utilization this move relieves. It is the number that justifies spending a live
+	// migration, and a move that cannot state one should not be made.
+	// +optional
+	ExpectedImprovementPercent int32 `json:"expectedImprovementPercent,omitempty"`
+
+	// reason names why the move is proposed.
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// eligible reports whether the tenant may actually be moved: cold enough, permitted by
+	// its workload class, and not sitting on a source that is too busy to decode for it.
+	// +optional
+	Eligible bool `json:"eligible,omitempty"`
+
+	// blockedBy names the check that makes an ineligible move ineligible.
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	BlockedBy string `json:"blockedBy,omitempty"`
+}
+
+// PlannedAction is one change class the plan proposes.
+type PlannedAction struct {
+	// name is the action class. It is the list map key, so a plan carries at most one entry
+	// per class and a reader can address the one it cares about.
+	// +required
+	Name AutoAction `json:"name"`
+
+	// target names the object the action would change.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	Target string `json:"target,omitempty"`
+
+	// detail spells out the change in the terms it would be applied in.
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	Detail string `json:"detail,omitempty"`
+
+	// permitted reports whether every guardrail allows this action to execute now.
+	// +optional
+	Permitted bool `json:"permitted,omitempty"`
+
+	// reason names the guardrail that refused, or records that none did.
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// message explains the reason in the numbers it was decided on.
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// executedAt is when this action class was last actually applied. An action that is
+	// permitted but never executed and one that executes every reconcile look identical
+	// without it.
+	// +optional
+	ExecutedAt *metav1.Time `json:"executedAt,omitempty"`
+}
+
 // PgElasticPoolStatus defines the observed state of PgElasticPool.
 type PgElasticPoolStatus struct {
 	// observedGeneration is the spec generation the rest of this status describes.
@@ -1365,6 +1674,11 @@ type PgElasticPoolStatus struct {
 	// tenants summarises the pool's tenant population.
 	// +optional
 	Tenants *PoolTenantCounts `json:"tenants,omitempty"`
+
+	// autoscaling is the whole capacity plan, published in every mode and executed only in
+	// the classes the pool has opted into.
+	// +optional
+	Autoscaling *AutoscalingPlan `json:"autoscaling,omitempty"`
 
 	// conditions represent the current state of the PgElasticPool resource.
 	// +listType=map

@@ -23,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/placement"
 )
 
 var _ = Describe("PgTenant controller", Ordered, func() {
@@ -138,7 +139,7 @@ var _ = Describe("PgTenant controller", Ordered, func() {
 		}
 	})
 
-	It("leaves the tenant unbound and asks to be looked at again rather than faking a placement", func() {
+	It("names the missing instance rather than faking a placement", func() {
 		tenant := createTenant("pgt-unbound", "unbound", nil)
 
 		result := reconcileNow(reconciler, tenant)
@@ -150,7 +151,8 @@ var _ = Describe("PgTenant controller", Ordered, func() {
 
 		bound := conditionOf(fetched.Status.Conditions, pgelasticv1alpha1.ConditionBound)
 		Expect(bound.Status).To(Equal(metav1.ConditionFalse))
-		Expect(bound.Reason).To(Equal(pgelasticv1alpha1.ReasonPending))
+		Expect(bound.Reason).To(Equal(pgelasticv1alpha1.ReasonUnplaceable))
+		Expect(bound.Message).To(ContainSubstring(placement.ReasonNoInstances))
 		Expect(conditionOf(fetched.Status.Conditions, pgelasticv1alpha1.ConditionReady).Status).
 			To(Equal(metav1.ConditionFalse))
 	})

@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -461,7 +462,9 @@ func awaitConverged() {
 	AddReportEntry("converged timeline", converged)
 }
 
-var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Serial, func() {
+// The chaos label is what CI filters on: these specs cordon nodes and force-delete Pods
+// and take minutes, so they run nightly rather than on every push.
+var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Serial, Label("chaos"), func() {
 	var oraclePassword string
 
 	AfterEach(dumpOnFailure)
@@ -785,20 +788,11 @@ func otherMember(primary string) string {
 
 func remainingMember(taken ...string) string {
 	for _, member := range chaosMemberNames() {
-		if !contains(taken, member) {
+		if !slices.Contains(taken, member) {
 			return member
 		}
 	}
 	return ""
-}
-
-func contains(values []string, value string) bool {
-	for _, candidate := range values {
-		if candidate == value {
-			return true
-		}
-	}
-	return false
 }
 
 func quoteSQLLiteral(value string) string {

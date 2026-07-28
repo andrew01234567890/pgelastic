@@ -20,6 +20,15 @@ use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres;
 use tokio::sync::watch;
 
+/// Containers allowed to be starting at once within one test binary.
+///
+/// Deliberately small. `cargo test` runs the test binaries in parallel too, so
+/// the real ceiling is this times the number of binaries, and `initdb` is disk
+/// bound: past a dozen at once they only make each other slower until one
+/// misses its readiness window and fails a test that has nothing to do with
+/// start-up.
+static STARTING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 pub const BACKEND_USER: &str = "pgelastic";
 pub const BACKEND_PASSWORD: &str = "backend-secret-not-real";
 pub const BACKEND_DATABASE: &str = "appdb";
@@ -137,6 +146,14 @@ pub async fn start_postgres() -> Postgres {
 /// `current_setting()` reads it back off any backend connection — which is
 /// exactly the property the fence's pull path depends on.
 pub async fn start_postgres_with(extra_conf: &str) -> Postgres {
+    // Container start-up is disk- and CPU-bound, and a binary whose tests each
+    // want two of them will start eight at once. Past a handful they simply
+    // make each other slower, and a server that has not finished initdb inside
+    // the readiness window fails a test that has nothing to do with start-up.
+    let _slot = STARTING
+        .acquire()
+        .await
+        .expect("the start-up limiter is never closed");
     let certificates = Certificates::generate();
     let script = format!(
         "set -e\n\
@@ -188,7 +205,7 @@ pub async fn start_postgres_with(extra_conf: &str) -> Postgres {
 /// remembers it for `serverLoginRetry` — so handing the proxy a backend that is
 /// not up yet poisons its pool for the rest of the test.
 async fn await_ready(postgres: &Postgres) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let url = postgres.direct_url("pgelastic_readiness");
     loop {
         match tokio_postgres::connect(&url, tokio_postgres::NoTls).await {
@@ -525,5 +542,303 @@ impl RawClient {
         )])
         .await;
         self.read_until_ready().await
+    }
+}
+
+/// Two `PostgreSQL` containers behind one proxy, plus its control API.
+///
+/// The pair is what makes "bounded to the affected instance" testable at all: a
+/// claim about blast radius needs a bystander, and a bystander that shares a
+/// process with the casualty is the only kind that can prove anything.
+pub struct Fleet {
+    pub a: Postgres,
+    pub b: Postgres,
+    pub proxy: ProxyUnderTest,
+    pub control: Control,
+}
+
+impl Fleet {
+    /// Starts both containers and a proxy fronting them, with `extra` appended
+    /// to the configuration.
+    pub async fn start(extra: &str) -> Self {
+        Self::start_sized(20, 20, extra).await
+    }
+
+    /// As [`start`](Self::start), with an explicit backend budget per instance.
+    ///
+    /// A budget of one makes the order a queue drains in observable: only one
+    /// transaction can be running, so the order rows land in *is* the order the
+    /// gate released them.
+    pub async fn start_sized(a_budget: u32, b_budget: u32, extra: &str) -> Self {
+        Self::start_leased(a_budget, b_budget, 15_000, extra).await
+    }
+
+    /// As [`start_sized`](Self::start_sized), with the control API's default
+    /// lease. The lease-expiry sweep is derived from it, so a test about what a
+    /// killed operator costs has to set it.
+    pub async fn start_leased(
+        a_budget: u32,
+        b_budget: u32,
+        default_lease_ms: u64,
+        extra: &str,
+    ) -> Self {
+        let (a, b) = tokio::join!(start_postgres(), start_postgres());
+        let control_port = free_port().await;
+        let source = format!(
+            "[listen]\n\
+             address = \"127.0.0.1:0\"\n\
+             \n\
+             [backend]\n\
+             address = \"{a_addr}\"\n\
+             user = \"{BACKEND_USER}\"\n\
+             password = \"{BACKEND_PASSWORD}\"\n\
+             database = \"{BACKEND_DATABASE}\"\n\
+             \n\
+             [drain]\n\
+             shutdownSeconds = 30\n\
+             \n\
+             [pool]\n\
+             mode = \"transaction\"\n\
+             \n\
+             [control]\n\
+             address = \"127.0.0.1:{control_port}\"\n\
+             defaultLeaseTtlMs = {default_lease_ms}\n\
+             \n\
+             [[instances]]\n\
+             name = \"inst-a\"\n\
+             address = \"{a_addr}\"\n\
+             backendConnections = {a_budget}\n\
+             \n\
+             [[instances]]\n\
+             name = \"inst-b\"\n\
+             address = \"{b_addr}\"\n\
+             backendConnections = {b_budget}\n\
+             \n\
+             [routing]\n\
+             defaultInstance = \"inst-a\"\n\
+             tenants = {{ beta = \"inst-b\" }}\n\
+             {extra}\n",
+            a_addr = a.address(),
+            b_addr = b.address(),
+        );
+        let proxy = start_proxy(&source).await;
+        let control = Control {
+            address: format!("127.0.0.1:{control_port}"),
+        };
+        control.await_ready().await;
+        Self {
+            a,
+            b,
+            proxy,
+            control,
+        }
+    }
+
+    pub fn url_for(&self, tenant: &str) -> String {
+        format!(
+            "host=127.0.0.1 port={} user={tenant} dbname={BACKEND_DATABASE}",
+            self.proxy.port()
+        )
+    }
+
+    pub async fn connect_as(&self, tenant: &str) -> tokio_postgres::Client {
+        let (client, connection) =
+            tokio_postgres::connect(&self.url_for(tenant), tokio_postgres::NoTls)
+                .await
+                .expect("connecting through the proxy must succeed");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    }
+
+    pub async fn try_connect_as(
+        &self,
+        tenant: &str,
+    ) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+        let (client, connection) =
+            tokio_postgres::connect(&self.url_for(tenant), tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
+    }
+
+    /// A connection straight to one container, past the proxy.
+    pub async fn observer(&self, pg: &Postgres, application_name: &str) -> tokio_postgres::Client {
+        let (client, connection) =
+            tokio_postgres::connect(&pg.direct_url(application_name), tokio_postgres::NoTls)
+                .await
+                .expect("connecting to the container must succeed");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    }
+}
+
+async fn free_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binding a scratch port");
+    listener.local_addr().expect("the scratch address").port()
+}
+
+/// A minimal HTTP/1.1 client for the proxy's control API.
+///
+/// Hand-rolled rather than pulled in: the proxy's own `hyper` carries only the
+/// server half, and a cutover's five calls are a status line and a JSON body
+/// each.
+pub struct Control {
+    pub address: String,
+}
+
+/// One control-API answer.
+#[derive(Debug)]
+pub struct ControlResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
+impl ControlResponse {
+    pub fn ok(self) -> serde_json::Value {
+        assert_eq!(self.status, 200, "the call was refused: {}", self.body);
+        self.body
+    }
+
+    pub fn str_field(&self, name: &str) -> String {
+        self.body[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} missing from {}", self.body))
+            .to_owned()
+    }
+}
+
+impl Control {
+    async fn await_ready(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::net::TcpStream::connect(&self.address).await.is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the control endpoint never bound"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    pub async fn get(&self, path: &str) -> ControlResponse {
+        self.request("GET", path, None).await
+    }
+
+    pub async fn post(&self, path: &str, body: serde_json::Value) -> ControlResponse {
+        self.request("POST", path, Some(body.to_string())).await
+    }
+
+    pub async fn quiesce(&self, tenant: &str, holder: &str, ttl_ms: u64) -> ControlResponse {
+        self.post(
+            "/quiesce",
+            serde_json::json!({ "tenant": tenant, "holder": holder, "ttlMs": ttl_ms }),
+        )
+        .await
+    }
+
+    pub async fn drain_status(&self, tenant: &str) -> serde_json::Value {
+        self.get(&format!("/drainStatus?tenant={tenant}"))
+            .await
+            .ok()
+    }
+
+    pub async fn set_route(&self, tenant: &str, holder: &str, instance: &str) -> ControlResponse {
+        self.post(
+            "/setRoute",
+            serde_json::json!({ "tenant": tenant, "holder": holder, "instance": instance }),
+        )
+        .await
+    }
+
+    pub async fn resume(&self, tenant: &str, holder: &str) -> ControlResponse {
+        self.post(
+            "/resume",
+            serde_json::json!({ "tenant": tenant, "holder": holder }),
+        )
+        .await
+    }
+
+    pub async fn unquiesce(&self, tenant: &str, holder: &str) -> ControlResponse {
+        self.post(
+            "/unquiesce",
+            serde_json::json!({ "tenant": tenant, "holder": holder }),
+        )
+        .await
+    }
+
+    /// The write health the proxy currently believes of one instance.
+    pub async fn write_health(&self, instance: &str) -> String {
+        let report = self.get("/instances").await.ok();
+        report["instances"]
+            .as_array()
+            .expect("instances is an array")
+            .iter()
+            .find(|entry| entry["name"] == instance)
+            .unwrap_or_else(|| panic!("{instance} is not in {report}"))["writeHealth"]
+            .as_str()
+            .expect("writeHealth is a string")
+            .to_owned()
+    }
+
+    async fn request(&self, method: &str, path: &str, body: Option<String>) -> ControlResponse {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut socket = tokio::net::TcpStream::connect(&self.address)
+            .await
+            .expect("the control endpoint must be reachable");
+        let body = body.unwrap_or_default();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: control\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(request.as_bytes())
+            .await
+            .expect("writing the control request");
+        socket.flush().await.expect("flushing the control request");
+
+        let mut raw = Vec::new();
+        socket
+            .read_to_end(&mut raw)
+            .await
+            .expect("reading the control response");
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let (head, payload) = text
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("a control response must have a body: {text:?}"));
+        let status: u16 = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("a control response must have a status: {head:?}"));
+        let body = serde_json::from_str(payload)
+            .unwrap_or_else(|error| panic!("the control body {payload:?} is not JSON: {error}"));
+        ControlResponse { status, body }
+    }
+}
+
+/// Polls `condition` until it holds, failing loudly at `deadline`.
+pub async fn until(
+    what: &str,
+    limit: std::time::Duration,
+    mut condition: impl AsyncFnMut() -> bool,
+) {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if condition().await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} did not happen within {limit:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }

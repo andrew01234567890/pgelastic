@@ -4,9 +4,10 @@
 //! from a closed enum, never from client input: a per-user or per-database
 //! label is a memory leak with a hostile peer choosing its size.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -168,6 +169,22 @@ pub struct Metrics {
     /// Microseconds rather than milliseconds because a healthy fence finishes
     /// inside one, and a gauge that always reads zero proves nothing.
     fence_latency_us: AtomicI64,
+    /// The budget is kept per instance and summed at render time. Per instance
+    /// because each has its own allocator; summed rather than labelled because
+    /// instance names come from operator configuration and a label whose value
+    /// set is not fixed at compile time is a series set that grows.
+    budgets: Mutex<BTreeMap<String, [u32; 3]>>,
+    /// Instances currently believed unable to complete a commit.
+    stalled: Mutex<BTreeSet<String>>,
+    write_stalls_detected: AtomicU64,
+    write_stall_refusals: AtomicU64,
+    tenants_rerouted: AtomicU64,
+    quiesces_started: AtomicU64,
+    quiesces_resumed: AtomicU64,
+    quiesce_leases_expired: AtomicU64,
+    quiesce_transactions_queued: AtomicU64,
+    /// Microseconds of the slowest quiesce/resume round trip seen so far.
+    quiesce_round_trip_max_us: AtomicI64,
 }
 
 impl Metrics {
@@ -288,10 +305,80 @@ impl Metrics {
     /// they still occupy a backend connection, so the reusable pool's ceiling
     /// drops by exactly this many, and a ceiling that drops without an
     /// attributable cause is the thing nobody can explain.
-    pub fn budget(&self, limit: u32, elastic: u32, elastic_limit: u32) {
-        self.budget[0].store(i64::from(limit), Ordering::Relaxed);
-        self.budget[1].store(i64::from(elastic), Ordering::Relaxed);
-        self.budget[2].store(i64::from(elastic_limit), Ordering::Relaxed);
+    pub fn budget(
+        &self,
+        instance: &crate::route::InstanceId,
+        limit: u32,
+        elastic: u32,
+        elastic_limit: u32,
+    ) {
+        let mut totals = [0u64; 3];
+        {
+            let mut budgets = self.budgets.lock().expect("the metrics are never poisoned");
+            budgets.insert(
+                instance.as_str().to_owned(),
+                [limit, elastic, elastic_limit],
+            );
+            for entry in budgets.values() {
+                for (total, value) in totals.iter_mut().zip(entry) {
+                    *total += u64::from(*value);
+                }
+            }
+        }
+        for (slot, total) in self.budget.iter().zip(totals) {
+            slot.store(i64::try_from(total).unwrap_or(i64::MAX), Ordering::Relaxed);
+        }
+    }
+
+    /// Publishes one instance's write health.
+    ///
+    /// The gauge is a *count* of stalled instances rather than a per-instance
+    /// series: an instance name is operator-supplied, and a label whose value
+    /// set is not fixed at compile time is how a metrics endpoint becomes a
+    /// memory leak. Which instance is stalled is answered by the control API.
+    pub fn write_health(&self, instance: &str, health: crate::stall::WriteHealth) {
+        let mut stalled = self.stalled.lock().expect("the metrics are never poisoned");
+        let changed = if health.is_stalled() {
+            stalled.insert(instance.to_owned())
+        } else {
+            stalled.remove(instance)
+        };
+        if changed && health.is_stalled() {
+            self.write_stalls_detected.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A checkout refused because its instance cannot commit.
+    pub fn write_stall_refused(&self) {
+        self.write_stall_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn tenant_rerouted(&self) {
+        self.tenants_rerouted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn quiesce_started(&self) {
+        self.quiesces_started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn quiesce_resumed(&self, released: u64) {
+        self.quiesces_resumed.fetch_add(1, Ordering::Relaxed);
+        self.quiesce_transactions_queued
+            .fetch_add(released, Ordering::Relaxed);
+    }
+
+    pub fn quiesce_lease_expired(&self) {
+        self.quiesce_leases_expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records how long one tenant stayed quiesced, as a high-water mark.
+    ///
+    /// The cutover pause is the number the migration design commits to, so the
+    /// interesting statistic is the worst one rather than the average.
+    pub fn quiesce_round_trip(&self, elapsed: std::time::Duration) {
+        let micros = i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX);
+        self.quiesce_round_trip_max_us
+            .fetch_max(micros, Ordering::Relaxed);
     }
 
     /// Records one epoch observation and the epoch the fence now holds.
@@ -421,7 +508,66 @@ impl Metrics {
         );
         self.render_pooling(&mut out);
         self.render_fence(&mut out);
+        self.render_availability(&mut out);
         out
+    }
+
+    /// Write-stall detection and the quiesce API.
+    fn render_availability(&self, out: &mut String) {
+        let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        let stalled = self
+            .stalled
+            .lock()
+            .expect("the metrics are never poisoned")
+            .len();
+        gauge(
+            out,
+            "pgelastic_proxy_write_stalled_instances",
+            "Instances whose loaded synchronous_standby_names cannot currently be \
+             satisfied, so every commit on them would block.",
+            i64::try_from(stalled).unwrap_or(i64::MAX),
+        );
+        counter(
+            out,
+            "pgelastic_proxy_write_stalls_detected_total",
+            "Times an instance was found unable to complete a commit.",
+            &[("", load(&self.write_stalls_detected))],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_write_stall_refusals_total",
+            "Checkouts refused rather than queued because the tenant's instance is \
+             write-stalled.",
+            &[("", load(&self.write_stall_refusals))],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_tenant_reroutes_total",
+            "Tenants moved to another instance by the control API.",
+            &[("", load(&self.tenants_rerouted))],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_quiesce_total",
+            "Quiesce lifecycle events, by which one.",
+            &[
+                ("event=\"started\"", load(&self.quiesces_started)),
+                ("event=\"resumed\"", load(&self.quiesces_resumed)),
+                ("event=\"expired\"", load(&self.quiesce_leases_expired)),
+            ],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_quiesce_transactions_queued_total",
+            "Transactions held at a closed gate and later released, rather than dropped.",
+            &[("", load(&self.quiesce_transactions_queued))],
+        );
+        gauge(
+            out,
+            "pgelastic_proxy_quiesce_round_trip_max_us",
+            "Microseconds of the longest quiesce-to-resume round trip observed.",
+            self.quiesce_round_trip_max_us.load(Ordering::Relaxed),
+        );
     }
 
     /// The primary-epoch fence's half of the exposition.

@@ -5,6 +5,12 @@
 //! accepts and hangs up. That listener is also the only honest way to count
 //! connection attempts — a proxy-side counter would be asserting on the very
 //! bookkeeping under test.
+//!
+//! The two diallers that live *outside* the pool's budget — the epoch prober
+//! and the write-stall probe — are switched off here for the same reason. They
+//! open backend sockets by design, so leaving them on would have this
+//! listener's count mean "sockets opened" rather than "attempts the connect
+//! gate let through", which is the only thing these assertions are about.
 
 mod harness;
 
@@ -70,7 +76,13 @@ async fn proxy_for(backend: &RefusingBackend, login_retry_seconds: u64) -> Proxy
          [pool]\n\
          mode = \"transaction\"\n\
          backendConnections = 32\n\
-         serverLoginRetrySeconds = {login_retry_seconds}\n",
+         serverLoginRetrySeconds = {login_retry_seconds}\n\
+         \n\
+         [fence]\n\
+         verifyAtCheckout = false\n\
+         \n\
+         [stall]\n\
+         enabled = false\n",
         address = backend.address,
     ))
     .await
