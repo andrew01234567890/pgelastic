@@ -1,0 +1,58 @@
+# cargo-deny configuration. Run `cargo deny --all-features check` locally; CI runs the
+# same four checks in .github/workflows/rust.yml.
+
+[graph]
+# The CI action passes --all-features; match it here so a local run and a CI run see the
+# same graph. Every target is checked rather than just linux-gnu: a licence that is only
+# reachable on Windows or wasm is still ingress into the source tree.
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# "all", not the default "workspace": an unmaintained crate three levels down still ends up
+# linked into the proxy, and the tree is clean at this setting today.
+unmaintained = "all"
+ignore = [
+  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 is archived upstream, not vulnerable — the crate is a thin wrapper over the PEM parser that now lives in rustls-pki-types >= 1.9. crates/pgelastic-proxy/src/tls.rs is the only caller and must move to rustls_pki_types::pem::PemObject; remove this entry with that change." },
+]
+
+[licenses]
+# pgelastic ships Apache-2.0. The allow list is the set of licences the resolved tree
+# actually needs — add to it only after reading the licence, never to make CI green.
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unlicense",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+]
+# AGPL, GPL, LGPL, SSPL and BUSL are absent from `allow`, which is the whole ban: the list
+# is exhaustive and cargo-deny removed `licenses.deny` precisely because it was redundant
+# (EmbarkStudios/cargo-deny#611). Nothing copyleft may be added here. PgDog is AGPL-3.0 and
+# may be read for reference, never copied or linked. A crate offering copyleft as one arm
+# of an OR (r-efi is MIT OR Apache-2.0 OR LGPL-2.1-or-later) still resolves permissively.
+confidence-threshold = 0.93
+unused-allowed-license = "warn"
+
+[bans]
+# Warn, not deny: every duplicate in the tree today is forced by a transitive dependency
+# we do not control (kube-rs, aws-lc-rs, the rustls stack). A deny plus a skip list would
+# have to be curated on every dependency bump and would fail on the first innocent one,
+# which trains people to add skips. A warning keeps the duplicate count visible in the job
+# log so an avoidable one gets noticed.
+multiple-versions = "warn"
+# A wildcard version requirement is always avoidable and defeats the lockfile.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

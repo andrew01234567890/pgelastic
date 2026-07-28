@@ -6,12 +6,17 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     permissions:
       contents: read
     name: Run on Ubuntu
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -23,7 +28,11 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # download, not tidy: `go mod tidy` rewrites go.mod inside the job, so a go.mod that
+      # is missing a requirement is repaired on the runner and the build stays green while
+      # nobody else can reproduce it.
+      - name: Download modules
+        run: go mod download
+
       - name: Running Tests
-        run: |
-          go mod tidy
-          make test
+        run: make test

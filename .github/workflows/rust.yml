@@ -3,26 +3,52 @@ name: Rust
 on:
   push:
     branches: ["main"]
-    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/rust.yml"
   pull_request:
-    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/rust.yml"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
   check:
+    permissions:
+      contents: read
     name: fmt / clippy / test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Scoped to this job rather than the whole workflow. Applied workflow-wide it also
+    # compiles cargo-fuzz and its dependencies with -D warnings in the fuzz job, so a new
+    # deprecation in someone else's crate turns a tool install red.
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: rustfmt
         run: cargo fmt --all --check
@@ -34,30 +60,56 @@ jobs:
         run: cargo test --workspace --all-features
 
   deny:
+    permissions:
+      contents: read
     name: licence and advisory audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Configured by deny.toml at the repository root. The licence allow list is what
+      # keeps AGPL and GPL out of the tree: pgelastic is Apache-2.0, and PgDog is AGPL-3.0
+      # and may be read for reference but never copied or linked.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check bans licenses sources advisories
 
   fuzz-smoke:
+    permissions:
+      contents: read
     name: codec fuzz smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
+
       - name: run each target briefly
         # A smoke run only. The long fuzzing campaigns run nightly, not per-PR.
+        #
+        # An empty target list is an error rather than a skip. The earlier form wrapped
+        # this in `if [ -d crates/pgelastic-wire/fuzz ]` and echoed "no fuzz targets yet",
+        # so deleting the fuzz directory - or a `cargo fuzz list` that failed - looked
+        # exactly like a passing job.
         run: |
-          if [ -d crates/pgelastic-wire/fuzz ]; then
-            for t in $(cargo fuzz list --fuzz-dir crates/pgelastic-wire/fuzz); do
-              cargo fuzz run --fuzz-dir crates/pgelastic-wire/fuzz "$t" -- -max_total_time=60
-            done
-          else
-            echo "no fuzz targets yet"
+          targets="$(cargo fuzz list --fuzz-dir crates/pgelastic-wire/fuzz)"
+          if [ -z "$targets" ]; then
+            echo "::error::no fuzz targets under crates/pgelastic-wire/fuzz"
+            exit 1
           fi
+          for t in $targets; do
+            cargo fuzz run --fuzz-dir crates/pgelastic-wire/fuzz "$t" -- -max_total_time=60
+          done

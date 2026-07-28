@@ -1,6 +1,10 @@
 version: "2"
 run:
   allow-parallel-runners: true
+  # Without this the whole of test/e2e is invisible to the linter, because every file in it
+  # is behind //go:build e2e. An unlinted test suite reads as covered without being covered.
+  build-tags:
+    - e2e
 linters:
   default: none
   enable:

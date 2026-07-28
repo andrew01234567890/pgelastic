@@ -1,0 +1,31 @@
+version: 2
+
+# Every action in .github/workflows is pinned to a commit SHA, which is the only pin
+# GitHub cannot move under us. A SHA nobody ever bumps is how a repository ends up on a
+# three-year-old action, so the pins need something that raises them; this is it.
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # One PR a week per ecosystem rather than one per crate or module: the value is in the
+  # cargo-deny advisory check running against a moved tree, and that happens either way.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      gomod:
+        patterns: ["*"]
