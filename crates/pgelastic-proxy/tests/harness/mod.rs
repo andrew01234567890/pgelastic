@@ -159,10 +159,37 @@ pub async fn start_postgres() -> Postgres {
         .await
         .expect("postgres port must be published");
 
-    Postgres {
+    let postgres = Postgres {
         _container: container,
         port,
         certificates,
+    };
+    await_ready(&postgres).await;
+    postgres
+}
+
+/// Waits until the server is really accepting connections on the published
+/// port.
+///
+/// The container's "ready" log line is emitted before the mapped host port is
+/// reliably reachable under load, and a proxy that meets a refused connect
+/// remembers it for `serverLoginRetry` — so handing the proxy a backend that is
+/// not up yet poisons its pool for the rest of the test.
+async fn await_ready(postgres: &Postgres) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let url = postgres.direct_url("pgelastic_readiness");
+    loop {
+        match tokio_postgres::connect(&url, tokio_postgres::NoTls).await {
+            Ok((_client, connection)) => {
+                drop(connection);
+                return;
+            }
+            Err(error) => assert!(
+                std::time::Instant::now() < deadline,
+                "postgres:18 never became reachable: {error}"
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 

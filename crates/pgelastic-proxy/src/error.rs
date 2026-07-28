@@ -18,6 +18,24 @@ pub mod sqlstate {
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
     /// `57P01 admin_shutdown`
     pub const ADMIN_SHUTDOWN: &str = "57P01";
+
+    /// Puts a SQLSTATE that has been through an owned `String` back on the
+    /// static set.
+    ///
+    /// The connect gate remembers a failed login as text so that the pooling
+    /// crate need not know the proxy's error type, and every client that
+    /// fast-fails against that cached failure still has to be handed a code from
+    /// the same closed set the rest of the proxy reports.
+    pub fn intern(code: &str) -> &'static str {
+        match code {
+            INVALID_PASSWORD => INVALID_PASSWORD,
+            INVALID_AUTHORIZATION => INVALID_AUTHORIZATION,
+            PROTOCOL_VIOLATION => PROTOCOL_VIOLATION,
+            TOO_MANY_CONNECTIONS => TOO_MANY_CONNECTIONS,
+            ADMIN_SHUTDOWN => ADMIN_SHUTDOWN,
+            _ => CONNECTION_FAILURE,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

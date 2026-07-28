@@ -52,6 +52,34 @@ impl RejectReason {
     }
 }
 
+/// What the pool's connect gate did with a request for a new backend link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectGateOutcome {
+    /// This request held the pool's single connect slot and dialled.
+    Attempted,
+    /// Another request held the slot, so this one waited for it to settle.
+    Deferred,
+    /// The last attempt failed inside `serverLoginRetry`, so this request was
+    /// refused with the cached error without dialling.
+    FastFailed,
+}
+
+const CONNECT_GATE_OUTCOMES: [ConnectGateOutcome; 3] = [
+    ConnectGateOutcome::Attempted,
+    ConnectGateOutcome::Deferred,
+    ConnectGateOutcome::FastFailed,
+];
+
+impl ConnectGateOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Attempted => "attempted",
+            Self::Deferred => "deferred",
+            Self::FastFailed => "fast_failed",
+        }
+    }
+}
+
 /// Every code in the capacity taxonomy, so the exposition carries all six even
 /// when nothing has been refused.
 const ERROR_CODES: [pgelastic_capacity::ErrorCode; 6] = pgelastic_capacity::ErrorCode::ALL;
@@ -66,6 +94,8 @@ pub struct Metrics {
     backend_auth: [AtomicU64; 2],
     cancels_matched: AtomicU64,
     cancels_unmatched: AtomicU64,
+    cancels_refused: AtomicU64,
+    connect_gate: [AtomicU64; 3],
     bytes_to_backend: AtomicU64,
     bytes_to_client: AtomicU64,
     drains_completed: AtomicU64,
@@ -122,6 +152,15 @@ impl Metrics {
             &self.cancels_unmatched
         }
         .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A cancel that resolved to a live session but could not draw credit.
+    pub fn cancel_refused(&self) {
+        self.cancels_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn connect_gated(&self, outcome: ConnectGateOutcome) {
+        self.connect_gate[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn relayed_to_backend(&self, bytes: usize) {
@@ -259,10 +298,11 @@ impl Metrics {
         counter(
             &mut out,
             "pgelastic_proxy_cancel_requests_total",
-            "CancelRequests received, by whether the key resolved to a session.",
+            "CancelRequests received, by whether the key resolved and drew credit.",
             &[
                 ("outcome=\"matched\"", load(&self.cancels_matched)),
                 ("outcome=\"unmatched\"", load(&self.cancels_unmatched)),
+                ("outcome=\"refused\"", load(&self.cancels_refused)),
             ],
         );
         counter(
@@ -298,6 +338,17 @@ impl Metrics {
                 ("source=\"reused\"", load(&self.checkouts_reused)),
                 ("source=\"opened\"", load(&self.checkouts_opened)),
             ],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_backend_connect_gate_total",
+            "Trips through a pool's connect gate, by what it decided. A deferred request comes back.",
+            &labelled(&CONNECT_GATE_OUTCOMES.map(|outcome| {
+                (
+                    format!("outcome=\"{}\"", outcome.label()),
+                    load(&self.connect_gate[outcome as usize]),
+                )
+            })),
         );
         counter(
             out,

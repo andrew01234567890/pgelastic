@@ -1,5 +1,8 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
+# INSTANCE_IMG carries the instance manager; PG_IMG carries PostgreSQL 18 and pgBackRest.
+INSTANCE_IMG ?= pgelastic/instance:latest
+PG_IMG ?= pgelastic/postgres:18
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -88,7 +91,24 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	$(MAKE) test-e2e-instance E2E_KIND_CLUSTER=$(KIND_CLUSTER)
 	$(MAKE) cleanup-test-e2e
+
+# The instance e2e provisions a real three-node PostgreSQL 18 instance and asserts on what
+# PostgreSQL reports, not on what the operator believes. It needs a Kind cluster with the
+# CRDs installed; E2E_KIND_CLUSTER defaults to the repo's development cluster.
+E2E_KIND_CLUSTER ?= pgelastic-dev
+E2E_TIMEOUT ?= 30m
+
+.PHONY: test-e2e-instance
+test-e2e-instance: manifests generate install kind-load-instance-images ## Provision a real 3-node PostgreSQL 18 instance in Kind and assert on it.
+	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) \
+	go test -tags=e2e ./test/e2e/instance/ -v -ginkgo.v -timeout $(E2E_TIMEOUT)
+
+.PHONY: kind-load-instance-images
+kind-load-instance-images: docker-build-instance docker-build-postgres ## Load the instance and Postgres images into Kind.
+	$(KIND) load docker-image $(INSTANCE_IMG) --name $(E2E_KIND_CLUSTER)
+	$(KIND) load docker-image $(PG_IMG) --name $(E2E_KIND_CLUSTER)
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
@@ -163,6 +183,21 @@ docker-build: ## Build docker image with the manager.
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
+
+# The instance manager ships in its own image so an init container can copy it into the
+# Postgres pod with nothing but cp, which is what lets the agent be upgraded without
+# rebuilding and re-certifying the database image.
+.PHONY: docker-build-instance
+docker-build-instance: ## Build the instance manager image.
+	$(CONTAINER_TOOL) build -f Dockerfile.instance -t $(INSTANCE_IMG) .
+
+.PHONY: docker-build-postgres
+docker-build-postgres: ## Build the pgelastic PostgreSQL 18 image.
+	$(CONTAINER_TOOL) build -f Dockerfile.postgres -t $(PG_IMG) .
+
+.PHONY: build-instance
+build-instance: ## Build the instance manager binary.
+	go build -o bin/pgelastic-instance ./cmd/instance
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:

@@ -307,6 +307,11 @@ pub struct PoolConfig {
     /// jittered window so a pool does not recycle every link at once.
     #[serde(default = "default_server_lifetime_seconds")]
     pub server_lifetime_seconds: u64,
+    /// `serverLoginRetry`: how long a pool whose last backend connect failed
+    /// fast-fails arriving clients against the cached error before it lets one
+    /// through to try again.
+    #[serde(default = "default_server_login_retry_seconds")]
+    pub server_login_retry_seconds: u64,
     #[serde(default)]
     pub tenants: Vec<TenantConfig>,
 }
@@ -324,6 +329,7 @@ impl Default for PoolConfig {
             queue_depth_per_tenant: default_queue_depth_per_tenant(),
             max_server_statements: default_max_server_statements(),
             server_lifetime_seconds: default_server_lifetime_seconds(),
+            server_login_retry_seconds: default_server_login_retry_seconds(),
             tenants: Vec::new(),
         }
     }
@@ -340,6 +346,10 @@ impl PoolConfig {
 
     pub fn server_lifetime(&self) -> Duration {
         Duration::from_secs(self.server_lifetime_seconds)
+    }
+
+    pub fn server_login_retry(&self) -> Duration {
+        Duration::from_secs(self.server_login_retry_seconds)
     }
 }
 
@@ -445,6 +455,9 @@ fn default_max_server_statements() -> usize {
 }
 fn default_server_lifetime_seconds() -> u64 {
     3600
+}
+fn default_server_login_retry_seconds() -> u64 {
+    15
 }
 fn default_pool_max_client_connections() -> u32 {
     10_000

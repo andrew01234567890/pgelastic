@@ -1,0 +1,26 @@
+# The instance manager image exists only to be copied out of.
+#
+# An init container mounts an emptyDir, runs `cp /pgelastic-instance /agent/...` and
+# nothing else. Keeping the agent out of the PostgreSQL image is what lets it be upgraded
+# without rebuilding or re-certifying the database image, and keeping the init container
+# down to one cp is what stops that indirection growing logic of its own.
+FROM golang:1.26 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+COPY go.mod go.mod
+COPY go.sum go.sum
+RUN go mod download
+
+COPY . .
+
+# CGO is off so the binary is static: it runs inside the PostgreSQL image, which shares
+# none of this builder's libraries.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -a -o pgelastic-instance ./cmd/instance
+
+FROM busybox:1.37
+COPY --from=builder /workspace/pgelastic-instance /pgelastic-instance
+USER 65532:65532
+ENTRYPOINT ["/pgelastic-instance"]

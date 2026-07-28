@@ -21,7 +21,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use pgelastic_capacity::{
@@ -29,16 +29,17 @@ use pgelastic_capacity::{
     RequestKind, TenantId as CapacityTenant, TenantSpec, TicketId,
 };
 use pgelastic_pool::{
-    GlobalStatementCache, PinReason, PoolKey, Priority, ServerLink, ServerStatements, WaitQueue,
-    Waiter, jittered_lifetime,
+    ConnectDecision, ConnectGate, ConnectPermit, GlobalStatementCache, LoginFailure, PinReason,
+    PoolKey, Priority, ServerLink, ServerStatements, WaitQueue, Waiter, jittered_lifetime,
 };
 use pgelastic_wire::{BackendKeyData, BackendMessage, StartupMessage};
 use tokio::io::AsyncWrite;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::config::PoolConfig;
 use crate::error::{ProxyError, Result};
-use crate::metrics::Metrics;
+use crate::metrics::{ConnectGateOutcome, Metrics};
 use crate::relay::FrameRelay;
 use crate::scram::KdfPool;
 use crate::stream::BackendStream;
@@ -72,6 +73,13 @@ impl Denial {
         Self {
             sqlstate: crate::error::sqlstate::CONNECTION_FAILURE,
             message: message.into(),
+        }
+    }
+
+    fn login(failure: &LoginFailure) -> Self {
+        Self {
+            sqlstate: crate::error::sqlstate::intern(&failure.sqlstate),
+            message: failure.message.clone(),
         }
     }
 }
@@ -115,7 +123,7 @@ pub struct Checkout {
 }
 
 /// The per-`PoolKey` view: which links exist under this identity.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Pool {
     idle: BTreeSet<pgelastic_capacity::ServerId>,
     active: BTreeSet<pgelastic_capacity::ServerId>,
@@ -125,6 +133,28 @@ struct Pool {
     /// client does not have to hold a backend just to learn the server's
     /// `TimeZone`.
     greeting: Option<Arc<Vec<BackendMessage>>>,
+    /// One backend connect at a time, and the cached failure the rest are
+    /// refused with.
+    gate: ConnectGate,
+    /// Bumped whenever this pool's connect slot settles.
+    ///
+    /// Subscribed to under the manager's lock and in the same critical section
+    /// that read `AlreadyInFlight`, which is what makes the wake-up impossible
+    /// to miss: a settle that has not happened by then still has a receiver to
+    /// reach.
+    settled: watch::Sender<u64>,
+}
+
+impl Pool {
+    fn new(login_retry: Duration) -> Self {
+        Self {
+            idle: BTreeSet::new(),
+            active: BTreeSet::new(),
+            greeting: None,
+            gate: ConnectGate::new(login_retry),
+            settled: watch::Sender::new(0),
+        }
+    }
 }
 
 /// A link parked between clients, under the key it may be reused for.
@@ -143,6 +173,7 @@ struct Inner {
     ledger: pgelastic_pool::BudgetLedger,
     statements: GlobalStatementCache,
     tenants: BTreeSet<CapacityTenant>,
+    login_retry: Duration,
 }
 
 /// Everything a checkout needs to open a link it could not find parked.
@@ -208,6 +239,7 @@ impl PoolManager {
         }
 
         let ledger = pgelastic_pool::BudgetLedger::new(config.backend_connections);
+        let login_retry = config.server_login_retry();
         Ok(Arc::new(Self {
             inner: Mutex::new(Inner {
                 allocator,
@@ -217,6 +249,7 @@ impl PoolManager {
                 ledger,
                 statements: GlobalStatementCache::new(),
                 tenants,
+                login_retry,
             }),
             config,
             metrics,
@@ -284,6 +317,46 @@ impl PoolManager {
         let mut inner = self.lock();
         let grants = inner.allocator.disconnect_client(client);
         inner.dispatch(grants);
+    }
+
+    /// Draws step 0 of the ladder — the dedicated cancel credit pool — for one
+    /// `CancelRequest` aimed at `client`.
+    ///
+    /// A cancel takes a fresh unauthenticated socket, so it is a backend
+    /// connection like any other and has to be admitted like one. It cannot go
+    /// through the normal rungs: a cancel that queues behind the query it is
+    /// cancelling never completes, and a tenant sitting at its burst ceiling is
+    /// precisely the tenant whose clients most need to cancel. So the credit
+    /// pool is bounded at `min(8, burstable)` and sits outside `total` — a
+    /// cancel storm can neither consume tenant capacity nor be starved by it.
+    pub fn lease_cancel(
+        self: &Arc<Self>,
+        client: ClientId,
+    ) -> std::result::Result<CancelCredit, Denial> {
+        let mut inner = self.lock();
+        match inner.allocator.try_lease(client, RequestKind::Cancel) {
+            Admission::Granted(lease) => Ok(CancelCredit {
+                manager: Arc::clone(self),
+                lease: Some(lease),
+            }),
+            Admission::Denied(reason) => {
+                self.metrics.admission_denied(reason.code());
+                Err(Denial::from_reason(&reason))
+            }
+            Admission::Stale => Err(Denial::backend(
+                "the client a cancel names is no longer connected",
+            )),
+            // Step 0 grants or denies and has no queue to put a ticket in.
+            Admission::Queued { .. } => Err(Denial::backend("a cancel request was queued")),
+        }
+    }
+
+    /// Returns a cancel's credit. The connection it paid for is already gone —
+    /// the server closes a cancel socket as soon as it has read the request.
+    fn release_cancel(&self, lease: Lease) {
+        let mut inner = self.lock();
+        let outcome = inner.allocator.release(lease);
+        inner.dispatch(outcome.grants);
     }
 
     /// The cached greeting for a pool, if any link has ever been opened under
@@ -500,7 +573,7 @@ impl PoolManager {
             tokio::spawn(conn.close());
         }
 
-        match self.open(request, connector, server).await {
+        match self.gated_open(request, connector, server).await {
             Ok(conn) => {
                 self.metrics.checkout(false);
                 Ok(Checkout {
@@ -509,13 +582,74 @@ impl PoolManager {
                     lease,
                 })
             }
-            Err(error) => {
+            Err(denial) => {
                 let mut inner = self.lock();
                 let grants = inner.allocator.backend_died(server);
                 inner.dispatch(grants);
-                Err(Denial::backend(format!(
-                    "opening a backend connection failed: {error}"
-                )))
+                Err(denial)
+            }
+        }
+    }
+
+    /// Opens a link through the pool's connect gate.
+    ///
+    /// One connect per pool key is in flight at a time. Everything else that
+    /// wants a link either waits for that attempt to settle or, if it has
+    /// already failed inside `serverLoginRetry`, is refused with the remembered
+    /// error without dialling. That is the whole thundering-herd defense: two
+    /// hundred clients reconnecting at a backend that has just come back open
+    /// one socket between them, not two hundred.
+    async fn gated_open(
+        &self,
+        request: &AcquireRequest<'_>,
+        connector: &Connector<'_>,
+        server: pgelastic_capacity::ServerId,
+    ) -> std::result::Result<BackendConn, Denial> {
+        loop {
+            let gated = {
+                let mut inner = self.lock();
+                let pool = inner.pool(request.key);
+                match pool.gate.try_start(Instant::now()) {
+                    ConnectDecision::Start(permit) => Gated::Open(ConnectSlot {
+                        manager: self,
+                        key: request.key.clone(),
+                        permit: Some(permit),
+                    }),
+                    ConnectDecision::AlreadyInFlight => Gated::Wait(pool.settled.subscribe()),
+                    ConnectDecision::BackingOff(failure) => Gated::Refused(failure),
+                }
+            };
+
+            match gated {
+                Gated::Refused(failure) => {
+                    self.metrics.connect_gated(ConnectGateOutcome::FastFailed);
+                    return Err(Denial::login(&failure));
+                }
+                Gated::Wait(mut settled) => {
+                    self.metrics.connect_gated(ConnectGateOutcome::Deferred);
+                    // A closed channel means the pool was forgotten, which can
+                    // only leave the gate free; looping re-reads it either way.
+                    let _ = settled.changed().await;
+                }
+                Gated::Open(slot) => {
+                    self.metrics.connect_gated(ConnectGateOutcome::Attempted);
+                    return match self.open(request, connector, server).await {
+                        Ok(conn) => {
+                            slot.succeeded();
+                            Ok(conn)
+                        }
+                        Err(error) => {
+                            let failure = slot.failed(
+                                LoginFailure::new(
+                                    error.sqlstate(),
+                                    format!("opening a backend connection failed: {error}"),
+                                ),
+                                Instant::now(),
+                            );
+                            Err(Denial::login(&failure))
+                        }
+                    };
+                }
             }
         }
     }
@@ -589,7 +723,7 @@ impl PoolManager {
         relay.extend_from_slice(session.buf.as_slice());
 
         let mut inner = self.lock();
-        let pool = inner.pools.entry(request.key.clone()).or_default();
+        let pool = inner.pool(request.key);
         pool.active.insert(server);
         if pool.greeting.is_none() {
             pool.greeting = Some(Arc::new(session.parameters.clone()));
@@ -751,6 +885,63 @@ pub fn pool_key(
     }))
 }
 
+/// One cancel's place in the tenant's cancel credit pool, returned on drop.
+#[derive(Debug)]
+pub struct CancelCredit {
+    manager: Arc<PoolManager>,
+    lease: Option<Lease>,
+}
+
+impl Drop for CancelCredit {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.manager.release_cancel(lease);
+        }
+    }
+}
+
+/// What the connect gate said, once the manager's lock has been given back.
+enum Gated<'a> {
+    Open(ConnectSlot<'a>),
+    Wait(watch::Receiver<u64>),
+    Refused(Arc<LoginFailure>),
+}
+
+/// The pool's single connect slot, held for as long as an attempt is running.
+///
+/// Whatever ends the attempt — success, failure, or the whole future being
+/// dropped — wakes the clients queued behind it, and the wake-up is published
+/// under the manager's lock so it cannot land between a waiter reading
+/// `AlreadyInFlight` and that waiter subscribing.
+struct ConnectSlot<'a> {
+    manager: &'a PoolManager,
+    key: PoolKey,
+    permit: Option<ConnectPermit>,
+}
+
+impl ConnectSlot<'_> {
+    fn succeeded(mut self) {
+        if let Some(permit) = self.permit.take() {
+            permit.succeeded();
+        }
+    }
+
+    fn failed(mut self, failure: LoginFailure, now: Instant) -> Arc<LoginFailure> {
+        match self.permit.take() {
+            Some(permit) => permit.failed(failure, now),
+            None => Arc::new(failure),
+        }
+    }
+}
+
+impl Drop for ConnectSlot<'_> {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        let mut inner = self.manager.lock();
+        inner.pool(&self.key).settled.send_modify(|seen| *seen += 1);
+    }
+}
+
 /// What the ladder produced, before any awaiting happens.
 enum Waiting {
     Granted(Lease),
@@ -800,6 +991,13 @@ pub struct LedgerSnapshot {
 }
 
 impl Inner {
+    fn pool(&mut self, key: &PoolKey) -> &mut Pool {
+        let login_retry = self.login_retry;
+        self.pools
+            .entry(key.clone())
+            .or_insert_with(|| Pool::new(login_retry))
+    }
+
     fn wait_queue(&mut self, tenant: &CapacityTenant) -> Arc<WaitQueue<Grant>> {
         Arc::clone(
             self.waits
@@ -826,11 +1024,7 @@ impl Inner {
             pool.idle.remove(&server);
         }
         if &parked.key == key {
-            self.pools
-                .entry(parked.key)
-                .or_default()
-                .active
-                .insert(server);
+            self.pool(&parked.key).active.insert(server);
             return (Some(parked.conn), None);
         }
         let _ = self.ledger.close();
@@ -839,7 +1033,7 @@ impl Inner {
     }
 
     fn park(&mut self, server: pgelastic_capacity::ServerId, key: PoolKey, conn: BackendConn) {
-        let pool = self.pools.entry(key.clone()).or_default();
+        let pool = self.pool(&key);
         pool.active.remove(&server);
         pool.idle.insert(server);
         self.parked.insert(server, Parked { key, conn });
@@ -989,6 +1183,90 @@ mod tests {
         });
         assert_eq!(denial.sqlstate, "53400");
         assert!(denial.message.starts_with("PGE1024"));
+    }
+
+    fn capped_pool(backend_connections: u32, burstable: u32) -> PoolConfig {
+        PoolConfig {
+            mode: PoolModeConfig::Transaction,
+            backend_connections,
+            tenants: vec![TenantConfig {
+                name: "acme".to_owned(),
+                guaranteed: 0,
+                burstable,
+                weight: 100,
+                priority: 1_000,
+                max_client_connections: 10,
+            }],
+            ..PoolConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_cancel_is_admitted_from_step_zero_while_the_tenant_is_at_its_ceiling() {
+        let manager = manager(capped_pool(4, 1));
+        let tenant = manager.ensure_tenant("acme").unwrap();
+        let holder = manager.connect_client(&tenant).unwrap();
+        let other = manager.connect_client(&tenant).unwrap();
+
+        {
+            let mut inner = manager.lock();
+            assert!(matches!(
+                inner.allocator.try_lease(holder, RequestKind::Normal),
+                Admission::Granted(_)
+            ));
+            assert!(matches!(
+                inner.allocator.try_lease(other, RequestKind::Normal),
+                Admission::Denied(DenialReason::TenantCap { .. })
+            ));
+        }
+
+        assert!(
+            manager.lease_cancel(holder).is_ok(),
+            "a cancel must bypass the rungs that just refused a normal checkout"
+        );
+    }
+
+    #[test]
+    fn a_cancel_storm_is_bounded_by_the_credit_pool_and_leaves_normal_capacity_alone() {
+        let manager = manager(capped_pool(2, 4));
+        let tenant = manager.ensure_tenant("acme").unwrap();
+        let canceller = manager.connect_client(&tenant).unwrap();
+        let worker = manager.connect_client(&tenant).unwrap();
+
+        let credits = (0..4)
+            .map(|_| {
+                manager
+                    .lease_cancel(canceller)
+                    .expect("min(8, burstable) cancels fit in the credit pool")
+            })
+            .collect::<Vec<_>>();
+        let refused = manager
+            .lease_cancel(canceller)
+            .expect_err("the storm must stop at the credit pool's edge");
+        assert_eq!(refused.sqlstate, "53400");
+        assert!(refused.message.starts_with("PGE1929"));
+
+        {
+            let mut inner = manager.lock();
+            assert_eq!(inner.allocator.cancel_in_flight(&tenant), 4);
+            for _ in 0..2 {
+                assert!(
+                    matches!(
+                        inner.allocator.try_lease(worker, RequestKind::Normal),
+                        Admission::Granted(_)
+                    ),
+                    "a cancel storm must not have taken any of the pool's own capacity"
+                );
+            }
+        }
+        assert_eq!(manager.ledger_snapshot().elastic, 0);
+
+        drop(credits);
+        assert_eq!(manager.lock().allocator.cancel_in_flight(&tenant), 0);
+        assert!(
+            manager.lease_cancel(canceller).is_ok(),
+            "credit must come back when a cancel finishes"
+        );
     }
 
     #[test]

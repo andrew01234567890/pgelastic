@@ -172,6 +172,63 @@ async fn twenty_clients_share_four_backends_and_the_server_never_sees_a_fifth() 
     );
 }
 
+/// The other half of the connect gate: serialising attempts must not stall the
+/// pool. Every client that waited behind an attempt has to get its own link the
+/// moment that attempt succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_connect_releases_the_gate_and_the_clients_behind_it_proceed() {
+    let stack = stack_with(
+        "\
+[pool]
+mode = \"transaction\"
+backendConnections = 8
+",
+    )
+    .await;
+
+    let mut clients = Vec::new();
+    for _ in 0..8 {
+        clients.push(stack.connect().await);
+    }
+
+    let mut tasks = Vec::new();
+    for client in clients {
+        tasks.push(tokio::spawn(async move {
+            let row = client
+                .query_one(
+                    "SELECT pg_catalog.pg_sleep(1), pg_catalog.pg_backend_pid()",
+                    &[],
+                )
+                .await
+                .expect("every overlapping query must get a backend of its own");
+            row.get::<_, i32>(1)
+        }));
+    }
+
+    let mut backends = BTreeSet::new();
+    for task in tasks {
+        backends.insert(task.await.expect("no client task may panic"));
+    }
+
+    assert_eq!(
+        backends.len(),
+        8,
+        "eight overlapping queries shared backends, so somebody never got past the gate"
+    );
+
+    // One attempt for the link that cached the greeting, seven for the clients
+    // that had to open one of their own; the eighth reused the parked link.
+    let rendered = stack.proxy.metrics.render();
+    assert!(
+        rendered.contains("outcome=\"attempted\"} 8"),
+        "expected eight gated attempts in {rendered}"
+    );
+    assert!(
+        rendered.contains("outcome=\"fast_failed\"} 0"),
+        "no attempt failed, so nothing may have fast-failed: {rendered}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transaction_keeps_its_backend_from_begin_to_commit() {
     let stack = stack_with(FOUR).await;
@@ -803,6 +860,67 @@ async fn a_cancel_reaches_whichever_backend_is_running_that_clients_query() {
             .unwrap()
             .get::<_, i32>(0),
         9
+    );
+}
+
+/// Step 0 of the ladder, from the client's side: at the instant a normal
+/// checkout is refused at the tenant's burst ceiling, a cancel for that same
+/// tenant still gets through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_is_admitted_while_its_tenant_sits_at_its_burst_ceiling() {
+    let stack = stack_with(
+        "\
+[pool]
+mode = \"transaction\"
+backendConnections = 4
+
+[[pool.tenants]]
+name = \"capped\"
+guaranteed = 0
+burstable = 1
+",
+    )
+    .await;
+
+    let busy = stack.connect_as("capped").await;
+    busy.query_one("SELECT 1", &[]).await.unwrap();
+    let token = busy.cancel_token();
+
+    let running =
+        tokio::spawn(async move { busy.simple_query("SELECT pg_catalog.pg_sleep(30)").await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Rung 2 is shut: the tenant's one burstable connection is held by the
+    // query that is about to be cancelled.
+    let mut blocked = RawClient::connect(stack.localhost(), "capped", BACKEND_DATABASE).await;
+    let refusal = blocked.query_until_closed("SELECT 1").await;
+    let denied = refusal
+        .iter()
+        .find(|message| matches!(message, BackendMessage::ErrorResponse(_)))
+        .expect("a normal checkout must be refused at the ceiling");
+    assert_eq!(sqlstate(denied).as_deref(), Some("53300"));
+    assert!(text(denied).starts_with("PGE1928"));
+
+    token.cancel_query(tokio_postgres::NoTls).await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the cancel must not have been queued behind the query it cancels")
+        .unwrap()
+        .expect_err("a cancelled query must fail");
+    assert_eq!(
+        error.code().map(tokio_postgres::error::SqlState::code),
+        Some("57014"),
+        "expected query_canceled, got {error}"
+    );
+
+    let rendered = stack.proxy.metrics.render();
+    assert!(
+        rendered.contains("pgelastic_proxy_cancel_requests_total{outcome=\"matched\"} 1"),
+        "the cancel must have drawn credit and been delivered: {rendered}"
+    );
+    assert!(
+        rendered.contains("pgelastic_proxy_cancel_requests_total{outcome=\"refused\"} 0"),
+        "no cancel may have been refused: {rendered}"
     );
 }
 

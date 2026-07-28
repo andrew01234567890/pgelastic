@@ -413,7 +413,7 @@ async fn multiplexed(
     }
 
     let token = CancelToken::mint(proxy.config.routing.cancel_routing_id)?;
-    let route = CancelRoute::new();
+    let route = CancelRoute::for_client(client_id);
     let _registration = proxy.cancels.register(token.clone(), route.clone());
 
     let mut greeting = vec![BackendMessage::Authentication(
@@ -500,6 +500,21 @@ async fn cancel(proxy: &Arc<Proxy>, request: &pgelastic_wire::CancelRequest) -> 
     let Some(target) = route.resolve() else {
         proxy.metrics.cancel(false);
         return Ok(());
+    };
+    // Step 0 of the admission ladder. A cancel opens a real backend socket, so
+    // it is admitted like one — but from its own bounded credit pool, which is
+    // both why a cancel storm cannot eat the tenant's capacity and why a tenant
+    // pinned at its burst ceiling can still cancel.
+    let _credit = match route.client() {
+        Some(client) => match proxy.pools.lease_cancel(client) {
+            Ok(credit) => Some(credit),
+            Err(denial) => {
+                proxy.metrics.cancel_refused();
+                debug!(%denial, "a cancel request was refused by the cancel credit pool");
+                return Ok(());
+            }
+        },
+        None => None,
     };
     proxy.metrics.cancel(true);
     if let Err(error) = crate::cancel::deliver(
