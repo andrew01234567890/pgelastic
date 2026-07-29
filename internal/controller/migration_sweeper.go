@@ -26,6 +26,7 @@ import (
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
+	"github.com/andrew01234567890/pgelastic/internal/ownership"
 )
 
 // DefaultSweepInterval is how often abandoned migration objects are reaped.
@@ -48,6 +49,12 @@ type MigrationSweeper struct {
 	client.Client
 	SQL      migration.SQL
 	Interval time.Duration
+
+	// ControllerName is this operator's identity. The sweep drops physical objects inside
+	// PostgreSQL, so it is confined to the instances this operator governs; the set of live
+	// claims it compares against stays cluster-wide, because an object another operator's
+	// migration is using is not an orphan whoever is looking at it.
+	ControllerName string
 }
 
 var _ manager.LeaderElectionRunnable = &MigrationSweeper{}
@@ -101,9 +108,17 @@ func (s *MigrationSweeper) Sweep(ctx context.Context) error {
 	if err := s.List(ctx, instances); err != nil {
 		return err
 	}
+	resolver := ownership.Resolver{Reader: s.Client, ControllerName: s.ControllerName}
 	for i := range instances.Items {
 		instance := &instances.Items[i]
 		if instance.Status.CurrentPrimary == "" {
+			continue
+		}
+		verdict, err := resolver.Of(ctx, instance)
+		if err != nil {
+			return err
+		}
+		if verdict != ownership.Mine {
 			continue
 		}
 		at := migration.Endpoint{

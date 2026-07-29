@@ -20,17 +20,22 @@ import (
 	"time"
 
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgtool"
+	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 )
 
-// StopCause is why a shutdown was asked for. The two causes translate to different
+// StopCause is why a shutdown was asked for. The three causes translate to different
 // PostgreSQL shutdown modes because they are answering different questions: a kubelet
-// SIGTERM is "finish your work", a switchover or a fence is "stop being the primary now".
+// SIGTERM is "finish your work", a switchover is "stop being the primary, cleanly, because
+// we chose this moment", and a fence is "stop being the primary now, whatever it costs".
 type StopCause string
 
 const (
 	// CauseKubelet is a SIGTERM from the kubelet: a drain, an eviction, a rolling update.
 	CauseKubelet StopCause = "Kubelet"
-	// CauseSwitchover is a planned role change.
+	// CauseSwitchover is a stop this control plane asked for at a moment it chose: a
+	// planned role change, an in-place restart for a parameter that needs one, or a
+	// diverged standby about to be rewound. Every one of them is followed by this member
+	// starting again from the data directory it is stopping with.
 	CauseSwitchover StopCause = "Switchover"
 	// CauseFence is this node taking itself out of service, because it lost the promotion
 	// Lease or found itself isolated.
@@ -76,17 +81,52 @@ func DefaultStopTimeouts() StopTimeouts {
 	}
 }
 
+// StopTimeoutsFrom resolves the deadlines out of the operator's configuration document.
+//
+// spec.highAvailability.switchoverTimeout says it bounds a planned role change *end to
+// end*, so it is halved rather than taken as the first attempt's deadline: the plan is two
+// clean attempts, and two attempts each given the whole figure would take twice what the
+// field promises. Halving is also what keeps the retry from being an empty budget, which is
+// what an escalation to immediate was doing the work of before. It cannot exceed the
+// termination grace period either way, because the kubelet reaches for SIGKILL at that point
+// whatever this says.
+func StopTimeoutsFrom(config provision.AgentConfig) StopTimeouts {
+	timeouts := DefaultStopTimeouts()
+	if configured := config.SwitchoverTimeout.Duration; configured > 0 {
+		timeouts.MaxSwitchoverDelay = min(configured, timeouts.MaxStop) / 2
+	}
+	return timeouts
+}
+
 // TranslateStop turns a shutdown cause into a PostgreSQL shutdown plan.
 //
 // A kubelet SIGTERM gets a smart shutdown first, because the tenant connections on this
 // pod are the product and letting them finish is worth the wait; it escalates to fast so
 // the escalation still completes inside the grace period rather than being SIGKILLed
-// mid-checkpoint. A switchover or a fence never waits for clients at all: the whole point
-// is that this node must stop being the primary, and it escalates to immediate, accepting
-// crash recovery on the next start as the cheaper outcome.
+// mid-checkpoint.
+//
+// A fence never waits for clients: the whole point is that this node must stop being the
+// primary, and it escalates to immediate, accepting crash recovery on the next start as
+// the cheaper outcome. Its writes are about to be discarded, so there is nothing a
+// slower shutdown would preserve.
+//
+// A switchover is the one that must not escalate that far, and the reason is mechanical
+// rather than aesthetic. Every switchover is followed by this member starting again from
+// the data directory it is stopping with - as a standby that rewinds, or in place after a
+// restart - and pg_rewind requires its target to have been shut down cleanly. An
+// immediate stop leaves a data directory that has to be started and stopped again before
+// it can be rewound at all, which turns the cheap path back into the expensive one at
+// exactly the moment the design chose the cheap one. So a switchover checkpoints, stops
+// fast, and if that does not finish it tries fast again with the rest of the budget: a
+// stop that cannot be made clean is reported and retried, never converted into crash
+// recovery. Waiting for clients is not the alternative either - a pooled backend never
+// disconnects on its own, so a smart stop here would sit until its deadline and then
+// escalate anyway. What holds the clients across the gap is the proxy's quiesce, not
+// PostgreSQL's shutdown mode.
 func TranslateStop(cause StopCause, role Role, timeouts StopTimeouts) StopPlan {
 	checkpoint := role == RolePrimary
-	if cause == CauseKubelet {
+	switch cause {
+	case CauseKubelet:
 		return StopPlan{
 			Mode:            pgtool.StopSmart,
 			Timeout:         timeouts.SmartShutdown,
@@ -94,6 +134,17 @@ func TranslateStop(cause StopCause, role Role, timeouts StopTimeouts) StopPlan {
 			EscalateTimeout: max(timeouts.MaxStop-timeouts.SmartShutdown, 0),
 			Checkpoint:      checkpoint,
 		}
+	case CauseSwitchover:
+		// Both attempts are bounded by the same figure, so the pair of them is the end-to-end
+		// deadline the API field names rather than twice it.
+		return StopPlan{
+			Mode:            pgtool.StopFast,
+			Timeout:         timeouts.MaxSwitchoverDelay,
+			EscalateTo:      pgtool.StopFast,
+			EscalateTimeout: min(timeouts.MaxSwitchoverDelay, max(timeouts.MaxStop-timeouts.MaxSwitchoverDelay, 0)),
+			Checkpoint:      checkpoint,
+		}
+	case CauseFence:
 	}
 	return StopPlan{
 		Mode:            pgtool.StopFast,

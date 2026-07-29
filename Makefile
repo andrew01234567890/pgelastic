@@ -103,6 +103,9 @@ ifeq ($(E2E_HEAVY),true)
 # The proxy suite stands up two full three-node instances and a fleet in front of them, so
 # it costs what migration costs and runs where migration runs.
 	$(MAKE) test-e2e-proxy E2E_CONTEXT=kind-$(KIND_CLUSTER)
+# The restart suite drives real Pod recreations and a real switchover, six postmasters and a
+# fleet. It costs what the other two cost and belongs with them.
+	$(MAKE) test-e2e-restart E2E_CONTEXT=kind-$(KIND_CLUSTER)
 endif
 	$(MAKE) cleanup-test-e2e
 
@@ -170,6 +173,39 @@ test-e2e-proxy: manifests generate install-e2e load-data-plane-images ## Route a
 	PGELASTIC_PROXY_IMG=$(PROXY_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
 	go test -tags=e2e ./test/e2e/proxy/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
 		$(if $(E2E_LABEL_FILTER),-ginkgo.label-filter='$(E2E_LABEL_FILTER)')
+
+# The restart e2e rolls a real three-node instance under a client that never disconnects,
+# and is the only place the claim "a restart costs a latency spike and not a connection" is
+# answered by the client's own socket rather than by the operator's account of its pause. It
+# needs the proxy image because that claim cannot be made without a fleet holding the
+# clients.
+#
+# The drain-trap spec needs more than one node - a switchover away from a node that is going
+# away is pointless when every member is on it - so it is excluded by its `multinode` label
+# unless the caller asks for something else. The coexistence spec is excluded for the same
+# shape of reason: it requires a second, deployed operator to be running on the cluster, and
+# a CI cluster that only has the CRDs installed has nothing for it to coexist with. It fails
+# rather than skipping when asked for, so it is asked for explicitly.
+RESTART_LABEL_FILTER ?= $(if $(E2E_LABEL_FILTER),$(E2E_LABEL_FILTER),!multinode && !coexistence)
+
+.PHONY: test-e2e-restart
+test-e2e-restart: manifests generate install-e2e load-data-plane-images ## Roll a real 3-node instance under load and assert no client saw an error.
+	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) \
+	PGELASTIC_PROXY_IMG=$(PROXY_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
+	go test -tags=e2e ./test/e2e/restart/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
+		-ginkgo.label-filter='$(RESTART_LABEL_FILTER)'
+
+# The coexistence e2e is the proof that pgelastic can share a cluster with pgelastic. It
+# stands the restart suite's pool and fleet up next to an operator already deployed on
+# E2E_CONTEXT and asserts that neither touches the other's objects. Deploy the operator
+# first - `make docker-build deploy IMG=...` - because the spec fails, deliberately, if
+# there is nothing running for it to coexist with.
+.PHONY: test-e2e-coexistence
+test-e2e-coexistence: manifests generate install-e2e load-data-plane-images ## Prove two pgelastic operators can share one cluster.
+	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) \
+	PGELASTIC_PROXY_IMG=$(PROXY_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
+	go test -tags=e2e ./test/e2e/restart/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
+		-ginkgo.label-filter='coexistence'
 
 .PHONY: install-e2e
 install-e2e: manifests kustomize ## Install CRDs into E2E_CONTEXT.

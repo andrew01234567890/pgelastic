@@ -34,12 +34,9 @@ import (
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/index"
+	"github.com/andrew01234567890/pgelastic/internal/ownership"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
 )
-
-// DefaultControllerName is the controllerName a PgElasticClass must carry for this
-// controller to claim it.
-const DefaultControllerName = "pgelastic.io/elastic-pool-controller"
 
 // PoolsExistFinalizer keeps a PgElasticClass alive while pools still depend on the
 // policy it publishes. Deleting a class out from under a live pool would leave the pool
@@ -82,7 +79,7 @@ func (r *PgElasticClassReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// A class naming another controller is not an error and never becomes one: it is
 	// simply not ours, so it gets no conditions, no finalizer and no status. This is the
 	// GatewayClass rule, and it is what lets two controllers share one cluster.
-	if elasticClass.Spec.ControllerName != r.controllerName() {
+	if !r.ownership().ClaimsClass(elasticClass) {
 		logf.FromContext(ctx).V(1).Info("Ignoring PgElasticClass claimed by another controller",
 			"controllerName", elasticClass.Spec.ControllerName)
 		return ctrl.Result{}, nil
@@ -179,10 +176,11 @@ func (r *PgElasticClassReconciler) countPools(ctx context.Context, className str
 }
 
 func (r *PgElasticClassReconciler) controllerName() string {
-	if r.ControllerName == "" {
-		return DefaultControllerName
-	}
-	return r.ControllerName
+	return r.ownership().Name()
+}
+
+func (r *PgElasticClassReconciler) ownership() ownership.Resolver {
+	return ownership.Resolver{Reader: r.Client, ControllerName: r.ControllerName}
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -664,6 +664,8 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 			return nil
 		}, "5m", "3s").Should(Succeed())
 
+		claimNamespace(chaosNamespace)
+
 		oraclePassword = randomSecret()
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: oracleSecret, Namespace: chaosNamespace},
@@ -676,7 +678,7 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 		instance := &pgelasticv1alpha1.PgInstance{
 			ObjectMeta: metav1.ObjectMeta{Name: chaosInstance, Namespace: chaosNamespace},
 			Spec: pgelasticv1alpha1.PgInstanceSpec{
-				PoolRef: corev1.LocalObjectReference{Name: "e2e-pool"},
+				PoolRef: corev1.LocalObjectReference{Name: claimPoolName},
 				Class:   sizingClass,
 				Storage: pgelasticv1alpha1.InstanceStorage{
 					Size:      resource.MustParse("2Gi"),

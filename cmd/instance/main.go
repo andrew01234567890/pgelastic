@@ -145,7 +145,7 @@ func options(ctx context.Context, needClient bool) (agent.Options, error) {
 		ReplicationPassword: os.Getenv(provision.EnvReplPassword),
 		OpsPassword:         os.Getenv(provision.EnvOpsPassword),
 		RewindPassword:      os.Getenv(provision.EnvRewindPassword),
-		Timeouts:            agent.DefaultStopTimeouts(),
+		Timeouts:            agent.StopTimeoutsFrom(config),
 	}
 	if built.Member == "" {
 		return agent.Options{}, errors.New(provision.EnvMember + " is not set")

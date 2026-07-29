@@ -183,6 +183,12 @@ struct Running<'a> {
     /// Held for exactly as long as `checkout` is, so `drainStatus` can say
     /// whether the tenant still has work on its source.
     holding: Option<InFlight>,
+    /// The gate that holds every tenant on the bound instance, which a planned
+    /// switchover closes and a migration does not.
+    ///
+    /// Re-resolved at every checkout alongside the route, because the instance
+    /// a session is bound to is the thing that moves.
+    instance_gate: Arc<TenantGate>,
     /// The bound instance's epoch fence.
     ///
     /// Resubscribed whenever the session follows its tenant elsewhere: two
@@ -220,6 +226,7 @@ pub async fn run(
         witness: TransactionWitness::new(),
         draining_fence: false,
         holding: None,
+        instance_gate: instance_gate_of(&session),
         epochs: epochs_of(&session),
         session,
     };
@@ -330,6 +337,20 @@ impl Running<'_> {
         Ok(())
     }
 
+    /// Whether this session's traffic is being kept still on purpose.
+    ///
+    /// Either gate counts. A migration holds the tenant, a planned switchover
+    /// holds the instance, and the fact the fence needs is the same either way:
+    /// somebody chose this moment, so the promotion that just happened is not
+    /// one whose writes are about to be discarded out from under a client.
+    fn held(&self) -> crate::epoch::Held {
+        if self.session.gate.held() || self.instance_gate.held() {
+            crate::epoch::Held::ByHolder
+        } else {
+            crate::epoch::Held::No
+        }
+    }
+
     /// Applies the in-flight transaction policy to the held link.
     ///
     /// The matrix lives in `epoch::policy` and is not re-derived here. What
@@ -349,11 +370,13 @@ impl Running<'_> {
             .tx_status()
             .unwrap_or(TransactionStatus::Idle);
         let state = self.witness.state(status);
-        let action = crate::epoch::action(state);
+        let held = self.held();
+        let action = crate::epoch::action(state, held);
         debug!(
             %opened_under,
             %current,
             ?state,
+            ?held,
             ?action,
             "the primary epoch moved under a held backend"
         );
@@ -378,6 +401,33 @@ impl Running<'_> {
             // that was going to be correct. Nothing new is admitted from here.
             FenceAction::DrainThenClose => {
                 self.draining_fence = true;
+                Ok(())
+            }
+            // Somebody is deliberately holding this tenant's clients, and this
+            // session owes the superseded primary nothing. The backend is given
+            // back with a `Terminate` rather than an RST — it is stopping
+            // cleanly, so there is no commit to race — and the client keeps its
+            // socket. Its next transaction waits at the gate and runs against
+            // whichever member is the primary when that gate opens.
+            //
+            // A pinned link is the exception, and it is not one the hold can
+            // paper over: its temp tables, its `LISTEN` registrations and its
+            // session advisory locks lived in a postmaster that is going away,
+            // so the client has to be told. Such a session also never releases
+            // its backend, which is why a drain that waited for it would never
+            // report drained and a switchover would refuse to proceed.
+            FenceAction::HoldForResume => {
+                let pinned = checkout.conn.link.pin().is_some();
+                let checkout = self.take_checkout().expect("just observed");
+                self.session.route.set(None);
+                if pinned {
+                    self.manager().sever(checkout, FenceAction::Close);
+                    self.manager().publish_budget();
+                    return Err(superseded_error(opened_under, current));
+                }
+                self.manager().discard(checkout);
+                self.session.metrics.backend_held();
+                self.manager().publish_budget();
                 Ok(())
             }
             FenceAction::ResetNow => {
@@ -494,14 +544,10 @@ impl Running<'_> {
         if self.superseded() {
             self.apply_fence()?;
         }
-        if self.draining_fence {
-            let current = self.manager().fence().current();
-            let opened_under = self
-                .checkout
-                .as_ref()
-                .map_or(current, |checkout| checkout.conn.epoch);
-            self.finish_fence_drain(FenceAction::DrainThenClose);
-            return Err(superseded_error(opened_under, current));
+        if self.draining_fence
+            && let Some(error) = self.finish_fence_drain()
+        {
+            return Err(error);
         }
 
         if matches!(message, FrontendMessage::Flush) {
@@ -723,14 +769,12 @@ impl Running<'_> {
         // The read the fence was waiting on has been delivered. It could not
         // have caused split brain, the client has its answer, and now the
         // socket goes.
-        if saw_ready && self.draining_fence && self.at_backend_frame_boundary() {
-            let current = self.manager().fence().current();
-            let opened_under = self
-                .checkout
-                .as_ref()
-                .map_or(current, |checkout| checkout.conn.epoch);
-            self.finish_fence_drain(FenceAction::DrainThenClose);
-            return Err(superseded_error(opened_under, current));
+        if saw_ready
+            && self.draining_fence
+            && self.at_backend_frame_boundary()
+            && let Some(error) = self.finish_fence_drain()
+        {
+            return Err(error);
         }
         // Only once the whole read has been drained: a release taken with bytes
         // still buffered would run the reset ladder over the tail of the
@@ -741,13 +785,40 @@ impl Running<'_> {
         Ok(())
     }
 
-    fn finish_fence_drain(&mut self, action: FenceAction) {
+    /// Ends a fence drain now that the read it was waiting on has been
+    /// answered, and reports what the client is owed.
+    ///
+    /// The disposition is the matrix again, applied to the session the drain
+    /// has just left idle. Consulting it twice at the drain's two instants is
+    /// what keeps the decision in `epoch::policy` instead of half here: the
+    /// session really is idle now, and the idle row is exactly the question.
+    /// `None` means the client keeps its socket.
+    fn finish_fence_drain(&mut self) -> Option<ProxyError> {
         self.draining_fence = false;
+        let current = self.manager().fence().current();
+        let opened_under = self
+            .checkout
+            .as_ref()
+            .map_or(current, |checkout| checkout.conn.epoch);
+        let pinned = self
+            .checkout
+            .as_ref()
+            .is_some_and(|checkout| checkout.conn.link.pin().is_some());
+        let hold = !pinned
+            && crate::epoch::action(crate::epoch::InFlight::Idle, self.held())
+                == FenceAction::HoldForResume;
+
         if let Some(checkout) = self.take_checkout() {
             self.session.route.set(None);
-            self.manager().sever(checkout, action);
+            if hold {
+                self.manager().discard(checkout);
+                self.session.metrics.backend_held();
+            } else {
+                self.manager().sever(checkout, FenceAction::DrainThenClose);
+            }
             self.manager().publish_budget();
         }
+        (!hold).then(|| superseded_error(opened_under, current))
     }
 
     fn at_backend_frame_boundary(&self) -> bool {
@@ -818,13 +889,19 @@ impl Running<'_> {
         // the answer to the client's previous request.
         self.flush().await?;
 
-        // The gate, then the route, then the stall check, in that order. A
-        // queued client has to read the routing table *after* it is released,
-        // because being released is precisely the moment a cutover has finished
-        // rewriting it. The baton is held until this client has its backend, so
-        // the queue drains in the order it filled.
+        // The tenant gate, then the route, then the instance gate, then the
+        // stall check, in that order. A queued client has to read the routing
+        // table *after* it is released from the tenant gate, because being
+        // released is precisely the moment a cutover has finished rewriting it
+        // — and it can only ask which instance is holding it once it knows
+        // which instance it is on. Batons are held until this client has its
+        // backend, so each queue drains in the order it filled, and they are
+        // always taken tenant-first so two gates never wait on each other.
         let baton = self.session.gate.admit().await;
         self.follow_route()?;
+        self.instance_gate = instance_gate_of(&self.session);
+        let instance_gate = Arc::clone(&self.instance_gate);
+        let instance_baton = instance_gate.admit().await;
         let instance = Arc::clone(&self.session.binding.instance);
         if let Some(health) = instance.stall.must_refuse() {
             self.session.metrics.write_stall_refused();
@@ -847,6 +924,7 @@ impl Running<'_> {
             .acquire(&request, &connector, self.session.client)
             .await
             .map_err(admission_error)?;
+        drop(instance_baton);
         drop(baton);
 
         self.session.route.set(Some(CancelTarget {
@@ -1238,6 +1316,14 @@ async fn read_backend(checkout: &mut Option<Checkout>) -> std::io::Result<usize>
 /// The bound instance's epoch channel.
 fn epochs_of(session: &Session<'_>) -> watch::Receiver<Epoch> {
     session.binding.instance.fence.fence.subscribe()
+}
+
+/// The bound instance's admission gate.
+fn instance_gate_of(session: &Session<'_>) -> Arc<TenantGate> {
+    session
+        .proxy
+        .quiesce
+        .instance(session.binding.instance.id.as_str())
 }
 
 /// The refusal a client gets when its connection was on a superseded epoch.

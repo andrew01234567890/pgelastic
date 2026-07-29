@@ -68,6 +68,17 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 )
 
+// suiteControllerName is this suite's identity, deliberately not the default one a
+// deployed operator carries. Every object the suite creates is governed by a
+// PgElasticClass naming it, so an operator already running on the cluster resolves those
+// objects to a controller that is not itself and leaves them alone, instead of rewriting
+// them under the suite for as long as both are running.
+//
+// It is a constant rather than an environment override because the deployed operator reads
+// its own identity from the environment: a shared variable would put both back on the same
+// name, which is the state this exists to leave.
+const suiteControllerName = "pgelastic.io/e2e-proxy-controller"
+
 var (
 	suiteCtx    context.Context
 	cancelSuite context.CancelFunc
@@ -179,26 +190,29 @@ var _ = BeforeSuite(func() {
 		AgentImage:    envOr("PGELASTIC_INSTANCE_IMG", "pgelastic/instance:latest"),
 		// A single-node cluster cannot honour node anti-affinity, and what this suite proves
 		// is routing rather than placement.
-		AntiAffinity: provision.AntiAffinityPreferred,
-		PeerSources:  []string{"all"},
-		ProxySources: []string{"all"},
-		Prober:       execProber{runner: runner},
+		AntiAffinity:   provision.AntiAffinityPreferred,
+		PeerSources:    []string{"all"},
+		ProxySources:   []string{"all"},
+		Prober:         execProber{runner: runner},
+		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
 	collector := metering.NewCollector(metering.Options{}, nil)
 
 	Expect((&controller.PgTenantReconciler{
-		Client:   manager.GetClient(),
-		Scheme:   manager.GetScheme(),
-		Metering: collector,
-		SQL:      sql,
+		Client:         manager.GetClient(),
+		Scheme:         manager.GetScheme(),
+		Metering:       collector,
+		SQL:            sql,
+		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
 	Expect((&controller.PgElasticPoolReconciler{
-		Client:     manager.GetClient(),
-		Scheme:     manager.GetScheme(),
-		Metering:   collector,
-		ProxyImage: envOr("PGELASTIC_PROXY_IMG", "pgelastic/proxy:latest"),
+		Client:         manager.GetClient(),
+		Scheme:         manager.GetScheme(),
+		Metering:       collector,
+		ProxyImage:     envOr("PGELASTIC_PROXY_IMG", "pgelastic/proxy:latest"),
+		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
 	go func() {

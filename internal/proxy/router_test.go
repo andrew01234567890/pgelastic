@@ -46,6 +46,8 @@ const (
 	routerSource    = "pg-a"
 	routerTarget    = "pg-b"
 	routerHolder    = "shop/move-acme"
+	firstReplica    = "proxy-0"
+	secondReplica   = "proxy-1"
 )
 
 var acme = migration.TenantRef{Namespace: routerNamespace, Name: routerTenant}
@@ -151,6 +153,9 @@ func (f *fleetStub) Do(
 	if pod == f.refuse {
 		return Answer{}, errors.New("the replica is not answering")
 	}
+	if strings.HasPrefix(path, "/instanceDrainStatus") {
+		return Answer{Status: 200, Body: []byte(f.report[pod+"/instance"])}, nil
+	}
 	if strings.HasPrefix(path, "/drainStatus") {
 		return Answer{Status: 200, Body: []byte(f.report[pod])}, nil
 	}
@@ -229,7 +234,7 @@ type harness struct {
 
 func newHarness(t *testing.T, routedTo string) *harness {
 	t.Helper()
-	pods := []string{"proxy-0", "proxy-1", "proxy-2"}
+	pods := []string{firstReplica, secondReplica, "proxy-2"}
 	shared := &journal{}
 	fleet := &fleetStub{journal: shared, pods: pods, report: map[string]string{}}
 	for _, pod := range pods {

@@ -101,6 +101,7 @@ func (r *PgInstanceReconciler) reconcileFailover(
 		Evidence:          ha.EvidenceFrom(instance.Status.QuorumEvidence),
 		FailoverDelay:     provision.FailoverDelay(instance.Spec),
 		QuorumGateEnabled: provision.FailoverQuorumEnabled(instance.Spec),
+		Maintenance:       ha.MaintenanceMembers(instance.GetAnnotations()),
 		Now:               time.Now(),
 	}
 	if failing := instance.Status.CurrentPrimaryFailingSince; failing != nil {

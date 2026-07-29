@@ -55,6 +55,17 @@ import (
 	proxyobjects "github.com/andrew01234567890/pgelastic/internal/proxy"
 )
 
+// suiteControllerName is this suite's identity, deliberately not the default one a
+// deployed operator carries. Every object the suite creates is governed by a
+// PgElasticClass naming it, so an operator already running on the cluster resolves those
+// objects to a controller that is not itself and leaves them alone, instead of rewriting
+// them under the suite for as long as both are running.
+//
+// It is a constant rather than an environment override because the deployed operator reads
+// its own identity from the environment: a shared variable would put both back on the same
+// name, which is the state this exists to leave.
+const suiteControllerName = "pgelastic.io/e2e-migration-controller"
+
 var (
 	suiteCtx    context.Context
 	cancelSuite context.CancelFunc
@@ -148,29 +159,32 @@ var _ = BeforeSuite(func() {
 		AgentImage:    envOr("PGELASTIC_INSTANCE_IMG", "pgelastic/instance:latest"),
 		// A single-node cluster cannot honour node anti-affinity, and what this suite proves
 		// is a tenant move rather than placement.
-		AntiAffinity: provision.AntiAffinityPreferred,
-		PeerSources:  []string{"all"},
-		ProxySources: []string{"all"},
-		Prober:       execProber{runner: runner},
+		AntiAffinity:   provision.AntiAffinityPreferred,
+		PeerSources:    []string{"all"},
+		ProxySources:   []string{"all"},
+		Prober:         execProber{runner: runner},
+		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
 	// The pool controller is here for one reason: it is what turns spec.proxy into a running
 	// fleet, and the claim this suite exists to check is about clients queued at that fleet.
 	// It creates no PgInstance, so the two members the specs drive are still the suite's own.
 	Expect((&controller.PgElasticPoolReconciler{
-		Client:     manager.GetClient(),
-		Scheme:     manager.GetScheme(),
-		Metering:   metering.NewCollector(metering.Options{}, nil),
-		ProxyImage: envOr("PGELASTIC_PROXY_IMG", "pgelastic/proxy:latest"),
+		Client:         manager.GetClient(),
+		Scheme:         manager.GetScheme(),
+		Metering:       metering.NewCollector(metering.Options{}, nil),
+		ProxyImage:     envOr("PGELASTIC_PROXY_IMG", "pgelastic/proxy:latest"),
+		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
 	// The router the deployed operator runs, wired to the same control API, differing only
 	// in how a replica is addressed from outside the cluster.
 	Expect((&controller.PgTenantMigrationReconciler{
-		Client: manager.GetClient(),
-		Scheme: manager.GetScheme(),
-		SQL:    sql,
-		Shell:  sql,
+		Client:         manager.GetClient(),
+		Scheme:         manager.GetScheme(),
+		SQL:            sql,
+		Shell:          sql,
+		ControllerName: suiteControllerName,
 		Router: &proxyobjects.ProxyRouter{
 			Binding:   migration.BindingRouter{Client: manager.GetClient(), Reader: manager.GetAPIReader()},
 			Reader:    manager.GetAPIReader(),
@@ -179,7 +193,8 @@ var _ = BeforeSuite(func() {
 		},
 	}).SetupWithManager(manager)).To(Succeed())
 
-	sweeper = &controller.MigrationSweeper{Client: manager.GetClient(), SQL: sql}
+	sweeper = &controller.MigrationSweeper{
+		Client: manager.GetClient(), SQL: sql, ControllerName: suiteControllerName}
 
 	go func() {
 		defer GinkgoRecover()

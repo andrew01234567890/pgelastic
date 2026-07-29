@@ -46,10 +46,68 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/controller"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 )
+
+// suiteControllerName is this suite's identity, deliberately not the default one a
+// deployed operator carries. Every object the suite creates is governed by a
+// PgElasticClass naming it, so an operator already running on the cluster resolves those
+// objects to a controller that is not itself and leaves them alone, instead of rewriting
+// them under the suite for as long as both are running.
+//
+// It is a constant rather than an environment override because the deployed operator reads
+// its own identity from the environment: a shared variable would put both back on the same
+// name, which is the state this exists to leave.
+const suiteControllerName = "pgelastic.io/e2e-instance-controller"
+
+// claimClassName and claimPoolName are the route every instance in this suite takes to a
+// class. An instance inherits ownership from its pool and from nothing else, so without
+// them the suite's own operator could not prove the instances were its own either.
+const (
+	claimClassName = "e2e-instance-class"
+	claimPoolName  = "e2e-pool"
+)
+
+// claimNamespace publishes the class and the pool that make this suite's instances this
+// suite's own. Both are created idempotently because the two spec files that need them run
+// in the same process against the same cluster.
+func claimNamespace(namespace string) {
+	GinkgoHelper()
+	elasticClass := &pgelasticv1alpha1.PgElasticClass{
+		ObjectMeta: metav1.ObjectMeta{Name: claimClassName},
+		Spec:       pgelasticv1alpha1.PgElasticClassSpec{ControllerName: suiteControllerName},
+	}
+	Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, elasticClass))).To(Succeed())
+
+	pool := &pgelasticv1alpha1.PgElasticPool{
+		ObjectMeta: metav1.ObjectMeta{Name: claimPoolName, Namespace: namespace},
+		Spec: pgelasticv1alpha1.PgElasticPoolSpec{
+			ClassRef: pgelasticv1alpha1.ClassReference{
+				APIGroup: pgelasticv1alpha1.SchemeGroupVersion.Group,
+				Kind:     "PgElasticClass",
+				Name:     claimClassName,
+			},
+			Capacity: pgelasticv1alpha1.PoolCapacity{BackendConnections: 100},
+			Instances: pgelasticv1alpha1.PoolInstances{
+				Template: pgelasticv1alpha1.PgInstanceTemplate{
+					Class: sizingClass,
+					Storage: pgelasticv1alpha1.InstanceStorage{
+						Size:      resource.MustParse("1Gi"),
+						WALVolume: pgelasticv1alpha1.WALVolume{Size: resource.MustParse("1Gi")},
+					},
+				},
+			},
+		},
+	}
+	Eventually(func() error {
+		return client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, pool))
+	}, "5m", "3s").Should(Succeed())
+}
 
 // kubectlProber asks a member to describe itself by running the instance manager's own
 // status subcommand inside its Pod.
@@ -157,7 +215,8 @@ var _ = BeforeSuite(func() {
 		// each member the same question over the same status endpoint, through kubectl exec
 		// instead of a direct socket; an exec that fails is the same evidence a refused
 		// connection would be. A deployed operator uses the direct HTTP prober.
-		Prober: kubectlProber{},
+		Prober:         kubectlProber{},
+		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
 	go func() {

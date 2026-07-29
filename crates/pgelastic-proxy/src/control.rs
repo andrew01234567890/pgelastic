@@ -10,6 +10,21 @@
 //! | `POST /resume` | Opens the gate. Queued clients run against the new route, in the order they arrived. |
 //! | `POST /unquiesce` | Releases the lease. If no `resume` committed the flip, the route goes back. |
 //!
+//! and the same five at instance scope, which a planned switchover drives:
+//! `POST /quiesceInstance`, `GET /instanceDrainStatus`, `POST /resumeInstance`,
+//! `POST /unquiesceInstance`. There is no instance `setRoute`, because a
+//! switchover changes which *member* of an instance is the primary and moves no
+//! tenant anywhere.
+//!
+//! **The instance lease is its own lease, not the tenant leases taken in bulk.**
+//! Holding every tenant one at a time would make a switchover contend with any
+//! live migration on the instance and lose: the tenant lease is single-holder,
+//! so one tenant mid-cutover answers `409` and a bulk take has no partial
+//! success to report — 199 tenants held and one admitting is not an instance
+//! that is held. Instead a checkout must pass *both* gates, so the two holds
+//! compose: the migration keeps the tenant it is moving, the switchover keeps
+//! the instance, and neither can take the other's.
+//!
 //! Plus `GET /instances`, which answers the two questions a stall makes urgent:
 //! which instance a tenant is on, and whether that instance can commit.
 //!
@@ -78,6 +93,40 @@ struct RouteRequest {
     tenant: String,
     holder: String,
     instance: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InstanceQuiesceRequest {
+    instance: String,
+    holder: String,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InstanceHolderRequest {
+    instance: String,
+    holder: String,
+}
+
+/// What `instanceDrainStatus` answers.
+///
+/// The tenant list is part of the answer rather than an implementation detail:
+/// a switchover that held an instance has to be able to show *which* tenants it
+/// believes it is holding, because the set is derived from a routing table that
+/// moves and a fallback to the default instance that is easy to forget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceDrainStatus {
+    pub instance: InstanceId,
+    pub quiesced: bool,
+    pub tenants: Vec<String>,
+    pub in_flight: u64,
+    pub queued: u64,
+    pub drained: bool,
+    pub holder: Option<String>,
+    pub lease_expires_in: Option<Duration>,
 }
 
 impl Control {
@@ -188,6 +237,112 @@ impl Control {
         Ok(self.fleet.route_id(tenant))
     }
 
+    /// Closes an instance's gate under a lease of its own.
+    ///
+    /// Every tenant the instance serves is held by this one call, including the
+    /// ones the routing table never names because they are on the default
+    /// instance. Nothing here touches a tenant lease, so a migration already
+    /// holding one of those tenants is unaffected and this is not refused
+    /// because of it.
+    pub fn quiesce_instance(
+        &self,
+        instance: &str,
+        holder: &str,
+        ttl: Option<Duration>,
+    ) -> Result<InstanceDrainStatus, QuiesceError> {
+        let id = self.known_instance(instance)?;
+        let ttl = ttl.unwrap_or_else(|| self.config.default_lease_ttl());
+        // The source is the instance itself: a switchover does not move a
+        // tenant, so there is nothing for an expiry to roll back and the field
+        // exists only to keep one Lease type.
+        self.quiesce.instance(instance).quiesce(
+            holder,
+            ttl,
+            self.config.max_lease_ttl(),
+            id.clone(),
+        )?;
+        self.metrics.quiesce_started();
+        info!(
+            instance,
+            holder,
+            ttl_ms = ttl.as_millis(),
+            "every tenant on this instance is held; a planned role change may proceed once it drains"
+        );
+        Ok(self.instance_drain_status(instance))
+    }
+
+    /// Sums the drain over every tenant the instance serves.
+    ///
+    /// In-flight is the tenants' own count, because that is where a backend is
+    /// held: the instance gate admits, it does not check out. Queued is both,
+    /// because a client waiting at either gate is a client this instance is
+    /// holding.
+    pub fn instance_drain_status(&self, instance: &str) -> InstanceDrainStatus {
+        let id = InstanceId::new(instance);
+        let tenants = self.fleet.tenants_on(&id, &self.quiesce.tenants());
+        let gate = self.quiesce.instance(instance);
+        let lease = gate.lease();
+        let quiesced = !gate.is_open();
+
+        let mut in_flight = 0;
+        let mut queued = gate.queued();
+        for tenant in &tenants {
+            if let Some(tenant_gate) = self.quiesce.existing(tenant) {
+                in_flight += tenant_gate.in_flight();
+                queued += tenant_gate.queued();
+            }
+        }
+        InstanceDrainStatus {
+            instance: id,
+            quiesced,
+            tenants,
+            in_flight,
+            queued,
+            drained: quiesced && in_flight == 0,
+            holder: lease.as_ref().map(|lease| lease.holder.clone()),
+            lease_expires_in: lease.as_ref().map(super::quiesce::Lease::expires_in),
+        }
+    }
+
+    /// Opens the instance's gate. Queued clients run against whichever member
+    /// is the primary now, in the order they arrived.
+    pub fn resume_instance(&self, instance: &str, holder: &str) -> Result<u64, QuiesceError> {
+        let gate = self.quiesce.instance(instance);
+        let held = gate.held_for();
+        let released = gate.resume(holder)?;
+        if let Some(held) = held {
+            self.metrics.quiesce_round_trip(held);
+        }
+        self.metrics.quiesce_resumed(released);
+        info!(
+            instance,
+            released,
+            "a held instance resumed; every queued transaction was released, none dropped"
+        );
+        Ok(released)
+    }
+
+    /// Releases the instance lease.
+    pub fn unquiesce_instance(&self, instance: &str, holder: &str) -> Result<(), QuiesceError> {
+        let gate = self.quiesce.instance(instance);
+        let held = gate.held_for();
+        gate.unquiesce(holder)?;
+        if let Some(held) = held {
+            self.metrics.quiesce_round_trip(held);
+        }
+        Ok(())
+    }
+
+    fn known_instance(&self, instance: &str) -> Result<InstanceId, QuiesceError> {
+        let id = InstanceId::new(instance);
+        if self.fleet.get(&id).is_none() {
+            return Err(QuiesceError::NoSuchInstance {
+                instance: instance.to_owned(),
+            });
+        }
+        Ok(id)
+    }
+
     /// Applies whatever lease expiry implies, for every tenant it applies to.
     ///
     /// Called on a timer. Expiry is defined to be an `unquiesce`, so a killed
@@ -207,6 +362,21 @@ impl Control {
                      serving from its source again"
                 );
             }
+        }
+        // An instance expiry carries a rollback the same way, and it is
+        // deliberately discarded: a switchover moved no tenant, so the only
+        // thing expiry owes is that the gate opens.
+        for (instance, expiry) in self.quiesce.reap_expired_instances() {
+            self.metrics.quiesce_lease_expired();
+            if let Some(held) = expiry.held {
+                self.metrics.quiesce_round_trip(held);
+            }
+            warn!(
+                instance,
+                holder = %expiry.holder,
+                "an instance hold expired before the switchover finished; its tenants are \
+                 admitting again against whichever member is the primary"
+            );
         }
     }
 }
@@ -315,6 +485,40 @@ async fn respond(
             }),
             Err(message) => bad_request(&message),
         },
+        (&Method::GET, "/instanceDrainStatus") => match param(&query, "instance") {
+            Some(instance) => json(
+                StatusCode::OK,
+                instance_drain_report(&control.instance_drain_status(&instance)),
+            ),
+            None => bad_request("instanceDrainStatus needs an instance"),
+        },
+        (&Method::POST, "/quiesceInstance") => {
+            match body::<InstanceQuiesceRequest>(request).await {
+                Ok(ask) => {
+                    let ttl = ask.ttl_ms.map(Duration::from_millis);
+                    answer(
+                        control.quiesce_instance(&ask.instance, &ask.holder, ttl),
+                        |status| instance_drain_report(&status),
+                    )
+                }
+                Err(message) => bad_request(&message),
+            }
+        }
+        (&Method::POST, "/resumeInstance") => match body::<InstanceHolderRequest>(request).await {
+            Ok(ask) => answer(
+                control.resume_instance(&ask.instance, &ask.holder),
+                |released| format!("{{\"released\":{released}}}"),
+            ),
+            Err(message) => bad_request(&message),
+        },
+        (&Method::POST, "/unquiesceInstance") => match body::<InstanceHolderRequest>(request).await
+        {
+            Ok(ask) => answer(
+                control.unquiesce_instance(&ask.instance, &ask.holder),
+                |()| format!("{{\"instance\":{}}}", quote(&ask.instance)),
+            ),
+            Err(message) => bad_request(&message),
+        },
         _ => json(
             StatusCode::NOT_FOUND,
             "{\"error\":\"not found\"}".to_owned(),
@@ -359,6 +563,27 @@ fn drain_report(status: &DrainStatus) -> String {
         quote(&status.tenant),
         quote(status.instance.as_str()),
         status.quiesced,
+        status.in_flight,
+        status.queued,
+        status.drained,
+        status
+            .holder
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), |holder| quote(holder)),
+        status
+            .lease_expires_in
+            .map_or_else(|| "null".to_owned(), |left| left.as_millis().to_string()),
+    )
+}
+
+fn instance_drain_report(status: &InstanceDrainStatus) -> String {
+    let tenants: Vec<String> = status.tenants.iter().map(|tenant| quote(tenant)).collect();
+    format!(
+        "{{\"instance\":{},\"quiesced\":{},\"tenants\":[{}],\"inFlight\":{},\"queued\":{},\
+          \"drained\":{},\"holder\":{},\"leaseExpiresInMs\":{}}}",
+        quote(status.instance.as_str()),
+        status.quiesced,
+        tenants.join(","),
         status.in_flight,
         status.queued,
         status.drained,

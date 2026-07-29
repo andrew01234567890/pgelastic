@@ -54,6 +54,9 @@ const (
 	// PhasePromoting is a candidate already written to targetPrimary, waiting for that
 	// member's own agent to finish promoting and write currentPrimary.
 	PhasePromoting Phase = "Promoting"
+	// PhasePlannedSwitchover is a healthy primary being handed over on purpose, because
+	// something is about to disrupt the member currently holding the role.
+	PhasePlannedSwitchover Phase = "PlannedSwitchover"
 )
 
 // Veto is one of the four named refusals. Each is its own CR condition and its own metric
@@ -94,6 +97,12 @@ const (
 	ReasonNoEligibleCandidate = "NoEligibleCandidate"
 	// ReasonSplitBrain is two members out of recovery at once.
 	ReasonSplitBrain = "TwoPrimariesObserved"
+	// ReasonSwitchoverChosen is a planned handover whose candidate passed every gate.
+	ReasonSwitchoverChosen = "SwitchoverCandidateSelected"
+	// ReasonSwitchoverNoCandidate is a planned handover with nowhere to hand the role to.
+	// It is a refusal rather than a failure: the disruption simply does not happen, and
+	// the primary keeps serving.
+	ReasonSwitchoverNoCandidate = "SwitchoverHasNoEligibleCandidate"
 )
 
 // Observation is the whole input to one failover decision.
@@ -114,8 +123,22 @@ type Observation struct {
 	// permits promoting a standby that cannot be proven to hold the last acknowledged
 	// commit, and is never the default.
 	QuorumGateEnabled bool
+	// Maintenance is the members a rolling operation is about to disrupt: restart for a
+	// parameter that needs one, drain for a node that is going away, an explicit rollout.
+	//
+	// It is an input to this decision rather than a separate mechanism because a planned
+	// handover and an unplanned failover choose their candidate against the same evidence
+	// and must refuse for the same reasons. A member named here is disqualified from
+	// candidacy - promoting onto a pod that is about to be restarted buys nothing - and a
+	// primary named here is handed over before it is disrupted.
+	Maintenance []string
 	// Now is the operator's clock.
 	Now time.Time
+}
+
+// UnderMaintenance reports whether a member is one the caller intends to disrupt.
+func (o Observation) UnderMaintenance(member string) bool {
+	return slices.Contains(o.Maintenance, member)
 }
 
 // Decision is what the reconcile should do about the failover, and nothing else.
@@ -287,6 +310,9 @@ func operatorIsolated(observation Observation) *Decision {
 }
 
 func healthyPrimary(observation Observation) Decision {
+	if observation.UnderMaintenance(observation.CurrentPrimary) {
+		return plannedSwitchover(observation)
+	}
 	decision := Decision{
 		Phase:             PhaseSteady,
 		ClearFailingSince: !observation.FailingSince.IsZero(),
@@ -297,6 +323,88 @@ func healthyPrimary(observation Observation) Decision {
 		decision.TargetPrimary = observation.CurrentPrimary
 	}
 	return decision
+}
+
+// plannedSwitchover hands the role over before the member holding it is disrupted.
+//
+// It is the healthy-primary path, not a second failover: the primary is answering, its
+// quorum evidence is current, and the moment was chosen. What it shares with the failover
+// is every refusal - the quorum gate and candidate selection are the same functions
+// against the same evidence, because a handover that cannot be proven not to lose an
+// acknowledged commit is exactly as unacceptable when it was planned.
+//
+// The two differences from chooseCandidate are both consequences of the primary being
+// alive. There is no wait for every WAL receiver to go down, because they are streaming
+// from a primary that has not stopped and never will while this decision is being made -
+// waiting for that would deadlock the handover it is gating. And the quorum evidence is
+// measured against now rather than against a failing instant, because there is no failing
+// instant.
+//
+// A refusal here leaves the primary serving. That is the whole safety property: the worst
+// outcome of a switchover that cannot be done safely is that the maintenance does not
+// happen, which is a decision a human can act on, rather than an instance that lost its
+// primary and could not replace it.
+func plannedSwitchover(observation Observation) Decision {
+	verdict := EvaluateQuorum(observation.Evidence, reachableMembers(observation.Members),
+		observation.Now)
+	if observation.QuorumGateEnabled && !verdict.Satisfied {
+		return Decision{
+			Phase:  PhaseVetoed,
+			Quorum: verdict,
+			Reason: verdict.Reason,
+			Message: fmt.Sprintf(
+				"the planned switchover away from %s is denied because %s; it keeps serving",
+				observation.CurrentPrimary, verdict.Message),
+			RequeueAfter: 5 * time.Second,
+		}
+	}
+
+	candidates := SelectCandidate(CandidateInput{
+		Members:              observation.Members,
+		KnownPrimary:         observation.CurrentPrimary,
+		LastKnownTimeline:    LastKnownTimeline(observation.Members),
+		SyncSet:              observation.Evidence.VotingMembers,
+		StreamingAtDetection: observation.Evidence.StreamingMembers,
+		Maintenance:          observation.Maintenance,
+	})
+	if candidates.Candidate == "" {
+		return Decision{
+			Phase:     PhaseVetoed,
+			Quorum:    verdict,
+			Candidate: candidates,
+			Reason:    ReasonSwitchoverNoCandidate,
+			Message: fmt.Sprintf(
+				"%s is due to be disrupted but every other member was disqualified: %v",
+				observation.CurrentPrimary, candidates.Disqualified),
+			RequeueAfter: 5 * time.Second,
+		}
+	}
+
+	chosen, _ := memberNamed(observation.Members, candidates.Candidate)
+	if chosen.WALVolumeFull {
+		decision := vetoed(observation, VetoCandidateWALVolumeFull,
+			chosen.Name+" has a full WAL volume; handing the role to it buys a primary that PANICs")
+		decision.Candidate, decision.Quorum = candidates, verdict
+		return decision
+	}
+	if !chosen.PodReady {
+		decision := vetoed(observation, VetoCandidateNotReady,
+			chosen.Name+" answers over HTTP but its Pod is not Ready; waiting rather than "+
+				"handing the role to a Pod no Service will select")
+		decision.Candidate, decision.Quorum = candidates, verdict
+		return decision
+	}
+
+	return Decision{
+		Phase:         PhasePlannedSwitchover,
+		TargetPrimary: candidates.Candidate,
+		Quorum:        verdict,
+		Candidate:     candidates,
+		Reason:        ReasonSwitchoverChosen,
+		Message: fmt.Sprintf("%s is due to be disrupted, so %s takes the role; %s",
+			observation.CurrentPrimary, candidates.Candidate, verdict.Message),
+		RequeueAfter: time.Second,
+	}
 }
 
 // failing runs the debounce and then the two phases.

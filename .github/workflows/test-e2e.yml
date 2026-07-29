@@ -14,6 +14,10 @@ name: E2E Tests
 # they read. workflow_dispatch takes a `chaos` input so the nightly job can be demanded on
 # a branch before merging anything that touches failover.
 #
+# The rolling-restart suite runs there too, for the same reason and one more: it recreates
+# every member Pod of a real instance and switches the primary away, so it costs several
+# minutes of real restarts that a per-push job cannot absorb.
+#
 # The split is a Ginkgo label, not a spec-name regex: the chaos Describe carries
 # Label("chaos"), so a new chaos spec is nightly by construction rather than by remembering
 # to update a pattern here.
@@ -130,6 +134,14 @@ jobs:
       # the same job.
       - name: Run the proxy suite
         run: make test-e2e-proxy E2E_CONTEXT="kind-${KIND_CLUSTER}"
+
+      # The restart suite recreates every member Pod of a real instance and switches the
+      # primary away under a client that never disconnects. It drives real restarts, so it
+      # belongs with the chaos and migration specs rather than on the per-push job. The
+      # drain-trap spec is excluded by its own label: kind here is one node, and a
+      # switchover away from a node that is going away needs somewhere for the role to go.
+      - name: Run the restart suite
+        run: make test-e2e-restart E2E_CONTEXT="kind-${KIND_CLUSTER}"
 
       - name: Tear down the kind cluster
         if: always()

@@ -36,6 +36,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
+	"github.com/andrew01234567890/pgelastic/internal/ownership"
 )
 
 const (
@@ -91,6 +92,12 @@ type PgTenantMigrationReconciler struct {
 
 	// Now is injectable so the pause clock and the rollback deadline can be driven in tests.
 	Now func() time.Time
+
+	// ControllerName is this operator's identity. A migration reaches a PgElasticClass
+	// through its tenant's pool, and one naming a different controller is left entirely
+	// alone - which matters more here than anywhere else, because two operators running the
+	// same move would each quiesce and cut over the same tenant.
+	ControllerName string
 }
 
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenantmigrations,verbs=get;list;watch;create;update;patch;delete
@@ -117,6 +124,9 @@ func (r *PgTenantMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	object := &pgelasticv1alpha1.PgTenantMigration{}
 	if err := r.reader().Get(ctx, req.NamespacedName, object); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if result, stop, err := unclaimed(ctx, r.ownership(), object); stop {
+		return result, err
 	}
 	if !object.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
@@ -438,6 +448,10 @@ func (r *PgTenantMigrationReconciler) replicationPassword(
 }
 
 // SetupWithManager sets up the controller with the Manager.
+func (r *PgTenantMigrationReconciler) ownership() ownership.Resolver {
+	return ownership.Resolver{Reader: r.Client, ControllerName: r.ControllerName}
+}
+
 func (r *PgTenantMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.APIReader == nil {
 		r.APIReader = mgr.GetAPIReader()

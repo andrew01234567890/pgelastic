@@ -65,6 +65,17 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 )
 
+// suiteControllerName is this suite's identity, deliberately not the default one a
+// deployed operator carries. Every object the suite creates is governed by a
+// PgElasticClass naming it, so an operator already running on the cluster resolves those
+// objects to a controller that is not itself and leaves them alone, instead of rewriting
+// them under the suite for as long as both are running.
+//
+// It is a constant rather than an environment override because the deployed operator reads
+// its own identity from the environment: a shared variable would put both back on the same
+// name, which is the state this exists to leave.
+const suiteControllerName = "pgelastic.io/e2e-placement-controller"
+
 var (
 	suiteCtx    context.Context
 	cancelSuite context.CancelFunc
@@ -146,16 +157,18 @@ var _ = BeforeSuite(func() {
 	}
 
 	Expect((&controller.PgTenantReconciler{
-		Client:   manager.GetClient(),
-		Scheme:   manager.GetScheme(),
-		Metering: collector,
-		SQL:      tenantSQL,
+		Client:         manager.GetClient(),
+		Scheme:         manager.GetScheme(),
+		Metering:       collector,
+		SQL:            tenantSQL,
+		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
 	Expect((&controller.PgElasticPoolReconciler{
-		Client:   manager.GetClient(),
-		Scheme:   manager.GetScheme(),
-		Metering: collector,
+		Client:         manager.GetClient(),
+		Scheme:         manager.GetScheme(),
+		Metering:       collector,
+		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
 	go func() {
@@ -204,7 +217,8 @@ func startInstanceManager(config *rest.Config) {
 		// The operator runs on the developer's machine here and a node's Pod CIDR is not
 		// routable from it, so each member is asked the same question over the same status
 		// endpoint through kubectl exec.
-		Prober: kubectlProber{},
+		Prober:         kubectlProber{},
+		ControllerName: suiteControllerName,
 	}).SetupWithManager(instanceManager)).To(Succeed())
 
 	go func() {

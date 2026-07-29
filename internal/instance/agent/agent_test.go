@@ -25,7 +25,10 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgtool"
+	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 )
 
 const postmasterPID = 7
@@ -134,20 +137,92 @@ func TestTranslateStopKubeletIsSmartThenFast(t *testing.T) {
 	}
 }
 
-func TestTranslateStopSwitchoverIsFastThenImmediate(t *testing.T) {
-	timeouts := StopTimeouts{SmartShutdown: 20 * time.Second, MaxStop: 60 * time.Second,
+func switchoverTimeouts() StopTimeouts {
+	return StopTimeouts{SmartShutdown: 20 * time.Second, MaxStop: 60 * time.Second,
 		MaxSwitchoverDelay: 30 * time.Second}
-	for _, cause := range []StopCause{CauseSwitchover, CauseFence} {
-		plan := TranslateStop(cause, RolePrimary, timeouts)
-		if plan.Mode != pgtool.StopFast {
-			t.Errorf("%s mode = %q, want fast", cause, plan.Mode)
-		}
-		if plan.EscalateTo != pgtool.StopImmediate {
-			t.Errorf("%s escalation = %q, want immediate", cause, plan.EscalateTo)
-		}
-		if plan.Timeout != 30*time.Second {
-			t.Errorf("%s timeout = %v, want the switchover delay", cause, plan.Timeout)
-		}
+}
+
+func TestTranslateStopFenceIsFastThenImmediate(t *testing.T) {
+	plan := TranslateStop(CauseFence, RolePrimary, switchoverTimeouts())
+	if plan.Mode != pgtool.StopFast {
+		t.Errorf("mode = %q, want fast", plan.Mode)
+	}
+	if plan.EscalateTo != pgtool.StopImmediate {
+		t.Errorf("escalation = %q, want immediate", plan.EscalateTo)
+	}
+	if plan.Timeout != 30*time.Second {
+		t.Errorf("timeout = %v, want the switchover delay", plan.Timeout)
+	}
+}
+
+// This replaces an assertion that CauseSwitchover and CauseFence behaved identically. They
+// no longer do, and the difference is the point: a fenced primary's writes are about to be
+// discarded, while a switched-over one is going to be rewound onto the new primary's
+// history, and pg_rewind requires a target that was shut down cleanly.
+func TestTranslateStopSwitchoverNeverEscalatesToImmediate(t *testing.T) {
+	plan := TranslateStop(CauseSwitchover, RolePrimary, switchoverTimeouts())
+	if plan.Mode != pgtool.StopFast {
+		t.Errorf("mode = %q, want fast", plan.Mode)
+	}
+	if plan.EscalateTo == pgtool.StopImmediate {
+		t.Error("an immediate stop leaves a data directory pg_rewind refuses until it has " +
+			"been started and stopped again, which is the cost the planned path exists to avoid")
+	}
+	if plan.EscalateTo != pgtool.StopFast {
+		t.Errorf("escalation = %q, want a second clean attempt", plan.EscalateTo)
+	}
+	if plan.Timeout != 30*time.Second || plan.EscalateTimeout != 30*time.Second {
+		t.Errorf("timeouts = %v/%v, want the retry to fit inside the grace period",
+			plan.Timeout, plan.EscalateTimeout)
+	}
+	if !plan.Checkpoint {
+		t.Error("a primary handing over must checkpoint, or the rewind that follows " +
+			"computes the wrong divergence point")
+	}
+}
+
+func TestTranslateStopDiffersBetweenAPlannedStopAndAFence(t *testing.T) {
+	timeouts := switchoverTimeouts()
+	planned := TranslateStop(CauseSwitchover, RolePrimary, timeouts)
+	forced := TranslateStop(CauseFence, RolePrimary, timeouts)
+	if planned.EscalateTo == forced.EscalateTo {
+		t.Errorf("a chosen stop and a forced one both escalate to %q; the cause carries "+
+			"nothing if the plan does not differ", planned.EscalateTo)
+	}
+}
+
+// switchoverTimeout says it bounds a planned role change end to end, so the two clean
+// attempts have to fit inside it rather than each being given the whole figure.
+func TestTheConfiguredSwitchoverTimeoutBoundsTheWholeRoleChange(t *testing.T) {
+	config := provision.AgentConfig{
+		SwitchoverTimeout: metav1.Duration{Duration: 20 * time.Second},
+	}
+	plan := TranslateStop(CauseSwitchover, RolePrimary, StopTimeoutsFrom(config))
+	if total := plan.Timeout + plan.EscalateTimeout; total != 20*time.Second {
+		t.Errorf("the two attempts total %v, want the configured 20s end to end", total)
+	}
+	if got := StopTimeoutsFrom(provision.AgentConfig{}).MaxSwitchoverDelay; got != 30*time.Second {
+		t.Errorf("an unset switchoverTimeout gave %v, want the default", got)
+	}
+}
+
+// The retry is what a clean stop gets instead of an escalation to immediate, so a
+// switchoverTimeout longer than the grace period must not leave it an empty budget: that
+// would quietly restore the single-attempt behaviour being removed. The kubelet reaches
+// for SIGKILL at the grace period whatever the field says.
+func TestASwitchoverTimeoutBeyondTheGracePeriodStillLeavesTheRetryABudget(t *testing.T) {
+	config := provision.AgentConfig{
+		SwitchoverTimeout: metav1.Duration{Duration: 10 * time.Minute},
+	}
+	timeouts := StopTimeoutsFrom(config)
+	plan := TranslateStop(CauseSwitchover, RolePrimary, timeouts)
+	if plan.EscalateTimeout <= 0 {
+		t.Errorf("timeouts = %v/%v, want the retry to have a budget",
+			plan.Timeout, plan.EscalateTimeout)
+	}
+	if plan.Timeout+plan.EscalateTimeout > timeouts.MaxStop {
+		t.Errorf("the two attempts total %v, more than the grace period %v",
+			plan.Timeout+plan.EscalateTimeout, timeouts.MaxStop)
 	}
 }
 

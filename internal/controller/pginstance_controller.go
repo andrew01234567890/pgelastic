@@ -40,6 +40,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/ha"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
+	"github.com/andrew01234567890/pgelastic/internal/ownership"
 )
 
 // requeueInterval paces the provisioning ladder. Members are created one per reconcile and
@@ -80,6 +81,14 @@ type PgInstanceReconciler struct {
 	// member on every reconcile, which is what a test driving the reconciler by hand needs:
 	// it changes what a member reports and then expects the very next reconcile to see it.
 	ProbeTTL time.Duration
+	// Quiescer holds this instance's clients at the proxy across a planned role change.
+	// Nil is the headless deployment: no fleet fronts the pool, so there is nobody to hold
+	// and the handover is simply the unheld one.
+	Quiescer InstanceQuiescer
+
+	// ControllerName is this operator's identity. An instance reaches a PgElasticClass
+	// through its pool, and one naming a different controller is left entirely alone.
+	ControllerName string
 
 	// observations reuses one round of member polls across the burst of reconciles that
 	// each member's own status write produces.
@@ -95,12 +104,17 @@ type PgInstanceReconciler struct {
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
 // Reconcile converges one PgInstance.
 func (r *PgInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	instance := &pgelasticv1alpha1.PgInstance{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if result, stop, err := unclaimed(ctx, r.ownership(), instance); stop {
+		return result, err
 	}
 	if !instance.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
@@ -130,10 +144,27 @@ func (r *PgInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.reconcileRoleLabels(ctx, instance, decision, pods); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.publishStatus(ctx, instance, builder, groups, pods, decision); err != nil {
+	// The roll runs after the role labels for the same reason the failover decision runs
+	// before them: it acts on which member is serving, and the label is what makes that
+	// true. It runs before the status apply because the status is where it publishes.
+	roll, err := r.reconcileRoll(ctx, instance, builder, pods, decision)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: failoverRequeue(decision)}, nil
+	if err := r.publishStatus(ctx, instance, builder, groups, pods, decision, roll); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: reconcileRequeue(decision, roll)}, nil
+}
+
+// reconcileRequeue paces the reconcile. A roll in progress is waiting on things that take
+// a second or two - a drain reaching zero, a promotion completing, a Pod coming back - so
+// it asks for a faster heartbeat than the provisioning ladder's.
+func reconcileRequeue(decision ha.Decision, roll rollState) time.Duration {
+	if roll.active {
+		return min(rollRequeue, failoverRequeue(decision))
+	}
+	return failoverRequeue(decision)
 }
 
 func (r *PgInstanceReconciler) builderFor(
@@ -408,7 +439,7 @@ func (r *PgInstanceReconciler) ensurePods(
 		if group.Serial > 1 && !r.previousMemberReady(existing, group.Serial, instance) {
 			return pods.Items, nil
 		}
-		pod := builder.Pod(group.Serial, configHashOf(builder))
+		pod := builder.Pod(group.Serial, builder.DesiredStamp())
 		if err := r.ensure(ctx, instance, pod); err != nil {
 			return nil, err
 		}
@@ -439,12 +470,6 @@ func podReady(pod *corev1.Pod) bool {
 		}
 	}
 	return false
-}
-
-func configHashOf(builder provision.Builder) string {
-	config := builder.AgentConfig()
-	settings := pgconf.FormatSettings("custom", pgconf.RenderCustomConf(config.Postgres))
-	return pgconf.Hash(settings, pgconf.RenderHBA(config.HBA))
 }
 
 // reconcileRoleLabels flips the label the two Services and the two PodDisruptionBudgets
@@ -543,6 +568,7 @@ func (r *PgInstanceReconciler) publishStatus(
 	groups []provision.Group,
 	pods []corev1.Pod,
 	decision ha.Decision,
+	roll rollState,
 ) error {
 	capacity := builder.Capacity
 	status := map[string]any{
@@ -552,13 +578,17 @@ func (r *PgInstanceReconciler) publishStatus(
 			"maxConnections":   int64(capacity.MaxConnections),
 			"reservedForAdmin": int64(capacity.SuperuserReserved + capacity.Reserved),
 			"replicationSlots": int64(capacity.ReplicationSlots),
-			"allocatable":      int64(allocatableOf(instance, capacity)),
+			"allocatable":      int64(allocatableOf(instance, capacity, roll, decision)),
 		},
 		"storage": map[string]any{
 			"allocated": instance.Spec.Storage.Size.String(),
 		},
-		"instances":  syncSetEntries(instance),
-		"conditions": conditionsFor(instance, groups, pods, decision, builder.Replicas()),
+		"instances": syncSetEntries(instance),
+		"conditions": append(conditionsFor(instance, groups, pods, decision, builder.Replicas()),
+			rollCondition(instance, roll)),
+	}
+	if published := rollStatus(roll); published != nil {
+		status["roll"] = published
 	}
 	maps.Copy(status, failoverStatus(instance, decision))
 	// primaryEpoch is deliberately absent. It belongs to whichever member holds the role,
@@ -577,11 +607,50 @@ func (r *PgInstanceReconciler) publishStatus(
 // A re-cloning or half-built instance must not have its headroom counted as available:
 // quorum-gated failover is impossible while it is at reduced redundancy, so promising
 // tenants that capacity would be promising something the instance cannot honour.
-func allocatableOf(instance *pgelasticv1alpha1.PgInstance, capacity pgconf.Capacity) int32 {
-	if instance.Status.Phase != pgelasticv1alpha1.InstancePhaseReady {
+//
+// A rolling restart is the one exception, and it is not a nicety. This number is part of
+// the proxy fleet's *structural* configuration, so every time it moves the fleet's Pod
+// template changes and the rollout that follows drops every client on the pool - including
+// the clients of instances the roll never touched. An instance whose allocatable collapsed
+// to zero for each member restart would roll the fleet several times per roll, which is a
+// rolling restart that produces exactly the outcome it exists to prevent. It ran, and the
+// held probes recorded 1426 dropped statements on the rolled instance and 857 on its
+// untouched neighbour before this exception existed.
+//
+// Publishing the capacity through a roll is also the truthful answer. A roll takes one
+// member away at a time, on purpose, for as long as one restart takes; the instance is
+// serving every tenant it had, on the same number of connections, throughout. What the
+// zero is for is a member rebuilding itself for minutes to hours with no end in sight.
+// The test is which phases *withhold* the capacity, not which ones publish it. Listing the
+// publishing phases leaves every transient phase zeroing a structural value, and a roll
+// passes through several of them: the window between the last member restarting and the
+// instance reporting Ready again zeroed this, rewrote the fleet's Pod template, and churned
+// proxy Pods through the end of every roll. Observed directly — the rendered document
+// gained and lost `backendConnections = 50` every few seconds while the fleet rolled.
+func allocatableOf(
+	instance *pgelasticv1alpha1.PgInstance,
+	capacity pgconf.Capacity,
+	roll rollState,
+	decision ha.Decision,
+) int32 {
+	_ = roll
+	if decision.SplitBrain {
 		return 0
 	}
-	return capacity.Allocatable
+	// Ready, Degraded and FailingOver all describe an instance that is carrying its tenants
+	// right now, on the same number of connections. A roll passes through the latter two on
+	// every member, so admitting only Ready made this value flap for the length of every
+	// roll. Anything else — half-built, rebuilding, being taken apart, or a phase this
+	// function has not been taught — withholds, because an unrecognised state is not
+	// evidence of capacity.
+	switch instance.Status.Phase {
+	case pgelasticv1alpha1.InstancePhaseReady,
+		pgelasticv1alpha1.InstancePhaseDegraded,
+		pgelasticv1alpha1.InstancePhaseFailingOver:
+		return capacity.Allocatable
+	default:
+		return 0
+	}
 }
 
 // primaryEpochOf keeps the epoch monotonic. It is seeded once at bootstrap; every later
@@ -808,6 +877,10 @@ func (r *PgInstanceReconciler) publishInvalid(
 }
 
 // SetupWithManager sets up the controller with the Manager.
+func (r *PgInstanceReconciler) ownership() ownership.Resolver {
+	return ownership.Resolver{Reader: r.Client, ControllerName: r.ControllerName}
+}
+
 func (r *PgInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.PostgresImage == "" {
 		r.PostgresImage = envOrDefault(envPostgresImage, "pgelastic/postgres:18")

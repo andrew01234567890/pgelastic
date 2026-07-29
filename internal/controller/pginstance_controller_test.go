@@ -102,6 +102,7 @@ var _ = Describe("PgInstance controller", func() {
 
 	BeforeEach(func() {
 		ensureNamespace(instanceNamespace)
+		claimPool(instanceNamespace, "pginstance-class", "saas-pool")
 		reconciler = newInstanceReconciler()
 	})
 

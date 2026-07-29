@@ -63,12 +63,16 @@ pub enum ConnectGateOutcome {
     /// The last attempt failed inside `serverLoginRetry`, so this request was
     /// refused with the cached error without dialling.
     FastFailed,
+    /// The dial was refused by the transport and retried inside the same slot,
+    /// which is what a Service being repointed looks like from here.
+    Retried,
 }
 
-const CONNECT_GATE_OUTCOMES: [ConnectGateOutcome; 3] = [
+const CONNECT_GATE_OUTCOMES: [ConnectGateOutcome; 4] = [
     ConnectGateOutcome::Attempted,
     ConnectGateOutcome::Deferred,
     ConnectGateOutcome::FastFailed,
+    ConnectGateOutcome::Retried,
 ];
 
 impl ConnectGateOutcome {
@@ -77,6 +81,7 @@ impl ConnectGateOutcome {
             Self::Attempted => "attempted",
             Self::Deferred => "deferred",
             Self::FastFailed => "fast_failed",
+            Self::Retried => "retried",
         }
     }
 }
@@ -119,6 +124,9 @@ impl From<crate::epoch::Observation> for EpochOutcome {
     }
 }
 
+/// The actions that end a client's session, which is what the severed counter
+/// is about. `HoldForResume` is deliberately not one of them and is counted on
+/// its own.
 const FENCE_ACTIONS: [crate::epoch::FenceAction; 4] = [
     crate::epoch::FenceAction::Close,
     crate::epoch::FenceAction::DrainThenClose,
@@ -132,6 +140,7 @@ fn fence_action_label(action: crate::epoch::FenceAction) -> &'static str {
         crate::epoch::FenceAction::DrainThenClose => "drain_then_close",
         crate::epoch::FenceAction::ResetNow => "reset_now",
         crate::epoch::FenceAction::ReportUnknown => "report_unknown",
+        crate::epoch::FenceAction::HoldForResume => "hold_for_resume",
     }
 }
 
@@ -146,7 +155,7 @@ pub struct Metrics {
     cancels_matched: AtomicU64,
     cancels_unmatched: AtomicU64,
     cancels_refused: AtomicU64,
-    connect_gate: [AtomicU64; 3],
+    connect_gate: [AtomicU64; 4],
     bytes_to_backend: AtomicU64,
     bytes_to_client: AtomicU64,
     drains_completed: AtomicU64,
@@ -163,7 +172,11 @@ pub struct Metrics {
     primary_epoch: AtomicI64,
     /// `source x outcome`, flattened row-major over the three of each.
     epoch_observations: [AtomicU64; 9],
-    backends_severed: [AtomicU64; FENCE_ACTIONS.len()],
+    backends_severed: [AtomicU64; crate::epoch::FenceAction::ALL.len()],
+    /// Backends handed back rather than severed, because their tenant was being
+    /// held on purpose. The number that says a planned switchover cost the
+    /// clients latency and not errors.
+    backends_held: AtomicU64,
     in_doubt: AtomicI64,
     /// Microseconds from the epoch advancing to the last sweep completing.
     /// Microseconds rather than milliseconds because a healthy fence finishes
@@ -444,7 +457,13 @@ impl Metrics {
     /// One backend socket severed by the fence, labelled with what the policy
     /// said to do about whatever it was carrying.
     pub fn backend_severed(&self, action: crate::epoch::FenceAction) {
+        debug_assert!(action.severs(), "a held backend was counted as severed");
         self.backends_severed[action as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One backend returned by the fence with its client's socket kept.
+    pub fn backend_held(&self) {
+        self.backends_held.fetch_add(1, Ordering::Relaxed);
     }
 
     /// How many transactions the proxy has recorded as undecidable. A gauge
@@ -678,6 +697,14 @@ impl Metrics {
                     load(&self.backends_severed[action as usize]),
                 )
             })),
+        );
+        counter(
+            out,
+            "pgelastic_proxy_fence_holds_total",
+            "Backend sockets the epoch fence handed back instead of severing, because a \
+             holder was keeping that tenant's clients still. Each one is a client that saw \
+             latency rather than an error across a planned role change.",
+            &[("", load(&self.backends_held))],
         );
         gauge(
             out,

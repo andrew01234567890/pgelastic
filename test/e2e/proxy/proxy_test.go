@@ -107,10 +107,7 @@ var _ = Describe("the pool's inline proxy fleet", Ordered, func() {
 
 		elasticClass := &pgelasticv1alpha1.PgElasticClass{
 			ObjectMeta: metav1.ObjectMeta{Name: className},
-			Spec: pgelasticv1alpha1.PgElasticClassSpec{
-				ControllerName: envOr("PGELASTIC_CONTROLLER_NAME",
-					"pgelastic.io/elastic-pool-controller"),
-			},
+			Spec:       pgelasticv1alpha1.PgElasticClassSpec{ControllerName: suiteControllerName},
 		}
 		Expect(k8sClient.Create(suiteCtx, elasticClass)).To(Succeed())
 

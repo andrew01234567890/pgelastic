@@ -67,6 +67,19 @@ func makePool(namespace, name, className string, backendConnections int32) *pgel
 	}
 }
 
+// claimPool gives a namespace a PgElasticClass this controller claims and a pool bound to
+// it, so instances, tenants and migrations under that pool resolve to this controller.
+// Ownership is inherited by reference and nothing else, so a spec that skips this gets an
+// object the reconciler is required to leave alone.
+func claimPool(namespace, className, poolName string) {
+	GinkgoHelper()
+	elasticClass := makeElasticClass(className, defaultControllerName)
+	Expect(client.IgnoreAlreadyExists(k8sClient.Create(ctx, elasticClass))).To(Succeed())
+	pool := makePool(namespace, poolName, className, 100)
+	Expect(client.IgnoreAlreadyExists(k8sClient.Create(ctx, pool))).To(Succeed())
+	awaitCached(elasticClass, pool)
+}
+
 func makeWorkloadClass(name string, guaranteed, burstable int32) *pgelasticv1alpha1.PgWorkloadClass {
 	return &pgelasticv1alpha1.PgWorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{Name: name},

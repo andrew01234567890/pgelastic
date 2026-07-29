@@ -47,6 +47,11 @@ const (
 	// dedicated alarm, never a tiebreak: while it is true, every automated remediation is
 	// refused, because silent recovery from split brain hides the data loss.
 	ConditionSplitBrain = "SplitBrain"
+	// ConditionRolling reports whether a rolling restart is working through the members.
+	// It is separate from Progressing because the two answer different questions: an
+	// instance one member short during a roll is converging on purpose, and an operator
+	// deciding whether to wait needs to know which member and why.
+	ConditionRolling = "Rolling"
 	// ConditionWriteStalled reports that fewer standbys are streaming than the loaded
 	// synchronous_standby_names waits for, so commits are blocking. Under dataDurability
 	// Required that is correct behaviour, but it has to be first-class and alertable rather
@@ -120,6 +125,13 @@ const (
 	ReasonNotFailingOver       = "NotFailingOver"
 	ReasonNoVeto               = "NoVeto"
 	ReasonWritesFlowing        = "WritesFlowing"
+
+	// Rolling restart reasons. A roll that is not moving has to say which of the two
+	// reasons it is not moving for, because one of them resolves itself and the other
+	// needs a human.
+	ReasonRolling        = "RollingRestart"
+	ReasonRollBlocked    = "RollingRestartBlocked"
+	ReasonMembersCurrent = "MembersOnCurrentConfiguration"
 )
 
 // QoSClass is derived by the controller from the relationship between a tenant's

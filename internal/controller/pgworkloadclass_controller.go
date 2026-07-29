@@ -37,7 +37,12 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/policy"
 )
 
-// PgWorkloadClassReconciler reconciles a PgWorkloadClass object
+// PgWorkloadClassReconciler reconciles a PgWorkloadClass object.
+//
+// It is the one reconciler that is not scoped by controllerName. A workload class carries
+// no route to a PgElasticClass - tenants and pools reach it, not the other way round - and
+// what this controller publishes is a function of the cluster alone, so two operators
+// computing it arrive at the same answer rather than at two answers to overwrite.
 type PgWorkloadClassReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme

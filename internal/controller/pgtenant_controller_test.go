@@ -23,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/ownership"
 	"github.com/andrew01234567890/pgelastic/internal/placement"
 )
 
@@ -157,19 +158,15 @@ var _ = Describe("PgTenant controller", Ordered, func() {
 			To(Equal(metav1.ConditionFalse))
 	})
 
-	It("reports an unresolved pool as pending rather than as an error", func() {
+	It("leaves a tenant whose pool is gone untouched and comes back for it", func() {
 		tenant := makeTenant(namespace, "pgt-no-pool", "pgt-pool-that-is-not-there", "no_pool")
 		Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
 		DeferCleanup(func() { deleteAndAwait(tenant) })
+		before := refetch(tenant).ResourceVersion
 
-		reconcileNow(reconciler, tenant)
+		result := reconcileNow(reconciler, tenant)
 
-		fetched := refetch(tenant)
-		Expect(fetched.Status.Effective).To(BeNil())
-		Expect(fetched.Status.Phase).To(Equal(pgelasticv1alpha1.PgTenantPhasePending))
-		accepted := conditionOf(fetched.Status.Conditions, pgelasticv1alpha1.ConditionAccepted)
-		Expect(accepted.Status).To(Equal(metav1.ConditionFalse))
-		Expect(accepted.Reason).To(Equal(pgelasticv1alpha1.ReasonPending))
-		Expect(accepted.Message).To(ContainSubstring("pgt-pool-that-is-not-there"))
+		Expect(result.RequeueAfter).To(Equal(ownership.RetryUnresolved))
+		Expect(refetch(tenant).ResourceVersion).To(Equal(before))
 	})
 })

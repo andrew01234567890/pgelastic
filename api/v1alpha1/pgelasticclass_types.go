@@ -114,6 +114,13 @@ type PgElasticClassSpec struct {
 	// controller whose own name does not match this value ignores the object silently: it
 	// sets no conditions and raises no error, because an unmatched class belongs to a
 	// different controller and is not a failure.
+	//
+	// The claim is inherited by the whole object graph beneath the class, because no other
+	// kind carries one: a PgElasticPool through its classRef, a PgInstance and a PgTenant
+	// through their poolRef, and a PgTenantMigration through its tenant. An object whose
+	// route to a class cannot be resolved is claimed by nobody, so that two operators
+	// looking at the same dangling reference do not both claim it and then rewrite it under
+	// each other.
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\/[A-Za-z0-9\/\-._~%!$&'()*+,;=:]+$`

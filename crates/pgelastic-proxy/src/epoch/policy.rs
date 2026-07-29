@@ -1,11 +1,34 @@
 //! The in-flight transaction policy, which is explicit and asymmetric.
 //!
-//! | State on the old epoch | Action |
-//! |---|---|
-//! | Read-only transaction | Let it finish, then close. It cannot cause split brain. |
-//! | Idle in transaction | RST immediately. |
-//! | Write transaction, `Commit` not sent | RST immediately; an aborted transaction is a correct answer. |
-//! | `Commit` forwarded, `CommandComplete` not received | **Genuinely undecidable.** Report `UNKNOWN`, record it, never retry, never claim either outcome. |
+//! | State on the old epoch | Action | …when the tenant is held |
+//! |---|---|---|
+//! | Nothing outstanding | Close the socket. | Close it and keep the client: [`FenceAction::HoldForResume`]. |
+//! | Read-only transaction | Let it finish, then close. It cannot cause split brain. | Let it finish, then hold. |
+//! | Idle in transaction | RST immediately. | RST immediately. |
+//! | Write transaction, `Commit` not sent | RST immediately; an aborted transaction is a correct answer. | RST immediately. |
+//! | `Commit` forwarded, `CommandComplete` not received | **Genuinely undecidable.** Report `UNKNOWN`, record it, never retry, never claim either outcome. | Still `UNKNOWN`. |
+//!
+//! # Why the hold is a second input rather than a second matrix
+//!
+//! An epoch advance cannot say why it happened: a promotion the operator chose
+//! and a promotion forced on it bump the same counter. What *can* say so is the
+//! quiesce — a closed gate under a live lease means somebody is deliberately
+//! keeping this tenant's clients still, which is only ever true of a planned
+//! handover. So [`Held`] is the cause the epoch does not carry, and it changes
+//! exactly the two rows where the old primary owes the client nothing: an idle
+//! session and a read that is allowed to finish. Its backend goes either way;
+//! what it buys is that the *client* socket stays and its next transaction
+//! queues at the gate instead of being told the connection died.
+//!
+//! The three rows it does not change are the point. An open transaction cannot
+//! be carried across a promotion — its snapshot, its locks and its unflushed
+//! writes belong to a postmaster that is about to be rewound — so a client
+//! inside one has to be told, held or not. And a commit that was forwarded and
+//! never answered is undecidable *whoever* is holding the gate: softening that
+//! row would be inventing an outcome, which is the one thing the in-doubt log
+//! exists to refuse. What keeps those rows empty during a planned switchover is
+//! not this matrix, it is the drain that precedes it: `drainStatus.drained` is
+//! `in_flight == 0`, and every one of those three states holds a backend.
 //!
 //! Every classification here errs towards *write*. Mistaking a read for a write
 //! costs one client an aborted transaction, which is recoverable. Mistaking a
@@ -66,15 +89,58 @@ pub enum FenceAction {
     /// durable in-doubt log, and then RST. Never reported as a success, never
     /// as a failure, never retried.
     ReportUnknown,
+    /// Hand the backend back with a `Terminate` and **keep the client socket**.
+    /// Its next transaction waits at the gate that is holding it and runs
+    /// against whichever primary the routing table names once it opens.
+    ///
+    /// Only ever reached under a [`Held::ByHolder`] tenant, and only from the
+    /// two rows where the superseded postmaster owes the client nothing.
+    HoldForResume,
+}
+
+impl FenceAction {
+    /// Every action, so a counter over them is enumerable rather than
+    /// discovered by grep.
+    pub const ALL: [Self; 5] = [
+        Self::Close,
+        Self::DrainThenClose,
+        Self::ResetNow,
+        Self::ReportUnknown,
+        Self::HoldForResume,
+    ];
+
+    /// Whether this action ends the client's session as well as the backend's.
+    pub const fn severs(self) -> bool {
+        !matches!(self, Self::HoldForResume)
+    }
+}
+
+/// Whether somebody is deliberately keeping this tenant's clients still.
+///
+/// The signal is the quiesce itself rather than a new field on the wire: an
+/// epoch advance is identical whether it was planned or forced, and a gate held
+/// under a live lease is exactly the fact "this promotion is one we chose".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// Nothing holds this tenant, so the advance is an unplanned promotion and
+    /// the old primary's recent writes are about to be discarded.
+    No,
+    /// A holder's lease has this tenant's gate — or its instance's gate —
+    /// closed.
+    ByHolder,
 }
 
 /// The policy matrix, and the only place it is written down.
-pub const fn action(state: InFlight) -> FenceAction {
-    match state {
-        InFlight::Idle => FenceAction::Close,
-        InFlight::ReadOnlyTransaction => FenceAction::DrainThenClose,
-        InFlight::IdleInTransaction | InFlight::WriteUncommitted => FenceAction::ResetNow,
-        InFlight::CommitInDoubt => FenceAction::ReportUnknown,
+pub const fn action(state: InFlight, held: Held) -> FenceAction {
+    match (state, held) {
+        (InFlight::Idle, Held::ByHolder) => FenceAction::HoldForResume,
+        (InFlight::Idle, Held::No) => FenceAction::Close,
+        // Held or not, the read is allowed to finish. What the hold changes is
+        // what happens at the end of it, which is this same matrix applied
+        // again to the idle session the drain leaves behind.
+        (InFlight::ReadOnlyTransaction, _) => FenceAction::DrainThenClose,
+        (InFlight::IdleInTransaction | InFlight::WriteUncommitted, _) => FenceAction::ResetNow,
+        (InFlight::CommitInDoubt, _) => FenceAction::ReportUnknown,
     }
 }
 
@@ -510,7 +576,7 @@ mod tests {
 
         let state = witness.state(TransactionStatus::Transaction);
         assert_eq!(state, InFlight::ReadOnlyTransaction);
-        assert_eq!(action(state), FenceAction::DrainThenClose);
+        assert_eq!(action(state, Held::No), FenceAction::DrainThenClose);
     }
 
     #[test]
@@ -522,7 +588,7 @@ mod tests {
 
         let state = witness.state(TransactionStatus::Transaction);
         assert_eq!(state, InFlight::IdleInTransaction);
-        assert_eq!(action(state), FenceAction::ResetNow);
+        assert_eq!(action(state, Held::No), FenceAction::ResetNow);
     }
 
     #[test]
@@ -535,7 +601,7 @@ mod tests {
 
         let state = witness.state(TransactionStatus::Transaction);
         assert_eq!(state, InFlight::WriteUncommitted);
-        assert_eq!(action(state), FenceAction::ResetNow);
+        assert_eq!(action(state, Held::No), FenceAction::ResetNow);
     }
 
     #[test]
@@ -551,7 +617,7 @@ mod tests {
 
         let state = witness.state(TransactionStatus::Transaction);
         assert_eq!(state, InFlight::CommitInDoubt);
-        assert_eq!(action(state), FenceAction::ReportUnknown);
+        assert_eq!(action(state, Held::No), FenceAction::ReportUnknown);
     }
 
     // ---- the rows' boundaries -------------------------------------------
@@ -569,7 +635,7 @@ mod tests {
         witness.observe_backend(&ready(TransactionStatus::Idle));
 
         assert_eq!(witness.state(TransactionStatus::Idle), InFlight::Idle);
-        assert_eq!(action(InFlight::Idle), FenceAction::Close);
+        assert_eq!(action(InFlight::Idle, Held::No), FenceAction::Close);
     }
 
     /// An autocommit write carries its own commit, so losing its answer is the
@@ -779,7 +845,7 @@ mod tests {
 
         let state = witness.state(TransactionStatus::Idle);
         assert_eq!(state, InFlight::CommitInDoubt);
-        assert_eq!(action(state), FenceAction::ReportUnknown);
+        assert_eq!(action(state, Held::No), FenceAction::ReportUnknown);
     }
 
     #[test]
@@ -930,13 +996,88 @@ mod tests {
 
     #[test]
     fn the_matrix_maps_every_state_to_exactly_one_action() {
-        assert_eq!(action(InFlight::Idle), FenceAction::Close);
+        assert_eq!(action(InFlight::Idle, Held::No), FenceAction::Close);
         assert_eq!(
-            action(InFlight::ReadOnlyTransaction),
+            action(InFlight::ReadOnlyTransaction, Held::No),
             FenceAction::DrainThenClose
         );
-        assert_eq!(action(InFlight::IdleInTransaction), FenceAction::ResetNow);
-        assert_eq!(action(InFlight::WriteUncommitted), FenceAction::ResetNow);
-        assert_eq!(action(InFlight::CommitInDoubt), FenceAction::ReportUnknown);
+        assert_eq!(
+            action(InFlight::IdleInTransaction, Held::No),
+            FenceAction::ResetNow
+        );
+        assert_eq!(
+            action(InFlight::WriteUncommitted, Held::No),
+            FenceAction::ResetNow
+        );
+        assert_eq!(
+            action(InFlight::CommitInDoubt, Held::No),
+            FenceAction::ReportUnknown
+        );
+    }
+
+    #[test]
+    fn a_held_tenant_keeps_its_client_where_nothing_is_owed_to_it() {
+        assert_eq!(
+            action(InFlight::Idle, Held::ByHolder),
+            FenceAction::HoldForResume
+        );
+        assert!(!action(InFlight::Idle, Held::ByHolder).severs());
+    }
+
+    #[test]
+    fn a_held_read_finishes_and_then_lands_on_the_idle_row_rather_than_an_error() {
+        assert_eq!(
+            action(InFlight::ReadOnlyTransaction, Held::ByHolder),
+            FenceAction::DrainThenClose
+        );
+        assert_eq!(
+            action(InFlight::Idle, Held::ByHolder),
+            FenceAction::HoldForResume
+        );
+    }
+
+    /// The regression guard. A hold is a statement about *this promotion*, not
+    /// about the transaction, so the three rows that owe the client an answer
+    /// are identical either way.
+    #[test]
+    fn a_hold_never_softens_a_transaction_the_old_primary_still_owes_an_answer() {
+        for state in [
+            InFlight::IdleInTransaction,
+            InFlight::WriteUncommitted,
+            InFlight::CommitInDoubt,
+        ] {
+            assert_eq!(
+                action(state, Held::ByHolder),
+                action(state, Held::No),
+                "{state:?} must not change because somebody is holding the gate"
+            );
+            assert!(action(state, Held::ByHolder).severs());
+        }
+    }
+
+    /// An in-doubt commit is undecidable whoever holds the gate. A planned
+    /// switchover keeps this row empty by draining before it promotes, never by
+    /// deciding it here.
+    #[test]
+    fn a_held_tenant_still_reports_an_unacknowledged_commit_as_unknown() {
+        let mut witness = TransactionWitness::new();
+        witness.observe_frontend(&query("INSERT INTO orders (id) VALUES (1)"));
+        witness.observe_backend(&complete("INSERT 0 1"));
+        witness.observe_backend(&ready(TransactionStatus::Idle));
+        witness.observe_frontend(&query("BEGIN"));
+        witness.observe_backend(&complete("BEGIN"));
+        witness.observe_backend(&ready(TransactionStatus::Transaction));
+        witness.observe_frontend(&query("INSERT INTO orders (id) VALUES (2)"));
+        witness.observe_backend(&complete("INSERT 0 1"));
+        witness.observe_backend(&ready(TransactionStatus::Transaction));
+        witness.observe_frontend(&query("COMMIT"));
+
+        let state = witness.state(TransactionStatus::Transaction);
+        assert_eq!(state, InFlight::CommitInDoubt);
+        assert_eq!(
+            action(state, Held::ByHolder),
+            FenceAction::ReportUnknown,
+            "a held gate must never decide a commit nobody observed"
+        );
     }
 }

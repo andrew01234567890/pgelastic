@@ -43,6 +43,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/metering"
+	"github.com/andrew01234567890/pgelastic/internal/ownership"
 	"github.com/andrew01234567890/pgelastic/internal/placement"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
 	"github.com/andrew01234567890/pgelastic/internal/tenantdb"
@@ -92,6 +93,10 @@ type PgTenantReconciler struct {
 
 	// Now is the clock, injectable for the same reason.
 	Now func() time.Time
+
+	// ControllerName is this operator's identity. A tenant reaches a PgElasticClass through
+	// its pool, and one naming a different controller is left entirely alone.
+	ControllerName string
 }
 
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenants,verbs=get;list;watch;create;update;patch;delete
@@ -109,6 +114,11 @@ func (r *PgTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	tenant := &pgelasticv1alpha1.PgTenant{}
 	if err := r.reader().Get(ctx, req.NamespacedName, tenant); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	// Ahead of the deletion branch, because releasing a finalizer is a write and a tenant
+	// this operator never claimed never carried one of ours to release.
+	if result, stop, err := unclaimed(ctx, r.ownership(), tenant); stop {
+		return result, err
 	}
 	if !tenant.DeletionTimestamp.IsZero() {
 		return r.finalize(ctx, tenant)
@@ -705,6 +715,10 @@ func tenantPhase(conditions []metav1.Condition) pgelasticv1alpha1.PgTenantPhase 
 }
 
 // SetupWithManager sets up the controller with the Manager.
+func (r *PgTenantReconciler) ownership() ownership.Resolver {
+	return ownership.Resolver{Reader: r.Client, ControllerName: r.ControllerName}
+}
+
 func (r *PgTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.APIReader == nil {
 		r.APIReader = mgr.GetAPIReader()

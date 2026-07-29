@@ -44,7 +44,7 @@ use tracing::{info, warn};
 
 pub use config::{FenceTiming, FenceTimingError};
 pub use indoubt::{InDoubtKey, InDoubtLog, InDoubtRecord};
-pub use policy::{FenceAction, InFlight, TransactionWitness, action};
+pub use policy::{FenceAction, Held, InFlight, TransactionWitness, action};
 
 /// The fence token: a monotonic counter the operator derives from the promotion
 /// Lease's `LeaderTransitions`.

@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 )
 
 // Label keys. The PVC labels are what instance identity is derived from, so they are part
@@ -52,8 +54,21 @@ const (
 	// trigger Pod recreation: an offline-expansion CSI driver can never finish a
 	// filesystem resize while nothing mounts the volume.
 	AnnotationPVCStatus = "pgelastic.io/pvcStatus"
-	// AnnotationConfigHash records the configuration a Pod was created for.
+	// AnnotationConfigHash records the configuration a Pod was created for. It is read
+	// back by the rolling restart, which is the only thing that recreates a Pod for a
+	// parameter change: a Pod carrying a hash that is no longer the desired one is a
+	// member whose postmaster is running the wrong parameters.
+	//
+	// The Pod is the record rather than the member's own report because the two hashes
+	// are not the same hash. The agent's is over the file it wrote, which includes its
+	// own name and the primary epoch and so differs per member and per promotion; this
+	// one is over the operator's inputs alone, and is therefore the same for all three
+	// members and stable across a failover.
 	AnnotationConfigHash = "pgelastic.io/configHash"
+	// AnnotationRestartedAt records the value of the instance's own restartedAt
+	// annotation that a Pod was created for, so an explicit rollout is compared with the
+	// same single comparison a configuration change is.
+	AnnotationRestartedAt = pgelasticv1alpha1.AnnotationRestartedAt
 )
 
 // PVC roles.
