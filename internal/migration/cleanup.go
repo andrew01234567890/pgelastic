@@ -45,6 +45,10 @@ const (
 	StepDropPublication LadderStep = "DropPublication"
 	// StepRevokeGrants closes the reads the migration opened on the source.
 	StepRevokeGrants LadderStep = "RevokeGrants"
+	// StepClearSchemaStamp takes the schema-copy mark off the target database, so the database
+	// a successful migration hands to the tenant carries nothing of the machinery that built
+	// it.
+	StepClearSchemaStamp LadderStep = "ClearSchemaStamp"
 )
 
 // LadderOrder is the order the steps must run in. It is exported because the order is the
@@ -58,6 +62,7 @@ var LadderOrder = []LadderStep{
 	StepDropSlot,
 	StepDropPublication,
 	StepRevokeGrants,
+	StepClearSchemaStamp,
 }
 
 // Cleanup runs the whole ladder and never stops early.
@@ -123,6 +128,8 @@ func runStep(ctx context.Context, sql SQL, plan Plan, role string, step LadderSt
 			fmt.Sprintf(`DROP PUBLICATION IF EXISTS %s`, QuoteIdentifier(plan.Publication)))
 	case StepRevokeGrants:
 		return revokeSourceReads(ctx, sql, plan.Source, role)
+	case StepClearSchemaStamp:
+		return clearSchemaStamp(ctx, sql, plan)
 	default:
 		return fmt.Errorf("unknown cleanup step %q", step)
 	}
@@ -153,6 +160,19 @@ func ifSubscriptionExists(ctx context.Context, sql SQL, plan Plan, statement str
 		return nil
 	}
 	return sql.Exec(ctx, plan.Target, statement)
+}
+
+// clearSchemaStamp removes the mark the schema copy left. An unstamped target - one this
+// migration never got as far as copying onto, or one that has already been discarded - is
+// left alone, so an abort from an early phase does not report a failure to unmark a database
+// that was never marked.
+func clearSchemaStamp(ctx context.Context, sql SQL, plan Plan) error {
+	stamped, err := SchemaCopied(ctx, sql, plan)
+	if err != nil || !stamped {
+		return err
+	}
+	return sql.Exec(ctx, plan.Target,
+		fmt.Sprintf(`COMMENT ON DATABASE %s IS NULL`, QuoteIdentifier(plan.Target.Database)))
 }
 
 func revokeSourceReads(ctx context.Context, sql SQL, source Endpoint, role string) error {

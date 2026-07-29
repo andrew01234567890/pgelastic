@@ -17,9 +17,12 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"time"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
@@ -191,5 +194,26 @@ var _ = Describe("bidirectional namespace consent", func() {
 		mustCreate(pool)
 
 		mustCreate(makeTenant(namespace, "wh-both-consent-tenant", pool.Name, "both_consent", ""))
+	})
+})
+
+var _ = Describe("PgTenant webhook during deletion", func() {
+	It("admits a write to a tenant being deleted whose pool is already gone", func() {
+		validator := &PgTenantCustomValidator{Reader: k8sClient}
+		tenant := &pgelasticv1alpha1.PgTenant{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "doomed",
+				Namespace:         "default",
+				DeletionTimestamp: &metav1.Time{Time: time.Now()},
+				Finalizers:        []string{"pgelastic.io/tenant-database"},
+			},
+			Spec: pgelasticv1alpha1.PgTenantSpec{
+				PoolRef:      corev1.LocalObjectReference{Name: "pool-that-does-not-exist"},
+				DatabaseName: "doomed",
+			},
+		}
+
+		_, err := validator.ValidateUpdate(ctx, tenant, tenant)
+		Expect(err).NotTo(HaveOccurred())
 	})
 })

@@ -303,9 +303,14 @@ spec:
                 type: object
               parameters:
                 additionalProperties:
-                  description: GUCValue is a PostgreSQL parameter value as written
-                    to custom.conf.
+                  description: |-
+                    GUCValue is a PostgreSQL parameter value as written to custom.conf.
+
+                    A line break is refused rather than escaped. postgresql.conf is line-oriented, so a value
+                    carrying one stops being a value and becomes a directive of its own - which is how a
+                    parameter nobody owns turns into `fsync = off`, past a denylist that matches by name.
                   maxLength: 1024
+                  pattern: ^[^\n\r]*$
                   type: string
                 description: |-
                   parameters carries user-settable PostgreSQL GUCs only.
@@ -317,6 +322,10 @@ spec:
                   poison a pod that reads it later.
                 maxProperties: 64
                 type: object
+                x-kubernetes-validations:
+                - message: a parameter name must be a PostgreSQL identifier, optionally
+                    qualified by an extension prefix
+                  rule: self.all(name, name.matches('^[a-zA-Z_][a-zA-Z0-9_]*([.][a-zA-Z_][a-zA-Z0-9_]*)?$'))
               perTenantLogicalBackup:
                 description: |-
                   perTenantLogicalBackup configures the nightly per-database pg_dump that covers the

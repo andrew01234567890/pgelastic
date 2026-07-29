@@ -234,3 +234,75 @@ func TestPrimaryConnInfoCarriesDBName(t *testing.T) {
 		t.Error("application_name is what synchronous_standby_names names")
 	}
 }
+
+// A reader that opens the file at any instant sees either the whole of the old contents or
+// the whole of the new ones, never a truncated file - which is what CurrentReplicationConfig
+// depends on when it reads override.conf back before replacing it wholesale.
+func TestWriteConfigNeverExposesAPartialFile(t *testing.T) {
+	dir := t.TempDir()
+	standby := pgconf.ReplicationConfig{
+		Standby:                 true,
+		PrimaryConnInfo:         "host=pg-a-1 dbname=postgres",
+		PrimarySlotName:         "pgelastic_pg_a_2",
+		SynchronousStandbyNames: "ANY 1 (pg-a-2, pg-a-3)",
+	}
+	if _, err := WriteConfig(agentConfig(), standbyMember, standby, dir, nil); err != nil {
+		t.Fatalf("WriteConfig = %v", err)
+	}
+
+	settled := make(chan struct{})
+	go func() {
+		defer close(settled)
+		for range 200 {
+			if _, err := WriteConfig(agentConfig(), standbyMember, standby, dir, nil); err != nil {
+				t.Errorf("WriteConfig = %v", err)
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-settled:
+			return
+		default:
+		}
+		values := pgconf.ParseSettings(readFile(t, dir, pgconf.OverrideConfFile))
+		if values["synchronous_standby_names"] != standby.SynchronousStandbyNames {
+			t.Fatalf("override.conf was observed mid-rewrite: %v", values)
+		}
+	}
+}
+
+func TestWriteConfigLeavesNoTemporaryFilesBehind(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := WriteConfig(agentConfig(), standbyMember, pgconf.ReplicationConfig{}, dir, nil); err != nil {
+		t.Fatalf("WriteConfig = %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") {
+			t.Errorf("%s was left in the data directory", entry.Name())
+		}
+	}
+}
+
+func TestWriteConfigKeepsTheOwnedFilesUnreadableToOthers(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := WriteConfig(agentConfig(), standbyMember, pgconf.ReplicationConfig{
+		PrimaryConnInfo: "host=pg-a-1 password=secret",
+	}, dir, nil); err != nil {
+		t.Fatalf("WriteConfig = %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dir, pgconf.OverrideConfFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != configFileMode {
+		t.Errorf("override.conf mode = %v, want %v: it carries the replication password",
+			info.Mode().Perm(), configFileMode)
+	}
+}

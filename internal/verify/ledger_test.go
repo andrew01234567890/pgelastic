@@ -162,7 +162,11 @@ func TestReplayDropsATornTrailingRecord(t *testing.T) {
 	}
 }
 
-func TestReplayDropsATrailingRecordThatFailsItsChecksum(t *testing.T) {
+// A crash mid-append leaves a prefix with no newline. It can never leave a whole
+// terminated line, so a terminated line whose checksum is wrong is damage rather than a
+// torn tail - and dropping it would take a COMMITTED out of the set the oracle requires,
+// which turns a lost acknowledged write into a passing verdict.
+func TestReplayRefusesATerminatedTrailingRecordThatFailsItsChecksum(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ledger.log")
 	ledger, _, err := Open(path)
 	if err != nil {
@@ -173,6 +177,25 @@ func TestReplayDropsATrailingRecordThatFailsItsChecksum(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	appendRaw(t, path, "COMMITTED 1 00000000\n")
+
+	if _, err := ReadFile(path); !errors.Is(err, ErrCorruptLedger) {
+		t.Fatalf("ReadFile error = %v, want ErrCorruptLedger", err)
+	}
+}
+
+// The same record with its newline lost is the one shape a crash can produce, and is the
+// only shape that may be dropped.
+func TestReplayDropsTheSameRecordWhenItsNewlineIsMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.log")
+	ledger, _, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	writeAll(t, ledger, []Record{{StateAttempted, 1}})
+	if err := ledger.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	appendRaw(t, path, "COMMITTED 1 00000000")
 
 	records, err := ReadFile(path)
 	if err != nil {

@@ -20,22 +20,27 @@ limitations under the License.
 // behave against a real API server: real CRD schemas, real pruning, real status subresources
 // and the real controllers running inside a manager.
 //
-// It deliberately does not provision PostgreSQL. Placement is a control-plane decision, and
-// what it consumes from an instance is exactly what the instance publishes in status — the
-// allocatable connection count, the storage figures and the readiness. Standing up nine
-// postmasters to hand those numbers over would prove nothing this suite does not, and the
-// provisioning path already has its own suite that proves them against a real postmaster.
+// The placement specs deliberately provision no PostgreSQL. Placement is a control-plane
+// decision, and what it consumes from an instance is exactly what the instance publishes in
+// status — the allocatable connection count, the storage figures and the readiness.
+// Standing up nine postmasters to hand those numbers over would prove nothing they do not.
+// What they do prove, and what envtest cannot, is that the plan the controller computes
+// survives a real CRD: a status field that fails validation or is pruned away looks
+// identical to a controller that chose not to write it.
 //
-// What this suite does prove, and what envtest cannot, is that the plan the controller
-// computes survives a real CRD: a status field that fails validation or is pruned away
-// looks identical to a controller that chose not to write it.
+// The tenant-provisioning specs carry the `postgres` label and do stand up a real instance,
+// because the only trustworthy answer to "does this tenant's database exist" comes from
+// pg_database on the instance hosting it. A PgTenant once reported Ready for a database that
+// was never created; the CR is exactly the witness that cannot be believed here.
 package placement
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,7 +48,9 @@ import (
 	. "github.com/onsi/gomega"
 
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -53,7 +60,9 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/controller"
 	"github.com/andrew01234567890/pgelastic/internal/index"
+	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/metering"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
 )
 
 var (
@@ -67,6 +76,12 @@ var (
 	k8sClient client.Client
 
 	collector *metering.Collector
+
+	// provisioningNamespace holds the one real instance this suite stands up. It is
+	// separate from the namespace the placement specs use because those specs write
+	// instance status by hand, and an instance controller reconciling them would replace
+	// every number they depend on with a real one.
+	provisioningNamespace string
 )
 
 func TestPlacementE2E(t *testing.T) {
@@ -119,10 +134,22 @@ var _ = BeforeSuite(func() {
 	// placed on and the percentile the plan packs on have to be the same number.
 	collector = metering.NewCollector(metering.Options{}, nil)
 
+	// The same transport the operator binary gives the tenant controller: the bootstrap
+	// superuser over the hosting member's Unix socket, through the API server's exec
+	// subresource. Handing the suite a stub here would put the one thing under test — that
+	// a database is really created — back inside the test.
+	execer, err := migration.NewKubeExec(config)
+	Expect(err).NotTo(HaveOccurred())
+	tenantSQL := migration.PodSQL{
+		Runner:  execer,
+		Members: migration.PrimaryResolver{Client: manager.GetAPIReader()},
+	}
+
 	Expect((&controller.PgTenantReconciler{
 		Client:   manager.GetClient(),
 		Scheme:   manager.GetScheme(),
 		Metering: collector,
+		SQL:      tenantSQL,
 	}).SetupWithManager(manager)).To(Succeed())
 
 	Expect((&controller.PgElasticPoolReconciler{
@@ -140,9 +167,83 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(config, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 
+	startInstanceManager(config)
+
 	SetDefaultEventuallyTimeout(2 * time.Minute)
 	SetDefaultEventuallyPollingInterval(time.Second)
 })
+
+// startInstanceManager runs a PgInstance controller over one namespace only.
+//
+// The scoping is the point. The placement specs publish instance status by hand, and a
+// controller that reconciled those instances would build Pods for them and overwrite the
+// very numbers those specs feed to placement.
+func startInstanceManager(config *rest.Config) {
+	GinkgoHelper()
+	provisioningNamespace = uniqueNamespace("pgelastic-tenantdb")
+
+	instanceManager, err := ctrl.NewManager(config, ctrl.Options{
+		Scheme:  scheme.Scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+		Cache: cache.Options{
+			DefaultNamespaces: map[string]cache.Config{provisioningNamespace: {}},
+		},
+	})
+	Expect(err).NotTo(HaveOccurred())
+
+	Expect((&controller.PgInstanceReconciler{
+		Client:        instanceManager.GetClient(),
+		Scheme:        instanceManager.GetScheme(),
+		PostgresImage: envOr("PGELASTIC_POSTGRES_IMG", "pgelastic/postgres:18"),
+		AgentImage:    envOr("PGELASTIC_INSTANCE_IMG", "pgelastic/instance:latest"),
+		// A single-node test cluster cannot honour node anti-affinity, and what this suite
+		// proves is what is in pg_database rather than where the members landed.
+		AntiAffinity: provision.AntiAffinityPreferred,
+		PeerSources:  []string{"all"},
+		ProxySources: []string{"all"},
+		// The operator runs on the developer's machine here and a node's Pod CIDR is not
+		// routable from it, so each member is asked the same question over the same status
+		// endpoint through kubectl exec.
+		Prober: kubectlProber{},
+	}).SetupWithManager(instanceManager)).To(Succeed())
+
+	go func() {
+		defer GinkgoRecover()
+		Expect(instanceManager.Start(suiteCtx)).To(Succeed())
+	}()
+	Expect(instanceManager.GetCache().WaitForCacheSync(suiteCtx)).To(BeTrue())
+}
+
+// kubectlProber asks a member to describe itself by running the instance manager's own
+// status subcommand inside its Pod. The report is byte for byte the one the HTTP prober
+// would fetch; only the transport differs.
+type kubectlProber struct{}
+
+func (kubectlProber) Probe(ctx context.Context, member, _ string) (provision.MemberReport, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	command := exec.CommandContext(probeCtx, "kubectl", kubectlArgs(
+		"exec", "-n", provisioningNamespace, member, "-c", "postgres", "--",
+		provision.AgentBinary, "status")...)
+	output, err := command.Output()
+	if err != nil {
+		return provision.MemberReport{}, err
+	}
+	var report provision.MemberReport
+	if err := json.Unmarshal(output, &report); err != nil {
+		return provision.MemberReport{}, err
+	}
+	return report, nil
+}
+
+// psql runs one query on one member over its local Unix socket as the bootstrap superuser,
+// which is the only route to that superuser: it has no password at all.
+func psql(member, database, query string) (string, error) {
+	output, err := kubectlCommand("exec", "-n", provisioningNamespace, member, "-c", "postgres", "--",
+		"psql", "-h", provision.SocketDir, "-U", "postgres", "-d", database, "-tAqc", query).CombinedOutput()
+	return strings.TrimSpace(string(output)), err
+}
 
 var _ = AfterSuite(func() {
 	if cancelSuite != nil {

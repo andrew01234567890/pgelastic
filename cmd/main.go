@@ -235,25 +235,28 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "pginstance")
 		os.Exit(1)
 	}
-	if err := (&controller.PgTenantReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Metering: meteringCollector,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "pgtenant")
-		os.Exit(1)
-	}
-	// Every migration statement runs as the bootstrap superuser over a member's Unix socket,
-	// because that superuser has no password and no TCP route by design. The exec transport
-	// is therefore not a fallback for a missing driver; it is the only way in.
+	// Every statement pgelastic issues runs as the bootstrap superuser over a member's Unix
+	// socket, because that superuser has no password and no TCP route by design. The exec
+	// transport is therefore not a fallback for a missing driver; it is the only way in.
+	// Tenant provisioning and tenant migration share it so that a provisioned database and
+	// a migrated one are reached, and created, the same way.
 	migrationExec, err := migration.NewKubeExec(mgr.GetConfig())
 	if err != nil {
-		setupLog.Error(err, "Failed to build the migration exec transport")
+		setupLog.Error(err, "Failed to build the exec transport")
 		os.Exit(1)
 	}
 	migrationSQL := migration.PodSQL{
 		Runner:  migrationExec,
 		Members: migration.PrimaryResolver{Client: mgr.GetAPIReader()},
+	}
+	if err := (&controller.PgTenantReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Metering: meteringCollector,
+		SQL:      migrationSQL,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "pgtenant")
+		os.Exit(1)
 	}
 	if err := (&controller.PgTenantMigrationReconciler{
 		Client: mgr.GetClient(),

@@ -216,6 +216,28 @@ func (c *Collector) ForgetPool(namespace, pool string) {
 	}
 }
 
+// ForgetDeparted drops the series of every tenant of a pool that is not in present.
+//
+// Age is the worst age across the pool's series, so a tenant that has been deleted keeps
+// answering with the moment it was last sampled and drags the whole pool stale — which
+// refuses every autoscaling action, including the storage expansion that stops a filling
+// volume. Prune eventually removes it, but eventually is the retention window, and a week
+// of refused autoscaling is not a recovery.
+func (c *Collector) ForgetDeparted(namespace, pool string, present []Key) {
+	live := make(map[Key]struct{}, len(present))
+	for _, key := range present {
+		live[key] = struct{}{}
+	}
+	for _, key := range c.Store.Keys() {
+		if key.Namespace != namespace || key.Pool != pool {
+			continue
+		}
+		if _, ok := live[key]; !ok {
+			c.Store.Forget(key)
+		}
+	}
+}
+
 // Forget drops every trace of one tenant.
 func (c *Collector) Forget(key Key, database string) {
 	c.Store.Forget(key)

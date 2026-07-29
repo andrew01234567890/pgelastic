@@ -24,6 +24,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
@@ -65,9 +67,18 @@ func (httpMemberProber) Probe(
 // delay, so nothing it caches can hold a failover back.
 const defaultProbeTTL = time.Second
 
-// observationCache holds the last round of member observations for one instance.
+// observationCache holds the last round of member observations, per instance.
+//
+// One reconciler serves every PgInstance in the cluster, so the instance the round belongs
+// to is part of the key. A cache shared across instances hands one instance's timelines and
+// LSNs to another's failover decision, and two instances of the same size are
+// indistinguishable to a key that is only a member count.
 type observationCache struct {
-	mutex    sync.Mutex
+	mutex   sync.Mutex
+	entries map[types.NamespacedName]observationRound
+}
+
+type observationRound struct {
 	members  []ha.Member
 	observed time.Time
 }
@@ -84,7 +95,7 @@ func (r *PgInstanceReconciler) reconcileFailover(
 	pods []corev1.Pod,
 ) ha.Decision {
 	observation := ha.Observation{
-		Members:           r.observeMembers(ctx, pods),
+		Members:           r.observeMembers(ctx, client.ObjectKeyFromObject(instance), pods),
 		CurrentPrimary:    instance.Status.CurrentPrimary,
 		TargetPrimary:     instance.Status.TargetPrimary,
 		Evidence:          ha.EvidenceFrom(instance.Status.QuorumEvidence),
@@ -105,17 +116,49 @@ func (r *PgInstanceReconciler) reconcileFailover(
 
 // observeMembers asks every member directly and pairs its answer with the kubelet's verdict
 // on its Pod. The two are kept apart because the case where they disagree is a named veto.
-func (r *PgInstanceReconciler) observeMembers(ctx context.Context, pods []corev1.Pod) []ha.Member {
+func (r *PgInstanceReconciler) observeMembers(
+	ctx context.Context,
+	instance types.NamespacedName,
+	pods []corev1.Pod,
+) []ha.Member {
 	r.observations.mutex.Lock()
 	defer r.observations.mutex.Unlock()
-	if r.ProbeTTL > 0 && time.Since(r.observations.observed) < r.ProbeTTL &&
-		len(r.observations.members) == len(pods) {
-		return r.observations.members
+
+	round, cached := r.observations.entries[instance]
+	if r.ProbeTTL > 0 && cached && time.Since(round.observed) < r.ProbeTTL &&
+		sameMembers(round.members, pods) {
+		return round.members
 	}
 
 	members := r.pollMembers(ctx, pods)
-	r.observations.members, r.observations.observed = members, time.Now()
+	now := time.Now()
+	if r.observations.entries == nil {
+		r.observations.entries = map[types.NamespacedName]observationRound{}
+	}
+	// Rounds that can no longer be served from the cache are dropped as they are passed, so
+	// a deleted PgInstance does not leave its last observation behind forever.
+	for key, stale := range r.observations.entries {
+		if now.Sub(stale.observed) >= r.ProbeTTL {
+			delete(r.observations.entries, key)
+		}
+	}
+	r.observations.entries[instance] = observationRound{members: members, observed: now}
 	return members
+}
+
+// sameMembers reports whether a cached round describes exactly the Pods being reconciled
+// now. Names rather than a count, because a Pod recreated under a different name between
+// two reconciles is a different member with a different position.
+func sameMembers(members []ha.Member, pods []corev1.Pod) bool {
+	if len(members) != len(pods) {
+		return false
+	}
+	for i := range pods {
+		if members[i].Name != pods[i].Name {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *PgInstanceReconciler) pollMembers(ctx context.Context, pods []corev1.Pod) []ha.Member {
@@ -213,20 +256,22 @@ func failoverConditions(
 	decision ha.Decision,
 ) []any {
 	generation := instance.Generation
+	existing := instance.Status.Conditions
 	conditions := make([]any, 0, 3+len(ha.Vetoes))
 	conditions = append(conditions,
-		condition(pgelasticv1alpha1.ConditionFailingOver,
+		condition(existing, pgelasticv1alpha1.ConditionFailingOver,
 			ha.FailoverInProgress(instance.Status.CurrentPrimary, targetPrimaryAfter(instance, decision)),
 			generation, failoverReason(decision), decision.Message),
-		condition(pgelasticv1alpha1.ConditionSplitBrain, decision.SplitBrain, generation,
+		condition(existing, pgelasticv1alpha1.ConditionSplitBrain, decision.SplitBrain, generation,
 			splitBrainReason(decision.SplitBrain), splitBrainMessage(decision)),
-		condition(pgelasticv1alpha1.ConditionWriteStalled,
+		condition(existing, pgelasticv1alpha1.ConditionWriteStalled,
 			ha.WriteStalled(ha.EvidenceFrom(instance.Status.QuorumEvidence)), generation,
 			writeStalledReason(instance), writeStalledMessage(instance)),
 	)
 	for _, veto := range ha.Vetoes {
-		conditions = append(conditions, condition(vetoConditionType(veto), decision.Veto == veto,
-			generation, vetoReason(veto, decision.Veto == veto), vetoMessage(veto, decision)))
+		conditions = append(conditions, condition(existing, vetoConditionType(veto),
+			decision.Veto == veto, generation,
+			vetoReason(veto, decision.Veto == veto), vetoMessage(veto, decision)))
 	}
 	return conditions
 }

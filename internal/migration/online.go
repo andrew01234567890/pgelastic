@@ -40,6 +40,10 @@ type Plan struct {
 	Slot         string
 	Subscription string
 
+	// SchemaStamp is the comment the schema copy leaves on the target database to record
+	// that it committed.
+	SchemaStamp string
+
 	// SourceConnInfo is the libpq string the subscriber dials the source with. It carries a
 	// password, so it is never written to status or to a log line.
 	SourceConnInfo string
@@ -65,6 +69,11 @@ func (p CopyProgress) Done() bool { return p.Total > 0 && p.Copied >= p.Total }
 // the subscription starts or the initial sync fails one relation at a time. The offline path
 // must NOT have it: its dump carries the schema, and restoring a schema into a database that
 // already has one fails on the first object that exists twice.
+//
+// Every step here is re-enterable, because Provisioning is retried: a target that already
+// carries the schema is a satisfied precondition rather than an error. What makes that
+// judgement safe is that the copy is applied in one transaction and stamps the database from
+// inside it, so the stamp is present if and only if the whole schema is.
 func ProvisionTarget(
 	ctx context.Context, sql SQL, shell Shell, plan Plan, owner string, copySchema bool,
 ) error {
@@ -90,11 +99,46 @@ func ProvisionTarget(
 	if !copySchema {
 		return nil
 	}
+	copied, err := SchemaCopied(ctx, sql, plan)
+	if err != nil {
+		return err
+	}
+	if copied {
+		return nil
+	}
 	output, err := shell.Run(ctx, plan.Target, []string{"sh", "-c", schemaCopyCommand(plan)})
 	if err != nil {
 		return fmt.Errorf("copying the schema onto the target: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+// schemaStampQuery asks whether the target carries a stamp, rather than asking what the
+// stamp is.
+//
+// It is asked of the postgres database rather than of the target, because pg_shdescription
+// is a shared catalog and the target may not exist at all; the aggregate is what makes an
+// absent database answer at all. It answers 0 or 1 rather than the stamp itself because a
+// text answer of "" and no answer are the same bytes over this port, so an unstamped
+// database would come back as a query that returned no rows.
+const schemaStampQuery = `SELECT starts_with(
+  coalesce(max(shobj_description(oid, 'pg_database')), ''), %s)::int::text
+FROM pg_database WHERE datname = %s`
+
+// SchemaCopied reports whether the target already carries a complete copy of the source's
+// schema.
+//
+// The stamp is written by the last statement of the transaction that applies the schema, so
+// its absence means no part of a previous attempt survived: an interrupted copy rolls the
+// whole apply back, and a database that is half-way through one cannot exist to be mistaken
+// for a finished one.
+func SchemaCopied(ctx context.Context, sql SQL, plan Plan) (bool, error) {
+	stamped, err := scalarInt64(ctx, sql, plan.Target.WithDatabase("postgres"),
+		fmt.Sprintf(schemaStampQuery, QuoteLiteral(SchemaStampPrefix), QuoteLiteral(plan.Target.Database)))
+	if err != nil {
+		return false, err
+	}
+	return stamped == 1, nil
 }
 
 // ensureOwnerRole creates the tenant's owner role on the target if it is not there.
@@ -120,13 +164,23 @@ func ensureOwnerRole(ctx context.Context, sql SQL, postgres Endpoint, owner stri
 // is deliberately two steps through a file rather than one pipe, because a pipe's exit
 // status is the last command's and the shell in this image has no pipefail - a pg_dump that
 // died halfway would be reported as a successful psql over a truncated schema.
+//
+// The apply is one transaction, and the stamp is appended to the dump so that it is the last
+// statement of that transaction. Together those two make the schema copy an atom: it either
+// leaves the whole schema and the stamp, or it leaves the database exactly as it found it.
+// Without them a copy interrupted part-way would leave objects behind that the retry then
+// failed on - which is not a retry at all, only a slower way to exhaust the budget.
 func schemaCopyCommand(plan Plan) string {
 	file := plan.DumpDir + ".schema.sql"
+	stamp := fmt.Sprintf(`COMMENT ON DATABASE %s IS %s;`,
+		QuoteIdentifier(plan.Target.Database), QuoteLiteral(plan.SchemaStamp))
 	return fmt.Sprintf(
 		`set -e; mkdir -p %s; pg_dump --schema-only --no-owner --no-privileges `+
-			`--quote-all-identifiers --file=%s --dbname=%s; `+
-			`psql --set=ON_ERROR_STOP=1 --quiet --host=%s --username=postgres --dbname=%s --file=%s; rm -f %s`,
+			`--quote-all-identifiers --file=%s --dbname=%s; printf '%%s\n' %s >> %s; `+
+			`psql --set=ON_ERROR_STOP=1 --single-transaction --quiet --host=%s --username=postgres `+
+			`--dbname=%s --file=%s; rm -f %s`,
 		shellQuote(ScratchDir), shellQuote(file), shellQuote(plan.SourceConnInfo),
+		shellQuote(stamp), shellQuote(file),
 		shellQuote(socketDir), shellQuote(plan.Target.Database), shellQuote(file), shellQuote(file))
 }
 

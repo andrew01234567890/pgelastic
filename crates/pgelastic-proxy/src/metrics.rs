@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use http_body_util::Full;
@@ -185,6 +185,21 @@ pub struct Metrics {
     quiesce_transactions_queued: AtomicU64,
     /// Microseconds of the slowest quiesce/resume round trip seen so far.
     quiesce_round_trip_max_us: AtomicI64,
+    configs_applied: AtomicU64,
+    configs_rejected: AtomicU64,
+    /// The `configVersion` this replica is serving.
+    ///
+    /// Held as a string and served from `/configz` rather than carried as a
+    /// metric label: a version changes every time the operator rewrites the
+    /// document, so a label would grow one series per revision for the life of
+    /// the process.
+    applied_config_version: Mutex<String>,
+    /// Whether this replica will serve a client right now.
+    ///
+    /// The readiness probe reads this rather than opening a socket. A listener
+    /// accepts long before the fleet can serve, so a bare TCP probe marks a
+    /// replica ready while every client on it would be refused.
+    ready: AtomicBool,
 }
 
 impl Metrics {
@@ -355,6 +370,38 @@ impl Metrics {
 
     pub fn tenant_rerouted(&self) {
         self.tenants_rerouted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records the configuration this replica has adopted.
+    pub fn config_applied(&self, version: &str) {
+        self.configs_applied.fetch_add(1, Ordering::Relaxed);
+        version.clone_into(
+            &mut self
+                .applied_config_version
+                .lock()
+                .expect("the applied version is never poisoned"),
+        );
+    }
+
+    /// Records a published configuration that could not be adopted, so a fleet
+    /// silently serving a stale routing table is visible rather than quiet.
+    pub fn config_rejected(&self) {
+        self.configs_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn applied_config_version(&self) -> String {
+        self.applied_config_version
+            .lock()
+            .expect("the applied version is never poisoned")
+            .clone()
+    }
+
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Relaxed);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
     }
 
     pub fn quiesce_started(&self) {
@@ -555,6 +602,21 @@ impl Metrics {
                 ("event=\"resumed\"", load(&self.quiesces_resumed)),
                 ("event=\"expired\"", load(&self.quiesce_leases_expired)),
             ],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_config_total",
+            "Published configurations, by whether this replica adopted one.",
+            &[
+                ("outcome=\"applied\"", load(&self.configs_applied)),
+                ("outcome=\"rejected\"", load(&self.configs_rejected)),
+            ],
+        );
+        gauge(
+            out,
+            "pgelastic_proxy_ready",
+            "Whether this replica will serve a client right now.",
+            i64::from(self.is_ready()),
         );
         counter(
             out,
@@ -782,6 +844,27 @@ fn respond(request: &Request<hyper::body::Incoming>, metrics: &Metrics) -> Respo
             .body(Full::new(Bytes::from(metrics.render())))
             .expect("static response builds"),
         "/healthz" => Response::new(Full::new(Bytes::from_static(b"ok\n"))),
+        // Admin state, never a bare TCP probe: the listener is bound before the
+        // fleet can serve anything, so a connect-and-close probe would mark this
+        // replica ready while every client on it would be refused.
+        "/readyz" => {
+            let (status, body) = if metrics.is_ready() {
+                (StatusCode::OK, "ready\n")
+            } else {
+                (StatusCode::SERVICE_UNAVAILABLE, "not ready\n")
+            };
+            Response::builder()
+                .status(status)
+                .body(Full::new(Bytes::from(body)))
+                .expect("static response builds")
+        }
+        "/configz" => Response::builder()
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Full::new(Bytes::from(format!(
+                "{}\n",
+                metrics.applied_config_version()
+            ))))
+            .expect("static response builds"),
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from_static(b"not found\n")))

@@ -34,6 +34,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/autoscale"
 	"github.com/andrew01234567890/pgelastic/internal/metering"
+	"github.com/andrew01234567890/pgelastic/internal/tenantdb/tenantdbtest"
 )
 
 // reconcilePool drives two passes.
@@ -138,6 +139,10 @@ var _ = Describe("tenant placement", Ordered, func() {
 			Metering: collector,
 			Rand:     rand.New(rand.NewPCG(11, 13)),
 			Now:      func() time.Time { return placementClock },
+			// Placement decides where a tenant goes; Ready decides whether its database is
+			// there. These specs are about the first, and they get a PostgreSQL that answers
+			// so that the second does not silently become the thing being asserted.
+			SQL: tenantdbtest.NewCluster(),
 		}
 	})
 
@@ -231,6 +236,42 @@ var _ = Describe("tenant placement", Ordered, func() {
 		Expect(secondBinding.InstanceRef.Name).NotTo(Equal(firstInstance),
 			"two tenants of the same customer shard landed together, which is the correlation the "+
 				"oversubscription bet cannot survive")
+	})
+
+	It("refuses to rebind a tenant whose bound instance has gone", func() {
+		tenant := createTenant("stranded", "stranded_db", nil)
+		reconcileNow(reconciler, tenant)
+
+		bound := refetch(tenant).Status.Binding
+		Expect(bound).NotTo(BeNil())
+		original := bound.InstanceRef.Name
+
+		// The tenant's database lives on this instance and nowhere else, so a binding that
+		// moved without a migration would point at an empty database.
+		vanished := &pgelasticv1alpha1.PgInstance{ObjectMeta: metav1.ObjectMeta{
+			Name: original, Namespace: namespace}}
+		deleteAndAwait(vanished)
+		DeferCleanup(func() {
+			restored := makeReadyInstance(namespace, original, poolName, 225, 40)
+			awaitCached(restored)
+			for i, instance := range instances {
+				if instance.Name == original {
+					instances[i] = restored
+				}
+			}
+		})
+
+		reconcileNow(reconciler, refetch(tenant))
+
+		fetched := refetch(tenant)
+		Expect(fetched.Status.Binding).NotTo(BeNil())
+		Expect(fetched.Status.Binding.InstanceRef.Name).To(Equal(original),
+			"the binding was repointed at an instance that has never held this tenant's data")
+		condition := conditionOf(fetched.Status.Conditions, pgelasticv1alpha1.ConditionBound)
+		Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+		Expect(condition.Reason).To(Equal(pgelasticv1alpha1.ReasonInstanceMissing))
+		Expect(condition.Message).To(ContainSubstring(original))
+		Expect(fetched.Status.Phase).NotTo(Equal(pgelasticv1alpha1.PgTenantPhaseReady))
 	})
 
 	It("publishes the trailing-window numbers on the tenant rather than as metric labels", func() {

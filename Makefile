@@ -3,6 +3,8 @@ IMG ?= controller:latest
 # INSTANCE_IMG carries the instance manager; PG_IMG carries PostgreSQL 18 and pgBackRest.
 INSTANCE_IMG ?= pgelastic/instance:latest
 PG_IMG ?= pgelastic/postgres:18
+# PROXY_IMG carries the inline proxy fleet.
+PROXY_IMG ?= pgelastic/proxy:latest
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -97,6 +99,10 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 # rather than being given a longer timeout that would only make the slow path flakier.
 ifeq ($(E2E_HEAVY),true)
 	$(MAKE) test-e2e-migration E2E_CONTEXT=kind-$(KIND_CLUSTER)
+	$(MAKE) test-e2e-tenantdb E2E_CONTEXT=kind-$(KIND_CLUSTER)
+# The proxy suite stands up two full three-node instances and a fleet in front of them, so
+# it costs what migration costs and runs where migration runs.
+	$(MAKE) test-e2e-proxy E2E_CONTEXT=kind-$(KIND_CLUSTER)
 endif
 	$(MAKE) cleanup-test-e2e
 
@@ -133,10 +139,33 @@ test-e2e-migration: manifests generate install-e2e load-instance-images ## Move 
 # exactly what that instance publishes in status, and the provisioning path has its own
 # suite. What this one proves that envtest cannot is that the whole plan survives a real
 # CRD, where a pruned status field is indistinguishable from a decision not to write one.
+# The placement specs stand up no PostgreSQL, so the tenant-provisioning specs that share
+# the suite are excluded by their `postgres` label unless the caller asks for something else.
+PLACEMENT_LABEL_FILTER ?= $(if $(E2E_LABEL_FILTER),$(E2E_LABEL_FILTER),!postgres)
+
 .PHONY: test-e2e-placement
 test-e2e-placement: manifests generate install-e2e ## Place a tenant population across a pool and assert the plan.
 	E2E_CONTEXT=$(E2E_CONTEXT) \
 	go test -tags=e2e ./test/e2e/placement/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
+		-ginkgo.label-filter='$(PLACEMENT_LABEL_FILTER)'
+
+# The tenant-provisioning e2e is the only place that answers "does this tenant's database
+# exist" by asking PostgreSQL rather than by reading the PgTenant, which is the witness that
+# was wrong. It needs a real instance, so it carries the images and the long timeout.
+.PHONY: test-e2e-tenantdb
+test-e2e-tenantdb: manifests generate install-e2e load-instance-images ## Create a tenant's database on a real instance and assert it from PostgreSQL.
+	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
+	go test -tags=e2e ./test/e2e/placement/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
+		-ginkgo.label-filter='postgres'
+
+# The proxy e2e is the only place that answers "can a client reach its tenant's database
+# through the pool" by connecting to the pool's Service and running a query, rather than by
+# reading what the operator believes about the fleet it created.
+.PHONY: test-e2e-proxy
+test-e2e-proxy: manifests generate install-e2e load-data-plane-images ## Route a client to its tenant's database through a real proxy fleet.
+	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) \
+	PGELASTIC_PROXY_IMG=$(PROXY_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
+	go test -tags=e2e ./test/e2e/proxy/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
 		$(if $(E2E_LABEL_FILTER),-ginkgo.label-filter='$(E2E_LABEL_FILTER)')
 
 .PHONY: install-e2e
@@ -144,11 +173,21 @@ install-e2e: manifests kustomize ## Install CRDs into E2E_CONTEXT.
 	"$(KUSTOMIZE)" build config/crd | "$(KUBECTL)" --context=$(E2E_CONTEXT) apply --server-side --force-conflicts -f -
 
 .PHONY: load-instance-images
-load-instance-images: docker-build-instance docker-build-postgres ## Make the images reachable from E2E_CONTEXT.
+load-instance-images: docker-build-instance docker-build-postgres ## Make the instance images reachable from E2E_CONTEXT.
 	@case "$(E2E_CONTEXT)" in \
 	  kind-*) "$(KIND)" load docker-image $(INSTANCE_IMG) --name $${E2E_CONTEXT#kind-}; \
 	          "$(KIND)" load docker-image $(PG_IMG) --name $${E2E_CONTEXT#kind-} ;; \
 	  *) echo "$(E2E_CONTEXT) shares the local Docker daemon; images already reachable" ;; \
+	esac
+
+# The proxy is not part of an instance, so it is a separate step rather than a third image
+# in the one above: a suite that never stands a fleet up would otherwise pay for a Rust
+# release build it has no use for.
+.PHONY: load-data-plane-images
+load-data-plane-images: load-instance-images docker-build-proxy ## Make every image a client's path runs on reachable from E2E_CONTEXT.
+	@case "$(E2E_CONTEXT)" in \
+	  kind-*) "$(KIND)" load docker-image $(PROXY_IMG) --name $${E2E_CONTEXT#kind-} ;; \
+	  *) echo "$(E2E_CONTEXT) shares the local Docker daemon; the proxy image is already reachable" ;; \
 	esac
 
 .PHONY: cleanup-test-e2e
@@ -235,6 +274,12 @@ docker-build-instance: ## Build the instance manager image.
 .PHONY: docker-build-postgres
 docker-build-postgres: ## Build the pgelastic PostgreSQL 18 image.
 	$(CONTAINER_TOOL) build -f Dockerfile.postgres -t $(PG_IMG) .
+
+# The proxy is the only component on the client's data path, so its image carries the binary
+# and nothing that could be executed instead of it.
+.PHONY: docker-build-proxy
+docker-build-proxy: ## Build the inline proxy image.
+	$(CONTAINER_TOOL) build -f Dockerfile.proxy -t $(PROXY_IMG) .
 
 .PHONY: build-instance
 build-instance: ## Build the instance manager binary.

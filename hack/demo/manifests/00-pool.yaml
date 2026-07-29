@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgelastic-demo
+---
+apiVersion: pgelastic.io/v1alpha1
+kind: PgElasticClass
+metadata:
+  name: demo-class
+spec:
+  controllerName: pgelastic.io/pool-controller
+  tier: GeneralPurpose
+  tenancyModel: SharedInstance
+  admittedNamespaces:
+    from: All
+---
+apiVersion: pgelastic.io/v1alpha1
+kind: PgWorkloadClass
+metadata:
+  name: demo-standard
+spec:
+  priority: 1000
+  global: true
+  capacity:
+    guaranteed: 2
+    burstable: 20
+    weight: 100
+    maxClientConnections: 100
+---
+apiVersion: pgelastic.io/v1alpha1
+kind: PgElasticPool
+metadata:
+  name: demo-pool
+  namespace: pgelastic-demo
+spec:
+  classRef:
+    kind: PgElasticClass
+    name: demo-class
+  capacity:
+    backendConnections: 100
+    headroomPercent: 25
+  admission:
+    defaultWorkloadClassName: demo-standard
+    allowedWorkloadClassNames: [demo-standard]
+  instances:
+    replicas: 2
+    template:
+      class: dev-1
+      storage:
+        size: 2Gi
+        walVolume:
+          size: 1Gi

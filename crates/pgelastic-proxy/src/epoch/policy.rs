@@ -79,7 +79,10 @@ pub const fn action(state: InFlight) -> FenceAction {
 }
 
 /// What the outstanding request would do if it completed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Ordered by how much a mistake costs, so folding a multi-statement batch is a
+/// maximum: a batch is as undecidable as its most undecidable statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
     /// Provably unable to write.
     Read,
@@ -106,6 +109,10 @@ pub struct TransactionWitness {
     /// The text of that request, so the in-doubt log records what it was rather
     /// than only that there was one.
     pending_sql: String,
+    /// Whether the pending request is a simple `Query` carrying more than one
+    /// statement, which is retired only by `ReadyForQuery`. See
+    /// [`TransactionWitness::observe_backend`].
+    pending_batch: bool,
     statements: HashMap<Bytes, Kind>,
     portals: HashMap<Bytes, Kind>,
     texts: HashMap<Bytes, String>,
@@ -124,7 +131,24 @@ impl TransactionWitness {
     pub fn observe_frontend(&mut self, message: &FrontendMessage) {
         match message {
             FrontendMessage::Query(sql) => {
-                let kind = classify(sql);
+                // A simple `Query` may carry several statements, and the batch is
+                // classified by folding every one of them in order — not by the first
+                // token of the string. `BEGIN; INSERT ...; COMMIT` begins with a token
+                // that provably cannot write, and reading only that classifies an
+                // acknowledged commit as a read.
+                let batch = split_statements(sql);
+                self.pending_batch = batch.len() > 1;
+                let mut kind = Kind::Read;
+                for statement in &batch {
+                    let classified = classify(statement);
+                    // A write anywhere in the batch has to be visible to the `COMMIT`
+                    // that may follow it in the same batch, which is what makes that
+                    // commit undecidable rather than a no-op.
+                    if classified == Kind::Write {
+                        self.wrote = true;
+                    }
+                    kind = kind.max(classified);
+                }
                 self.begin_request(kind, text(sql));
             }
             FrontendMessage::Parse(parse) => {
@@ -185,12 +209,24 @@ impl TransactionWitness {
         match message {
             // The outcome of the outstanding request has been observed. That is
             // the whole point: after this the commit is no longer in doubt.
+            // A multi-statement `Query` draws one `CommandComplete` per statement, so the
+            // first of them retires nothing: the rest of the batch is still running, and
+            // the commit that ends it has not been observed. Only the error that aborts
+            // the batch, or the `ReadyForQuery` that ends it, retires the request.
+            BackendMessage::CommandComplete(_)
+            | BackendMessage::EmptyQueryResponse
+            | BackendMessage::PortalSuspended
+                if self.pending_batch => {}
             BackendMessage::CommandComplete(_)
             | BackendMessage::EmptyQueryResponse
             | BackendMessage::ErrorResponse(_)
-            | BackendMessage::PortalSuspended => self.pending = None,
+            | BackendMessage::PortalSuspended => {
+                self.pending = None;
+                self.pending_batch = false;
+            }
             BackendMessage::ReadyForQuery(status) => {
                 self.pending = None;
+                self.pending_batch = false;
                 if *status == TransactionStatus::Idle {
                     self.wrote = false;
                     self.portals.clear();
@@ -335,6 +371,107 @@ fn text(sql: &Bytes) -> String {
 
 fn eq(token: &[u8], word: &str) -> bool {
     token.eq_ignore_ascii_case(word.as_bytes())
+}
+
+/// Splits a simple-query string into the statements `PostgreSQL` will run.
+///
+/// A statement separator is a `;` at the top level, which means one that is not
+/// inside a string literal, a quoted identifier, a dollar-quoted body or a
+/// comment. Getting that wrong in the splitting direction is safe — an extra
+/// fragment is an unrecognised statement, and an unrecognised statement is a
+/// write — so the lexer only has to be right about where a literal *ends*.
+fn split_statements(sql: &[u8]) -> Vec<&[u8]> {
+    let mut statements = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while at < sql.len() {
+        match sql[at] {
+            b';' => {
+                statements.push(&sql[start..at]);
+                at += 1;
+                start = at;
+            }
+            b'\'' | b'"' => at = end_of_quoted(sql, at),
+            b'$' => at = end_of_dollar_quoted(sql, at),
+            b'-' if sql.get(at + 1) == Some(&b'-') => {
+                at = sql[at..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(sql.len(), |end| at + end + 1);
+            }
+            b'/' if sql.get(at + 1) == Some(&b'*') => at = end_of_block_comment(sql, at),
+            _ => at += 1,
+        }
+    }
+    statements.push(&sql[start..]);
+    statements.retain(|statement| !statement.iter().all(u8::is_ascii_whitespace));
+    statements
+}
+
+/// The index just past a `'...'` or `"..."` run, doubling counting as an escape.
+/// An unterminated literal consumes the rest of the string, which is what makes
+/// the batch one statement rather than several.
+fn end_of_quoted(sql: &[u8], open: usize) -> usize {
+    let delimiter = sql[open];
+    let mut at = open + 1;
+    while at < sql.len() {
+        if sql[at] != delimiter {
+            at += 1;
+            continue;
+        }
+        if sql.get(at + 1) == Some(&delimiter) {
+            at += 2;
+            continue;
+        }
+        return at + 1;
+    }
+    sql.len()
+}
+
+/// The index just past a `$tag$...$tag$` body, or past the `$` when what
+/// follows is not a dollar-quote opener at all.
+fn end_of_dollar_quoted(sql: &[u8], open: usize) -> usize {
+    let Some(offset) = sql[open + 1..]
+        .iter()
+        .position(|byte| *byte == b'$')
+        .filter(|offset| {
+            sql[open + 1..open + 1 + offset]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        })
+    else {
+        return open + 1;
+    };
+    let tag = &sql[open..=open + 1 + offset];
+    let body = open + tag.len();
+    sql[body..]
+        .windows(tag.len())
+        .position(|window| window == tag)
+        .map_or(sql.len(), |end| body + end + tag.len())
+}
+
+/// The index just past a `/* ... */` comment. `PostgreSQL`'s block comments
+/// nest, so the depth is counted rather than the first `*/` taken.
+fn end_of_block_comment(sql: &[u8], open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut at = open;
+    while at + 1 < sql.len() {
+        match (sql[at], sql[at + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                at += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                at += 2;
+                if depth == 0 {
+                    return at;
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    sql.len()
 }
 
 /// Splits on everything that cannot appear inside an identifier, so
@@ -628,6 +765,167 @@ mod tests {
         assert!(!is_commit(b"ROLLBACK"));
         assert!(!is_commit(b"PREPARE p AS SELECT $1::int"));
         assert!(!is_commit(b"SELECT committed_at FROM orders"));
+    }
+
+    // ---- multi-statement simple queries ---------------------------------
+
+    /// The whole reason a batch cannot be classified by its first token: the
+    /// first token of `BEGIN; INSERT ...; COMMIT` is one that provably cannot
+    /// write, and the batch ends in an acknowledged commit.
+    #[test]
+    fn a_write_batch_that_opens_with_begin_is_not_a_read() {
+        let mut witness = TransactionWitness::new();
+        witness.observe_frontend(&query("BEGIN; INSERT INTO orders (id) VALUES (1); COMMIT"));
+
+        let state = witness.state(TransactionStatus::Idle);
+        assert_eq!(state, InFlight::CommitInDoubt);
+        assert_eq!(action(state), FenceAction::ReportUnknown);
+    }
+
+    #[test]
+    fn a_write_after_a_read_in_the_same_batch_is_still_a_write() {
+        let mut witness = TransactionWitness::new();
+        witness.observe_frontend(&query("SELECT 1; DELETE FROM orders"));
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::CommitInDoubt
+        );
+    }
+
+    #[test]
+    fn a_read_after_a_write_in_the_same_batch_is_still_a_write() {
+        let mut witness = TransactionWitness::new();
+        witness.observe_frontend(&query("DELETE FROM orders; SELECT 1"));
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::CommitInDoubt
+        );
+    }
+
+    /// One `CommandComplete` per statement, so the first of them retires
+    /// nothing. Retiring on it would report a batch whose commit has not been
+    /// observed as decided.
+    #[test]
+    fn the_first_command_complete_of_a_batch_does_not_retire_it() {
+        let mut witness = TransactionWitness::new();
+        witness.observe_frontend(&query("BEGIN; INSERT INTO orders (id) VALUES (1); COMMIT"));
+        witness.observe_backend(&complete("BEGIN"));
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::CommitInDoubt
+        );
+
+        witness.observe_backend(&complete("INSERT 0 1"));
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::CommitInDoubt
+        );
+
+        witness.observe_backend(&complete("COMMIT"));
+        witness.observe_backend(&ready(TransactionStatus::Idle));
+        assert_eq!(witness.state(TransactionStatus::Idle), InFlight::Idle);
+    }
+
+    #[test]
+    fn an_error_aborts_the_rest_of_the_batch_and_retires_it() {
+        let mut witness = TransactionWitness::new();
+        witness.observe_frontend(&query("BEGIN; INSERT INTO orders (id) VALUES (1)"));
+        witness.observe_backend(&BackendMessage::ErrorResponse(pgelastic_wire::Fields::new(
+            Vec::new(),
+        )));
+        assert_eq!(
+            witness.state(TransactionStatus::Failed),
+            InFlight::IdleInTransaction
+        );
+    }
+
+    #[test]
+    fn a_read_only_batch_is_still_allowed_to_finish() {
+        let mut witness = TransactionWitness::new();
+        witness.observe_frontend(&query("SELECT 1; SELECT 2"));
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::ReadOnlyTransaction
+        );
+    }
+
+    #[test]
+    fn a_single_statement_query_is_still_retired_by_its_command_complete() {
+        let mut witness = TransactionWitness::new();
+        witness.observe_frontend(&query("INSERT INTO orders (id) VALUES (1)"));
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::CommitInDoubt
+        );
+        witness.observe_backend(&complete("INSERT 0 1"));
+        assert_eq!(witness.state(TransactionStatus::Idle), InFlight::Idle);
+    }
+
+    #[test]
+    fn the_in_doubt_log_records_the_whole_batch_rather_than_one_statement() {
+        let mut witness = TransactionWitness::new();
+        let sql = "BEGIN; INSERT INTO orders (id) VALUES (1); COMMIT";
+        witness.observe_frontend(&query(sql));
+        assert_eq!(witness.pending_sql(), sql);
+    }
+
+    // ---- the statement splitter -----------------------------------------
+
+    fn split(sql: &str) -> Vec<String> {
+        split_statements(sql.as_bytes())
+            .into_iter()
+            .map(|statement| String::from_utf8_lossy(statement).trim().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_literal_does_not_split_a_statement() {
+        assert_eq!(split("SELECT ';'"), vec!["SELECT ';'"]);
+        assert_eq!(split("SELECT 'it''s; fine'"), vec!["SELECT 'it''s; fine'"]);
+        assert_eq!(
+            split(r#"SELECT "a;b" FROM t"#),
+            vec![r#"SELECT "a;b" FROM t"#]
+        );
+        assert_eq!(split("SELECT $q$a;b$q$"), vec!["SELECT $q$a;b$q$"]);
+        assert_eq!(
+            split("SELECT 1 -- ; not a split\n"),
+            vec!["SELECT 1 -- ; not a split"]
+        );
+        assert_eq!(
+            split("SELECT /* ; /* ; */ ; */ 1"),
+            vec!["SELECT /* ; /* ; */ ; */ 1"]
+        );
+    }
+
+    #[test]
+    fn trailing_and_empty_statements_are_dropped() {
+        assert_eq!(split("SELECT 1;"), vec!["SELECT 1"]);
+        assert_eq!(split("SELECT 1;;  ;"), vec!["SELECT 1"]);
+        assert_eq!(split(""), Vec::<String>::new());
+        assert_eq!(split("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_dollar_quoted_function_body_is_one_statement() {
+        let sql = "CREATE FUNCTION f() RETURNS int AS $$ BEGIN; RETURN 1; END; $$ LANGUAGE plpgsql";
+        assert_eq!(split(sql).len(), 1);
+    }
+
+    /// An unterminated literal is one statement, never several: splitting it
+    /// would be the only direction in which the lexer could be unsafe.
+    #[test]
+    fn an_unterminated_literal_swallows_the_rest_of_the_batch() {
+        assert_eq!(split("SELECT 'oops; DELETE FROM orders").len(), 1);
+    }
+
+    #[test]
+    fn an_empty_query_classifies_as_a_read() {
+        let mut witness = TransactionWitness::new();
+        witness.observe_frontend(&query(""));
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::ReadOnlyTransaction
+        );
     }
 
     #[test]

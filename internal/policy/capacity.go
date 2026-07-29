@@ -53,6 +53,10 @@ type Effective struct {
 	StatementTimeout *metav1.Duration
 	// TempFileLimit is the per-process temporary file cap published to the backend.
 	TempFileLimit *resource.Quantity
+	// AutomaticMigrationAllowed is whether the rebalancer may move this tenant on its own
+	// initiative. It is resolved here rather than read at the point of use so that a class
+	// that cannot be resolved at all fails closed.
+	AutomaticMigrationAllowed bool
 }
 
 // DeriveQoS derives a tenant's QoS class from its effective capacity exactly as the
@@ -90,6 +94,12 @@ func EffectiveFor(tenant *pgelasticv1alpha1.PgTenant, class *pgelasticv1alpha1.P
 	if limits := class.Spec.Limits; limits != nil {
 		effective.StatementTimeout = limits.StatementTimeout
 		effective.TempFileLimit = limits.TempFileLimit
+	}
+	// The CRD defaults allowAutomatic to true, so an unset pointer means the field was
+	// never rendered rather than that the tenant opted out.
+	effective.AutomaticMigrationAllowed = true
+	if migration := class.Spec.Migration; migration != nil && migration.AllowAutomatic != nil {
+		effective.AutomaticMigrationAllowed = *migration.AllowAutomatic
 	}
 
 	if override := tenant.Spec.Capacity; override != nil {

@@ -36,6 +36,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -44,6 +45,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/metering"
 	"github.com/andrew01234567890/pgelastic/internal/placement"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
+	"github.com/andrew01234567890/pgelastic/internal/tenantdb"
 )
 
 // placementRetryInterval is how long a tenant waits before its unresolved references or
@@ -51,11 +53,27 @@ import (
 // so retrying faster only burns API calls.
 const placementRetryInterval = 30 * time.Second
 
-// PgTenantReconciler resolves a tenant's effective policy, places it on an instance and
-// publishes what it is observed consuming.
+// TenantDatabaseFinalizer blocks deletion of a PgTenant until its reclaimPolicy has been
+// carried out on the instance hosting it.
+//
+// It is added before the first CREATE rather than after it, because a database created
+// without the finalizer already persisted outlives every record that it exists.
+const TenantDatabaseFinalizer = "pgelastic.io/tenant-database"
+
+// PgTenantReconciler resolves a tenant's effective policy, places it on an instance,
+// creates the database and role that back it, and publishes what it is observed consuming.
 type PgTenantReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// SQL is how the tenant's database is created on the instance it is bound to: as the
+	// bootstrap superuser, over that member's Unix socket, through the API server's exec
+	// subresource. It is the same port the migration path uses, because a provisioned
+	// tenant and a migrated one have to be the same object.
+	//
+	// A nil port provisions nothing, and a tenant it is asked about is Ready=False saying
+	// exactly that rather than Ready=True saying nothing.
+	SQL tenantdb.SQL
 
 	// Metering supplies the trailing-window recommenders placement packs on. A nil collector
 	// places on declared guarantees alone, which is what a pool with no history has anyway.
@@ -82,16 +100,18 @@ type PgTenantReconciler struct {
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pginstances,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgworkloadclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 
 // Reconcile resolves the tenant's effective policy, derives its QoS class from the
-// resulting numbers, places it on an instance and publishes all three.
+// resulting numbers, places it on an instance, creates the database and role there, and
+// publishes all of it.
 func (r *PgTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	tenant := &pgelasticv1alpha1.PgTenant{}
 	if err := r.reader().Get(ctx, req.NamespacedName, tenant); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !tenant.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, nil
+		return r.finalize(ctx, tenant)
 	}
 
 	status := pgelasticv1alpha1.PgTenantStatus{
@@ -122,12 +142,16 @@ func (r *PgTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	setCondition(&status.Conditions, tenant.Generation, pgelasticv1alpha1.ConditionAccepted,
 		conditionStatus(accepted), resolved.reason, resolved.message)
 
-	binding, bound, err := r.place(ctx, tenant, resolved, &status)
+	placed, err := r.place(ctx, tenant, resolved, &status)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if bound {
-		status.Binding = binding
+	if placed.rebound {
+		status.Binding = placed.binding
+	}
+
+	if err := r.provision(ctx, tenant, resolved, placed.host, &status); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	status.Phase = tenantPhase(status.Conditions)
@@ -203,7 +227,19 @@ func (r *PgTenantReconciler) resolve(
 	}, nil
 }
 
-// place binds the tenant to an instance and sets the Bound and Ready conditions.
+// placed is where a tenant ended up: the instance it is on, the binding to publish, and
+// whether that binding is new.
+type placed struct {
+	host    *pgelasticv1alpha1.PgInstance
+	binding *pgelasticv1alpha1.PgTenantBinding
+	rebound bool
+}
+
+// place binds the tenant to an instance and sets the Bound condition.
+//
+// It says nothing about Ready. Where a tenant belongs and whether its database exists are
+// different questions, and answering the second with the first is what let a tenant with
+// no database at all report itself as being served.
 //
 // A tenant already bound to an instance that can still hold it stays where it is. Every
 // rebinding costs a live migration, so placement here only ever answers the question "where
@@ -214,28 +250,40 @@ func (r *PgTenantReconciler) place(
 	tenant *pgelasticv1alpha1.PgTenant,
 	resolved resolution,
 	status *pgelasticv1alpha1.PgTenantStatus,
-) (*pgelasticv1alpha1.PgTenantBinding, bool, error) {
+) (placed, error) {
 	if resolved.reason != pgelasticv1alpha1.ReasonAccepted {
 		r.unbound(status, tenant.Generation, pgelasticv1alpha1.ReasonPending,
 			"the tenant's policy has not resolved, so no instance can be chosen for it")
-		return nil, false, nil
+		return placed{}, nil
 	}
 
 	instances, err := r.instancesOf(ctx, resolved.pool)
 	if err != nil {
-		return nil, false, err
+		return placed{}, err
 	}
 
 	if existing := placement.BoundInstanceFor(tenant); existing != "" {
-		if host, ok := instanceNamed(instances, existing); ok {
-			r.boundTo(status, tenant.Generation, host)
-			return tenant.Status.Binding, false, nil
+		host, ok := instanceNamed(instances, existing)
+		if !ok {
+			// The tenant's database is on the instance it is bound to and nowhere else.
+			// Falling through to ordinary placement here would repoint the binding at an
+			// instance that has never held this tenant's data, which reads to the client
+			// as an empty database and leaves the real one stranded. A binding is only
+			// ever moved by a migration that copies the data first.
+			r.unbound(status, tenant.Generation, pgelasticv1alpha1.ReasonInstanceMissing,
+				fmt.Sprintf("PgInstance %q holds this tenant's database and is not present "+
+					"in pool %q; the binding is kept and no replacement is chosen, because "+
+					"rebinding without a migration would serve an empty database",
+					existing, resolved.pool.Name))
+			return placed{binding: tenant.Status.Binding}, nil
 		}
+		r.boundTo(status, tenant.Generation, host.Name)
+		return placed{host: host, binding: tenant.Status.Binding}, nil
 	}
 
 	candidates, err := r.candidatesFor(ctx, resolved, instances, tenant.Name)
 	if err != nil {
-		return nil, false, err
+		return placed{}, err
 	}
 
 	assignment, refusal := placement.Admit(
@@ -243,15 +291,191 @@ func (r *PgTenantReconciler) place(
 	if refusal != nil {
 		r.unbound(status, tenant.Generation, pgelasticv1alpha1.ReasonUnplaceable,
 			fmt.Sprintf("%s: %s", refusal.Reason, refusal.Message))
-		return nil, false, nil
+		return placed{}, nil
 	}
 
 	host, _ := instanceNamed(instances, assignment.Instance)
-	r.boundTo(status, tenant.Generation, host)
-	return &pgelasticv1alpha1.PgTenantBinding{
-		InstanceRef: &corev1.LocalObjectReference{Name: assignment.Instance},
-		BoundAt:     &metav1.Time{Time: r.now()},
-	}, true, nil
+	r.boundTo(status, tenant.Generation, assignment.Instance)
+	return placed{
+		host: host,
+		binding: &pgelasticv1alpha1.PgTenantBinding{
+			InstanceRef: &corev1.LocalObjectReference{Name: assignment.Instance},
+			BoundAt:     &metav1.Time{Time: r.now()},
+		},
+		rebound: true,
+	}, nil
+}
+
+// provision creates the tenant's role and database on the instance it was placed on, and
+// sets Ready from what PostgreSQL's catalog says afterwards rather than from the fact that
+// a placement decision was reached.
+//
+// A failure is reported on the condition and not returned. The caller would only requeue,
+// and a tenant whose CREATE DATABASE is being refused needs an operator to read the reason,
+// not a faster retry loop.
+func (r *PgTenantReconciler) provision(
+	ctx context.Context,
+	tenant *pgelasticv1alpha1.PgTenant,
+	resolved resolution,
+	host *pgelasticv1alpha1.PgInstance,
+	status *pgelasticv1alpha1.PgTenantStatus,
+) error {
+	if host == nil {
+		return nil
+	}
+	database := tenant.Spec.DatabaseName
+	if host.Status.Phase != pgelasticv1alpha1.InstancePhaseReady {
+		r.notServing(status, tenant.Generation, pgelasticv1alpha1.ReasonPending,
+			fmt.Sprintf("PgInstance %q is not ready yet, so database %q cannot be created on it",
+				host.Name, database))
+		return nil
+	}
+	if r.SQL == nil {
+		r.notServing(status, tenant.Generation, tenantdb.ReasonProvisioning,
+			fmt.Sprintf("no PostgreSQL transport is configured, so database %q has not been created "+
+				"on PgInstance %q", database, host.Name))
+		return nil
+	}
+
+	if err := r.holdForReclaim(ctx, tenant); err != nil {
+		return err
+	}
+
+	spec := tenantSpecOf(tenant, connectionLimitOf(resolved))
+	state, err := tenantdb.Ensure(ctx, r.SQL, tenantEndpoint(tenant, host.Name), spec)
+	if err != nil {
+		r.notServing(status, tenant.Generation, tenantdb.ReasonProvisioningFailed, err.Error())
+		return nil
+	}
+
+	binding := status.Binding.DeepCopy()
+	if binding == nil {
+		binding = &pgelasticv1alpha1.PgTenantBinding{
+			InstanceRef: &corev1.LocalObjectReference{Name: host.Name},
+			BoundAt:     &metav1.Time{Time: r.now()},
+		}
+	}
+	binding.DatabaseOID = ptr.To(state.DatabaseOID)
+	status.Binding = binding
+
+	setCondition(&status.Conditions, tenant.Generation, pgelasticv1alpha1.ConditionReady,
+		metav1.ConditionTrue, pgelasticv1alpha1.ReasonReady, fmt.Sprintf(
+			"PgInstance %q is serving database %q (oid %d), owned by role %q with an in-database "+
+				"connection limit of %d", host.Name, database, state.DatabaseOID,
+			spec.Owner, state.ConnectionLimit))
+	return nil
+}
+
+// holdForReclaim persists the finalizer before the first CREATE. A finalizer added after
+// the database exists leaves a window in which deleting the tenant deletes the only record
+// that there is anything to reclaim.
+func (r *PgTenantReconciler) holdForReclaim(ctx context.Context, tenant *pgelasticv1alpha1.PgTenant) error {
+	if !controllerutil.AddFinalizer(tenant, TenantDatabaseFinalizer) {
+		return nil
+	}
+	return r.Update(ctx, tenant)
+}
+
+// finalize carries out the tenant's reclaimPolicy and only then releases the finalizer.
+//
+// The order is the whole point: the finalizer is what guarantees the policy runs at all,
+// so removing it before the action has actually completed turns Delete into Retain and
+// hides the difference.
+func (r *PgTenantReconciler) finalize(
+	ctx context.Context,
+	tenant *pgelasticv1alpha1.PgTenant,
+) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(tenant, TenantDatabaseFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	if err := r.reclaim(ctx, tenant); err != nil {
+		if reportErr := r.reportReclaimFailure(ctx, tenant, err); reportErr != nil {
+			return ctrl.Result{}, reportErr
+		}
+		return ctrl.Result{}, err
+	}
+	controllerutil.RemoveFinalizer(tenant, TenantDatabaseFinalizer)
+	return ctrl.Result{}, r.Update(ctx, tenant)
+}
+
+// reclaim performs the action the tenant's reclaimPolicy names.
+//
+// Retain is the default and is a no-op by design: dropping a tenant's database is
+// irreversible and nothing in the system can undo it, so the destructive branch is the one
+// that has to be asked for.
+func (r *PgTenantReconciler) reclaim(ctx context.Context, tenant *pgelasticv1alpha1.PgTenant) error {
+	if ptr.Deref(tenant.Spec.ReclaimPolicy, pgelasticv1alpha1.ReclaimRetain) !=
+		pgelasticv1alpha1.ReclaimDelete {
+		return nil
+	}
+	bound := placement.BoundInstanceFor(tenant)
+	if bound == "" {
+		return nil
+	}
+
+	host := &pgelasticv1alpha1.PgInstance{}
+	key := types.NamespacedName{Namespace: tenant.Namespace, Name: bound}
+	if err := r.Get(ctx, key, host); err != nil {
+		// A database cannot outlive the instance that held it, and PgInstance's own drain
+		// finalizer is what stops one going away under a bound tenant. Holding this tenant
+		// for an instance that is already gone would strand it forever with nothing left
+		// to drop.
+		return client.IgnoreNotFound(err)
+	}
+	if r.SQL == nil {
+		return fmt.Errorf(
+			"reclaimPolicy Delete has to drop database %q on PgInstance %q and no PostgreSQL "+
+				"transport is configured", tenant.Spec.DatabaseName, bound)
+	}
+	return tenantdb.Drop(ctx, r.SQL, tenantEndpoint(tenant, bound),
+		tenantSpecOf(tenant, tenantdb.NoConnectionLimit))
+}
+
+// reportReclaimFailure publishes why a deletion is not completing, because a tenant stuck
+// on its finalizer is otherwise indistinguishable from one the controller has forgotten.
+func (r *PgTenantReconciler) reportReclaimFailure(
+	ctx context.Context,
+	tenant *pgelasticv1alpha1.PgTenant,
+	cause error,
+) error {
+	status := *tenant.Status.DeepCopy()
+	status.Phase = pgelasticv1alpha1.PgTenantPhaseTerminating
+	setCondition(&status.Conditions, tenant.Generation, pgelasticv1alpha1.ConditionReady,
+		metav1.ConditionFalse, tenantdb.ReasonReclaimFailed, cause.Error())
+	if equality.Semantic.DeepEqual(tenant.Status, status) {
+		return nil
+	}
+	tenant.Status = status
+	return r.Status().Update(ctx, tenant)
+}
+
+// tenantEndpoint addresses the tenant's database on the instance hosting it. No member is
+// named, which resolves to that instance's current primary: the only member a CREATE can
+// be issued on.
+func tenantEndpoint(tenant *pgelasticv1alpha1.PgTenant, instance string) tenantdb.Endpoint {
+	return tenantdb.Endpoint{
+		Namespace: tenant.Namespace,
+		Instance:  instance,
+		Database:  tenant.Spec.DatabaseName,
+	}
+}
+
+func tenantSpecOf(tenant *pgelasticv1alpha1.PgTenant, connectionLimit int32) tenantdb.Spec {
+	return tenantdb.Spec{
+		Database:        tenant.Spec.DatabaseName,
+		Owner:           ptr.Deref(tenant.Spec.Owner, tenant.Spec.DatabaseName),
+		ConnectionLimit: connectionLimit,
+	}
+}
+
+// connectionLimitOf mirrors the effective burstable ceiling onto the tenant's role. The
+// proxy is where the ceiling is really enforced; this is the backstop for a client that
+// reached PostgreSQL some other way.
+func connectionLimitOf(resolved resolution) int32 {
+	if resolved.effective.Burstable <= 0 {
+		return tenantdb.NoConnectionLimit
+	}
+	return resolved.effective.Burstable
 }
 
 // candidatesFor charges each instance with the tenants already bound to it, so that an
@@ -377,19 +601,11 @@ func (r *PgTenantReconciler) utilizationOf(
 func (r *PgTenantReconciler) boundTo(
 	status *pgelasticv1alpha1.PgTenantStatus,
 	generation int64,
-	host *pgelasticv1alpha1.PgInstance,
+	instance string,
 ) {
-	name := "an instance that no longer exists"
-	ready := false
-	if host != nil {
-		name = host.Name
-		ready = host.Status.Phase == pgelasticv1alpha1.InstancePhaseReady
-	}
 	setCondition(&status.Conditions, generation, pgelasticv1alpha1.ConditionBound,
 		metav1.ConditionTrue, pgelasticv1alpha1.ReasonPlaced,
-		fmt.Sprintf("bound to PgInstance %q", name))
-	setCondition(&status.Conditions, generation, pgelasticv1alpha1.ConditionReady,
-		conditionStatus(ready), readyTenantReason(ready), readyTenantMessage(name, ready))
+		fmt.Sprintf("bound to PgInstance %q", instance))
 }
 
 func (r *PgTenantReconciler) unbound(
@@ -399,9 +615,19 @@ func (r *PgTenantReconciler) unbound(
 ) {
 	setCondition(&status.Conditions, generation, pgelasticv1alpha1.ConditionBound,
 		metav1.ConditionFalse, reason, message)
-	setCondition(&status.Conditions, generation, pgelasticv1alpha1.ConditionReady,
-		metav1.ConditionFalse, pgelasticv1alpha1.ReasonPending,
+	r.notServing(status, generation, pgelasticv1alpha1.ReasonPending,
 		"the tenant database is not serving until the tenant is bound to an instance")
+}
+
+// notServing is the only way Ready is set to False, so that every reason a tenant is not
+// being served passes through one place.
+func (r *PgTenantReconciler) notServing(
+	status *pgelasticv1alpha1.PgTenantStatus,
+	generation int64,
+	reason, message string,
+) {
+	setCondition(&status.Conditions, generation, pgelasticv1alpha1.ConditionReady,
+		metav1.ConditionFalse, reason, message)
 }
 
 func (r *PgTenantReconciler) instancesOf(
@@ -463,20 +689,6 @@ func storageBytesOf(tenant *pgelasticv1alpha1.PgTenant) int64 {
 		return 0
 	}
 	return *tenant.Status.Utilization.StorageBytes
-}
-
-func readyTenantReason(ready bool) string {
-	if ready {
-		return pgelasticv1alpha1.ReasonReady
-	}
-	return pgelasticv1alpha1.ReasonPending
-}
-
-func readyTenantMessage(instance string, ready bool) string {
-	if ready {
-		return fmt.Sprintf("PgInstance %q is serving this tenant's database", instance)
-	}
-	return fmt.Sprintf("PgInstance %q is not ready yet", instance)
 }
 
 // tenantPhase is a pure function of the conditions, present only so kubectl output has a

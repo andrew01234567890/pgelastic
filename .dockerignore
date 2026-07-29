@@ -9,3 +9,10 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Re-include the Rust workspace, which Dockerfile.proxy builds from. The test
+# sources come with it: cargo resolves the whole workspace before it builds any
+# target, and a crate whose tests reference a missing file does not resolve.
+!Cargo.toml
+!Cargo.lock
+!crates/**

@@ -506,7 +506,7 @@ var _ = Describe("v1alpha1 CRD round-trip", Ordered, func() {
 								},
 							},
 							Parameters: map[string]pgelasticv1alpha1.GUCValue{
-								"work_mem":             "8MB",
+								tenantParameter:        tenantParameterValue,
 								"maintenance_work_mem": "512MB",
 							},
 							Backup: &pgelasticv1alpha1.InstanceBackup{

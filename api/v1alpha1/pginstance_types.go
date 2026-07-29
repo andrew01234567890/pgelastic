@@ -111,7 +111,12 @@ const (
 const TargetPrimaryPending = "pending"
 
 // GUCValue is a PostgreSQL parameter value as written to custom.conf.
+//
+// A line break is refused rather than escaped. postgresql.conf is line-oriented, so a value
+// carrying one stops being a value and becomes a directive of its own - which is how a
+// parameter nobody owns turns into `fsync = off`, past a denylist that matches by name.
 // +kubebuilder:validation:MaxLength=1024
+// +kubebuilder:validation:Pattern=`^[^\n\r]*$`
 type GUCValue string
 
 // PgInstanceSpec is the desired state of one provisioned PostgreSQL instance and its
@@ -164,6 +169,7 @@ type PgInstanceSpec struct {
 	// webhook and additionally dropped by the config generator, so a stale object cannot
 	// poison a pod that reads it later.
 	// +kubebuilder:validation:MaxProperties=64
+	// +kubebuilder:validation:XValidation:rule="self.all(name, name.matches('^[a-zA-Z_][a-zA-Z0-9_]*([.][a-zA-Z_][a-zA-Z0-9_]*)?$'))",message="a parameter name must be a PostgreSQL identifier, optionally qualified by an extension prefix"
 	// +optional
 	Parameters map[string]GUCValue `json:"parameters,omitempty"`
 

@@ -27,6 +27,7 @@ package pgconf
 import (
 	"maps"
 	"slices"
+	"strings"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 )
@@ -134,6 +135,7 @@ const (
 	GUCLoggingCollector        = "logging_collector"
 	GUCSharedPreloadLibraries  = "shared_preload_libraries"
 	GUCClusterName             = "cluster_name"
+	GUCSynchronousCommit       = "synchronous_commit"
 )
 
 // valueOff and valueOn are the two boolean literals PostgreSQL accepts in a config file.
@@ -166,7 +168,7 @@ var ownedParameters = map[string]Owned{
 	"sync_replication_slots":         {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOn},
 	"synchronized_standby_slots":     {Ownership: OwnershipFixed, Context: ContextSighup},
 	GUCSynchronousStandbyNames:       {Ownership: OwnershipFixed, Context: ContextSighup},
-	"synchronous_commit":             {Ownership: OwnershipFixed, Context: ContextUser},
+	GUCSynchronousCommit:             {Ownership: OwnershipFixed, Context: ContextUser},
 	"primary_conninfo":               {Ownership: OwnershipFixed, Context: ContextSighup},
 	"primary_slot_name":              {Ownership: OwnershipFixed, Context: ContextSighup},
 	"restore_command":                {Ownership: OwnershipFixed, Context: ContextSighup},
@@ -261,14 +263,15 @@ func OwnedNames() []string {
 	return slices.Sorted(maps.Keys(ownedParameters))
 }
 
-// UserParameters drops every operator-owned parameter from a spec's parameter map and
-// reports which ones were dropped. The webhook rejects them too; this second pass is what
-// makes an object admitted under an older classification harmless.
+// UserParameters drops every operator-owned parameter from a spec's parameter map, and
+// every parameter that cannot be rendered as one configuration line, and reports which ones
+// were dropped. The webhook rejects them too; this second pass is what makes an object
+// admitted under an older classification harmless.
 func UserParameters(parameters map[string]pgelasticv1alpha1.GUCValue) (map[string]string, []string) {
 	kept := make(map[string]string, len(parameters))
 	var dropped []string
 	for name, value := range parameters {
-		if IsOwned(name) {
+		if IsOwned(name) || !RenderableParameter(name, string(value)) {
 			dropped = append(dropped, name)
 			continue
 		}
@@ -276,6 +279,49 @@ func UserParameters(parameters map[string]pgelasticv1alpha1.GUCValue) (map[strin
 	}
 	slices.Sort(dropped)
 	return kept, dropped
+}
+
+// RenderableParameter reports whether a parameter can be written as exactly one
+// postgresql.conf line.
+//
+// The ownership table matches a parameter by its exact name, and the renderer writes that
+// name verbatim. A name or a value carrying a line break therefore escapes the line it was
+// meant to occupy and becomes a configuration directive of its own - which is how a
+// parameter nobody owns turns into `fsync = off`, three characters past a denylist that
+// never saw the string `fsync`. PostgreSQL's configuration file is line-oriented, so the
+// only sound answer is to refuse anything that is not one line.
+func RenderableParameter(name, value string) bool {
+	return validGUCName(name) && !strings.ContainsAny(value, "\n\r")
+}
+
+// validGUCName accepts the grammar PostgreSQL itself accepts for a configuration parameter:
+// an identifier, optionally qualified by an extension prefix. Everything else - whitespace,
+// `#`, `=`, quotes, control characters - is refused rather than escaped, because a name is
+// not quotable in a configuration file the way a value is.
+func validGUCName(name string) bool {
+	if name == "" {
+		return false
+	}
+	prefix, rest, qualified := strings.Cut(name, ".")
+	if qualified {
+		return validGUCIdentifier(prefix) && validGUCIdentifier(rest)
+	}
+	return validGUCIdentifier(name)
+}
+
+func validGUCIdentifier(identifier string) bool {
+	if identifier == "" {
+		return false
+	}
+	for index, char := range identifier {
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char == '_':
+		case index > 0 && char >= '0' && char <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // BlockedDefaults returns the constant values for every blocked parameter that is emitted

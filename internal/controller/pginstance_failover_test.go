@@ -29,6 +29,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
@@ -553,5 +554,94 @@ var _ = Describe("The reserved failover sentinel", func() {
 	It("is spelled the same in the API and in the state machine", func() {
 		Expect(ha.TargetPrimaryPending).To(Equal(pgelasticv1alpha1.TargetPrimaryPending),
 			"two spellings of the sentinel is two different total signals")
+	})
+})
+
+// cacheNamespace is where the observation-cache specs put their Pods. They never reach the
+// API server, so the name only has to be stable.
+const cacheNamespace = "one"
+
+var _ = Describe("The member observation cache", func() {
+	var (
+		reconciler *PgInstanceReconciler
+		prober     *fakeProber
+	)
+
+	podsOf := func(namespace string, members ...string) []corev1.Pod {
+		pods := make([]corev1.Pod, 0, len(members))
+		for _, member := range members {
+			pods = append(pods, corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: member, Namespace: namespace},
+				Status: corev1.PodStatus{
+					PodIP:      podIPOf(member),
+					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+				},
+			})
+		}
+		return pods
+	}
+
+	BeforeEach(func() {
+		prober = &fakeProber{reports: map[string]provision.MemberReport{}}
+		reconciler = &PgInstanceReconciler{Prober: prober, ProbeTTL: time.Minute}
+	})
+
+	It("never answers one instance with another instance's members", func() {
+		prober.set("alpha-1", primaryReport("alpha-1", 3, "0/5000000"))
+		prober.set("beta-1", primaryReport("beta-1", 1, "0/1000000"))
+
+		alpha := types.NamespacedName{Namespace: cacheNamespace, Name: "alpha"}
+		beta := types.NamespacedName{Namespace: cacheNamespace, Name: "beta"}
+
+		observed := reconciler.observeMembers(ctx, alpha, podsOf(cacheNamespace, "alpha-1"))
+		Expect(observed).To(HaveLen(1))
+		Expect(observed[0].Name).To(Equal("alpha-1"))
+
+		observed = reconciler.observeMembers(ctx, beta, podsOf(cacheNamespace, "beta-1"))
+		Expect(observed).To(HaveLen(1))
+		Expect(observed[0].Name).To(Equal("beta-1"),
+			"beta's failover decision was handed alpha's members")
+		Expect(observed[0].Timeline).To(Equal(int32(1)))
+	})
+
+	It("keeps two same-named instances in different namespaces apart", func() {
+		prober.set("shared-1", primaryReport("shared-1", 7, "0/9000000"))
+
+		left := types.NamespacedName{Namespace: "left", Name: "shared"}
+		right := types.NamespacedName{Namespace: "right", Name: "shared"}
+
+		Expect(reconciler.observeMembers(ctx, left, podsOf("left", "shared-1"))).To(HaveLen(1))
+
+		prober.silence("shared-1")
+		observed := reconciler.observeMembers(ctx, right, podsOf("right", "shared-1"))
+		Expect(observed).To(HaveLen(1))
+		Expect(observed[0].StatusReachable).To(BeFalse(),
+			"the right-hand instance was answered from the left-hand namespace's cache")
+	})
+
+	It("re-polls when the same instance's Pods have been renamed", func() {
+		prober.set("gamma-1", primaryReport("gamma-1", 1, "0/1000000"))
+		prober.set("gamma-2", standbyReport("gamma-2", 1, "0/1000000"))
+
+		gamma := types.NamespacedName{Namespace: cacheNamespace, Name: "gamma"}
+		Expect(reconciler.observeMembers(ctx, gamma, podsOf(cacheNamespace, "gamma-1"))).To(
+			HaveLen(1))
+
+		observed := reconciler.observeMembers(ctx, gamma, podsOf(cacheNamespace, "gamma-2"))
+		Expect(observed).To(HaveLen(1))
+		Expect(observed[0].Name).To(Equal("gamma-2"))
+		Expect(observed[0].StatusReachable).To(BeTrue())
+	})
+
+	It("serves the same instance from the cache inside the TTL", func() {
+		prober.set("delta-1", primaryReport("delta-1", 4, "0/4000000"))
+		delta := types.NamespacedName{Namespace: cacheNamespace, Name: "delta"}
+
+		Expect(reconciler.observeMembers(ctx, delta, podsOf(cacheNamespace, "delta-1"))).To(HaveLen(1))
+		prober.silence("delta-1")
+
+		observed := reconciler.observeMembers(ctx, delta, podsOf(cacheNamespace, "delta-1"))
+		Expect(observed[0].StatusReachable).To(BeTrue(),
+			"the TTL is what keeps three agents' status writes from re-polling every member")
 	})
 })

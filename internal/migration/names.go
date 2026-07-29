@@ -89,6 +89,18 @@ func transliterate(name string) string {
 	return builder.String()
 }
 
+// SchemaStampPrefix marks a target database whose schema copy has committed. It is a
+// prefix rather than an exact value because any pgelastic stamp answers the only question
+// asked of it - has a complete copy of this tenant's schema already been applied here -
+// and a migration that refused to recognise another's stamp would try to copy on top of it.
+const SchemaStampPrefix = "pgelastic:schema-copied-by:"
+
+// SchemaStamp is the comment one migration writes on its target database, in the same
+// transaction that applies the schema.
+func SchemaStamp(namespace, name string) string {
+	return SchemaStampPrefix + namespace + "/" + name
+}
+
 // ScratchDir is where the offline path writes its dump. It sits on the data volume but
 // outside PGDATA, so the directory PostgreSQL owns stays free of files it did not create
 // while the dump still lands on the volume whose headroom preflight checked.
