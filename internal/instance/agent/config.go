@@ -82,11 +82,64 @@ func WriteConfig(
 		pgconf.IdentFile:        ident,
 	}
 	for name, contents := range files {
-		if err := os.WriteFile(filepath.Join(dataDir, name), []byte(contents), configFileMode); err != nil {
+		if err := writeFileAtomically(filepath.Join(dataDir, name), contents); err != nil {
 			return "", err
 		}
 	}
 	return hash, nil
+}
+
+// writeFileAtomically replaces a configuration file in one step that either happens or
+// does not.
+//
+// os.WriteFile truncates the target and then writes into it, so a crash in between leaves
+// a file that is empty or half a file. That is not a cosmetic loss here: override.conf is
+// read back before every rewrite precisely so that replacing it wholesale does not discard
+// the settings the rewrite was not about, and a primary that restarts having lost
+// synchronous_standby_names acknowledges commits no standby has seen. The rename is the
+// atomic step; the two fsyncs are what make it survive the power cut rather than only the
+// process dying.
+func writeFileAtomically(path, contents string) error {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	name := temporary.Name()
+	defer func() { _ = os.Remove(name) }()
+
+	if err := writeAndSync(temporary, contents); err != nil {
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return syncDirectory(directory)
+}
+
+func writeAndSync(file *os.File, contents string) error {
+	defer func() { _ = file.Close() }()
+	if err := file.Chmod(configFileMode); err != nil {
+		return err
+	}
+	if _, err := file.WriteString(contents); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	return file.Close()
+}
+
+// syncDirectory makes the rename itself durable. Without it the new contents are on disk
+// and the directory entry still points at the old inode.
+func syncDirectory(path string) error {
+	directory, err := os.Open(path) // #nosec G304 -- the data directory is the agent's own
+	if err != nil {
+		return err
+	}
+	defer func() { _ = directory.Close() }()
+	return directory.Sync()
 }
 
 // applyEnforcedFloor raises the five enforced parameters to max(desired, pg_controldata).

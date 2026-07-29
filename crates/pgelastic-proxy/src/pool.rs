@@ -365,6 +365,51 @@ impl PoolManager {
         Ok(id)
     }
 
+    /// Adopts the per-tenant claims the operator published.
+    ///
+    /// Applied under the allocator's own lock, which is held by a checkout for
+    /// the moment it takes to decide and never across a statement — so a claim
+    /// changes between two transactions of a session and never inside one. A
+    /// tenant whose ceiling rises has its queued clients re-examined
+    /// immediately, which is what makes raising `burstable` take effect for the
+    /// clients already waiting on it rather than only for the next arrivals.
+    ///
+    /// Returns the number of claims accepted; the rest were refused and logged.
+    pub fn apply_tenants(&self, tenants: &[crate::config::TenantConfig]) -> usize {
+        let mut inner = self.lock();
+        let mut changed = 0;
+        for tenant in tenants {
+            let id = CapacityTenant::new(tenant.name.as_str());
+            let spec = TenantSpec {
+                guaranteed: tenant.guaranteed,
+                burstable: tenant.burstable,
+                weight: tenant.weight,
+                priority: tenant.priority,
+                max_client_connections: tenant.max_client_connections,
+                storage_bytes: u64::MAX,
+            };
+            let outcome = if inner.tenants.contains(&id) {
+                inner.allocator.set_tenant_spec(&id, spec)
+            } else {
+                inner
+                    .allocator
+                    .add_tenant(id.clone(), spec)
+                    .map(|()| Vec::new())
+            };
+            match outcome {
+                Ok(grants) => {
+                    inner.tenants.insert(id);
+                    changed += 1;
+                    inner.dispatch(grants);
+                }
+                Err(error) => {
+                    warn!(tenant = tenant.name, %error, "a published tenant claim was refused");
+                }
+            }
+        }
+        changed
+    }
+
     pub fn connect_client(&self, tenant: &CapacityTenant) -> std::result::Result<ClientId, Denial> {
         self.lock()
             .allocator
@@ -1113,7 +1158,7 @@ pub fn pool_key(
     config: &crate::config::Config,
     backend: &crate::config::BackendConfig,
     startup: &StartupMessage,
-    role: &str,
+    tenant: &str,
 ) -> Result<PoolKey> {
     use pgelastic_pool::{
         BackendTarget, CredentialGeneration, DatabaseName, FingerprintPolicy, PoolKeySpec,
@@ -1143,10 +1188,10 @@ pub fn pool_key(
         .database
         .clone()
         .or_else(|| text(startup.get(b"database")))
-        .unwrap_or_else(|| role.to_owned());
+        .unwrap_or_else(|| tenant.to_owned());
 
     Ok(PoolKey::new(PoolKeySpec {
-        tenant: TenantId::new(role),
+        tenant: TenantId::new(tenant),
         target: BackendTarget::new(address.ip().to_string(), address.port()),
         database: DatabaseName::new(database),
         role: RoleName::new(&backend.user),

@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -41,12 +42,17 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/metering"
 	"github.com/andrew01234567890/pgelastic/internal/placement"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
+	"github.com/andrew01234567890/pgelastic/internal/proxy"
 )
 
 // poolResyncInterval paces the planner. Placement and autoscaling read trailing windows
 // measured in days, so nothing is gained by recomputing more often than the shortest
 // stabilization window can react to.
 const poolResyncInterval = time.Minute
+
+// proxyConvergenceInterval paces the wait for the fleet to report which configuration it is
+// serving. It is short because it is the only thing being waited for.
+const proxyConvergenceInterval = 3 * time.Second
 
 // migrationRateWindow is how far back migrations are counted when the pool declares no
 // migration windows of its own, so the per-window budget still means something.
@@ -84,9 +90,17 @@ type PgElasticPoolReconciler struct {
 	// this controller reads is cached, because everything else is recomputed from scratch.
 	APIReader client.Reader
 
+	// ProxyImage carries the proxy binary the fleet runs. Empty falls back to the
+	// PGELASTIC_PROXY_IMAGE environment variable and then to the development tag.
+	ProxyImage string
+
 	// Now is the clock, injectable so a test can drive a dwell time without waiting a day.
 	Now func() time.Time
 }
+
+// envProxyImage names the proxy image, so a deployment can pin it without rebuilding the
+// operator.
+const envProxyImage = "PGELASTIC_PROXY_IMAGE"
 
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools/status,verbs=get;update;patch
@@ -94,6 +108,11 @@ type PgElasticPoolReconciler struct {
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pginstances,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenants,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenantmigrations,verbs=get;list;watch;create
+// The recorder is client-go's events.EventRecorder, which writes events.k8s.io/v1 rather
+// than core/v1. Granting only the core group leaves every automatic-action and refusal
+// Event rejected with Forbidden, which removes exactly the audit trail an operator reads
+// after an unattended scale-in.
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile publishes the ledger and the plan, and applies at most one action.
@@ -120,8 +139,21 @@ func (r *PgElasticPoolReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// The fleet is reconciled before the status is published, so one pass writes both the
+	// configuration the proxies read and the report of what they are running.
+	view.proxy, err = r.reconcileProxy(ctx, pool, view)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := r.publish(ctx, pool, view, plan, executed); err != nil {
 		return ctrl.Result{}, err
+	}
+	// A replica reports the configuration it has applied by annotating its own Pod, and a
+	// Pod annotation is not something this controller watches. Waiting a whole resync to
+	// notice would make a converged fleet look unconverged for a minute after it was.
+	if view.proxy != nil && view.proxy.ConfigVersion == "" {
+		return ctrl.Result{RequeueAfter: proxyConvergenceInterval}, nil
 	}
 	return ctrl.Result{RequeueAfter: poolResyncInterval}, nil
 }
@@ -139,6 +171,7 @@ type poolView struct {
 	byQoS        pgelasticv1alpha1.QoSClassCounts
 	metricsAge   time.Duration
 	metricsSeen  bool
+	proxy        *pgelasticv1alpha1.ProxyStatus
 }
 
 // tenantView is one tenant with its resolved policy and its metered demand.
@@ -329,8 +362,10 @@ func (r *PgElasticPoolReconciler) meter(pool *pgelasticv1alpha1.PgElasticPool, v
 	}
 
 	observations := make([]metering.TenantObservation, 0, len(view.tenants))
+	present := make([]metering.Key, 0, len(view.tenants))
 	for i := range view.tenants {
 		entry := &view.tenants[i]
+		present = append(present, meteringKeyOf(entry.tenant))
 		observations = append(observations, metering.TenantObservation{
 			Key:                meteringKeyOf(entry.tenant),
 			Database:           entry.tenant.Spec.DatabaseName,
@@ -345,6 +380,11 @@ func (r *PgElasticPoolReconciler) meter(pool *pgelasticv1alpha1.PgElasticPool, v
 	// of histograms, so the store is swept every pass. Held state is then bounded by the
 	// tenants that exist rather than by the tenants that ever existed, which is the same
 	// bound the label set gives the metrics.
+	//
+	// The sweep is by pool membership rather than by age alone. Pool freshness is the worst
+	// age across the pool's series, so a departed tenant left in the store until its window
+	// expires holds every autoscaling action for that whole window.
+	r.Metering.ForgetDeparted(pool.Namespace, pool.Name, present)
 	defer r.Metering.Store.Prune(r.now())
 
 	r.Metering.Observe(metering.PoolObservation{
@@ -429,7 +469,7 @@ func (r *PgElasticPoolReconciler) tenantSignalOf(entry *tenantView, view *poolVi
 		StorageBytes:          entry.observation.StorageBytes,
 		Relations:             entry.observation.Relations,
 		Cold:                  isColdTenant(entry, view.policy.HotTenantPercent),
-		MigrationAllowed:      true,
+		MigrationAllowed:      entry.effective.AutomaticMigrationAllowed,
 		AntiAffinity:          placement.AntiAffinityFor(entry.tenant),
 		PinnedInstance:        placement.PinnedInstanceFor(entry.tenant),
 		EvidenceSpan:          entry.observation.LastSampleAt.Sub(entry.observation.FirstSampleAt),
@@ -495,10 +535,10 @@ func (r *PgElasticPoolReconciler) historySignals(
 	}
 	for _, target := range previous.PerInstance {
 		if target.Consolidatable && target.ConsolidatableSince != nil {
-			since := target.ConsolidatableSince.Time
-			if signals.ConsolidatableSince == nil || since.Before(*signals.ConsolidatableSince) {
-				signals.ConsolidatableSince = &since
+			if signals.ConsolidatableSince == nil {
+				signals.ConsolidatableSince = map[string]time.Time{}
 			}
+			signals.ConsolidatableSince[target.Name] = target.ConsolidatableSince.Time
 		}
 	}
 }
@@ -722,8 +762,8 @@ func (r *PgElasticPoolReconciler) publish(
 ) error {
 	status := pgelasticv1alpha1.PgElasticPoolStatus{
 		ObservedGeneration: pool.Generation,
-		Selector:           pool.Status.Selector,
-		Proxy:              pool.Status.Proxy,
+		Selector:           poolSelector(pool),
+		Proxy:              view.proxy,
 		Conditions:         pool.Status.Conditions,
 		Capacity:           ledgerStatus(view),
 		PerInstance:        perInstanceStatus(view),
@@ -814,10 +854,21 @@ func (r *PgElasticPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pgelasticv1alpha1.PgElasticPool{}).
+		Owns(&appsv1.Deployment{}).
 		Watches(&pgelasticv1alpha1.PgInstance{}, handler.EnqueueRequestsFromMapFunc(poolOfInstance)).
 		Watches(&pgelasticv1alpha1.PgTenant{}, handler.EnqueueRequestsFromMapFunc(poolOfTenant)).
 		Named("pgelasticpool").
 		Complete(r)
+}
+
+// poolSelector is the label selector the scale subresource resolves replicas through. It
+// names the proxy fleet because that is what scaling a pool's front end means; a pool with
+// no fleet declares no selector rather than one that matches nothing.
+func poolSelector(pool *pgelasticv1alpha1.PgElasticPool) string {
+	if pool.Spec.Proxy == nil {
+		return ""
+	}
+	return proxy.SelectorString(pool.Name)
 }
 
 func poolOfInstance(_ context.Context, object client.Object) []reconcile.Request {

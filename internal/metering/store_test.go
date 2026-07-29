@@ -23,8 +23,14 @@ import (
 
 var epoch = time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 
+// The one namespace and pool every test in this package meters into.
+const (
+	testNamespace = "saas-prod"
+	testPool      = "saas-pool"
+)
+
 func tenantKey(name string) Key {
-	return Key{Namespace: "saas-prod", Pool: "saas-pool", Tenant: name}
+	return Key{Namespace: testNamespace, Pool: testPool, Tenant: name}
 }
 
 func TestPercentileReportsTheBurstAndTheMeanWouldNot(t *testing.T) {

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use clap::Parser;
 use pgelastic_proxy::config::{self, Config};
 use pgelastic_proxy::metrics::{self, Metrics};
+use pgelastic_proxy::reload::{self, Reloader};
 use pgelastic_proxy::server::{self, Proxy};
 use pgelastic_proxy::{Result, tls};
 use tokio::sync::watch;
@@ -33,20 +34,36 @@ async fn main() -> Result<()> {
     let config = Config::from_file(&args.config)?;
     let metrics = Metrics::new();
 
+    // Bound before the proxy is announced ready, so a replica whose metrics port
+    // is already taken fails at start-up rather than passing a readiness probe
+    // nobody can reach.
     let metrics_listener = match &config.metrics.address {
         Some(address) => Some(tokio::net::TcpListener::bind(config::resolve(address)?).await?),
         None => None,
     };
 
     let (shutdown, receiver) = watch::channel(false);
-    let proxy = Proxy::new(config, Arc::clone(&metrics))?;
-    let running = server::spawn(proxy, shutdown).await?;
+    let proxy = Proxy::new(config.clone(), Arc::clone(&metrics))?;
+    let reloader = Reloader::new(&config, Arc::clone(&proxy.fleet), Arc::clone(&metrics));
+    let running = server::spawn(proxy, shutdown.clone()).await?;
 
     if let Some(listener) = metrics_listener {
-        tokio::spawn(metrics::serve(listener, metrics, receiver));
+        tokio::spawn(metrics::serve(listener, Arc::clone(&metrics), receiver));
+    }
+    if let Some(reloader) = reloader {
+        tokio::spawn(reload::run(reloader, config, shutdown.subscribe()));
     }
 
+    // Readiness is admin state and is set here, once the listener is bound and
+    // the fleet is built. A probe that answers before this point would report a
+    // replica ready while every client on it would be refused.
+    metrics.set_ready(true);
+
     wait_for_signal().await;
+    // Flipped before the drain starts rather than after it, so the endpoint is
+    // withdrawn while there are still sessions to finish rather than once there
+    // are none left to lose.
+    metrics.set_ready(false);
     info!("draining");
     if running.shutdown().await {
         info!("drain complete");

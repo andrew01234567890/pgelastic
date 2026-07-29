@@ -95,10 +95,14 @@ func decodeRecord(line []byte) (Record, error) {
 }
 
 // Replay parses a ledger, returning every intact record and the byte length of the
-// intact prefix. A trailing record that is short or fails its checksum is a torn append
-// from the verifier being killed mid-write: it is dropped and excluded from the returned
-// length. Damage anywhere before the last record is not attributable to a crash and
-// yields ErrCorruptLedger, because silently discarding it could discard a COMMITTED.
+// intact prefix.
+//
+// The only damage a crash can explain is an unterminated final fragment: records are
+// appended one whole line at a time, so being killed mid-write leaves a prefix with no
+// newline and can never leave a complete line. A terminated record that fails to decode
+// is therefore corruption wherever it appears, including at the end, and yields
+// ErrCorruptLedger — dropping it would take a COMMITTED out of the set the oracle
+// requires and turn a lost acknowledged write into a pass.
 func Replay(r io.Reader) ([]Record, int64, error) {
 	br := bufio.NewReader(r)
 	var (
@@ -111,9 +115,6 @@ func Replay(r io.Reader) ([]Record, int64, error) {
 		if terminated {
 			rec, decErr := decodeRecord(line[:len(line)-1])
 			if decErr != nil {
-				if _, peekErr := br.Peek(1); errors.Is(peekErr, io.EOF) {
-					return recs, intact, nil
-				}
 				return nil, 0, fmt.Errorf("%w at offset %d: %w", ErrCorruptLedger, intact, decErr)
 			}
 			recs = append(recs, rec)

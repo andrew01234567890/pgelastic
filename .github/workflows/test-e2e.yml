@@ -124,6 +124,13 @@ jobs:
       - name: Run the migration suite
         run: make test-e2e-migration E2E_CONTEXT="kind-${KIND_CLUSTER}"
 
+      # The proxy suite is the only place a client reaches a tenant's database the way a
+      # real one does: through the pool's Service. It stands up two three-node instances and
+      # a fleet in front of them, so it costs what the migration suite costs and belongs in
+      # the same job.
+      - name: Run the proxy suite
+        run: make test-e2e-proxy E2E_CONTEXT="kind-${KIND_CLUSTER}"
+
       - name: Tear down the kind cluster
         if: always()
         run: make cleanup-test-e2e

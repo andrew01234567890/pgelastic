@@ -340,6 +340,7 @@ type PgInstanceTemplate struct {
 	// parameters listed as fixed or blocked are rejected at admission and dropped again in
 	// the config generator, so a stale object cannot poison a pod.
 	// +kubebuilder:validation:MaxProperties=64
+	// +kubebuilder:validation:XValidation:rule="self.all(name, name.matches('^[a-zA-Z_][a-zA-Z0-9_]*([.][a-zA-Z_][a-zA-Z0-9_]*)?$'))",message="a parameter name must be a PostgreSQL identifier, optionally qualified by an extension prefix"
 	// +optional
 	Parameters map[string]GUCValue `json:"parameters,omitempty"`
 

@@ -186,7 +186,24 @@ var _ = Describe("placing a tenant population across a pool", Ordered, func() {
 		Expect(bound.Reason).To(Equal(pgelasticv1alpha1.ReasonPlaced))
 		Expect(bound.Message).To(ContainSubstring(fetched.Status.Binding.InstanceRef.Name))
 		Expect(bound.ObservedGeneration).To(Equal(fetched.Generation))
-		Expect(fetched.Status.Phase).To(Equal(pgelasticv1alpha1.PgTenantPhaseReady))
+	})
+
+	// The instances these tenants are placed on publish status by hand and have no
+	// postmaster behind them, so there is nowhere for a database to be created. Bound and
+	// Ready are different claims, and this is the difference: a tenant that has been given
+	// an address is not a tenant that is being served.
+	It("does not call a tenant Ready for a database that was never created", func() {
+		Eventually(func(g Gomega) {
+			fetched := &pgelasticv1alpha1.PgTenant{}
+			g.Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
+				Namespace: namespace, Name: "e2e-tenant-00",
+			}, fetched)).To(Succeed())
+
+			ready := conditionOf(fetched.Status.Conditions, pgelasticv1alpha1.ConditionReady)
+			g.Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			g.Expect(ready.Message).NotTo(BeEmpty())
+			g.Expect(fetched.Status.Phase).To(Equal(pgelasticv1alpha1.PgTenantPhaseBinding))
+		}).Should(Succeed())
 	})
 
 	It("respects every guarantee and the tenant-count skew bound", func() {

@@ -29,6 +29,7 @@ use crate::metrics::Metrics;
 use crate::pool::PoolManager;
 use crate::stall::StallMonitor;
 use crate::tls::BackendTls;
+use tracing::warn;
 
 /// The name of one `PgInstance`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -99,11 +100,9 @@ impl Fleet {
                 .instances
                 .iter()
                 .map(|instance| {
-                    let mut backend = config.backend.clone();
-                    backend.address.clone_from(&instance.address);
                     (
                         InstanceId::new(&instance.name),
-                        backend,
+                        instance.backend(&config.backend),
                         instance.backend_connections,
                     )
                 })
@@ -218,6 +217,52 @@ impl Fleet {
             .insert(tenant.to_owned(), instance.clone());
         self.metrics.tenant_rerouted();
         Some(previous.unwrap_or_else(|| self.default.clone()))
+    }
+
+    /// Replaces the whole routing table with the one the operator published.
+    ///
+    /// Wholesale rather than entry by entry, because a tenant that has left the
+    /// pool has to lose its route as well as gain none: merging would leave a
+    /// deleted tenant's clients pointed at an instance that no longer holds
+    /// their data. Entries naming an instance this proxy does not front are
+    /// dropped and counted rather than applied — a fleet mid-rollout can see a
+    /// route to an instance its own process was not built with.
+    ///
+    /// Returns the number of routes that changed. Nothing here touches a session
+    /// in flight: the table is read at every checkout, so a client between two
+    /// transactions moves and a client inside one does not.
+    pub fn apply_routes(&self, routes: &std::collections::BTreeMap<String, String>) -> usize {
+        let mut wanted = HashMap::with_capacity(routes.len());
+        for (tenant, instance) in routes {
+            let id = InstanceId::new(instance);
+            if self.instances.contains_key(&id) {
+                wanted.insert(tenant.clone(), id);
+            } else {
+                warn!(
+                    tenant,
+                    instance, "a published route names an instance this proxy does not front"
+                );
+            }
+        }
+
+        let mut current = self
+            .routes
+            .lock()
+            .expect("the routing table is never poisoned");
+        if *current == wanted {
+            return 0;
+        }
+        let changed = wanted
+            .iter()
+            .filter(|(tenant, id)| current.get(*tenant) != Some(id))
+            .count()
+            + current.keys().filter(|tenant| !wanted.contains_key(*tenant)).count();
+        *current = wanted;
+        drop(current);
+        for _ in 0..changed {
+            self.metrics.tenant_rerouted();
+        }
+        changed
     }
 
     /// Refreshes every instance's budget gauge.

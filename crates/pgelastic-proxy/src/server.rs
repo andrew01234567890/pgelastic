@@ -22,6 +22,7 @@ use crate::route::{Fleet, Instance};
 use crate::scram::{KdfPool, ScramVerifier};
 use crate::session::{self, Ending};
 use crate::stream::ClientStream;
+use crate::tenant::TenantResolver;
 
 /// Everything a connection task needs, shared by `Arc`.
 pub struct Proxy {
@@ -35,6 +36,8 @@ pub struct Proxy {
     pub fleet: Arc<Fleet>,
     /// Every tenant's admission gate, for the migration cutover.
     pub quiesce: Arc<QuiesceRegistry>,
+    /// Reads a new connection's tenant out of its startup packet.
+    pub tenant: TenantResolver,
     permits: Arc<Semaphore>,
 }
 
@@ -87,6 +90,7 @@ impl Proxy {
 
         Ok(Arc::new(Self {
             auth: Arc::new(ClientAuth::new(verifiers, iterations)?),
+            tenant: TenantResolver::new(&config.routing),
             config,
             acceptor,
             kdf,
@@ -403,27 +407,39 @@ async fn serve(
     proxy.metrics.client_auth(AuthOutcome::Success);
 
     let role = String::from_utf8_lossy(&user).into_owned();
-    // The route is read here only to decide the pool key's shape and to serve a
-    // session-mode client. A transaction-mode client re-reads it at every
-    // checkout, which is what lets a cutover move it without it reconnecting.
-    let instance = proxy.fleet.route(&role);
-    let key = match crate::pool::pool_key(&proxy.config, &instance.backend, &session.startup, &role)
-    {
-        Ok(key) => key,
+    // Everything downstream is keyed on the tenant: which instance holds the
+    // data, whose budget the checkout is charged to, which gate a cutover
+    // closes. So it is established once, here, from the startup packet the
+    // client actually sent.
+    let tenant = match proxy.tenant.resolve(&session.startup, &role) {
+        Ok(tenant) => tenant,
         Err(error) => {
             proxy.metrics.client_rejected(RejectReason::Handshake);
             handshake::report(&mut session.stream, Some(&user), &error).await;
             return Err(error);
         }
     };
+    // The route is read here only to decide the pool key's shape and to serve a
+    // session-mode client. A transaction-mode client re-reads it at every
+    // checkout, which is what lets a cutover move it without it reconnecting.
+    let instance = proxy.fleet.route(&tenant);
+    let key =
+        match crate::pool::pool_key(&proxy.config, &instance.backend, &session.startup, &tenant) {
+            Ok(key) => key,
+            Err(error) => {
+                proxy.metrics.client_rejected(RejectReason::Handshake);
+                handshake::report(&mut session.stream, Some(&user), &error).await;
+                return Err(error);
+            }
+        };
 
     // A replication connection is forced to session mode by the pool key
     // itself: a walsender stream has no transaction boundaries to release on,
     // and multiplexing one silently corrupts it.
     let result = if key.mode() == pgelastic_pool::PoolMode::Transaction {
-        multiplexed(proxy, &mut session, &role, &mut shutdown).await
+        multiplexed(proxy, &mut session, &tenant, &mut shutdown).await
     } else {
-        bound(proxy, &mut session, &instance, &role, &mut shutdown).await
+        bound(proxy, &mut session, &instance, &tenant, &mut shutdown).await
     };
 
     if let Err(error) = &result
@@ -439,7 +455,7 @@ async fn bound(
     proxy: &Arc<Proxy>,
     session: &mut handshake::ClientSession,
     instance: &Arc<Instance>,
-    role: &str,
+    tenant: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     // A session-mode client holds one backend for its whole life, so refusing
@@ -459,7 +475,7 @@ async fn bound(
     // A session-mode client never reaches an idle boundary, so it counts as
     // permanently in flight: a cutover must not believe a tenant has drained
     // while one of its sessions is still writing to the source.
-    let _holding = proxy.quiesce.gate(role).hold();
+    let _holding = proxy.quiesce.gate(tenant).hold();
 
     let mut link = match backend::connect(
         &instance.backend,
@@ -479,7 +495,7 @@ async fn bound(
     proxy.metrics.backend_auth(AuthOutcome::Success);
     proxy.metrics.backend_opened();
 
-    let fenced = match verify_bound(proxy, instance, session, &mut link, role).await {
+    let fenced = match verify_bound(proxy, instance, session, &mut link, tenant).await {
         Ok(fenced) => fenced,
         Err(error) => {
             proxy.metrics.client_rejected(RejectReason::Backend);
@@ -522,12 +538,12 @@ async fn verify_bound<'a>(
     instance: &'a Arc<Instance>,
     session: &handshake::ClientSession,
     link: &mut backend::BackendSession,
-    role: &str,
+    tenant: &str,
 ) -> Result<session::Fenced<'a>> {
     let mut fenced = session::Fenced {
         runtime: &instance.fence,
         opened_under: instance.fence.current(),
-        tenant: role.to_owned(),
+        tenant: tenant.to_owned(),
         backend_pid: link.key_data.as_ref().map(|data| data.process_id),
         lsn: None,
     };
@@ -667,11 +683,11 @@ async fn relay(
 async fn multiplexed(
     proxy: &Arc<Proxy>,
     session: &mut handshake::ClientSession,
-    role: &str,
+    tenant: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let gate = proxy.quiesce.gate(role);
-    let binding = crate::txn::Binding::open(proxy, &session.startup, role)?;
+    let gate = proxy.quiesce.gate(tenant);
+    let binding = crate::txn::Binding::open(proxy, &session.startup, tenant)?;
 
     // The greeting is the first link's `ParameterStatus` set, cached per pool
     // key: a client that arrives twentieth must not have to hold a backend just
@@ -722,7 +738,7 @@ async fn multiplexed(
             client: &mut session.stream,
             proxy,
             startup: &session.startup,
-            role: role.to_owned(),
+            tenant: tenant.to_owned(),
             gate,
             binding,
             route,

@@ -146,7 +146,7 @@ func RenderCustomConf(config InstanceConfig) []Setting {
 			config.WALVolumeBytes * slotRetentionNumerator / slotRetentionDenominator),
 		"wal_keep_size": mebibytes(config.WALVolumeBytes / walKeepDenominator),
 
-		"synchronous_commit": config.SynchronousCommit,
+		GUCSynchronousCommit: config.SynchronousCommit,
 
 		GUCPrimaryEpoch: strconv.FormatInt(config.PrimaryEpoch, 10),
 	}
@@ -159,7 +159,7 @@ func RenderCustomConf(config InstanceConfig) []Setting {
 		settings["effective_cache_size"] = config.EffectiveCacheSize
 	}
 	for name, value := range config.UserParameters {
-		if IsOwned(name) {
+		if IsOwned(name) || !RenderableParameter(name, value) {
 			continue
 		}
 		settings[name] = value

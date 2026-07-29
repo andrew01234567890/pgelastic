@@ -31,12 +31,14 @@ func testPlan() Plan {
 		Publication:  "pgelastic_pub_move_deadbeef",
 		Slot:         "pgelastic_mig_move_deadbeef",
 		Subscription: "pgelastic_sub_move_deadbeef",
+		SchemaStamp:  SchemaStamp(namespaceName, "move-acme"),
 	}
 }
 
 func cleanableSQL() *fakeSQL {
 	return newFakeSQL().
 		scalarAnswer("FROM pg_subscription WHERE subname", "1").
+		scalarAnswer("shobj_description(oid, 'pg_database')", "0").
 		answer("FROM pg_namespace n WHERE", Row{userSchema})
 }
 
@@ -97,6 +99,7 @@ func TestTheLadderStillDropsTheSlotAfterAnEarlierRungFails(t *testing.T) {
 func TestTheLadderIsANoOpWhenTheSubscriptionIsAlreadyGone(t *testing.T) {
 	sql := newFakeSQL().
 		scalarAnswer("FROM pg_subscription WHERE subname", "0").
+		scalarAnswer("shobj_description(oid, 'pg_database')", "0").
 		answer("FROM pg_namespace n WHERE", Row{userSchema})
 	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole); err != nil {
 		t.Fatal(err)
@@ -142,7 +145,7 @@ func TestTheLadderSkipsTheFencedSourceWithoutReportingAFailure(t *testing.T) {
 func TestLadderOrderMatchesTheDocumentedContract(t *testing.T) {
 	want := []LadderStep{
 		StepDisableSubscription, StepDetachSlot, StepDropSubscription,
-		StepDropSlot, StepDropPublication, StepRevokeGrants,
+		StepDropSlot, StepDropPublication, StepRevokeGrants, StepClearSchemaStamp,
 	}
 	if len(LadderOrder) != len(want) {
 		t.Fatalf("the ladder has %d rungs, wanted %d", len(LadderOrder), len(want))

@@ -1,12 +1,19 @@
 //! File-backed configuration.
 //!
-//! A stand-in for the operator control stream that lands in a later milestone,
-//! so the field names deliberately track `PgElasticPool`'s `spec.proxy` rather
-//! than inventing a second vocabulary.
+//! The field names deliberately track `PgElasticPool`'s `spec.proxy` rather than
+//! inventing a second vocabulary, because the operator renders this document
+//! from that spec.
 //!
-//! TOML rather than YAML: `serde_yaml` is archived and unmaintained, and this
-//! file is a development affordance — the production shape arrives over the
-//! control stream, not off disk.
+//! TOML rather than YAML: `serde_yaml` is archived and unmaintained.
+//!
+//! The document is split in two by [`Config::structural`]. The structural half —
+//! listen address, TLS material, the instance list, worker counts — can only be
+//! applied by a process restart, so a change to it rolls the fleet. The dynamic
+//! half — the tenant routing table and the per-tenant capacity claims — is
+//! re-read at run time by [`reload`](crate::reload) and applied at a checkout
+//! boundary. Rendering both halves into one document and hashing only the
+//! structural half is what keeps adding a tenant from restarting every proxy
+//! replica and dropping every client on it.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -16,7 +23,7 @@ use serde::Deserialize;
 
 use crate::error::{ProxyError, Result};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     pub listen: ListenConfig,
@@ -39,6 +46,15 @@ pub struct Config {
     pub stall: StallConfig,
     #[serde(default)]
     pub control: ControlConfig,
+    #[serde(default)]
+    pub reload: ReloadConfig,
+    /// Identifies this document.
+    ///
+    /// Rendered by the operator and reported back once applied, so a fleet
+    /// half-way through picking up a change is distinguishable from one that has
+    /// converged on it. Empty means nobody is tracking versions.
+    #[serde(default)]
+    pub config_version: String,
     /// The instances this proxy fronts.
     ///
     /// Empty means one implicit instance named [`DEFAULT_INSTANCE`] at
@@ -120,6 +136,13 @@ impl Config {
                  expired would quiesce a tenant nobody can resume",
             ));
         }
+        if self.routing.tenant_discriminators.is_empty() {
+            return Err(ProxyError::config(
+                "routing.tenantDiscriminators must name at least one input: a connection \
+                 whose tenant cannot be established is one that would be served from \
+                 somebody else's budget",
+            ));
+        }
         if self.stall.interval_ms == 0 || self.stall.confirmations == 0 {
             return Err(ProxyError::config(
                 "stall.intervalMs and stall.confirmations must both be non-zero",
@@ -164,6 +187,26 @@ impl Config {
         }
         Ok(())
     }
+
+    /// This document with everything a running process can adopt stripped out.
+    ///
+    /// Two configurations with equal structural halves describe the same
+    /// process, so the operator hashes this rather than the whole document into
+    /// the pod template: a new tenant then changes the file every replica reads
+    /// without changing the pod every replica runs in.
+    #[must_use]
+    pub fn structural(&self) -> Self {
+        let mut structural = self.clone();
+        structural.config_version = String::new();
+        structural.routing.tenants.clear();
+        structural.pool.tenants.clear();
+        structural
+    }
+
+    /// Whether `other` can be adopted without a restart.
+    pub fn is_dynamic_change(&self, other: &Self) -> bool {
+        self.structural() == other.structural()
+    }
 }
 
 /// The name the single-instance configuration's implicit instance carries.
@@ -175,7 +218,7 @@ pub const DEFAULT_INSTANCE: &str = "default";
 /// `backendConnections` is derived from *its own* `max_connections`, so two
 /// instances never draw on one budget and a tenant that saturates one cannot
 /// reach the other's.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstanceConfig {
     pub name: String,
@@ -183,6 +226,85 @@ pub struct InstanceConfig {
     /// Overrides `pool.backendConnections` for this instance.
     #[serde(default)]
     pub backend_connections: Option<u32>,
+    /// Overrides `backend.user` for this instance.
+    ///
+    /// Each `PgInstance` issues its own role passwords at bootstrap, so a fleet
+    /// spanning two instances holds two different credentials for the same role
+    /// name. One shared `backend.password` would authenticate against exactly
+    /// one of them.
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Overrides `backend.database` for this instance.
+    #[serde(default)]
+    pub database: Option<String>,
+}
+
+impl InstanceConfig {
+    /// This instance's backend leg: the pool-wide `backend` settings with
+    /// whatever this instance overrides applied.
+    pub fn backend(&self, base: &BackendConfig) -> BackendConfig {
+        let mut backend = base.clone();
+        backend.address.clone_from(&self.address);
+        if let Some(user) = &self.user {
+            backend.user.clone_from(user);
+        }
+        if self.user.is_some() || self.password.is_some() {
+            backend.password.clone_from(&self.password);
+        }
+        if self.database.is_some() {
+            backend.database.clone_from(&self.database);
+        }
+        backend
+    }
+}
+
+/// Where the run-time half of the configuration is re-read from.
+///
+/// A `get` on one named object rather than a list-watch on the namespace: RBAC
+/// can restrict `get` to a single `resourceName` and cannot restrict a watch at
+/// all, so polling one Secret is the form of this that does not hand the data
+/// plane read access to every Secret its namespace holds.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReloadConfig {
+    /// Omitted means the configuration is whatever was read at start-up and
+    /// nothing re-reads it.
+    #[serde(default)]
+    pub secret: Option<SecretSource>,
+    #[serde(default = "default_reload_interval_ms")]
+    pub interval_ms: u64,
+    /// Publish the applied `configVersion` as an annotation on this replica's
+    /// own Pod, which is how the operator tells a converged fleet from one
+    /// half-way through picking a change up. Needs `PGELASTIC_POD_NAME`.
+    #[serde(default)]
+    pub report_to_pod: bool,
+}
+
+impl Default for ReloadConfig {
+    fn default() -> Self {
+        Self {
+            secret: None,
+            interval_ms: default_reload_interval_ms(),
+            report_to_pod: false,
+        }
+    }
+}
+
+impl ReloadConfig {
+    pub fn interval(&self) -> Duration {
+        Duration::from_millis(self.interval_ms.max(1))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretSource {
+    pub namespace: String,
+    pub name: String,
+    /// The Secret key holding this same TOML document.
+    pub key: String,
 }
 
 /// Proactive write-stall detection.
@@ -193,7 +315,7 @@ pub struct InstanceConfig {
 /// proxy sees a connection that is merely busy. Detecting it is what keeps one
 /// instance's quorum loss from consuming every pooled backend and cascading
 /// into tenants that are not on it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StallConfig {
     #[serde(default = "default_true")]
@@ -231,7 +353,7 @@ impl StallConfig {
 }
 
 /// The lease-bound control API: quiesce, drain, route, resume, unquiesce.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ControlConfig {
     /// Omitted means no control listener at all, and therefore no way to
@@ -273,7 +395,7 @@ impl ControlConfig {
 ///
 /// The lease parameters and the fence's reaction deadline are one decision and
 /// live in one struct — see [`FenceTiming`](crate::epoch::FenceTiming).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FenceConfig {
     #[serde(default)]
@@ -320,14 +442,14 @@ impl Default for FenceConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FenceWatchConfig {
     pub namespace: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListenConfig {
     pub address: String,
@@ -349,14 +471,14 @@ impl ListenConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServerTlsConfig {
     pub certificate_file: PathBuf,
     pub key_file: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BackendConfig {
     pub address: String,
@@ -390,7 +512,7 @@ pub enum BackendTlsMode {
     VerifyFull,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BackendTlsConfig {
     #[serde(default)]
@@ -403,7 +525,7 @@ pub struct BackendTlsConfig {
     pub server_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthConfig {
     #[serde(default = "default_scram_iterations")]
@@ -425,7 +547,7 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UserConfig {
     pub name: String,
@@ -439,7 +561,7 @@ pub struct UserConfig {
     pub password: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DrainConfig {
     /// How long a graceful drain waits for sessions to reach an idle boundary
@@ -462,7 +584,7 @@ impl DrainConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Omitted means no metrics listener at all.
@@ -470,7 +592,7 @@ pub struct MetricsConfig {
     pub address: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Largest frame buffered whole on the passthrough path. Anything bigger
@@ -490,7 +612,7 @@ impl Default for LimitsConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RoutingConfig {
     /// Identity of this replica, embedded in every cancel key it mints so a
@@ -507,6 +629,49 @@ pub struct RoutingConfig {
     /// run time; this is only where it begins.
     #[serde(default)]
     pub tenants: std::collections::BTreeMap<String, String>,
+    /// The inputs a new connection's tenant is read out of, consulted in order.
+    ///
+    /// The default is the login role alone, which is the single-tenant
+    /// development shape. A pool fronting many tenants behind one Service is
+    /// rendered by the operator with `DatabaseName` in the list, because that is
+    /// the only discriminator every `PostgreSQL` client already sends.
+    #[serde(default = "default_discriminators")]
+    pub tenant_discriminators: Vec<TenantDiscriminator>,
+    /// The key read out of the startup packet's `options` when
+    /// [`TenantDiscriminator::StartupOptions`] is consulted.
+    #[serde(default = "default_startup_option_key")]
+    pub startup_option_key: String,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            cancel_routing_id: 0,
+            default_instance: None,
+            tenants: std::collections::BTreeMap::new(),
+            tenant_discriminators: default_discriminators(),
+            startup_option_key: default_startup_option_key(),
+        }
+    }
+}
+
+/// One input a connection's tenant can be read out of.
+///
+/// The spelling matches `PgElasticPool`'s `spec.proxy.routing.tenantDiscriminators`
+/// so the operator renders the list it was given rather than translating it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum TenantDiscriminator {
+    /// Not implemented. Accepted so that a pool rendering the API's default list
+    /// starts rather than failing to parse its own configuration; it contributes
+    /// no candidate, and the discriminators after it decide.
+    #[serde(rename = "SNI")]
+    Sni,
+    /// `-c pgelastic.tenant=<name>` in the startup packet's `options`.
+    StartupOptions,
+    /// The database the client asked for. Every client sends one.
+    DatabaseName,
+    /// The login role. The single-tenant default.
+    Role,
 }
 
 /// Pooling, capacity and per-tenant claims.
@@ -516,7 +681,7 @@ pub struct RoutingConfig {
 /// `PgBouncer`'s `pool_size` are the same number; stacking two limiters is how
 /// a ceiling becomes unexplainable. Operators set `backendConnections` and
 /// per-tenant guaranteed/burstable, and everything else is derived.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PoolConfig {
     #[serde(default)]
@@ -601,7 +766,7 @@ impl PoolConfig {
 
 /// A tenant's effective claim, as the controller would have merged it from the
 /// workload class and the `PgTenant`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TenantConfig {
     pub name: String,
@@ -686,6 +851,15 @@ impl From<ResetPolicyConfig> for pgelastic_pool::ResetPolicy {
 
 fn default_true() -> bool {
     true
+}
+fn default_reload_interval_ms() -> u64 {
+    1_000
+}
+fn default_discriminators() -> Vec<TenantDiscriminator> {
+    vec![TenantDiscriminator::Role]
+}
+fn default_startup_option_key() -> String {
+    "pgelastic.tenant".to_owned()
 }
 fn default_stall_interval_ms() -> u64 {
     250
@@ -994,6 +1168,112 @@ mod tests {
     fn a_lease_that_has_already_expired_is_refused() {
         let source = format!("{MINIMAL}\n[control]\ndefaultLeaseTtlMs = 0\n");
         assert!(Config::from_str(&source).is_err());
+    }
+
+    #[test]
+    fn each_instance_carries_the_credentials_its_own_bootstrap_issued() {
+        let source = format!(
+            "{MINIMAL}\n\
+             [[instances]]\nname = \"inst-a\"\naddress = \"10.0.0.1:5432\"\n\
+             user = \"pgelastic_ops\"\npassword = \"a-secret\"\n\
+             \n[[instances]]\nname = \"inst-b\"\naddress = \"10.0.0.2:5432\"\n\
+             user = \"pgelastic_ops\"\npassword = \"b-secret\"\n"
+        );
+        let config = Config::from_str(&source).unwrap();
+        let a = config.instances[0].backend(&config.backend);
+        let b = config.instances[1].backend(&config.backend);
+        assert_eq!(a.user, "pgelastic_ops");
+        assert_eq!(a.password.as_deref(), Some("a-secret"));
+        assert_eq!(b.password.as_deref(), Some("b-secret"));
+        assert_ne!(a.password, b.password);
+    }
+
+    #[test]
+    fn an_instance_that_overrides_nothing_keeps_the_pool_wide_backend_leg() {
+        let source = format!(
+            "{MINIMAL}\n[[instances]]\nname = \"inst-a\"\naddress = \"10.0.0.1:5432\"\n"
+        );
+        let config = Config::from_str(&source).unwrap();
+        let backend = config.instances[0].backend(&config.backend);
+        assert_eq!(backend.user, "postgres");
+        assert_eq!(backend.address, "10.0.0.1:5432");
+    }
+
+    #[test]
+    fn a_new_tenant_changes_the_document_without_changing_the_process() {
+        let current = Config::from_str(MINIMAL).unwrap();
+        let next = Config::from_str(&format!(
+            "configVersion = \"2\"\n{MINIMAL}\n\
+             [[pool.tenants]]\nname = \"orders\"\nburstable = 4\n\
+             \n[routing]\ntenants = {{ orders = \"default\" }}\n"
+        ))
+        .unwrap();
+        assert!(current.is_dynamic_change(&next));
+    }
+
+    #[test]
+    fn moving_the_listener_is_not_something_a_running_process_can_adopt() {
+        let current = Config::from_str(MINIMAL).unwrap();
+        let next = Config::from_str(&MINIMAL.replace("127.0.0.1:0", "127.0.0.1:6543")).unwrap();
+        assert!(!current.is_dynamic_change(&next));
+    }
+
+    #[test]
+    fn the_discriminator_list_the_api_defaults_to_parses_rather_than_bricking_the_fleet() {
+        let source = format!(
+            "{MINIMAL}\n[routing]\n\
+             tenantDiscriminators = [\"SNI\", \"StartupOptions\", \"DatabaseName\"]\n"
+        );
+        let config = Config::from_str(&source).unwrap();
+        assert_eq!(
+            config.routing.tenant_discriminators,
+            vec![
+                TenantDiscriminator::Sni,
+                TenantDiscriminator::StartupOptions,
+                TenantDiscriminator::DatabaseName,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_configuration_naming_no_discriminator_at_all_is_refused() {
+        let source = format!("{MINIMAL}\n[routing]\ntenantDiscriminators = []\n");
+        let error = Config::from_str(&source).unwrap_err();
+        assert!(error.to_string().contains("tenantDiscriminators"), "{error}");
+    }
+
+    #[test]
+    fn the_single_tenant_default_is_the_login_role() {
+        let config = Config::from_str(MINIMAL).unwrap();
+        assert_eq!(
+            config.routing.tenant_discriminators,
+            vec![TenantDiscriminator::Role]
+        );
+        assert_eq!(config.routing.startup_option_key, "pgelastic.tenant");
+    }
+
+    #[test]
+    fn nothing_re_reads_the_configuration_unless_a_source_is_named() {
+        let config = Config::from_str(MINIMAL).unwrap();
+        assert!(config.reload.secret.is_none());
+        assert_eq!(config.reload.interval(), Duration::from_secs(1));
+        assert!(!config.reload.report_to_pod);
+    }
+
+    #[test]
+    fn the_reload_source_names_one_secret_and_one_key() {
+        let source = format!(
+            "{MINIMAL}\n[reload]\nintervalMs = 250\nreportToPod = true\n\
+             \n[reload.secret]\nnamespace = \"ns\"\nname = \"pool-proxy-config\"\n\
+             key = \"proxy.toml\"\n"
+        );
+        let config = Config::from_str(&source).unwrap();
+        let secret = config.reload.secret.as_ref().unwrap();
+        assert_eq!(secret.namespace, "ns");
+        assert_eq!(secret.name, "pool-proxy-config");
+        assert_eq!(secret.key, "proxy.toml");
+        assert_eq!(config.reload.interval(), Duration::from_millis(250));
+        assert!(config.reload.report_to_pod);
     }
 
     #[test]

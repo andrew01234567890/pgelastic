@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 )
 
@@ -53,6 +54,10 @@ const (
 	// something, and few enough that the whole suite stays inside its timeout.
 	seedRows = 20000
 )
+
+// probeDatabase is where the schema-copy specs apply their copy, so that driving the copy
+// directly cannot disturb the database a real migration is moving.
+const probeDatabase = "acme_copy_probe"
 
 func endpoint(instance, database string) migration.Endpoint {
 	return migration.Endpoint{Namespace: e2eNamespace, Instance: instance, Database: database}
@@ -282,6 +287,53 @@ func awaitPhase(name string, phase pgelasticv1alpha1.TenantMigrationPhase) *pgel
 	return fetchMigration(name)
 }
 
+// probePlan aims one schema copy at a scratch database on the target, so the copy can be
+// driven directly instead of through a whole migration. Its source is the tenant's real
+// database, which is what makes the dump a real one.
+func probePlan(database string) migration.Plan {
+	GinkgoHelper()
+	secret := &corev1.Secret{}
+	Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
+		Namespace: e2eNamespace, Name: provision.CredentialsSecretName(instanceA)}, secret)).To(Succeed())
+	password := string(secret.Data[provision.SecretKeyReplicationPassword])
+	Expect(password).NotTo(BeEmpty())
+
+	return migration.Plan{
+		Source:      endpoint(instanceA, tenantDatabase),
+		Target:      endpoint(instanceB, database),
+		SchemaStamp: migration.SchemaStamp(e2eNamespace, "copy-probe"),
+		DumpDir:     migration.DumpDir(e2eNamespace, "copy-probe"),
+		SourceConnInfo: fmt.Sprintf("host=%s.%s.svc port=%d user=%s password=%s dbname=%s",
+			provision.PrimaryServiceName(instanceA), e2eNamespace, provision.PostgresPort,
+			provision.ReplicationRole, password, tenantDatabase),
+	}
+}
+
+func relationCount(relation string) string {
+	GinkgoHelper()
+	return query(instanceB, probeDatabase, fmt.Sprintf(
+		`SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE n.nspname = 'public' AND c.relname = '%s'`, relation))
+}
+
+// schemaStampOf reads the mark a committed schema copy leaves. It is asked of the postgres
+// database because pg_shdescription is shared, which is also how the operator asks it.
+func schemaStampOf(database string) string {
+	GinkgoHelper()
+	return query(instanceB, "postgres", fmt.Sprintf(
+		`SELECT coalesce(max(shobj_description(oid, 'pg_database')), '')
+		 FROM pg_database WHERE datname = '%s'`, database))
+}
+
+func conditionNamed(object *pgelasticv1alpha1.PgTenantMigration, name string) *metav1.Condition {
+	for index := range object.Status.Conditions {
+		if object.Status.Conditions[index].Type == name {
+			return &object.Status.Conditions[index]
+		}
+	}
+	return nil
+}
+
 func conditionSummary(object *pgelasticv1alpha1.PgTenantMigration) string {
 	parts := make([]string, 0, len(object.Status.Conditions))
 	for _, condition := range object.Status.Conditions {
@@ -373,16 +425,14 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 		})
 
 		It("publishes what the verifier cannot prove alongside its verdict", func() {
-			object := fetchMigration(migrationName)
-			var verified *metav1.Condition
-			for i := range object.Status.Conditions {
-				if object.Status.Conditions[i].Type == migration.ConditionVerified {
-					verified = &object.Status.Conditions[i]
-				}
-			}
+			verified := conditionNamed(fetchMigration(migrationName), migration.ConditionVerified)
 			Expect(verified).NotTo(BeNil())
 			Expect(verified.Status).To(Equal(metav1.ConditionTrue))
 			Expect(verified.Message).To(ContainSubstring("equivalence is not correctness"))
+		})
+
+		It("hands the tenant a database carrying no mark of the machinery that built it", func() {
+			Expect(schemaStampOf(tenantDatabase)).To(BeEmpty())
 		})
 
 		// Logical replication carries no sequence state through PostgreSQL 18. Without the
@@ -474,6 +524,105 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 			Expect(refusal.Message).To(ContainSubstring("REPLICA IDENTITY FULL"))
 			Expect(routedInstance()).To(Equal(instanceA),
 				"a refused migration must leave the tenant exactly where it was")
+		})
+	})
+
+	// Provisioning is retried, so it has to be re-enterable. These specs drive the schema copy
+	// directly against the two real instances, because what is being checked is what
+	// PostgreSQL does with a transaction that does not commit - which no fake can answer.
+	Context("when the schema copy is restarted", func() {
+		var probe migration.Plan
+
+		BeforeEach(func() {
+			probe = probePlan(probeDatabase)
+			// pg_dump takes an ACCESS SHARE lock on every relation it reads, even for a
+			// schema-only dump, so the replication role needs the same reads a real migration
+			// opens for it.
+			Expect(migration.GrantSourceReads(
+				suiteCtx, sql, probe.Source, provision.ReplicationRole)).To(Succeed())
+			DeferCleanup(func() {
+				exec(instanceB, "postgres",
+					fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, probeDatabase))
+			})
+		})
+
+		It("treats a target that already carries the schema as a satisfied precondition", func() {
+			Expect(migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true)).To(Succeed())
+			Expect(migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true)).
+				To(Succeed(), "a second provisioning pass failed on the schema it had itself copied")
+
+			Expect(relationCount("line_items")).To(Equal("1"))
+			Expect(relationCount("orders")).To(Equal("1"))
+		})
+
+		It("leaves nothing behind when the copy does not commit, and converges on the retry", func() {
+			// One relation the dump also creates makes the apply fail exactly as the nightly
+			// did, part-way through a schema it has already begun creating.
+			exec(instanceB, "postgres", fmt.Sprintf(`CREATE DATABASE %q TEMPLATE template0`, probeDatabase))
+			exec(instanceB, probeDatabase, `CREATE TABLE orders (id bigint)`)
+
+			err := migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true)
+			Expect(err).To(HaveOccurred(), "a copy onto a relation that already exists reported success")
+			Expect(err.Error()).To(ContainSubstring("already exists"))
+
+			Expect(relationCount("line_items")).To(Equal("0"),
+				"the failed apply left objects behind, so the retry can only fail on them")
+			Expect(schemaStampOf(probeDatabase)).To(BeEmpty(),
+				"a copy that did not commit stamped the database as though it had")
+
+			exec(instanceB, probeDatabase, `DROP TABLE orders`)
+			Expect(migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true)).
+				To(Succeed(), "the retry did not converge")
+			Expect(relationCount("line_items")).To(Equal("1"))
+			Expect(schemaStampOf(probeDatabase)).To(Equal(probe.SchemaStamp))
+		})
+	})
+
+	// The retry budget exists for transient failures, and nothing else in this suite ever
+	// spends any of it. This spec obstructs Provisioning, watches the machine report itself
+	// retrying, clears the obstruction and requires it to recover on its own.
+	Context("when a phase faults and then recovers", func() {
+		It("retries the schema copy until it converges rather than until the budget runs out", func() {
+			holdTransactionOpen()
+			DeferCleanup(releaseHeldTransactions)
+
+			exec(instanceB, "postgres",
+				fmt.Sprintf(`CREATE DATABASE %q TEMPLATE template0`, tenantDatabase))
+			exec(instanceB, tenantDatabase, `CREATE TABLE orders (id bigint)`)
+			DeferCleanup(func() {
+				exec(instanceB, "postgres",
+					fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, tenantDatabase))
+			})
+
+			name := "retried-move"
+			object := makeMigration(name, instanceB, pgelasticv1alpha1.TenantMigrationOnline)
+			Expect(k8sClient.Create(suiteCtx, object)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				current := fetchMigration(name)
+				retrying := conditionNamed(current, migration.ConditionRetrying)
+				g.Expect(retrying).NotTo(BeNil())
+				g.Expect(retrying.Status).To(Equal(metav1.ConditionTrue))
+				g.Expect(retrying.Message).To(ContainSubstring("already exists"))
+				g.Expect(current.Status.Phase).
+					To(Equal(pgelasticv1alpha1.TenantMigrationPhaseProvisioning))
+			}, "3m", "1s").Should(Succeed())
+			AddReportEntry("faulted in phase", string(fetchMigration(name).Status.Phase))
+
+			exec(instanceB, tenantDatabase, `DROP TABLE orders`)
+
+			Eventually(func(g Gomega) {
+				current := fetchMigration(name)
+				g.Expect(reached(current.Status.Phase, pgelasticv1alpha1.TenantMigrationPhaseCopying)).
+					To(BeTrue(), "still in %s: %s", current.Status.Phase, conditionSummary(current))
+			}, "5m", "1s").Should(Succeed())
+
+			annotate(name, migrationAbortAnnotation, "stopped by the e2e suite after the retry recovered")
+			aborted := awaitPhase(name, pgelasticv1alpha1.TenantMigrationPhaseAborted)
+			Expect(routedInstance()).To(Equal(instanceA))
+			Expect(query(instanceB, "postgres",
+				"SELECT count(*) FROM pg_database WHERE datname = '"+tenantDatabase+"'")).To(Equal("0"))
+			Expect(k8sClient.Delete(suiteCtx, aborted)).To(Succeed())
 		})
 	})
 

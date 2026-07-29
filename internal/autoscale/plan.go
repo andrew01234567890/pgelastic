@@ -109,9 +109,12 @@ type Signals struct {
 
 	LastScaleUpAt   *time.Time
 	LastScaleDownAt *time.Time
-	// ConsolidatableSince is when the same instance was first found consolidatable. The
-	// dwell time is measured from it, and it resets when the identity of the victim changes.
-	ConsolidatableSince *time.Time
+	// ConsolidatableSince is when each instance was first found consolidatable, keyed by
+	// instance name. The dwell time is measured against the instance scale-in has actually
+	// chosen: collapsing these to one timestamp lets an instance that emptied a minute ago
+	// inherit the patience of one that emptied a day ago, which is the whole of the
+	// anti-flapping guard.
+	ConsolidatableSince map[string]time.Time
 }
 
 // InstanceCount is how many instances the pool has.
@@ -222,8 +225,6 @@ func Recommend(signals Signals, policy Policy) Plan {
 		ObservedInstances:        signals.InstanceCount(),
 		TargetUtilizationPercent: policy.TargetUtilizationPercent,
 	}
-	guard := Guard{Policy: policy, Signals: signals}
-
 	inUse, allocatable := int64(0), int64(0)
 	for _, instance := range signals.Instances {
 		if !instance.Ready {
@@ -240,6 +241,10 @@ func Recommend(signals Signals, policy Policy) Plan {
 	packing := repack(signals, policy)
 	plan.InstanceTargets = instanceTargets(signals, policy, packing)
 	plan.ConsolidationTarget = consolidationTarget(plan.InstanceTargets, policy)
+
+	// The guard is built once the victim is known, because the dwell time it enforces
+	// belongs to that instance and to no other.
+	guard := Guard{Policy: policy, Signals: signals, ConsolidationTarget: plan.ConsolidationTarget}
 	plan.Moves = moves(signals, guard, packing)
 
 	// The staleness verdict is computed once and stamped on the plan, so a reader can tell a

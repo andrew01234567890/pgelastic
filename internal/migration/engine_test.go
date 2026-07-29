@@ -36,6 +36,7 @@ func runningSQL() *fakeSQL {
 	return sql.
 		answer("FROM pg_namespace n WHERE", Row{userSchema}).
 		scalarAnswer("FROM pg_database WHERE datname", "0").
+		scalarAnswer("shobj_description(oid, 'pg_database')", "0").
 		scalarAnswer("FROM pg_publication WHERE pubname", "0").
 		scalarAnswer("SELECT count(*)::text FROM pg_replication_slots WHERE slot_name", "0").
 		scalarAnswer("FROM pg_subscription WHERE subname", "0").

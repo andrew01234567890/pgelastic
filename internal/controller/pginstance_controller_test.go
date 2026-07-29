@@ -423,3 +423,48 @@ var _ = Describe("PgInstance controller", func() {
 		})
 	})
 })
+
+// The one parameter these specs use that the operator does not own, and a value for it.
+const (
+	tenantParameter      = "work_mem"
+	tenantParameterValue = "8MB"
+)
+
+var _ = Describe("PgInstance parameter admission", Ordered, func() {
+	BeforeAll(func() {
+		ensureNamespace(instanceNamespace)
+	})
+
+	create := func(name string, parameters map[string]pgelasticv1alpha1.GUCValue) error {
+		instance := makeInstance(name)
+		instance.Spec.Parameters = parameters
+		return k8sClient.Create(ctx, instance)
+	}
+
+	It("refuses a parameter name that would escape its configuration line", func() {
+		Expect(create("guc-name-newline", map[string]pgelasticv1alpha1.GUCValue{
+			"#\nfsync = off\n#": "1",
+		})).NotTo(Succeed(), "a name carrying a line break becomes a directive of its own")
+
+		Expect(create("guc-name-equals", map[string]pgelasticv1alpha1.GUCValue{
+			tenantParameter + " = '1MB'": "1",
+		})).NotTo(Succeed())
+	})
+
+	It("refuses a parameter value that would escape its configuration line", func() {
+		Expect(create("guc-value-newline", map[string]pgelasticv1alpha1.GUCValue{
+			tenantParameter: tenantParameterValue + "'\nfsync = off\n#'",
+		})).NotTo(Succeed())
+
+		Expect(create("guc-value-carriage-return", map[string]pgelasticv1alpha1.GUCValue{
+			tenantParameter: tenantParameterValue + "\rfsync = off",
+		})).NotTo(Succeed())
+	})
+
+	It("admits the parameter names PostgreSQL itself admits", func() {
+		Expect(create("guc-ok", map[string]pgelasticv1alpha1.GUCValue{
+			tenantParameter:          tenantParameterValue,
+			"pg_stat_statements.max": "1000",
+		})).To(Succeed())
+	})
+})

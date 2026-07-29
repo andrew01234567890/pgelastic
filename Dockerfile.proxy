@@ -1,0 +1,30 @@
+# The inline proxy fleet.
+#
+# The proxy is the only component that sits on the client's data path, so the
+# image carries the binary and nothing that could be executed instead of it: no
+# shell, no package manager, no interpreter. A pod whose only executable is the
+# proxy cannot be talked into running anything else by a client that gets
+# further than it should.
+FROM rust:1.90-trixie AS builder
+
+# aws-lc-rs builds its own crypto from C, so the builder needs a C toolchain and
+# cmake. They exist only here; the runtime image has neither.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+
+# --locked so the image is built from the resolution the repository recorded
+# rather than from whatever has been published since.
+RUN cargo build --release --locked --bin pgelastic-proxy
+
+# cc rather than static: aws-lc-rs links libc, and building it against musl to
+# claim a fully static binary trades a real cryptography dependency for a
+# cosmetic property.
+FROM gcr.io/distroless/cc-debian13:nonroot
+COPY --from=builder /workspace/target/release/pgelastic-proxy /pgelastic-proxy
+USER 65532:65532
+ENTRYPOINT ["/pgelastic-proxy"]

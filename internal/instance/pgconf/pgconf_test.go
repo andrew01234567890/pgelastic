@@ -27,6 +27,9 @@ import (
 const (
 	userParameterName  = "work_mem"
 	userParameterValue = "8MB"
+
+	maintenanceWorkMem      = "maintenance_work_mem"
+	maintenanceWorkMemValue = "512MB"
 )
 
 func settingValue(settings []Setting, name string) (string, bool) {
@@ -54,7 +57,7 @@ func TestClassifyOwnedParameters(t *testing.T) {
 		{"logging_collector is pinned on", GUCLoggingCollector, OwnershipBlocked, ContextPostmaster},
 		{"synchronous_standby_names is computed", GUCSynchronousStandbyNames, OwnershipFixed, ContextSighup},
 		{"work_mem belongs to the tenant", userParameterName, OwnershipUser, ContextUser},
-		{"maintenance_work_mem belongs to the tenant", "maintenance_work_mem", OwnershipUser, ContextUser},
+		{"maintenance_work_mem belongs to the tenant", maintenanceWorkMem, OwnershipUser, ContextUser},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -106,12 +109,12 @@ func TestWALLogHintsIsOwnedButNeverEmitted(t *testing.T) {
 
 func TestUserParametersDropsOwnedNames(t *testing.T) {
 	kept, dropped := UserParameters(map[string]pgelasticv1alpha1.GUCValue{
-		userParameterName:      userParameterValue,
-		GUCMaxConnections:      "5000",
-		GUCAllowAlterSystem:    "on",
-		"maintenance_work_mem": "512MB",
+		userParameterName:   userParameterValue,
+		GUCMaxConnections:   "5000",
+		GUCAllowAlterSystem: "on",
+		maintenanceWorkMem:  maintenanceWorkMemValue,
 	})
-	if len(kept) != 2 || kept[userParameterName] != userParameterValue || kept["maintenance_work_mem"] != "512MB" {
+	if len(kept) != 2 || kept[userParameterName] != userParameterValue || kept[maintenanceWorkMem] != maintenanceWorkMemValue {
 		t.Errorf("kept = %v, want only the two tenant parameters", kept)
 	}
 	if !slices.Equal(dropped, []string{GUCAllowAlterSystem, GUCMaxConnections}) {
@@ -260,5 +263,72 @@ func TestIncludeDirectivesOrderOverrideLast(t *testing.T) {
 	override := strings.Index(IncludeDirectives, OverrideConfFile)
 	if custom < 0 || override < 0 || override < custom {
 		t.Fatalf("include directives = %q, want override.conf included after custom.conf", IncludeDirectives)
+	}
+}
+
+func TestUserParametersDropsNamesThatEscapeTheirLine(t *testing.T) {
+	injected := "# pgelastic\nfsync = off\n#"
+	kept, dropped := UserParameters(map[string]pgelasticv1alpha1.GUCValue{
+		injected:              "1",
+		"work_mem = '1MB'\nx": "1",
+		maintenanceWorkMem:    maintenanceWorkMemValue,
+	})
+	if len(kept) != 1 || kept[maintenanceWorkMem] != maintenanceWorkMemValue {
+		t.Errorf("kept = %v, want only the well-formed parameter", kept)
+	}
+	if len(dropped) != 2 {
+		t.Errorf("dropped = %v, want both malformed names", dropped)
+	}
+}
+
+func TestUserParametersDropsValuesThatEscapeTheirLine(t *testing.T) {
+	kept, dropped := UserParameters(map[string]pgelasticv1alpha1.GUCValue{
+		userParameterName: "8MB'\nfsync = off\n#",
+	})
+	if len(kept) != 0 {
+		t.Errorf("kept = %v, want nothing: the value carries a second directive", kept)
+	}
+	if !slices.Equal(dropped, []string{"work_mem"}) {
+		t.Errorf("dropped = %v, want work_mem", dropped)
+	}
+}
+
+// A user parameter must not be able to reach a durability GUC that the ownership table
+// blocks by name, which is exactly what a name or value carrying a newline would do.
+func TestNoUserParameterCanRewriteABlockedDurabilitySetting(t *testing.T) {
+	for name, value := range map[string]string{
+		"#\nfsync = off\n#":         "1",
+		"x\nfull_page_writes = off": "1",
+		userParameterName:           "8MB'\nfsync = off\n#'",
+		userParameterName + "2":     "8MB'\r\nsynchronous_commit = off\r\n#'",
+	} {
+		rendered := FormatSettings("custom", RenderCustomConf(InstanceConfig{
+			Capacity:       DeriveCapacity(50, 4, 3, 4),
+			UserParameters: map[string]string{name: value},
+		}))
+		for line := range strings.SplitSeq(rendered, "\n") {
+			trimmed := strings.TrimSpace(line)
+			for _, blocked := range []string{"fsync", "full_page_writes", GUCSynchronousCommit} {
+				if !strings.HasPrefix(trimmed, blocked+" ") && !strings.HasPrefix(trimmed, blocked+"=") {
+					continue
+				}
+				if strings.Contains(trimmed, "off") {
+					t.Errorf("parameter %q = %q rendered %q", name, value, trimmed)
+				}
+			}
+		}
+	}
+}
+
+func TestRenderableParameterAcceptsTheNamesPostgresAccepts(t *testing.T) {
+	for _, name := range []string{"work_mem", "_x", "pgelastic.primary_epoch", "a1"} {
+		if !RenderableParameter(name, "1") {
+			t.Errorf("RenderableParameter(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"", "1abc", "a.b.c", "a b", "a=b", "a'b", "a#b", ".x", "x."} {
+		if RenderableParameter(name, "1") {
+			t.Errorf("RenderableParameter(%q) = true, want false", name)
+		}
 	}
 }

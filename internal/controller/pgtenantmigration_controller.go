@@ -72,6 +72,17 @@ type PgTenantMigrationReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
+	// APIReader reads the migration itself straight from the API server, bypassing the
+	// informer cache.
+	//
+	// A reconcile that observed anything new ends in a status update, and an update carries
+	// the resourceVersion it read. The cache lags this controller's own last write by however
+	// long the watch event takes to arrive, so reading the object through it makes the
+	// controller lose an optimistic-concurrency race with nobody but itself - and losing one
+	// is not a harmless retry, because the phase's whole effect runs before the status is
+	// published and so runs again.
+	APIReader client.Reader
+
 	// SQL, Shell and Router are the three ports the migration engine acts through. An
 	// operator started without them can resolve and report, and nothing else.
 	SQL    migration.SQL
@@ -103,7 +114,7 @@ func (r *PgTenantMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	log := logf.FromContext(ctx)
 
 	object := &pgelasticv1alpha1.PgTenantMigration{}
-	if err := r.Get(ctx, req.NamespacedName, object); err != nil {
+	if err := r.reader().Get(ctx, req.NamespacedName, object); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !object.DeletionTimestamp.IsZero() {
@@ -210,6 +221,7 @@ func (r *PgTenantMigrationReconciler) resolve(
 			Publication:    migration.PublicationName(object.Namespace, object.Name),
 			Slot:           migration.SlotName(object.Namespace, object.Name),
 			Subscription:   migration.SubscriptionName(object.Namespace, object.Name),
+			SchemaStamp:    migration.SchemaStamp(object.Namespace, object.Name),
 			SourceConnInfo: sourceConnInfo(source, tenant.Spec.DatabaseName, password),
 			Concurrency:    provision.ConcurrentDumps(source.Spec),
 			DumpDir:        migration.DumpDir(object.Namespace, object.Name),
@@ -351,9 +363,27 @@ func (r *PgTenantMigrationReconciler) publish(
 	}
 	object.Status = status
 	if err := r.Status().Update(ctx, object); err != nil {
+		if apierrors.IsConflict(err) {
+			// Somebody else wrote the object between the read and here, so this status was
+			// computed against a revision that no longer exists. Returning the conflict as an
+			// error would requeue at the rate limiter's five-millisecond base and re-run the
+			// phase's whole effect against a cache that has not moved either; waiting for the
+			// phase's own poll interval costs one interval and re-reads something newer.
+			return ctrl.Result{RequeueAfter: result.RequeueAfter}, nil
+		}
 		return ctrl.Result{}, err
 	}
 	return result, nil
+}
+
+// reader is the API server wherever one was supplied, and the client itself otherwise: a
+// caller that hands this reconciler an uncached client has already answered the question
+// APIReader exists to answer.
+func (r *PgTenantMigrationReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 func (r *PgTenantMigrationReconciler) now() time.Time {
@@ -384,6 +414,9 @@ func (r *PgTenantMigrationReconciler) replicationPassword(
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PgTenantMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pgelasticv1alpha1.PgTenantMigration{}).
 		Named("pgtenantmigration").

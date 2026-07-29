@@ -74,13 +74,13 @@ impl Binding {
     pub fn open(
         proxy: &Arc<Proxy>,
         startup: &pgelastic_wire::StartupMessage,
-        role: &str,
+        tenant_name: &str,
     ) -> Result<Self> {
-        let instance = proxy.fleet.route(role);
-        let key = crate::pool::pool_key(&proxy.config, &instance.backend, startup, role)?;
+        let instance = proxy.fleet.route(tenant_name);
+        let key = crate::pool::pool_key(&proxy.config, &instance.backend, startup, tenant_name)?;
         let tenant = instance
             .pools
-            .ensure_tenant(role)
+            .ensure_tenant(tenant_name)
             .map_err(admission_error)?;
         let client = instance
             .pools
@@ -151,7 +151,7 @@ pub struct Session<'a> {
     pub client: &'a mut ClientStream,
     pub proxy: &'a Arc<Proxy>,
     pub startup: &'a pgelastic_wire::StartupMessage,
-    pub role: String,
+    pub tenant: String,
     /// This tenant's admission gate, closed for the length of a cutover.
     pub gate: Arc<TenantGate>,
     pub binding: Binding,
@@ -777,13 +777,14 @@ impl Running<'_> {
     /// instance changes at a transaction boundary and never underneath one.
     fn follow_route(&mut self) -> Result<()> {
         debug_assert!(self.checkout.is_none(), "a bound session must not be moved");
-        let routed = self.session.proxy.fleet.route_id(&self.session.role);
+        let routed = self.session.proxy.fleet.route_id(&self.session.tenant);
         if routed == self.session.binding.instance.id {
             return Ok(());
         }
-        let binding = Binding::open(self.session.proxy, self.session.startup, &self.session.role)?;
+        let binding =
+            Binding::open(self.session.proxy, self.session.startup, &self.session.tenant)?;
         debug!(
-            tenant = %self.session.role,
+            tenant = %self.session.tenant,
             from = %self.session.binding.instance.id,
             to = %binding.instance.id,
             "this session follows its tenant to another instance"

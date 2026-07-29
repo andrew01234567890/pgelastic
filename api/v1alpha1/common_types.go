@@ -84,6 +84,7 @@ const (
 	ReasonNotClaimed          = "NotClaimed"
 	ReasonPlaced              = "Placed"
 	ReasonUnplaceable         = "Unplaceable"
+	ReasonInstanceMissing     = "BoundInstanceMissing"
 	ReasonWithinLimits        = "WithinLimits"
 	ReasonTenantCapReached    = "TenantCapacityReached"
 	ReasonPoolCapReached      = "PoolCapacityReached"

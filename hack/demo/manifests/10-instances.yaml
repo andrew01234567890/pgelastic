@@ -1,0 +1,29 @@
+# Two instances is the whole point: "its own hardware" per tenant means a separate
+# three-node PostgreSQL instance, not a separate database on one server.
+apiVersion: pgelastic.io/v1alpha1
+kind: PgInstance
+metadata:
+  name: demo-a
+  namespace: pgelastic-demo
+spec:
+  poolRef:
+    name: demo-pool
+  class: dev-1
+  storage:
+    size: 2Gi
+    walVolume:
+      size: 1Gi
+---
+apiVersion: pgelastic.io/v1alpha1
+kind: PgInstance
+metadata:
+  name: demo-b
+  namespace: pgelastic-demo
+spec:
+  poolRef:
+    name: demo-pool
+  class: dev-1
+  storage:
+    size: 2Gi
+    walVolume:
+      size: 1Gi

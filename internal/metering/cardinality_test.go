@@ -81,7 +81,7 @@ func meterTenants(t *testing.T, collector *Collector, namespace, pool string, te
 			Relations: int32(20 + i),
 		}
 		observations = append(observations, TenantObservation{
-			Key:                Key{Namespace: namespace, Pool: pool, Tenant: name},
+			Key:                Key{Namespace: namespace, Pool: testPool, Tenant: name},
 			Database:           name,
 			Instance:           fmt.Sprintf("pg-%d", i%3),
 			Role:               RolePrimary,
@@ -191,5 +191,49 @@ func TestStoreCardinalityIsBoundedByLivingTenants(t *testing.T) {
 	collector.Store.Prune(epoch.Add(72 * time.Hour))
 	if collector.Store.Len() != 0 {
 		t.Errorf("store holds %d series three days after the last observation, want 0", collector.Store.Len())
+	}
+}
+
+// Pool freshness is the worst age across the pool's series, so a tenant that has been
+// deleted goes on answering with the moment it was last sampled and drags the whole pool
+// stale. Every autoscaling action is then refused - including the storage expansion that
+// stops a filling volume - for as long as the retention window, which is not a recovery.
+func TestADepartedTenantDoesNotHoldThePoolStale(t *testing.T) {
+	const staying = "staying"
+
+	collector := NewCollector(Options{Window: 168 * time.Hour, Resolution: time.Hour}, nil)
+
+	collector.Observe(PoolObservation{Namespace: testNamespace, Pool: testPool}, []TenantObservation{
+		{Key: Key{Namespace: testNamespace, Pool: testPool, Tenant: staying}, Database: staying},
+		{Key: Key{Namespace: testNamespace, Pool: testPool, Tenant: "leaving"}, Database: "leaving"},
+	}, epoch)
+
+	// An hour later only the surviving tenant is reported, which is exactly what the pool
+	// reconcile does once the other PgTenant is gone.
+	later := epoch.Add(time.Hour)
+	survivors := []Key{{Namespace: testNamespace, Pool: testPool, Tenant: staying}}
+	collector.ForgetDeparted(testNamespace, testPool, survivors)
+	collector.Observe(PoolObservation{Namespace: testNamespace, Pool: testPool}, []TenantObservation{
+		{Key: survivors[0], Database: staying},
+	}, later)
+
+	age, seen := collector.Age(testNamespace, testPool, later)
+	if !seen {
+		t.Fatal("the pool has been observed, so its age must be known")
+	}
+	if age != 0 {
+		t.Errorf("pool age = %s, want 0: a deleted tenant is holding the pool stale", age)
+	}
+}
+
+func TestForgettingDepartedTenantsLeavesTheOtherPoolsAlone(t *testing.T) {
+	collector := NewCollector(Options{Window: 168 * time.Hour, Resolution: time.Hour}, nil)
+	meterTenants(t, collector, testNamespace, "kept", 5)
+	meterTenants(t, collector, testNamespace, "swept", 5)
+
+	collector.ForgetDeparted(testNamespace, "swept", nil)
+
+	if got := collector.Store.Len(); got != 5 {
+		t.Errorf("store holds %d series, want the 5 belonging to the untouched pool", got)
 	}
 }

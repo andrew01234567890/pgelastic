@@ -65,6 +65,14 @@ func (v *PgTenantCustomValidator) ValidateUpdate(
 	ctx context.Context,
 	_, newObj *pgelasticv1alpha1.PgTenant,
 ) (admission.Warnings, error) {
+	// A tenant being deleted is not admitted against its pool, because the only writes left
+	// are the controller clearing its own finalizer. Deleting a namespace removes the pool
+	// and the tenant together, and validating the finalizer removal against a pool that is
+	// already gone rejects it for ever: the tenant keeps its finalizer, and the namespace
+	// never leaves Terminating.
+	if newObj.DeletionTimestamp != nil {
+		return nil, nil
+	}
 	return nil, v.validate(ctx, newObj)
 }
 

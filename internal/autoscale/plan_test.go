@@ -18,6 +18,7 @@ package autoscale
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +35,14 @@ const (
 	instanceC  = "pg-c"
 	someTenant = "acme"
 )
+
+func consolidatableFor(offset time.Duration, instances ...string) map[string]time.Time {
+	stamped := make(map[string]time.Time, len(instances))
+	for _, instance := range instances {
+		stamped[instance] = now.Add(offset)
+	}
+	return stamped
+}
 
 func at(offset time.Duration) *time.Time {
 	moment := now.Add(offset)
@@ -420,7 +429,7 @@ func scaleInSignals() Signals {
 	signals.Instances[1].InUseConnections, signals.Instances[1].Tenants = 20, 2
 	signals.Instances[2].InUseConnections, signals.Instances[2].Tenants = 0, 0
 	signals.Tenants = tenantsAcross([]string{instanceA, instanceB}, 2, 5)
-	signals.ConsolidatableSince = at(-48 * time.Hour)
+	signals.ConsolidatableSince = consolidatableFor(-48*time.Hour, instanceA, instanceB, instanceC)
 	signals.LastScaleDownAt = at(-72 * time.Hour)
 	return signals
 }
@@ -443,7 +452,7 @@ func TestScaleInNeedsAWeekOfEvidence(t *testing.T) {
 func TestScaleInNeedsTheConsolidationToHaveDwelled(t *testing.T) {
 	policy := basePolicy()
 	signals := scaleInSignals()
-	signals.ConsolidatableSince = at(-time.Hour)
+	signals.ConsolidatableSince = consolidatableFor(-time.Hour, instanceA, instanceB, instanceC)
 
 	plan := Recommend(signals, policy)
 	action := actionOf(t, plan, pgelasticv1alpha1.AutoActionScaleIn)
@@ -458,6 +467,37 @@ func TestScaleInNeedsTheConsolidationToHaveDwelled(t *testing.T) {
 	plan = Recommend(signals, policy)
 	if action := actionOf(t, plan, pgelasticv1alpha1.AutoActionScaleIn); action.Reason != ReasonDwellTime {
 		t.Errorf("with no observed dwell at all the refusal is %q, want %q", action.Reason, ReasonDwellTime)
+	}
+}
+
+// The dwell time belongs to the instance that is actually going to be reclaimed. Reading
+// the longest-waiting candidate's timestamp instead lets an instance that emptied a minute
+// ago be scaled in on another instance's patience, which is the whole of the anti-flapping
+// guard.
+func TestTheDwellTimeIsReadOffTheInstanceBeingReclaimed(t *testing.T) {
+	policy := basePolicy()
+	signals := scaleInSignals()
+
+	plan := Recommend(signals, policy)
+	victim := plan.ConsolidationTarget
+	if victim == "" {
+		t.Fatal("no consolidation target was chosen, so there is nothing to gate")
+	}
+
+	// Every other candidate has waited out the dwell time; the victim has just become
+	// consolidatable.
+	signals.ConsolidatableSince = consolidatableFor(-48*time.Hour, instanceA, instanceB, instanceC)
+	signals.ConsolidatableSince[victim] = now.Add(-time.Minute)
+
+	action := actionOf(t, Recommend(signals, policy), pgelasticv1alpha1.AutoActionScaleIn)
+	if action.Permitted {
+		t.Errorf("%s was scaled in a minute after becoming consolidatable, on another instance's dwell time", victim)
+	}
+	if action.Reason != ReasonDwellTime {
+		t.Errorf("refused with %q, want %q", action.Reason, ReasonDwellTime)
+	}
+	if !strings.Contains(action.Message, victim) {
+		t.Errorf("message = %q, want it to name %s", action.Message, victim)
 	}
 }
 

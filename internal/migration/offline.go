@@ -78,9 +78,15 @@ func offlineDumpCommand(plan Plan, jobs int32) string {
 // offlineRestoreCommand restores schema and data together. --exit-on-error is what turns a
 // half-restored database into a failed migration the tenant never sees, rather than a
 // successful-looking one that is missing whatever errored.
+//
+// --clean --if-exists is what makes the phase survive its own retry. A restore that died
+// part-way leaves objects behind, and a second attempt without the drops fails on the first
+// of them - so the retry budget would be spent re-running a command that could never succeed.
+// The drops are safe because the target database holds nothing but what this migration is
+// restoring into it.
 func offlineRestoreCommand(plan Plan, jobs int32) string {
 	return fmt.Sprintf(`pg_restore --jobs=%s --no-owner --no-privileges --exit-on-error `+
-		`--host=%s --username=postgres --dbname=%s %s`,
+		`--clean --if-exists --host=%s --username=postgres --dbname=%s %s`,
 		strconv.FormatInt(int64(jobs), 10), shellQuote(socketDir),
 		shellQuote(plan.Target.Database), shellQuote(plan.DumpDir))
 }

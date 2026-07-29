@@ -27,6 +27,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -688,14 +689,16 @@ func conditionsFor(
 
 	conditions := make([]any, 0, 3)
 	conditions = append(conditions,
-		condition(pgelasticv1alpha1.ConditionReady, ready, instance.Generation,
-			readyReason(phase), fmt.Sprintf("%d of %d members are ready", readyMembers(pods), replicas)),
-		condition(pgelasticv1alpha1.ConditionProgressing, !ready, instance.Generation,
-			progressingReason(phase), progressingMessage(instance, phase)),
+		condition(instance.Status.Conditions, pgelasticv1alpha1.ConditionReady, ready,
+			instance.Generation, readyReason(phase),
+			fmt.Sprintf("%d of %d members are ready", readyMembers(pods), replicas)),
+		condition(instance.Status.Conditions, pgelasticv1alpha1.ConditionProgressing, !ready,
+			instance.Generation, progressingReason(phase), progressingMessage(instance, phase)),
 	)
 	degraded := phase == pgelasticv1alpha1.InstancePhaseDegraded
-	conditions = append(conditions, condition(pgelasticv1alpha1.ConditionDegraded, degraded,
-		instance.Generation, degradedReason(degraded), quorumMessage(instance)))
+	conditions = append(conditions, condition(instance.Status.Conditions,
+		pgelasticv1alpha1.ConditionDegraded, degraded, instance.Generation,
+		degradedReason(degraded), quorumMessage(instance)))
 	return append(conditions, failoverConditions(instance, decision)...)
 }
 
@@ -743,14 +746,34 @@ func quorumMessage(instance *pgelasticv1alpha1.PgInstance) string {
 	return "the primary loaded synchronous_standby_names " + evidence.SynchronousStandbyNames
 }
 
-func condition(conditionType string, ok bool, generation int64, reason, message string) map[string]any {
+// condition renders one condition for the status apply, carrying its transition time
+// forward whenever the status has not in fact transitioned.
+//
+// Stamping the current instant unconditionally does two things, both wrong. It makes
+// lastTransitionTime mean "when this was last reconciled", which is the one thing the field
+// must not mean. And because the apply then differs from the stored object on every pass,
+// it re-enqueues the PgInstance through its own watch and fans that write out to every pool
+// and tenant watching it, for an instance where nothing happened.
+func condition(
+	existing []metav1.Condition,
+	conditionType string,
+	ok bool,
+	generation int64,
+	reason, message string,
+) map[string]any {
+	status := conditionStatus(ok)
+	transitioned := metav1.Now()
+	if previous := meta.FindStatusCondition(existing, conditionType); previous != nil &&
+		previous.Status == status && !previous.LastTransitionTime.IsZero() {
+		transitioned = previous.LastTransitionTime
+	}
 	return map[string]any{
 		"type":               conditionType,
-		"status":             string(conditionStatus(ok)),
+		"status":             string(status),
 		"reason":             reason,
 		"message":            message,
 		"observedGeneration": generation,
-		"lastTransitionTime": metav1.Now().UTC().Format(time.RFC3339),
+		"lastTransitionTime": transitioned.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -776,8 +799,8 @@ func (r *PgInstanceReconciler) publishInvalid(
 		fieldObservedGeneration: instance.Generation,
 		fieldPhase:              string(pgelasticv1alpha1.InstancePhasePending),
 		"conditions": []any{
-			condition(pgelasticv1alpha1.ConditionReady, false, instance.Generation,
-				pgelasticv1alpha1.ReasonInvalidSpec, cause.Error()),
+			condition(instance.Status.Conditions, pgelasticv1alpha1.ConditionReady, false,
+				instance.Generation, pgelasticv1alpha1.ReasonInvalidSpec, cause.Error()),
 		},
 	}
 	return r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(object),

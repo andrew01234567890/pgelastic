@@ -398,6 +398,29 @@ var _ = Describe("PgTenantMigration controller", func() {
 		Expect(final.Status.Verification.VerifiedAt).NotTo(BeNil())
 	})
 
+	// A deployed operator reads through the manager's informer cache, which lags its own last
+	// status write by however long the watch event takes to arrive. Driving reconciles with
+	// no cache sync between them is that lag made deterministic: the second reconcile computes
+	// a status against a revision the first one has already replaced. Losing that race is not
+	// a harmless retry - the effect runs before the status is published, so every lost race
+	// re-runs the whole phase.
+	It("does not lose a status race with its own previous write", func() {
+		awaitCached(object, tenant, source, target, secret)
+		cached := &PgTenantMigrationReconciler{
+			Client: cachedClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+			SQL: sql, Shell: scriptedShell{}, Router: router,
+			Now: func() time.Time { return clock },
+		}
+
+		for range 4 {
+			_, err := cached.Reconcile(ctx, requestFor(object))
+			Expect(err).NotTo(HaveOccurred())
+			clock = clock.Add(100 * time.Millisecond)
+		}
+		Expect(refetch(object).Status.Phase).
+			To(Equal(pgelasticv1alpha1.TenantMigrationPhaseCatchup))
+	})
+
 	It("refuses to run without the ports a migration acts through", func() {
 		portless := &PgTenantMigrationReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		_, err := portless.Reconcile(ctx, requestFor(object))

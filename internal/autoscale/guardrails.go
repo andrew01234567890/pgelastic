@@ -80,6 +80,9 @@ func refuse(reason, format string, args ...any) verdict {
 type Guard struct {
 	Policy  Policy
 	Signals Signals
+	// ConsolidationTarget is the instance scale-in would reclaim. The dwell time is read
+	// off this instance's own timestamp, never off whichever candidate has waited longest.
+	ConsolidationTarget string
 }
 
 // Evaluate answers whether one action class may execute now.
@@ -234,13 +237,14 @@ func (g Guard) scaleIn() verdict {
 			"the pool has %s of per-tenant history against the %s scale-in requires",
 			g.Signals.EvidenceSpan.Round(time.Hour), g.Policy.ScaleInEvidenceWindow)
 	}
-	elapsed, ok := since(g.Signals.Now, g.Signals.ConsolidatableSince)
+	elapsed, ok := g.consolidationDwell()
 	if !ok {
-		return refuse(ReasonDwellTime, "the consolidation has not been observed for any dwell time yet")
+		return refuse(ReasonDwellTime,
+			"%s has not been observed consolidatable for any dwell time yet", g.ConsolidationTarget)
 	}
 	if elapsed < g.Policy.ConsolidationDwell {
-		return refuse(ReasonDwellTime, "the instance has been consolidatable for %s of the required %s",
-			elapsed.Round(time.Minute), g.Policy.ConsolidationDwell)
+		return refuse(ReasonDwellTime, "%s has been consolidatable for %s of the required %s",
+			g.ConsolidationTarget, elapsed.Round(time.Minute), g.Policy.ConsolidationDwell)
 	}
 	return g.migrationBudget()
 }
@@ -265,6 +269,19 @@ func (g Guard) MoveEligible(tenant TenantSignal, source InstanceSignal) (bool, s
 		return false, fmt.Sprintf("a migration from %s is already in flight", source.Name)
 	}
 	return true, ""
+}
+
+// consolidationDwell is how long the instance scale-in has chosen has been consolidatable.
+// A target that is not named, or that has no timestamp of its own, has waited for nothing.
+func (g Guard) consolidationDwell() (time.Duration, bool) {
+	if g.ConsolidationTarget == "" {
+		return 0, false
+	}
+	at, ok := g.Signals.ConsolidatableSince[g.ConsolidationTarget]
+	if !ok {
+		return 0, false
+	}
+	return since(g.Signals.Now, &at)
 }
 
 func since(now time.Time, at *time.Time) (time.Duration, bool) {

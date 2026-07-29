@@ -112,6 +112,28 @@ var _ = Describe("effective capacity", func() {
 		Expect(effective.QoSClass).To(Equal(pgelasticv1alpha1.QoSGuaranteed))
 	})
 
+	It("carries the class's automatic-migration opt-out onto the effective policy", func() {
+		class := workloadClass("no-auto-moves", 0, 8)
+		class.Spec.Migration = &pgelasticv1alpha1.WorkloadMigrationPolicy{
+			AllowAutomatic: ptrTo(false),
+		}
+
+		effective := policy.EffectiveFor(&pgelasticv1alpha1.PgTenant{}, class)
+
+		Expect(effective.AutomaticMigrationAllowed).To(BeFalse(),
+			"the rebalancer would move a tenant whose class forbids being moved")
+	})
+
+	It("allows automatic migration when the class says nothing about it", func() {
+		class := workloadClass("standard", 0, 8)
+		Expect(policy.EffectiveFor(&pgelasticv1alpha1.PgTenant{}, class).AutomaticMigrationAllowed).
+			To(BeTrue())
+
+		class.Spec.Migration = &pgelasticv1alpha1.WorkloadMigrationPolicy{}
+		Expect(policy.EffectiveFor(&pgelasticv1alpha1.PgTenant{}, class).AutomaticMigrationAllowed).
+			To(BeTrue())
+	})
+
 	It("defaults the weight when the class predates the field", func() {
 		class := workloadClass("legacy", 0, 8)
 		class.Spec.Capacity.Weight = nil

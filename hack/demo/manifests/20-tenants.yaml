@@ -1,0 +1,30 @@
+# test and test2 are pinned to different instances so the migration later has somewhere
+# real to move to. Pinning is what makes "its own hardware" checkable rather than a
+# scheduling coincidence.
+apiVersion: pgelastic.io/v1alpha1
+kind: PgTenant
+metadata:
+  name: test
+  namespace: pgelastic-demo
+spec:
+  poolRef:
+    name: demo-pool
+  databaseName: test
+  workloadClassName: demo-standard
+  placement:
+    instanceRef:
+      name: demo-a
+---
+apiVersion: pgelastic.io/v1alpha1
+kind: PgTenant
+metadata:
+  name: test2
+  namespace: pgelastic-demo
+spec:
+  poolRef:
+    name: demo-pool
+  databaseName: test2
+  workloadClassName: demo-standard
+  placement:
+    instanceRef:
+      name: demo-b
