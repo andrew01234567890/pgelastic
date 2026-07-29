@@ -168,7 +168,14 @@ func (r *ProxyRouter) Quiesce(ctx context.Context, tenant migration.TenantRef, n
 	if err := r.closeGate(ctx, fleet, name); err != nil {
 		return err
 	}
-	r.keepAlive(fleet, name)
+	tenant, holder := fleet.tenant, name
+	r.keepAlive(tenant.String(), holder, func(ctx context.Context) bool {
+		if r.renew(ctx, tenant, holder) {
+			return true
+		}
+		r.abandon(ctx, tenant, holder)
+		return false
+	})
 	return nil
 }
 
@@ -248,7 +255,7 @@ func (r *ProxyRouter) finish(ctx context.Context, tenant migration.TenantRef, co
 	// The renewal loop stops whether or not the calls above succeeded. Leaving it running
 	// would keep renewing a hold nobody intends to end deliberately any more, which turns a
 	// failed release into an unbounded one instead of one bounded by the lease.
-	r.endHold(tenant)
+	r.endHold(tenant.String())
 	problems = append(problems, r.Binding.Release(ctx, tenant))
 	return errors.Join(problems...)
 }
@@ -364,7 +371,7 @@ func (r *ProxyRouter) closeGate(ctx context.Context, fleet *fleet, holder string
 		taken = append(taken, endpoint)
 	}
 	if failure == nil {
-		r.beginHold(fleet.tenant, holder)
+		r.beginHold(fleet.tenant.String(), holder)
 		return nil
 	}
 	for _, endpoint := range taken {
@@ -383,9 +390,9 @@ func (r *ProxyRouter) closeGate(ctx context.Context, fleet *fleet, holder string
 // of the TTL so two consecutive failures still leave a whole interval of margin, and it
 // stops the moment the hold ends: an operator that crashes should give the tenant back in
 // seconds rather than at the ceiling.
-func (r *ProxyRouter) keepAlive(fleet *fleet, holder string) {
+func (r *ProxyRouter) keepAlive(key, holder string, renew func(context.Context) bool) {
 	r.mu.Lock()
-	current, running := r.holds[fleet.tenant.String()]
+	current, running := r.holds[key]
 	if !running || current.holder != holder || current.done != nil {
 		r.mu.Unlock()
 		return
@@ -396,7 +403,6 @@ func (r *ProxyRouter) keepAlive(fleet *fleet, holder string) {
 	r.mu.Unlock()
 
 	interval := r.leaseTTL() / 3
-	tenant := fleet.tenant
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(interval)
@@ -406,8 +412,7 @@ func (r *ProxyRouter) keepAlive(fleet *fleet, holder string) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if !r.renew(ctx, tenant, holder) {
-					r.abandon(ctx, tenant, holder)
+				if !renew(ctx) {
 					return
 				}
 			}
@@ -492,31 +497,31 @@ func (r *ProxyRouter) abandon(ctx context.Context, tenant migration.TenantRef, h
 	r.pauses[tenant.String()] = r.now().Sub(current.closedAt)
 }
 
-func (r *ProxyRouter) beginHold(tenant migration.TenantRef, holder string) {
+func (r *ProxyRouter) beginHold(key, holder string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.holds == nil {
 		r.holds = map[string]*hold{}
 	}
-	if current, ok := r.holds[tenant.String()]; ok && current.holder == holder {
+	if current, ok := r.holds[key]; ok && current.holder == holder {
 		return
 	}
-	r.holds[tenant.String()] = &hold{holder: holder, closedAt: r.now()}
+	r.holds[key] = &hold{holder: holder, closedAt: r.now()}
 }
 
 // endHold stops the renewal loop and records how long the clients were actually queued.
-func (r *ProxyRouter) endHold(tenant migration.TenantRef) {
+func (r *ProxyRouter) endHold(key string) {
 	r.mu.Lock()
-	current, ok := r.holds[tenant.String()]
+	current, ok := r.holds[key]
 	if !ok {
 		r.mu.Unlock()
 		return
 	}
-	delete(r.holds, tenant.String())
+	delete(r.holds, key)
 	if r.pauses == nil {
 		r.pauses = map[string]time.Duration{}
 	}
-	r.pauses[tenant.String()] = r.now().Sub(current.closedAt)
+	r.pauses[key] = r.now().Sub(current.closedAt)
 	r.mu.Unlock()
 
 	if current.stop != nil {
@@ -549,6 +554,9 @@ func (r *ProxyRouter) holderFor(ctx context.Context, tenant migration.TenantRef)
 
 // fleet is one pool's control plane as this router needs it: who to call, about which
 // tenant, under whose identity.
+//
+// The tenant and database are empty for an instance-scoped call, which is about every
+// tenant an instance serves and therefore about none of them in particular.
 type fleet struct {
 	pool      client.ObjectKey
 	tenant    migration.TenantRef
@@ -670,15 +678,25 @@ func (r *ProxyRouter) post(
 	case 200:
 		return nil
 	case 422:
-		// The gate is not held. For a release that is the wanted state already reached,
-		// which is exactly what an expired lease leaves behind.
-		if path == "/unquiesce" {
+		// The gate is not held. For anything that ends a hold - opening the gate as well
+		// as giving the lease back - that is the wanted state already reached, which is
+		// exactly what an expired lease leaves behind and what a caller repeating its own
+		// release finds.
+		if endsAHold(path) {
 			return nil
 		}
 		return refusal(endpoint, path, answer)
 	default:
 		return refusal(endpoint, path, answer)
 	}
+}
+
+func endsAHold(path string) bool {
+	switch path {
+	case "/resume", "/unquiesce", "/resumeInstance", "/unquiesceInstance":
+		return true
+	}
+	return false
 }
 
 func refusal(endpoint ControlEndpoint, path string, answer Answer) error {

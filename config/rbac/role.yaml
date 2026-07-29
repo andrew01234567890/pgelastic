@@ -23,6 +23,7 @@ rules:
   - ""
   resources:
   - namespaces
+  - nodes
   verbs:
   - get
   - list
@@ -88,6 +89,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - pgelastic.io

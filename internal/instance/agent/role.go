@@ -178,8 +178,18 @@ func (s *Supervisor) holdPrimary(ctx context.Context, instance *pgelasticv1alpha
 	log := logf.FromContext(ctx)
 	target := instance.Status.TargetPrimary
 	if target != "" && target != ha.TargetPrimaryPending && target != s.options.Member {
+		// The epoch the proxy will see bumps identically for a handover and for a
+		// failover, so the cause has to be carried some other way, and this is it: the
+		// operator names the members it is about to disrupt before it names a new primary.
+		// Naming this member is what makes the stop clean rather than immediate, and a
+		// clean stop is what the rewind that follows needs.
+		planned := ha.UnderMaintenance(instance.GetAnnotations(), s.options.Member)
 		log.Info("the operator has named another member; stopping the postmaster",
-			"targetPrimary", target, "member", s.options.Member)
+			"targetPrimary", target, "member", s.options.Member, "planned", planned)
+		if planned {
+			s.queue(ctx, CommandSwitchover)
+			return
+		}
 		s.fence(ctx)
 		return
 	}
@@ -241,8 +251,12 @@ func (s *Supervisor) promoteIfChosen(ctx context.Context, instance *pgelasticv1a
 // pg_ctl from here, so that the shutdown, the wait and the probe state stay owned by the
 // goroutine that owns the postmaster.
 func (s *Supervisor) fence(ctx context.Context) {
+	s.queue(ctx, CommandFence)
+}
+
+func (s *Supervisor) queue(ctx context.Context, command Command) {
 	select {
-	case s.commands <- CommandFence:
+	case s.commands <- command:
 	default:
 		logf.FromContext(ctx).V(1).Info("a shutdown is already queued")
 	}

@@ -82,6 +82,10 @@ const (
 	DisqualifiedNoReceiverAtDetection = "NoWALReceiverAtDetection"
 	// DisqualifiedIsPrimary is the failed primary itself.
 	DisqualifiedIsPrimary = "IsTheFailedPrimary"
+	// DisqualifiedUnderMaintenance is a member the caller is itself about to disrupt.
+	// Handing it the role would mean switching over twice, and the second switchover
+	// would have one fewer member to choose from.
+	DisqualifiedUnderMaintenance = "UnderMaintenance"
 )
 
 // CandidateInput is everything candidate selection is allowed to look at.
@@ -102,6 +106,9 @@ type CandidateInput struct {
 	// WAL receiver at detection time: PostgreSQL counts a standby towards the quorum only
 	// while it is streaming.
 	StreamingAtDetection []string
+	// Maintenance is the members the caller is about to disrupt. Empty for an unplanned
+	// failover, where nothing is being disrupted on purpose.
+	Maintenance []string
 }
 
 // CandidateResult is the outcome of ranking the members.
@@ -125,11 +132,12 @@ type CandidateResult struct {
 func SelectCandidate(input CandidateInput) CandidateResult {
 	syncSet := setOf(input.SyncSet)
 	streaming := setOf(input.StreamingAtDetection)
+	maintenance := setOf(input.Maintenance)
 
 	result := CandidateResult{}
 	eligible := make([]Member, 0, len(input.Members))
 	for _, member := range input.Members {
-		if reason, ok := disqualify(member, input, syncSet, streaming); ok {
+		if reason, ok := disqualify(member, input, syncSet, streaming, maintenance); ok {
 			result.Disqualified = append(result.Disqualified,
 				Disqualification{Member: member.Name, Reason: reason})
 			continue
@@ -165,11 +173,13 @@ func SelectCandidate(input CandidateInput) CandidateResult {
 func disqualify(
 	member Member,
 	input CandidateInput,
-	syncSet, streaming map[string]bool,
+	syncSet, streaming, maintenance map[string]bool,
 ) (string, bool) {
 	switch {
 	case member.Name == input.KnownPrimary:
 		return DisqualifiedIsPrimary, true
+	case maintenance[member.Name]:
+		return DisqualifiedUnderMaintenance, true
 	case !member.StatusReachable:
 		return DisqualifiedUnreachable, true
 	case !member.InRecovery:

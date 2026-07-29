@@ -346,7 +346,11 @@ fn apply_fence(
         return None;
     }
     let state = witness.state(TransactionStatus::Idle);
-    let action = crate::epoch::action(state);
+    // Never held. A session-mode client owns its backend for its whole life, so
+    // there is no boundary at which to hand it back and let it queue - which is
+    // the same reason quiesce excludes session pooling outright. Offering it the
+    // held row would return a link the client still believes it owns.
+    let action = crate::epoch::action(state, crate::epoch::Held::No);
     if action == crate::epoch::FenceAction::DrainThenClose {
         *draining_fence = true;
         return None;

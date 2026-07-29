@@ -29,6 +29,64 @@ import (
 // leave the pool ledger claiming reservations against storage nobody owns.
 const PgInstanceDrainTenantsFinalizer = "pgelastic.io/drain-tenants"
 
+// AnnotationRestartedAt asks for one rolling restart of every member, and is the same
+// idiom `kubectl rollout restart` teaches: set it to a value different from the one
+// already there and the instance rolls once.
+//
+// The value is opaque and never parsed. It is compared - against the value each Pod was
+// last rolled for, which is recorded on the Pod itself - so a roll survives an operator
+// restart and resumes at the member it had reached rather than starting again, and two
+// edits made while one roll is running are still one roll. A timestamp is the conventional
+// value because it is unique and readable, but nothing here requires one.
+const AnnotationRestartedAt = "pgelastic.io/restartedAt"
+
+// InstanceRollReason is why a rolling restart is happening. It is published rather than
+// inferred because the three causes have different remedies: a configuration change waits
+// for nothing, an explicit request was somebody's decision, and a draining node is a
+// deadline the cluster imposed.
+// +kubebuilder:validation:Enum=ConfigurationChanged;RestartRequested;NodeDraining
+type InstanceRollReason string
+
+const (
+	// RollReasonConfigChanged is a parameter that PostgreSQL can only adopt at startup.
+	RollReasonConfigChanged InstanceRollReason = "ConfigurationChanged"
+	// RollReasonRestartRequested is AnnotationRestartedAt.
+	RollReasonRestartRequested InstanceRollReason = "RestartRequested"
+	// RollReasonNodeDraining is the primary's node having been made unschedulable. Without
+	// this the primary PodDisruptionBudget blocks the eviction and the drain hangs, because
+	// nothing else in the system ever initiates the switchover it is waiting for.
+	RollReasonNodeDraining InstanceRollReason = "NodeDraining"
+)
+
+// InstanceRollStep is what the roll is doing to the member it names, so that a roll that
+// has stopped moving says where it stopped.
+// +kubebuilder:validation:Enum=Quiescing;SwitchingOver;Restarting;Blocked;Stalled
+type InstanceRollStep string
+
+const (
+	// RollStepQuiescing is holding this instance's clients at the proxy, before a role
+	// change they must not be dropped by.
+	RollStepQuiescing InstanceRollStep = "Quiescing"
+	// RollStepSwitchingOver is waiting for another member to take the primary role.
+	RollStepSwitchingOver InstanceRollStep = "SwitchingOver"
+	// RollStepRestarting is waiting for one member's Pod to be recreated and come back
+	// Ready on the new configuration.
+	RollStepRestarting InstanceRollStep = "Restarting"
+	// RollStepBlocked is a roll that has work to do and may not do it yet: the instance is
+	// short of a member, or a failover is in flight. It clears itself, and the message
+	// says what it is waiting for.
+	RollStepBlocked InstanceRollStep = "Blocked"
+	// RollStepStalled is a roll that gave up rather than kept waiting, and gave the
+	// clients back when it did.
+	//
+	// It is a separate step from Blocked because it does not clear itself. Something on
+	// the instance is holding a backend that will never be returned - a session with
+	// temporary tables, a LISTEN registration or a session advisory lock - and until it
+	// ends, every attempt queues every other client behind a handover that cannot happen.
+	// So the roll waits a long time between attempts instead of a short one, and says so.
+	RollStepStalled InstanceRollStep = "Stalled"
+)
+
 // DataDurability selects what happens to commits when the synchronous quorum cannot be
 // satisfied.
 //
@@ -495,6 +553,10 @@ type PgInstanceStatus struct {
 	// +optional
 	QuorumEvidence *QuorumEvidence `json:"quorumEvidence,omitempty"`
 
+	// roll reports a rolling restart in progress, and is absent when none is.
+	// +optional
+	Roll *InstanceRollStatus `json:"roll,omitempty"`
+
 	// capacity is this instance's contribution to the pool's connection budget.
 	// +optional
 	Capacity *InstanceCapacityStatus `json:"capacity,omitempty"`
@@ -612,6 +674,44 @@ type InstanceMemberStatus struct {
 	// +kubebuilder:validation:Enum=rewinding;recloning
 	// +optional
 	Rejoining string `json:"rejoining,omitempty"`
+}
+
+// InstanceRollStatus is the roll's own account of itself: which member it is disrupting,
+// why, what it is doing to that member, and how many are still to come.
+//
+// It exists because a rolling restart is the one operation that is both routine and slow
+// enough to be watched, and because its two interesting failures - a client set that will
+// not drain, and an instance that is not fit to lose a member - are indistinguishable from
+// "still working" without it.
+type InstanceRollStatus struct {
+	// member is the Pod being rolled right now.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	Member string `json:"member,omitempty"`
+
+	// reason is what asked for the roll.
+	// +optional
+	Reason InstanceRollReason `json:"reason,omitempty"`
+
+	// step is what is being done to member.
+	// +optional
+	Step InstanceRollStep `json:"step,omitempty"`
+
+	// pending is how many members are still to be rolled, including member itself. It
+	// reaches zero on the reconcile that clears this whole record.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Pending int32 `json:"pending,omitempty"`
+
+	// startedAt is when this member's step began, which is what makes a stalled roll
+	// visible as one rather than as a slow one.
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+
+	// message says in one sentence what is being waited for.
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // QuorumEvidence is written only by the member that is both currentPrimary and

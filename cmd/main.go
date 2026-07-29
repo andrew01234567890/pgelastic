@@ -54,6 +54,17 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+// envControllerName names this operator's identity from the environment, so a Deployment
+// can give two operators disjoint claims without changing their command line.
+const envControllerName = "PGELASTIC_CONTROLLER_NAME"
+
+func envOrDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
+}
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
@@ -78,9 +89,12 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.StringVar(&controllerName, "controller-name", controller.DefaultControllerName,
-		"The controllerName a PgElasticClass must name for this controller to claim it. "+
-			"A class naming any other controller is ignored entirely.")
+	flag.StringVar(&controllerName, "controller-name",
+		envOrDefault(envControllerName, controller.DefaultControllerName),
+		"The controllerName a PgElasticClass must name for this operator to claim it. That "+
+			"claim is inherited by every pool bound to the class and by every instance, tenant "+
+			"and migration under those pools; anything governed by another controller is "+
+			"ignored entirely. Overrides "+envControllerName+".")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
@@ -222,16 +236,31 @@ func main() {
 	meteringCollector := metering.NewCollector(metering.Options{}, meteringMetrics)
 
 	if err := (&controller.PgElasticPoolReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Metering: meteringCollector,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		Metering:       meteringCollector,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgelasticpool")
 		os.Exit(1)
 	}
+	// The instance controller and the migration controller reach the same fleet through the
+	// same control API, and are given one router between them: both take holds on it, the
+	// renewal loops live inside it, and two routers would each keep half the holds alive.
+	fleetRouter := &proxy.ProxyRouter{
+		Binding:   migration.BindingRouter{Client: mgr.GetClient(), Reader: mgr.GetAPIReader()},
+		Reader:    mgr.GetAPIReader(),
+		Endpoints: proxy.PodEndpoints{Reader: mgr.GetAPIReader()},
+		Caller:    &proxy.MutualTLSCaller{Reader: mgr.GetAPIReader()},
+	}
 	if err := (&controller.PgInstanceReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		// Without this a rolling restart hands the primary role over with nobody holding the
+		// instance's clients, which is the difference between a latency spike and a dropped
+		// connection for every tenant on it.
+		Quiescer:       fleetRouter,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pginstance")
 		os.Exit(1)
@@ -251,10 +280,11 @@ func main() {
 		Members: migration.PrimaryResolver{Client: mgr.GetAPIReader()},
 	}
 	if err := (&controller.PgTenantReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Metering: meteringCollector,
-		SQL:      migrationSQL,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		Metering:       meteringCollector,
+		SQL:            migrationSQL,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgtenant")
 		os.Exit(1)
@@ -268,25 +298,21 @@ func main() {
 	// Every read goes through the API reader. The safety property that an abort restores the
 	// source rests on knowing where the tenant is routed now, and quiescing the replicas an
 	// informer cache remembers is quiescing the ones that have already been replaced.
-	migrationRouter := &proxy.ProxyRouter{
-		Binding:   migration.BindingRouter{Client: mgr.GetClient(), Reader: mgr.GetAPIReader()},
-		Reader:    mgr.GetAPIReader(),
-		Endpoints: proxy.PodEndpoints{Reader: mgr.GetAPIReader()},
-		Caller:    &proxy.MutualTLSCaller{Reader: mgr.GetAPIReader()},
-	}
 	if err := (&controller.PgTenantMigrationReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		SQL:    migrationSQL,
-		Shell:  migrationSQL,
-		Router: migrationRouter,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		SQL:            migrationSQL,
+		Shell:          migrationSQL,
+		Router:         fleetRouter,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgtenantmigration")
 		os.Exit(1)
 	}
 	if err := mgr.Add(&controller.MigrationSweeper{
-		Client: mgr.GetClient(),
-		SQL:    migrationSQL,
+		Client:         mgr.GetClient(),
+		SQL:            migrationSQL,
+		ControllerName: controllerName,
 	}); err != nil {
 		setupLog.Error(err, "Failed to add the migration orphan sweeper")
 		os.Exit(1)

@@ -154,9 +154,39 @@ pub struct DrainStatus {
     pub lease_expires_in: Option<Duration>,
 }
 
+/// What a gate holds: one tenant, or every tenant on one instance.
+///
+/// The two are the same machinery under two leases, and that is the whole
+/// design. A tenant lease is owned by whoever is moving *that tenant between
+/// instances*; an instance lease is owned by whoever is changing *which member
+/// of that instance is the primary*. They are different exclusions over
+/// different things, so a live migration and a planned switchover compose
+/// instead of colliding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Tenant,
+    Instance,
+}
+
+impl Scope {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Tenant => "tenant",
+            Self::Instance => "instance",
+        }
+    }
+}
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// One tenant's admission gate.
 #[derive(Debug)]
 pub struct TenantGate {
+    scope: Scope,
     tenant: String,
     /// `true` while transactions are admitted.
     open: watch::Sender<bool>,
@@ -184,8 +214,9 @@ struct Queue {
 }
 
 impl TenantGate {
-    fn new(tenant: &str) -> Arc<Self> {
+    fn new(scope: Scope, tenant: &str) -> Arc<Self> {
         Arc::new(Self {
+            scope,
             tenant: tenant.to_owned(),
             open: watch::Sender::new(true),
             queue: Mutex::new(Queue::default()),
@@ -200,8 +231,31 @@ impl TenantGate {
         &self.tenant
     }
 
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
     pub fn is_open(&self) -> bool {
         *self.open.borrow()
+    }
+
+    /// Whether somebody is deliberately keeping these clients still.
+    ///
+    /// The fence's input, and the reason it is a *live* lease rather than
+    /// merely a closed gate: a lease that has expired but has not been swept
+    /// yet is nobody's deliberate hold, and treating it as one would soften the
+    /// fence on the strength of a stale record. Reap-then-ask is not available
+    /// here — the fence fires from the data path, and the sweep is the control
+    /// plane's.
+    pub fn held(&self) -> bool {
+        if *self.open.borrow() {
+            return false;
+        }
+        self.lease
+            .lock()
+            .expect("a tenant gate is never poisoned")
+            .as_ref()
+            .is_some_and(|live| !live.expired())
     }
 
     pub fn queued(&self) -> u64 {
@@ -335,10 +389,11 @@ impl TenantGate {
                 .expect("a tenant gate is never poisoned") = Some(Instant::now());
         }
         info!(
+            scope = %self.scope,
             tenant = %self.tenant,
             holder,
             ttl_ms = ttl.as_millis(),
-            "this tenant is quiesced; new transactions are queued and their sockets held"
+            "this gate is quiesced; new transactions are queued and their sockets held"
         );
         Ok(taken)
     }
@@ -388,10 +443,11 @@ impl TenantGate {
             }
         };
         warn!(
+            scope = %self.scope,
             tenant = %self.tenant,
             holder = %live.holder,
             reverting = live.source.is_some(),
-            "the quiesce lease expired without being renewed; the tenant is unquiesced"
+            "the quiesce lease expired without being renewed; the gate is unquiesced"
         );
         let held = self.held_for();
         let released = self.open_gate();
@@ -506,10 +562,16 @@ impl Drop for InFlight {
     }
 }
 
-/// Every tenant's gate, created on first use.
+/// Every gate, tenant-scoped and instance-scoped, created on first use.
+///
+/// The two maps are kept apart rather than sharing one keyspace because a
+/// tenant and an instance may legitimately have the same name, and because
+/// their expiries mean different things: an expired tenant lease implies a route
+/// rollback and an expired instance lease implies nothing but "stop holding".
 #[derive(Debug, Default)]
 pub struct QuiesceRegistry {
     gates: Mutex<HashMap<String, Arc<TenantGate>>>,
+    instances: Mutex<HashMap<String, Arc<TenantGate>>>,
 }
 
 impl QuiesceRegistry {
@@ -518,14 +580,29 @@ impl QuiesceRegistry {
     }
 
     pub fn gate(&self, tenant: &str) -> Arc<TenantGate> {
-        let mut gates = self
-            .gates
-            .lock()
-            .expect("the quiesce registry is never poisoned");
+        Self::entry(&self.gates, Scope::Tenant, tenant)
+    }
+
+    /// The gate that holds every tenant on one instance.
+    ///
+    /// Composes with the tenant gates rather than replacing them: a checkout
+    /// passes both, so a live migration of one tenant and a planned switchover
+    /// of the instance it is leaving can be owned by two different holders at
+    /// once without either taking the other's lease.
+    pub fn instance(&self, instance: &str) -> Arc<TenantGate> {
+        Self::entry(&self.instances, Scope::Instance, instance)
+    }
+
+    fn entry(
+        map: &Mutex<HashMap<String, Arc<TenantGate>>>,
+        scope: Scope,
+        name: &str,
+    ) -> Arc<TenantGate> {
+        let mut gates = map.lock().expect("the quiesce registry is never poisoned");
         Arc::clone(
             gates
-                .entry(tenant.to_owned())
-                .or_insert_with(|| TenantGate::new(tenant)),
+                .entry(name.to_owned())
+                .or_insert_with(|| TenantGate::new(scope, name)),
         )
     }
 
@@ -538,6 +615,23 @@ impl QuiesceRegistry {
             .map(Arc::clone)
     }
 
+    /// Every tenant this proxy has ever admitted a client for.
+    ///
+    /// The input to resolving an instance's tenants: the routing table names
+    /// only the tenants somebody configured a route for, and a tenant on the
+    /// default instance has no entry there at all.
+    pub fn tenants(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .gates
+            .lock()
+            .expect("the quiesce registry is never poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
     pub fn quiesced(&self) -> Vec<Arc<TenantGate>> {
         self.gates
             .lock()
@@ -548,10 +642,23 @@ impl QuiesceRegistry {
             .collect()
     }
 
-    /// Drops every expired lease, returning the rollbacks they imply.
+    /// Drops every expired tenant lease, returning the rollbacks they imply.
     pub fn reap_expired(&self) -> Vec<(String, Expired)> {
-        let gates: Vec<Arc<TenantGate>> = self
-            .gates
+        Self::reap(&self.gates)
+    }
+
+    /// Drops every expired instance lease.
+    ///
+    /// Separate from [`reap_expired`](Self::reap_expired) because the caller
+    /// must not act on the rollback: a switchover never moved the tenants
+    /// anywhere, so putting them "back" would mean writing the instance's own
+    /// name into the routing table under an instance's name.
+    pub fn reap_expired_instances(&self) -> Vec<(String, Expired)> {
+        Self::reap(&self.instances)
+    }
+
+    fn reap(map: &Mutex<HashMap<String, Arc<TenantGate>>>) -> Vec<(String, Expired)> {
+        let gates: Vec<Arc<TenantGate>> = map
             .lock()
             .expect("the quiesce registry is never poisoned")
             .values()
@@ -571,7 +678,7 @@ mod tests {
     const MAX_TTL: Duration = Duration::from_secs(60);
 
     fn gate() -> Arc<TenantGate> {
-        TenantGate::new("alpha")
+        TenantGate::new(Scope::Tenant, "alpha")
     }
 
     fn source() -> InstanceId {
@@ -771,6 +878,83 @@ mod tests {
         assert_eq!(reaped.len(), 2);
         assert!(registry.gate("alpha").is_open());
         assert!(registry.quiesced().is_empty());
+    }
+
+    #[test]
+    fn a_gate_is_held_only_while_a_live_lease_keeps_it_closed() {
+        let gate = gate();
+        assert!(!gate.held());
+        gate.quiesce("switchover", Duration::from_secs(5), MAX_TTL, source())
+            .unwrap();
+        assert!(gate.held());
+        gate.resume("switchover").unwrap();
+        assert!(!gate.held(), "an open gate holds nobody");
+    }
+
+    /// The fence reads this from the data path and the sweep runs on the
+    /// control plane's timer, so the two are never ordered. A lease that has
+    /// run out must stop counting as a deliberate hold the instant it runs out.
+    #[test]
+    fn an_expired_lease_stops_holding_before_anything_reaps_it() {
+        let gate = gate();
+        gate.quiesce("switchover", Duration::from_millis(1), MAX_TTL, source())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!gate.is_open(), "the sweep has not run yet");
+        assert!(!gate.held());
+    }
+
+    #[test]
+    fn a_tenant_gate_and_an_instance_gate_of_the_same_name_are_two_gates() {
+        let registry = QuiesceRegistry::new();
+        registry
+            .instance("alpha")
+            .quiesce("switchover", Duration::from_secs(5), MAX_TTL, source())
+            .unwrap();
+        assert!(registry.instance("alpha").held());
+        assert!(registry.gate("alpha").is_open());
+    }
+
+    /// The composition the instance-scoped lease exists for: two holders, two
+    /// leases, neither taking the other's.
+    #[test]
+    fn a_migration_and_a_switchover_hold_the_same_traffic_without_conflicting() {
+        let registry = QuiesceRegistry::new();
+        registry
+            .gate("alpha")
+            .quiesce("migration", Duration::from_secs(5), MAX_TTL, source())
+            .unwrap();
+        registry
+            .instance("inst-a")
+            .quiesce("switchover", Duration::from_secs(5), MAX_TTL, source())
+            .unwrap();
+        assert!(registry.gate("alpha").held());
+        assert!(registry.instance("inst-a").held());
+    }
+
+    #[test]
+    fn instance_leases_are_reaped_apart_from_tenant_ones() {
+        let registry = QuiesceRegistry::new();
+        registry
+            .gate("alpha")
+            .quiesce("migration", Duration::from_millis(1), MAX_TTL, source())
+            .unwrap();
+        registry
+            .instance("inst-a")
+            .quiesce("switchover", Duration::from_millis(1), MAX_TTL, source())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(registry.reap_expired().len(), 1);
+        assert_eq!(registry.reap_expired_instances().len(), 1);
+    }
+
+    #[test]
+    fn the_registry_lists_every_tenant_it_has_a_gate_for() {
+        let registry = QuiesceRegistry::new();
+        registry.gate("beta");
+        registry.gate("alpha");
+        registry.instance("inst-a");
+        assert_eq!(registry.tenants(), vec!["alpha", "beta"]);
     }
 
     async fn wait_for(mut condition: impl FnMut() -> bool) {

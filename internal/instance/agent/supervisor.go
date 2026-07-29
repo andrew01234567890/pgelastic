@@ -59,6 +59,12 @@ const (
 	// does not restart in place - the member has to rejoin, and rejoining begins with the
 	// bootstrap path deciding between a rewind and a re-clone.
 	CommandFence
+	// CommandSwitchover stops the postmaster because the control plane is handing the role
+	// over at a moment it chose. It ends the same way a fence does - this member rejoins as
+	// a standby - and differs in exactly one thing, which is the whole point: the stop is
+	// clean, so the rewind that follows has the shutdown checkpoint it needs and the next
+	// start is not crash recovery.
+	CommandSwitchover
 	// CommandRejoin stops the postmaster, takes this member's history back onto the
 	// primary's, and starts it again. It is a rejoin in place rather than an exit because
 	// the alternative loses the status endpoint for the whole of a rewind - and for the
@@ -319,6 +325,10 @@ func (s *Supervisor) runPostmaster(ctx context.Context, signals chan os.Signal) 
 				s.stop(context.WithoutCancel(ctx), CauseFence)
 				<-exited
 				return outcomeStop, nil
+			case CommandSwitchover:
+				s.stop(context.WithoutCancel(ctx), CauseSwitchover)
+				<-exited
+				return outcomeStop, nil
 			case CommandRejoin:
 				s.stop(context.WithoutCancel(ctx), CauseSwitchover)
 				<-exited
@@ -358,8 +368,8 @@ func (s *Supervisor) reap(ctx context.Context) {
 	}
 }
 
-// stop translates the cause into a shutdown plan and carries it out, escalating once the
-// first deadline passes.
+// stop translates the cause into a shutdown plan and carries it out, taking the plan's
+// second attempt once the first deadline passes.
 func (s *Supervisor) stop(ctx context.Context, cause StopCause) {
 	log := logf.FromContext(ctx)
 	plan := TranslateStop(cause, s.ProbeState().Role, s.options.Timeouts)
@@ -370,9 +380,13 @@ func (s *Supervisor) stop(ctx context.Context, cause StopCause) {
 	if err := s.tools.Stop(ctx, plan.Mode, plan.Timeout); err == nil {
 		return
 	}
-	log.Info("escalating the shutdown", "from", plan.Mode, "to", plan.EscalateTo)
+	// A planned stop's second attempt is the same mode again rather than a harsher one, so
+	// this is a retry rather than an escalation and the log says which it is.
+	log.Info("the first shutdown attempt did not finish; taking the second",
+		"cause", cause, "first", plan.Mode, "second", plan.EscalateTo,
+		"escalating", plan.EscalateTo != plan.Mode)
 	if err := s.tools.Stop(ctx, plan.EscalateTo, plan.EscalateTimeout); err != nil {
-		log.Error(err, "the escalated shutdown failed")
+		log.Error(err, "the second shutdown attempt failed", "cause", cause)
 	}
 }
 
@@ -442,22 +456,33 @@ func (s *Supervisor) observe(ctx context.Context) {
 			contract = &read
 		}
 	}
-	s.requestRestartIfPending(ctx, observation)
 	instance := s.fetchInstance(ctx)
+	s.requestRestartIfPending(ctx, observation, instance)
 	s.report(ctx, observation)
 	s.publishPrimaryState(ctx, instance, observation, contract)
 	s.reconcileRole(ctx, observation, instance)
 }
 
-// requestRestartIfPending asks for one in-place restart per configuration.
+// requestRestartIfPending asks for one in-place restart per configuration, and only when
+// the operator has said it is this member's turn.
 //
 // The restart requirement is read from pg_settings.pending_restart and paired with the
 // configuration hash read back out of the same postmaster with current_setting(). Reading
 // the hash from pg_show_all_file_settings() instead would let the two describe different
 // instants, and a restart decided on a mismatched pair is a restart taken for a
 // configuration nobody is running.
-func (s *Supervisor) requestRestartIfPending(ctx context.Context, observation MemberObservation) {
-	if !observation.PendingRestart || observation.ConfigSHA256 == "" {
+//
+// The turn matters more than the pairing. One ConfigMap reaches all three members at once,
+// so a member that restarts the moment it notices restarts alongside the other two, and an
+// instance committing against "ANY 1" has exactly one member of slack to spend. That is the
+// unordered restart the operator's rolling loop exists to replace, and this is the half of
+// it that lives in the member: it acts only while named in the maintenance annotation.
+func (s *Supervisor) requestRestartIfPending(
+	ctx context.Context,
+	observation MemberObservation,
+	instance *pgelasticv1alpha1.PgInstance,
+) {
+	if !observation.PendingRestart || observation.ConfigSHA256 == "" || !s.restartPermitted(instance) {
 		return
 	}
 	s.mutex.Lock()
@@ -472,6 +497,28 @@ func (s *Supervisor) requestRestartIfPending(ctx context.Context, observation Me
 	case s.commands <- CommandRestart:
 	default:
 	}
+}
+
+// restartPermitted answers whether this member may stop its own postmaster for a parameter
+// that needs it.
+//
+// Being named in the maintenance annotation is the operator saying this member is the one
+// it is currently disrupting. A member that is not named waits, however stale its
+// configuration is: the wait is what makes the restart a roll rather than a stampede.
+//
+// A member the operator is handing the role away from is excluded even while it is named,
+// because the stop it is about to take belongs to the switchover. Restarting in place under
+// it would bring the postmaster straight back as a primary the operator has already decided
+// against, and the handover would then have to ask for the same stop a second time.
+func (s *Supervisor) restartPermitted(instance *pgelasticv1alpha1.PgInstance) bool {
+	if instance == nil || !ha.UnderMaintenance(instance.GetAnnotations(), s.options.Member) {
+		return false
+	}
+	if instance.Status.CurrentPrimary != s.options.Member {
+		return true
+	}
+	target := instance.Status.TargetPrimary
+	return target == "" || target == ha.TargetPrimaryPending || target == s.options.Member
 }
 
 func (s *Supervisor) report(ctx context.Context, observation MemberObservation) {

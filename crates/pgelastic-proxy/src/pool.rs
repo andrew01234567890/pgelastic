@@ -906,7 +906,7 @@ impl PoolManager {
                 }
                 Gated::Open(slot) => {
                     self.metrics.connect_gated(ConnectGateOutcome::Attempted);
-                    return match self.open(request, connector, server).await {
+                    return match self.open_transiently(request, connector, server).await {
                         Ok(conn) => {
                             slot.succeeded();
                             Ok(conn)
@@ -925,6 +925,42 @@ impl PoolManager {
                 }
             }
         }
+    }
+
+    /// Opens a backend, retrying only while the failure is the endpoint still moving.
+    ///
+    /// A planned switchover repoints `<instance>-rw` at the promoted member, and kube-proxy
+    /// converges its conntrack rules some time after the API server says the `EndpointSlice`
+    /// changed. A connect that lands in that window is refused. Without this the first
+    /// refusal is recorded as a login failure, which arms the gate's `serverLoginRetry`
+    /// backoff and fast-fails every queued client for the next fifteen seconds — so a
+    /// sub-second endpoint gap became a fifteen-second outage for a tenant whose clients had
+    /// just been held specifically so they would not notice.
+    ///
+    /// The retry stays inside the connect slot deliberately: other clients keep waiting on
+    /// the gate rather than stampeding the backend, which is the property the gate exists for.
+    /// Only transport failures are retried — an authentication failure or a missing database
+    /// is answered immediately, because those do not become true by waiting.
+    async fn open_transiently(
+        &self,
+        request: &AcquireRequest<'_>,
+        connector: &Connector<'_>,
+        server: pgelastic_capacity::ServerId,
+    ) -> Result<BackendConn> {
+        const ATTEMPTS: u32 = 5;
+        let mut backoff = Duration::from_millis(50);
+        for attempt in 1..=ATTEMPTS {
+            match self.open(request, connector, server).await {
+                Ok(conn) => return Ok(conn),
+                Err(error) if attempt < ATTEMPTS && transport_failure(&error) => {
+                    self.metrics.connect_gated(ConnectGateOutcome::Retried);
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the loop returns on the final attempt")
     }
 
     async fn open(
@@ -1393,11 +1429,59 @@ impl Inner {
     }
 }
 
+/// Whether a failed backend open is the transport still settling rather than a refusal.
+///
+/// Retrying an authentication failure or a missing database only delays the answer the
+/// client is owed; retrying a refused or reset connect is what carries a tenant across the
+/// moment its instance's Service is repointed.
+fn transport_failure(error: &ProxyError) -> bool {
+    let ProxyError::Io(io) = error else {
+        return false;
+    };
+    matches!(
+        io.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn a_refused_connect_is_the_service_still_moving_and_is_retried() {
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let error = ProxyError::Io(std::io::Error::new(kind, "endpoint converging"));
+            assert!(transport_failure(&error), "{kind:?} must be retried");
+        }
+    }
+
+    #[test]
+    fn an_answer_the_client_is_owed_is_never_retried() {
+        assert!(
+            !transport_failure(&ProxyError::AuthenticationFailed),
+            "waiting does not make a wrong password right"
+        );
+        assert!(
+            !transport_failure(&ProxyError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "no",
+            ))),
+            "a refusal on the merits is not the transport settling"
+        );
+    }
+
     use crate::config::{PoolModeConfig, TenantConfig};
 
     fn manager(config: PoolConfig) -> Arc<PoolManager> {

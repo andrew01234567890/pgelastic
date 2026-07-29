@@ -185,6 +185,7 @@ var _ = Describe("PgTenantMigration controller", func() {
 
 	BeforeEach(func() {
 		ensureNamespace(migrationNamespace)
+		claimPool(migrationNamespace, "migration-class", "migration-pool")
 		clock = time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
 
 		source = makeMigrationInstance(sourceInstance)

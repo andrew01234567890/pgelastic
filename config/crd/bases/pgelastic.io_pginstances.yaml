@@ -947,6 +947,49 @@ spec:
                     type: array
                     x-kubernetes-list-type: atomic
                 type: object
+              roll:
+                description: roll reports a rolling restart in progress, and is absent
+                  when none is.
+                properties:
+                  member:
+                    description: member is the Pod being rolled right now.
+                    maxLength: 253
+                    type: string
+                  message:
+                    description: message says in one sentence what is being waited
+                      for.
+                    maxLength: 1024
+                    type: string
+                  pending:
+                    description: |-
+                      pending is how many members are still to be rolled, including member itself. It
+                      reaches zero on the reconcile that clears this whole record.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  reason:
+                    description: reason is what asked for the roll.
+                    enum:
+                    - ConfigurationChanged
+                    - RestartRequested
+                    - NodeDraining
+                    type: string
+                  startedAt:
+                    description: |-
+                      startedAt is when this member's step began, which is what makes a stalled roll
+                      visible as one rather than as a slow one.
+                    format: date-time
+                    type: string
+                  step:
+                    description: step is what is being done to member.
+                    enum:
+                    - Quiescing
+                    - SwitchingOver
+                    - Restarting
+                    - Blocked
+                    - Stalled
+                    type: string
+                type: object
               storage:
                 description: storage reports allocated and used bytes for both volumes.
                 properties:

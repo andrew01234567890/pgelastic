@@ -154,6 +154,7 @@ var _ = Describe("PgInstance failover state machine", func() {
 
 	BeforeEach(func() {
 		ensureNamespace(failoverNamespace)
+		claimPool(failoverNamespace, "pginstance-failover-class", "saas-pool")
 		prober = &fakeProber{reports: map[string]provision.MemberReport{}}
 		reconciler = newInstanceReconciler()
 		reconciler.Prober = prober

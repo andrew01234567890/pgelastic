@@ -89,11 +89,12 @@ var _ = Describe("Provisioning a three-node PostgreSQL 18 instance", Ordered, fu
 		probeNamespace.Store(e2eNamespace)
 		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: e2eNamespace}}
 		Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, namespace))).To(Succeed())
+		claimNamespace(e2eNamespace)
 
 		instance := &pgelasticv1alpha1.PgInstance{
 			ObjectMeta: metav1.ObjectMeta{Name: instanceName, Namespace: e2eNamespace},
 			Spec: pgelasticv1alpha1.PgInstanceSpec{
-				PoolRef: corev1.LocalObjectReference{Name: "e2e-pool"},
+				PoolRef: corev1.LocalObjectReference{Name: claimPoolName},
 				Class:   sizingClass,
 				Storage: pgelasticv1alpha1.InstanceStorage{
 					Size: resource.MustParse("1Gi"),

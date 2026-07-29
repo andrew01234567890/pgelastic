@@ -201,6 +201,44 @@ impl Fleet {
         self.route(tenant).id.clone()
     }
 
+    /// Which of `known` this proxy would route to `instance`, resolved in one
+    /// pass under one acquisition of the routing lock.
+    ///
+    /// Two things make this not a filter over the routes map. The map holds
+    /// only the tenants somebody published a route for, while [`route`](Self::route)
+    /// falls back to the default instance — so a tenant with no entry is on the
+    /// default and belongs in the answer when `instance` is it. And the lock
+    /// this reads is the one every checkout takes, so asking per tenant would
+    /// put a linear number of acquisitions of the data path's own mutex on the
+    /// control plane; asking once does not.
+    ///
+    /// `known` is the caller's tenant universe — in practice every tenant the
+    /// proxy has admitted a client for. A tenant nobody has connected as has no
+    /// clients to hold, so its absence costs nothing.
+    pub fn tenants_on(&self, instance: &InstanceId, known: &[String]) -> Vec<String> {
+        if !self.instances.contains_key(instance) {
+            return Vec::new();
+        }
+        let default_is_target = &self.default == instance;
+        let routes = self
+            .routes
+            .lock()
+            .expect("the routing table is never poisoned");
+        let mut on = Vec::new();
+        for tenant in known {
+            let here = match routes.get(tenant) {
+                // A route naming an instance this proxy does not front is
+                // dropped by `route`, so it resolves to the default too.
+                Some(id) if self.instances.contains_key(id) => id == instance,
+                _ => default_is_target,
+            };
+            if here {
+                on.push(tenant.clone());
+            }
+        }
+        on
+    }
+
     /// Points a tenant at another instance.
     ///
     /// Takes effect at the next checkout, which for a quiesced tenant is the
@@ -378,5 +416,50 @@ mod tests {
     fn a_tenant_routed_nowhere_lands_on_the_default() {
         let fleet = fleet(TWO);
         assert_eq!(fleet.route("never-seen").id.as_str(), "inst-a");
+    }
+
+    fn known() -> Vec<String> {
+        ["alpha", "beta", "gamma"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn an_instances_tenants_include_the_ones_the_routing_table_never_mentions() {
+        let fleet = fleet(TWO);
+        assert_eq!(
+            fleet.tenants_on(&InstanceId::new("inst-a"), &known()),
+            vec!["alpha".to_owned(), "gamma".to_owned()],
+            "a tenant with no route is on the default instance"
+        );
+        assert_eq!(
+            fleet.tenants_on(&InstanceId::new("inst-b"), &known()),
+            vec!["beta".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_flip_moves_a_tenant_between_the_two_answers() {
+        let fleet = fleet(TWO);
+        fleet.set_route("gamma", &InstanceId::new("inst-b"));
+        assert_eq!(
+            fleet.tenants_on(&InstanceId::new("inst-a"), &known()),
+            vec!["alpha".to_owned()]
+        );
+        assert_eq!(
+            fleet.tenants_on(&InstanceId::new("inst-b"), &known()),
+            vec!["beta".to_owned(), "gamma".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_instance_this_proxy_does_not_front_holds_no_tenants() {
+        let fleet = fleet(TWO);
+        assert!(
+            fleet
+                .tenants_on(&InstanceId::new("elsewhere"), &known())
+                .is_empty()
+        );
     }
 }

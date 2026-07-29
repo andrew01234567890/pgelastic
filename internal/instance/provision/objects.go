@@ -187,10 +187,11 @@ func (b Builder) AgentConfig() AgentConfig {
 			OpsRole:         OpsRole,
 			RewindRole:      RewindRole,
 		},
-		Quorum:         quorum(spec),
-		DataDurability: string(dataDurability(spec)),
-		Lease:          leaseTimings(spec),
-		PeerService:    PeerServiceName(b.name()),
+		Quorum:            quorum(spec),
+		DataDurability:    string(dataDurability(spec)),
+		Lease:             leaseTimings(spec),
+		SwitchoverTimeout: metav1.Duration{Duration: SwitchoverTimeout(spec)},
+		PeerService:       PeerServiceName(b.name()),
 		CollationContract: CollationContract{
 			Encoding:       "UTF8",
 			LocaleProvider: "builtin",
@@ -201,12 +202,12 @@ func (b Builder) AgentConfig() AgentConfig {
 	}
 }
 
-// Pod builds one member.
-func (b Builder) Pod(serial int32, configHash string) *corev1.Pod {
+// Pod builds one member, stamped with the roll signature it is being created for.
+func (b Builder) Pod(serial int32, stamp RollStamp) *corev1.Pod {
 	member := MemberName(b.name(), serial)
 	labels := b.memberLabels(serial)
 	pod := &corev1.Pod{ObjectMeta: b.meta(member, labels)}
-	pod.Annotations = map[string]string{AnnotationConfigHash: configHash}
+	pod.Annotations = stamp.Annotations()
 	pod.Spec = corev1.PodSpec{
 		ServiceAccountName: ServiceAccountName(b.name()),
 		Hostname:           member,
@@ -527,6 +528,18 @@ func FailoverDelay(spec pgelasticv1alpha1.PgInstanceSpec) time.Duration {
 		return highAvailability.FailoverDelay.Duration
 	}
 	return 10 * time.Second
+}
+
+// SwitchoverTimeout bounds a planned, operator-initiated role change end to end. It is the
+// deadline the clean stop is given before it is retried with the rest of the termination
+// grace period, and never a licence to escalate to an immediate stop: a switchover is
+// always followed by this member starting again from the data directory it stopped with.
+func SwitchoverTimeout(spec pgelasticv1alpha1.PgInstanceSpec) time.Duration {
+	if highAvailability := spec.HighAvailability; highAvailability != nil &&
+		highAvailability.SwitchoverTimeout != nil && highAvailability.SwitchoverTimeout.Duration > 0 {
+		return highAvailability.SwitchoverTimeout.Duration
+	}
+	return 60 * time.Second
 }
 
 // FailoverQuorumEnabled reports whether promotion is gated on quorum evidence. Turning it

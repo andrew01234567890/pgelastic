@@ -40,6 +40,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/autoscale"
 	"github.com/andrew01234567890/pgelastic/internal/metering"
+	"github.com/andrew01234567890/pgelastic/internal/ownership"
 	"github.com/andrew01234567890/pgelastic/internal/placement"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
 	"github.com/andrew01234567890/pgelastic/internal/proxy"
@@ -96,6 +97,10 @@ type PgElasticPoolReconciler struct {
 
 	// Now is the clock, injectable so a test can drive a dwell time without waiting a day.
 	Now func() time.Time
+
+	// ControllerName is this operator's identity. A pool whose PgElasticClass names a
+	// different controller belongs to that controller and is left entirely alone.
+	ControllerName string
 }
 
 // envProxyImage names the proxy image, so a deployment can pin it without rebuilding the
@@ -120,6 +125,9 @@ func (r *PgElasticPoolReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	pool := &pgelasticv1alpha1.PgElasticPool{}
 	if err := r.reader().Get(ctx, req.NamespacedName, pool); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if result, stop, err := unclaimed(ctx, r.ownership(), pool); stop {
+		return result, err
 	}
 	if !pool.DeletionTimestamp.IsZero() {
 		if r.Metering != nil {
@@ -845,6 +853,10 @@ const (
 )
 
 // SetupWithManager sets up the controller with the Manager.
+func (r *PgElasticPoolReconciler) ownership() ownership.Resolver {
+	return ownership.Resolver{Reader: r.Client, ControllerName: r.ControllerName}
+}
+
 func (r *PgElasticPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("pgelasticpool")

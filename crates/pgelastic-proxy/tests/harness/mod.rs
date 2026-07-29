@@ -791,7 +791,7 @@ impl Fleet {
     }
 }
 
-async fn free_port() -> u16 {
+pub async fn free_port() -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("binding a scratch port");
@@ -886,6 +886,41 @@ impl Control {
         self.post(
             "/unquiesce",
             serde_json::json!({ "tenant": tenant, "holder": holder }),
+        )
+        .await
+    }
+
+    pub async fn quiesce_instance(
+        &self,
+        instance: &str,
+        holder: &str,
+        ttl_ms: u64,
+    ) -> ControlResponse {
+        self.post(
+            "/quiesceInstance",
+            serde_json::json!({ "instance": instance, "holder": holder, "ttlMs": ttl_ms }),
+        )
+        .await
+    }
+
+    pub async fn instance_drain_status(&self, instance: &str) -> serde_json::Value {
+        self.get(&format!("/instanceDrainStatus?instance={instance}"))
+            .await
+            .ok()
+    }
+
+    pub async fn resume_instance(&self, instance: &str, holder: &str) -> ControlResponse {
+        self.post(
+            "/resumeInstance",
+            serde_json::json!({ "instance": instance, "holder": holder }),
+        )
+        .await
+    }
+
+    pub async fn unquiesce_instance(&self, instance: &str, holder: &str) -> ControlResponse {
+        self.post(
+            "/unquiesceInstance",
+            serde_json::json!({ "instance": instance, "holder": holder }),
         )
         .await
     }

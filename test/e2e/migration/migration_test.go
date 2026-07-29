@@ -243,10 +243,7 @@ func poolObjects() []client.Object {
 	return []client.Object{
 		&pgelasticv1alpha1.PgElasticClass{
 			ObjectMeta: metav1.ObjectMeta{Name: className},
-			Spec: pgelasticv1alpha1.PgElasticClassSpec{
-				ControllerName: envOr("PGELASTIC_CONTROLLER_NAME",
-					"pgelastic.io/elastic-pool-controller"),
-			},
+			Spec:       pgelasticv1alpha1.PgElasticClassSpec{ControllerName: suiteControllerName},
 		},
 		&pgelasticv1alpha1.PgWorkloadClass{
 			ObjectMeta: metav1.ObjectMeta{Name: workloadClassName},

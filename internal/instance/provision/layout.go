@@ -146,6 +146,11 @@ type AgentConfig struct {
 	DataDurability string `json:"dataDurability"`
 	// Lease parameterises the promotion Lease the agent holds.
 	Lease LeaseTimings `json:"lease"`
+	// SwitchoverTimeout bounds a stop the control plane asked for at a moment it chose,
+	// which is spec.highAvailability.switchoverTimeout. It travels here rather than being
+	// hardcoded in the agent because it is the deadline a planned role change is measured
+	// against, and a value the API accepts and nothing reads is worse than no field.
+	SwitchoverTimeout metav1.Duration `json:"switchoverTimeout"`
 	// PeerService is the headless Service that gives members stable DNS names.
 	PeerService string `json:"peerService"`
 	// CollationContract is what initdb was pinned to, so a member can refuse to join a
