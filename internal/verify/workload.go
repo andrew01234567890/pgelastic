@@ -40,6 +40,23 @@ type WorkloadConfig struct {
 	FirstValue int64
 	// Interval optionally paces each writer between inserts.
 	Interval time.Duration
+	// Observe is called once per attempt, after it has been classified and recorded. It is
+	// how a caller measures what the writes cost while the ledger measures whether they
+	// survived: the two are different questions and the second one has no clock in it.
+	//
+	// It is called from every writer goroutine and must be safe for concurrent use.
+	Observe func(Attempt)
+}
+
+// Attempt is one insert as the client saw it.
+type Attempt struct {
+	Value int64
+	// Started is when the statement was issued and Elapsed is what it cost. A client queued
+	// at a proxy's gate shows up here as one long Elapsed and no error at all, which is the
+	// whole difference between a pause and an outage.
+	Started time.Time
+	Elapsed time.Duration
+	Outcome Outcome
 }
 
 // Stats counts what the workload did. They are diagnostics; the ledger is the evidence.
@@ -195,10 +212,15 @@ func (w *writer) insert(ctx context.Context, conn *pgx.Conn) (broken bool, err e
 	w.stats.attempted.Add(1)
 
 	opCtx, cancel := context.WithTimeout(ctx, w.cfg.OpTimeout)
+	started := time.Now()
 	_, execErr := conn.Exec(opCtx, w.sql, v)
+	elapsed := time.Since(started)
 	cancel()
 
 	class := Classify(execErr)
+	if w.cfg.Observe != nil {
+		w.cfg.Observe(Attempt{Value: v, Started: started, Elapsed: elapsed, Outcome: class.Outcome})
+	}
 	switch class.Outcome {
 	case OutcomeCommitted:
 		if err := w.ledger.Commit(v); err != nil {

@@ -127,10 +127,13 @@ test-e2e-instance: manifests generate install-e2e load-instance-images ## Provis
 		$(if $(E2E_LABEL_FILTER),-ginkgo.label-filter='$(E2E_LABEL_FILTER)')
 
 # The migration e2e moves a tenant between two real three-node instances, by logical
-# replication and by dump and restore, and measures the pause rather than asserting it.
+# replication and by dump and restore, and measures the pause rather than asserting it. It
+# stands a proxy fleet up as well, because the claim it exists to check - clients queued and
+# never dropped - is about a client's socket at that fleet and cannot be made without one.
 .PHONY: test-e2e-migration
-test-e2e-migration: manifests generate install-e2e load-instance-images ## Move a tenant between two real PostgreSQL 18 instances.
-	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
+test-e2e-migration: manifests generate install-e2e load-data-plane-images ## Move a tenant between two real PostgreSQL 18 instances.
+	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) \
+	PGELASTIC_PROXY_IMG=$(PROXY_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
 	go test -tags=e2e ./test/e2e/migration/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
 		$(if $(E2E_LABEL_FILTER),-ginkgo.label-filter='$(E2E_LABEL_FILTER)')
 

@@ -30,6 +30,8 @@ limitations under the License.
 // controller, and is what Render's structural/dynamic split exists to give.
 package proxy
 
+import pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+
 // Label keys. The selector is the one published in status.selector for the scale
 // subresource, so it is part of the API rather than decoration.
 const (
@@ -70,6 +72,11 @@ const (
 	TLSDir = "/etc/pgelastic/tls"
 	// BackendCADir holds the CA the backend certificates are verified against.
 	BackendCADir = "/etc/pgelastic/backend-ca"
+	// ControlTLSDir holds the control listener's own certificate and the CA the operator's
+	// client certificate is verified against. Separate from TLSDir because the two answer
+	// different questions: that one is what a tenant's client trusts, this one is what the
+	// operator proves.
+	ControlTLSDir = "/etc/pgelastic/control-tls"
 )
 
 // Ports. The client port is the pool's Service port; the others are never published on it.
@@ -80,16 +87,39 @@ const (
 	DefaultClientPort int32 = 5432
 	// DefaultMetricsPort serves /metrics, /healthz, /readyz and /configz.
 	DefaultMetricsPort int32 = 9127
+	// DefaultControlPort serves the lease-bound cutover API: quiesce, drainStatus,
+	// setRoute, resume, unquiesce. It is separate from the metrics port because these
+	// endpoints change behaviour and /metrics does not, and it is reachable only over
+	// mutual TLS — quiescing a tenant holds its clients' sockets open with nothing behind
+	// them, so an unauthenticated caller could stall any tenant at will.
+	DefaultControlPort int32 = 9128
 )
 
 // Port names, which is how a Service targets a container port without knowing its number.
 const (
 	PortNameClient  = "postgres"
 	PortNameMetrics = "metrics"
+	PortNameControl = "control"
 )
 
 // ContainerName names the proxy container, and is what a template override merges onto.
 const ContainerName = "proxy"
+
+// DefaultReplicas matches the spec.proxy.replicas CRD default and is applied to a pool
+// whose fleet was written before the default existed.
+const DefaultReplicas int32 = 3
+
+// Replicas is the fleet size a pool declares.
+//
+// Exported because it is a capacity multiplier and not merely a pod count: every replica
+// reads one configuration document carrying the undivided budget, so admission has to know
+// how many of them there are.
+func Replicas(pool *pgelasticv1alpha1.PgElasticPool) int32 {
+	if proxy := pool.Spec.Proxy; proxy != nil && proxy.Replicas != nil {
+		return *proxy.Replicas
+	}
+	return DefaultReplicas
+}
 
 // DeploymentName is the fleet.
 func DeploymentName(pool string) string { return pool + "-proxy" }
@@ -105,6 +135,56 @@ func ConfigSecretName(pool string) string { return pool + "-proxy-config" }
 // ServiceAccountName is the identity a replica re-reads its configuration and reports its
 // applied version under.
 func ServiceAccountName(pool string) string { return pool + "-proxy" }
+
+// controlSuffix names every object of the control listener's PKI, which cert-manager
+// issues per pool.
+//
+// A CA of its own rather than a cluster-wide issuer: its only job is to say which
+// certificate belongs to the operator for this pool, so scoping it to the pool keeps one
+// pool's compromised issuer from authenticating a cutover on another. cert-manager is
+// already a hard dependency of the webhooks, so this adds an issuer rather than a
+// dependency.
+const controlSuffix = "-proxy-control"
+
+// ControlSelfSignedIssuerName is the bootstrap issuer the control CA signs itself with.
+func ControlSelfSignedIssuerName(pool string) string { return pool + controlSuffix + "-selfsign" }
+
+// ControlCACertificateName is the per-pool CA both control certificates chain to.
+func ControlCACertificateName(pool string) string { return pool + controlSuffix + "-ca" }
+
+// ControlCASecretName holds that CA's certificate and key.
+func ControlCASecretName(pool string) string { return pool + controlSuffix + "-ca" }
+
+// ControlIssuerName signs the two leaf certificates from the pool's own CA.
+func ControlIssuerName(pool string) string { return pool + controlSuffix }
+
+// ControlServerCertificateName is the listener's own certificate.
+func ControlServerCertificateName(pool string) string { return pool + controlSuffix + "-server" }
+
+// ControlServerSecretName is mounted into every proxy replica.
+func ControlServerSecretName(pool string) string { return pool + controlSuffix + "-server" }
+
+// ControlClientCertificateName is the operator's identity for this pool.
+func ControlClientCertificateName(pool string) string { return pool + controlSuffix + "-client" }
+
+// ControlClientSecretName is the Secret the operator reads its client identity from. It is
+// never mounted into a proxy replica: a replica holding the key that authenticates the
+// operator to itself would make the whole check circular.
+func ControlClientSecretName(pool string) string { return pool + controlSuffix + "-client" }
+
+// ControlClientName is the DNS name the operator's certificate carries and the listener
+// checks. It is a name rather than a mere "signed by our CA" test because the same CA also
+// issues the listener's own certificate.
+func ControlClientName(pool, namespace string) string {
+	return ControlClientCertificateName(pool) + "." + namespace + ".svc"
+}
+
+// ControlServerName is the DNS name the listener's certificate carries, which is what the
+// operator verifies when it dials a replica. A replica is reached by Pod IP, so the name is
+// the fleet's Service name and the operator asks for it explicitly.
+func ControlServerName(pool, namespace string) string {
+	return ServiceName(pool) + "." + namespace + ".svc"
+}
 
 // RoleName is the fleet's permissions: read one Secret, annotate its own Pod.
 func RoleName(pool string) string { return pool + "-proxy" }

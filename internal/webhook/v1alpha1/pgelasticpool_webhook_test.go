@@ -84,4 +84,72 @@ var _ = Describe("PgElasticPool admission", func() {
 			Expect(k8sClient.Update(ctx, pool)).To(Succeed())
 		})
 	})
+
+	// Every replica reads one configuration document carrying the undivided budget, so the
+	// fleet's worst case is the replica count times the sum of every tenant's ceiling. The
+	// reservation ledger above cannot see this: it sums guarantees and has never heard of
+	// spec.proxy.replicas.
+	//
+	// The pool here sets maxOversubscriptionRatio to 1, which is the strict reading: the
+	// fleet may not commit past allocatable at all. 75 allocatable and a ceiling of 25 means
+	// three replicas fit exactly and a fourth does not.
+	Describe("a fleet that would multiply the budget past what the pool committed to",
+		Ordered, func() {
+			const (
+				namespace = "wh-pool-fleet"
+				poolName  = "wh-pool-fleet-pool"
+				className = "wh-pool-fleet-workload"
+			)
+
+			var pool *pgelasticv1alpha1.PgElasticPool
+
+			BeforeAll(func() {
+				ensureNamespace(namespace, nil)
+				elasticClass := makeElasticClass("wh-pool-fleet-class")
+				mustCreate(elasticClass, makeWorkloadClass(className, 0, 25))
+				pool = makePool(namespace, poolName, elasticClass.Name)
+				pool.Spec.Capacity.MaxOversubscriptionRatio = "1"
+				pool.Spec.Proxy = &pgelasticv1alpha1.ProxySpec{Replicas: ptrTo(int32(3))}
+				mustCreate(pool)
+			})
+
+			It("admits the tenant whose ceiling fills the fleet's budget exactly", func() {
+				Expect(k8sClient.Create(ctx,
+					makeTenant(namespace, "wh-pool-fleet-a", poolName, "fleeta", className))).
+					To(Succeed())
+			})
+
+			It("refuses a replica count that overcommits, naming every figure it computed", func() {
+				Expect(k8sClient.Get(ctx, keyIn(namespace, poolName), pool)).To(Succeed())
+				pool.Spec.Proxy.Replicas = ptrTo(int32(4))
+
+				err := k8sClient.Update(ctx, pool)
+
+				Expect(err).To(MatchError(ContainSubstring("spec.proxy.replicas")))
+				Expect(err).To(MatchError(ContainSubstring("4 x 25 = 100")))
+				Expect(err).To(MatchError(ContainSubstring("ceiling of 75")))
+				Expect(err).To(MatchError(ContainSubstring("allocatable 75")))
+				Expect(err).To(MatchError(ContainSubstring("maxOversubscriptionRatio 1")))
+			})
+
+			// The gate would be decorative if it only ran when a pool was edited: a tenant
+			// added afterwards raises the same sum without the pool changing at all.
+			It("refuses a second tenant that pushes the same worst case over", func() {
+				err := k8sClient.Create(ctx,
+					makeTenant(namespace, "wh-pool-fleet-b", poolName, "fleetb", className))
+
+				Expect(err).To(MatchError(ContainSubstring("3 x 50 = 150")))
+				Expect(err).To(MatchError(ContainSubstring("spec.workloadClassName")))
+			})
+
+			It("still admits a tenant small enough to fit beside the first", func() {
+				Expect(k8sClient.Get(ctx, keyIn(namespace, poolName), pool)).To(Succeed())
+				pool.Spec.Capacity.BackendConnections = 200
+				Expect(k8sClient.Update(ctx, pool)).To(Succeed())
+
+				Expect(k8sClient.Create(ctx,
+					makeTenant(namespace, "wh-pool-fleet-c", poolName, "fleetc", className))).
+					To(Succeed())
+			})
+		})
 })

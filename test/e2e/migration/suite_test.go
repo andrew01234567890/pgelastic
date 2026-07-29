@@ -36,7 +36,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,7 +50,9 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/controller"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
+	"github.com/andrew01234567890/pgelastic/internal/metering"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
+	proxyobjects "github.com/andrew01234567890/pgelastic/internal/proxy"
 )
 
 var (
@@ -65,6 +69,16 @@ var (
 	sql migration.PodSQL
 
 	sweeper *controller.MigrationSweeper
+
+	// restConfig and clientSet are what the in-process port-forwards are built on. A Pod
+	// CIDR is not routable from the machine this suite runs on, and both the tenant's own
+	// client path and the operator's control calls have to cross that gap.
+	restConfig *rest.Config
+	clientSet  *kubernetes.Clientset
+
+	// controlEndpoints is how the suite's operator reaches each replica's cutover API. It
+	// outlives every spec, so it is closed in AfterSuite rather than by DeferCleanup.
+	controlEndpoints = &forwardedEndpoints{}
 )
 
 func TestMigrationE2E(t *testing.T) {
@@ -104,6 +118,9 @@ var _ = BeforeSuite(func() {
 
 	config, err := ctrlconfig.GetConfigWithContext(os.Getenv("E2E_CONTEXT"))
 	Expect(err).NotTo(HaveOccurred(), "the cluster named by E2E_CONTEXT has to be reachable")
+	restConfig = config
+	clientSet, err = kubernetes.NewForConfig(config)
+	Expect(err).NotTo(HaveOccurred())
 
 	// The cache is scoped to this suite's own namespace. An operator started for a test must
 	// not reconcile objects a different suite is driving on the same cluster: two managers
@@ -137,12 +154,29 @@ var _ = BeforeSuite(func() {
 		Prober:       execProber{runner: runner},
 	}).SetupWithManager(manager)).To(Succeed())
 
+	// The pool controller is here for one reason: it is what turns spec.proxy into a running
+	// fleet, and the claim this suite exists to check is about clients queued at that fleet.
+	// It creates no PgInstance, so the two members the specs drive are still the suite's own.
+	Expect((&controller.PgElasticPoolReconciler{
+		Client:     manager.GetClient(),
+		Scheme:     manager.GetScheme(),
+		Metering:   metering.NewCollector(metering.Options{}, nil),
+		ProxyImage: envOr("PGELASTIC_PROXY_IMG", "pgelastic/proxy:latest"),
+	}).SetupWithManager(manager)).To(Succeed())
+
+	// The router the deployed operator runs, wired to the same control API, differing only
+	// in how a replica is addressed from outside the cluster.
 	Expect((&controller.PgTenantMigrationReconciler{
 		Client: manager.GetClient(),
 		Scheme: manager.GetScheme(),
 		SQL:    sql,
 		Shell:  sql,
-		Router: migration.BindingRouter{Client: manager.GetClient(), Reader: manager.GetAPIReader()},
+		Router: &proxyobjects.ProxyRouter{
+			Binding:   migration.BindingRouter{Client: manager.GetClient(), Reader: manager.GetAPIReader()},
+			Reader:    manager.GetAPIReader(),
+			Endpoints: controlEndpoints,
+			Caller:    &proxyobjects.MutualTLSCaller{Reader: manager.GetAPIReader()},
+		},
 	}).SetupWithManager(manager)).To(Succeed())
 
 	sweeper = &controller.MigrationSweeper{Client: manager.GetClient(), SQL: sql}
@@ -161,6 +195,7 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
+	controlEndpoints.closeAll()
 	if cancelSuite != nil {
 		cancelSuite()
 	}

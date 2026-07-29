@@ -27,6 +27,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/jackc/pgx/v5"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +39,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
+	proxyobjects "github.com/andrew01234567890/pgelastic/internal/proxy"
 )
 
 const (
@@ -50,6 +53,17 @@ const (
 	sizingClass = "dev-1"
 	// tenantDatabase is both the PgTenant name and its database.
 	tenantDatabase = "acme"
+	// neighbourDatabase is a second tenant, pinned to the other instance and never moved.
+	// It is what makes "the tenant that was migrated was paused" a claim with a control:
+	// without it, a latency spike everybody saw would be indistinguishable from one only the
+	// migrated tenant saw.
+	neighbourDatabase = "neighbour"
+	className         = "mg-class"
+	workloadClassName = "mg-standard"
+	// proxyReplicas is two because the gate is per-replica in-memory state and kube-proxy
+	// pins a connection to one endpoint for its life: a cutover that quiesced only the
+	// replica the operator happened to reach first would still be green with one.
+	proxyReplicas = 2
 	// seedRows is enough data for an initial table sync and a content checksum to mean
 	// something, and few enough that the whole suite stays inside its timeout.
 	seedRows = 20000
@@ -58,6 +72,24 @@ const (
 // probeDatabase is where the schema-copy specs apply their copy, so that driving the copy
 // directly cannot disturb the database a real migration is moving.
 const probeDatabase = "acme_copy_probe"
+
+const (
+	// probeInterval paces the client held across the cutover. Short enough that a
+	// sub-second pause is still sampled several times on either side of itself.
+	probeInterval = 20 * time.Millisecond
+	// baselineWindow is how long the probes run before the migration is created, which is
+	// what "during the cutover" is compared against.
+	baselineWindow = 5 * time.Second
+	// neighbourDisturbanceCeiling is the worst statement the untouched tenant may see. It is
+	// far above any normal statement and far below the pause the migrated tenant is expected
+	// to show, so it separates "somebody else's move" from "a fleet-wide stall" without
+	// being a threshold anybody has to tune.
+	neighbourDisturbanceCeiling = 500 * time.Millisecond
+)
+
+// lastNeighbourReport carries the control's measurements from the cutover spec to the spec
+// that asserts on them. They cannot be gathered twice: the cutover happens once.
+var lastNeighbourReport probeReport
 
 func endpoint(instance, database string) migration.Endpoint {
 	return migration.Endpoint{Namespace: e2eNamespace, Instance: instance, Database: database}
@@ -163,22 +195,29 @@ INSERT INTO line_items (order_id, sku, quantity)
 SELECT id, 'sku-' || (id %% 53), (id %% 7) + 1 FROM orders`, seedRows))
 }
 
-func makeTenant() *pgelasticv1alpha1.PgTenant {
+func makeTenant() *pgelasticv1alpha1.PgTenant { return makeNamedTenant(tenantDatabase) }
+
+func makeNamedTenant(name string) *pgelasticv1alpha1.PgTenant {
 	return &pgelasticv1alpha1.PgTenant{
-		ObjectMeta: metav1.ObjectMeta{Name: tenantDatabase, Namespace: e2eNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: e2eNamespace},
 		Spec: pgelasticv1alpha1.PgTenantSpec{
 			PoolRef:      corev1.LocalObjectReference{Name: poolName},
-			DatabaseName: tenantDatabase,
+			DatabaseName: name,
 		},
 	}
 }
 
-func bindTenant(instance string) {
+func bindTenant(instance string) { bindNamedTenant(tenantDatabase, instance) }
+
+// bindNamedTenant publishes the binding by hand. The tenant controller is deliberately not
+// running in this suite - what it would do is place tenants, and a spec that asserts "acme
+// starts on mg-a" has to be the thing that decided it.
+func bindNamedTenant(name, instance string) {
 	GinkgoHelper()
 	Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		tenant := &pgelasticv1alpha1.PgTenant{}
 		if err := k8sClient.Get(suiteCtx,
-			client.ObjectKey{Namespace: e2eNamespace, Name: tenantDatabase}, tenant); err != nil {
+			client.ObjectKey{Namespace: e2eNamespace, Name: name}, tenant); err != nil {
 			return err
 		}
 		tenant.Status.Binding = &pgelasticv1alpha1.PgTenantBinding{
@@ -187,6 +226,135 @@ func bindTenant(instance string) {
 		tenant.Status.Utilization = &pgelasticv1alpha1.PgTenantUtilization{IsCold: ptr.To(true)}
 		return k8sClient.Status().Update(suiteCtx, tenant)
 	})).To(Succeed())
+}
+
+// seedNeighbour puts a second tenant on the other instance. It is never migrated: it is the
+// control that tells a tenant move apart from a fleet-wide stall.
+func seedNeighbour(instance string) {
+	GinkgoHelper()
+	exec(instance, "postgres", fmt.Sprintf(
+		`CREATE DATABASE %s TEMPLATE template0`, neighbourDatabase))
+}
+
+// poolObjects are the pool and the two classes it resolves through. The pool declares a
+// proxy fleet, which is the only reason any of this is here: a cutover cannot queue clients
+// at a fleet that does not exist.
+func poolObjects() []client.Object {
+	return []client.Object{
+		&pgelasticv1alpha1.PgElasticClass{
+			ObjectMeta: metav1.ObjectMeta{Name: className},
+			Spec: pgelasticv1alpha1.PgElasticClassSpec{
+				ControllerName: envOr("PGELASTIC_CONTROLLER_NAME",
+					"pgelastic.io/elastic-pool-controller"),
+			},
+		},
+		&pgelasticv1alpha1.PgWorkloadClass{
+			ObjectMeta: metav1.ObjectMeta{Name: workloadClassName},
+			Spec: pgelasticv1alpha1.PgWorkloadClassSpec{
+				Priority: 1000,
+				Capacity: pgelasticv1alpha1.WorkloadCapacity{
+					Guaranteed: ptr.To(int32(1)),
+					Burstable:  8,
+				},
+			},
+		},
+		&pgelasticv1alpha1.PgElasticPool{
+			ObjectMeta: metav1.ObjectMeta{Name: poolName, Namespace: e2eNamespace},
+			Spec: pgelasticv1alpha1.PgElasticPoolSpec{
+				ClassRef: pgelasticv1alpha1.ClassReference{
+					APIGroup: pgelasticv1alpha1.SchemeGroupVersion.Group,
+					Kind:     "PgElasticClass",
+					Name:     className,
+				},
+				Capacity: pgelasticv1alpha1.PoolCapacity{BackendConnections: 100},
+				// The template is required by the schema and is never acted on here: the pool
+				// controller creates no PgInstance, and the two members this suite drives are
+				// the ones it creates itself.
+				Instances: pgelasticv1alpha1.PoolInstances{
+					Replicas: ptr.To(int32(2)),
+					Template: pgelasticv1alpha1.PgInstanceTemplate{
+						Class: sizingClass,
+						Storage: pgelasticv1alpha1.InstanceStorage{
+							Size:      resource.MustParse("2Gi"),
+							WALVolume: pgelasticv1alpha1.WALVolume{Size: resource.MustParse("512Mi")},
+						},
+					},
+				},
+				Admission: &pgelasticv1alpha1.PoolAdmission{
+					DefaultWorkloadClassName: workloadClassName,
+				},
+				Pooling: &pgelasticv1alpha1.PoolingConfig{
+					Mode: pgelasticv1alpha1.PoolModeTransaction,
+				},
+				Proxy: &pgelasticv1alpha1.ProxySpec{
+					Replicas: ptr.To(int32(proxyReplicas)),
+					Workers:  ptr.To(int32(2)),
+					Routing: &pgelasticv1alpha1.ProxyRouting{
+						// The database name is the only discriminator every PostgreSQL client
+						// already sends, and it is what these tenants are keyed on.
+						TenantDiscriminators: []pgelasticv1alpha1.TenantDiscriminator{
+							pgelasticv1alpha1.DiscriminatorDatabaseName,
+						},
+					},
+					Resources: &corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("50m"),
+							corev1.ResourceMemory: resource.MustParse("64Mi"),
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// awaitFleet waits for the Deployment to have finished rolling rather than merely to have
+// enough ready replicas: while the operator is still replacing replicas because an instance
+// has just published its address, anything that attaches to one of those Pods is about to
+// lose it.
+func awaitFleet(replicas int32) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		deployment := &appsv1.Deployment{}
+		g.Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
+			Namespace: e2eNamespace, Name: proxyobjects.DeploymentName(poolName),
+		}, deployment)).To(Succeed())
+		g.Expect(deployment.Status.ObservedGeneration).To(Equal(deployment.Generation))
+		g.Expect(deployment.Status.Replicas).To(Equal(replicas))
+		g.Expect(deployment.Status.UpdatedReplicas).To(Equal(replicas))
+		g.Expect(deployment.Status.ReadyReplicas).To(Equal(replicas),
+			"the fleet has %d/%d replicas ready", deployment.Status.ReadyReplicas, replicas)
+	}, "10m", "5s").Should(Succeed())
+
+	// The operator's client certificate is what every control call is made under, so a fleet
+	// that is up but unreachable has to fail here rather than inside a cutover.
+	Eventually(func() error {
+		return k8sClient.Get(suiteCtx, client.ObjectKey{
+			Namespace: e2eNamespace, Name: proxyobjects.ControlClientSecretName(poolName),
+		}, &corev1.Secret{})
+	}, "5m", "5s").Should(Succeed(),
+		"cert-manager never issued the operator's control certificate, so no cutover could "+
+			"reach the fleet's gate")
+}
+
+// currentDatabaseThrough opens one connection through the pool's Service and asks
+// PostgreSQL which database answered.
+func currentDatabaseThrough(database string) string {
+	GinkgoHelper()
+	forward, err := forwardPod(serviceEndpointPod(), proxyobjects.DefaultClientPort)
+	Expect(err).NotTo(HaveOccurred())
+	defer forward.close()
+
+	var name string
+	Eventually(func(g Gomega) {
+		connection, err := pgx.Connect(suiteCtx, forward.dsn(provision.OpsRole, database))
+		g.Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = connection.Close(suiteCtx) }()
+		g.Expect(connection.QueryRow(suiteCtx, "SELECT current_database()").Scan(&name)).To(Succeed())
+	}, "2m", "2s").Should(Succeed(),
+		"nothing answered for %s through the pool Service; the forward said:\n%s",
+		database, forward.log())
+	return name
 }
 
 // annotate is how an operator asks a running migration to stop or to roll back. It retries
@@ -350,8 +518,18 @@ func reportPause(object *pgelasticv1alpha1.PgTenantMigration) {
 	Expect(object.Status.PauseDurationMillis).NotTo(BeNil(), "no pause was measured at all")
 	AddReportEntry(fmt.Sprintf("pauseDurationMillis (%s)", object.Spec.Strategy),
 		*object.Status.PauseDurationMillis)
-	GinkgoWriter.Printf("\n=== %s migration %s: pauseDurationMillis = %d\n",
-		object.Spec.Strategy, object.Name, *object.Status.PauseDurationMillis)
+
+	// The two numbers are different things and both are published. pauseDurationMillis is
+	// the controller's own wall clock across the quiesced phases; clientPauseMillis is how
+	// long the gate was actually shut, which is the number the product's claim is about. A
+	// pool with a fleet has to report it: an empty one would mean nothing was ever held.
+	Expect(object.Status.ClientPauseMillis).NotTo(BeNil(),
+		"no client pause was reported, so nothing held this tenant's clients at all")
+	AddReportEntry(fmt.Sprintf("clientPauseMillis (%s)", object.Spec.Strategy),
+		*object.Status.ClientPauseMillis)
+	GinkgoWriter.Printf("\n=== %s migration %s: pauseDurationMillis = %d, clientPauseMillis = %d\n",
+		object.Spec.Strategy, object.Name,
+		*object.Status.PauseDurationMillis, *object.Status.ClientPauseMillis)
 }
 
 var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered, func() {
@@ -360,6 +538,10 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 	BeforeAll(func() {
 		namespace = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: e2eNamespace}}
 		Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, namespace))).To(Succeed())
+
+		for _, object := range poolObjects() {
+			Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, object))).To(Succeed())
+		}
 
 		// The source's WAL volume is deliberately small, so max_slot_wal_keep_size - two
 		// fifths of it - is a bound this suite can actually push a slot past.
@@ -376,6 +558,23 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 		seedTenant(instanceA)
 		Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, makeTenant()))).To(Succeed())
 		bindTenant(instanceA)
+
+		seedNeighbour(instanceB)
+		Expect(client.IgnoreAlreadyExists(
+			k8sClient.Create(suiteCtx, makeNamedTenant(neighbourDatabase)))).To(Succeed())
+		bindNamedTenant(neighbourDatabase, instanceB)
+	})
+
+	// The fleet has to exist before anything can be queued at it, and the routing has to be
+	// answered by PostgreSQL rather than by the operator: a client that reached the wrong
+	// instance would still report a pause, and would be reporting it about the wrong thing.
+	It("brings up the pool's proxy fleet and routes each tenant to its own instance", func() {
+		awaitFleet(proxyReplicas)
+		// Each database exists on exactly one instance, so reaching it at all is the routing
+		// claim: a connection sent to the other member would be refused for a database that
+		// is not there rather than answering with the wrong data.
+		Expect(currentDatabaseThrough(tenantDatabase)).To(Equal(tenantDatabase))
+		Expect(currentDatabaseThrough(neighbourDatabase)).To(Equal(neighbourDatabase))
 	})
 
 	It("runs the source with a finite bound on what one abandoned slot can retain", func() {
@@ -391,13 +590,77 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 	Context("by logical replication", func() {
 		const migrationName = "online-move"
 
-		It("carries the tenant onto the target and flips routing exactly once", func() {
+		// The load-bearing spec, and the only one that answers the product's actual claim.
+		//
+		// A client holding an open connection through the pool's Service across the cutover
+		// sees a latency spike and no error. Both halves matter and neither on its own is
+		// evidence: no error alone would also be true of a client that never noticed anything
+		// because nothing held it, and a spike alone would also be true of a client that was
+		// dropped and reconnected. The neighbour on the other instance is the control.
+		//
+		// Nothing here reads the operator's own account of its pause. That number is measured
+		// by the thing under suspicion; this one is measured by the client.
+		It("carries the tenant onto the target with its clients queued and never dropped", func() {
+			held := startProbe("the migrated tenant", provision.OpsRole,
+				tenantDatabase, probeInterval)
+			defer held.stop()
+			neighbour := startProbe("the neighbour on the other instance", provision.OpsRole,
+				neighbourDatabase, probeInterval)
+			defer neighbour.stop()
+
+			// A baseline first. "During the cutover" is only a meaningful window if there is
+			// something before it to compare against.
+			time.Sleep(baselineWindow)
+			held.mark()
+			neighbour.mark()
+
 			Expect(k8sClient.Create(suiteCtx,
 				makeMigration(migrationName, instanceB, pgelasticv1alpha1.TenantMigrationOnline))).To(Succeed())
 
 			object := awaitPhase(migrationName, pgelasticv1alpha1.TenantMigrationPhaseCompleted)
 			Expect(routedInstance()).To(Equal(instanceB))
 			reportPause(object)
+
+			held.stop()
+			neighbour.stop()
+			heldReport := held.report()
+			lastNeighbourReport = neighbour.report()
+			neighbourReport := lastNeighbourReport
+			AddReportEntry("client through the proxy", heldReport.String())
+			AddReportEntry("neighbour through the proxy", neighbourReport.String())
+			GinkgoWriter.Printf("\n=== %s\n=== %s\n", heldReport, neighbourReport)
+
+			Expect(heldReport.failures).To(BeEmpty(),
+				"the client was dropped rather than queued: %v", heldReport.failures)
+			Expect(heldReport.duringCount).To(BeNumerically(">", 0),
+				"no statement was issued during the cutover, so nothing was measured")
+			Expect(heldReport.duringMax).To(BeNumerically(">", heldReport.beforeP99*10),
+				"the client saw no pause at all across the cutover (max %s against a "+
+					"baseline p99 of %s), so nothing ever held it and the move was not a "+
+					"queued one", heldReport.duringMax, heldReport.beforeP99)
+
+			// The same socket, before and after. It was answered by one backend address and
+			// then by another, which is a tenant that moved underneath a connection that never
+			// closed - and is exactly what a client that had been dropped and had silently
+			// reconnected could not produce, because that one would have shown an error first.
+			Expect(heldReport.servers).To(HaveLen(2),
+				"the held connection was served by %v across a move between two instances",
+				heldReport.servers)
+		})
+
+		// The control. A pause every tenant in the pool sees is a fleet-wide stall and not a
+		// tenant move, and the two are indistinguishable without measuring both.
+		It("left the tenant on the other instance undisturbed", func() {
+			report := lastNeighbourReport
+			Expect(report.duringCount).To(BeNumerically(">", 0))
+			Expect(report.failures).To(BeEmpty(),
+				"the neighbour was disturbed by somebody else's migration: %v", report.failures)
+			Expect(report.servers).To(HaveLen(1),
+				"the neighbour was moved by somebody else's migration; it was served by %v",
+				report.servers)
+			Expect(report.duringMax).To(BeNumerically("<", neighbourDisturbanceCeiling),
+				"the neighbour's worst statement during the cutover took %s, which is a stall "+
+					"rather than a move of somebody else's tenant", report.duringMax)
 		})
 
 		It("opened a failover-enabled slot rather than one a failover would destroy", func() {

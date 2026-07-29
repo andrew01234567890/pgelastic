@@ -931,8 +931,13 @@ type PoolAuthRotation struct {
 // verifiers: sharing one fleet across pools would put a config blast radius and a CVE
 // blast radius across a tenancy boundary.
 type ProxySpec struct {
-	// replicas is the proxy pod count. Per-replica connection budgets are leased from the
-	// pool budget rather than divided statically, so this is not a capacity multiplier.
+	// replicas is the proxy pod count, and it is a capacity multiplier. Every replica reads
+	// one configuration document carrying the undivided backendConnections budget, so N
+	// replicas can hold N times it against PostgreSQL. Admission accounts for that: a
+	// configuration whose worst case exceeds the pool's declared oversubscription ceiling is
+	// rejected, and status.proxy.leasedConnections publishes the grant actually in force.
+	// Per-replica leases, which would make this a division rather than a multiplication, are
+	// not implemented.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100
 	// +kubebuilder:default=3
@@ -1299,8 +1304,10 @@ type PgElasticPoolSpec struct {
 }
 
 // CapacityLedger is the pool's published accounting. It is the only place the derived
-// numbers appear: users set a budget and per-tenant guarantees, and every per-replica and
-// per-instance figure is computed here rather than configured.
+// pool-wide and per-instance numbers appear: users set a budget and per-tenant guarantees,
+// and these figures are computed rather than configured. The per-replica arithmetic is not
+// here — it is in status.proxy.leasedConnections, because it is a property of the fleet
+// rather than of the budget.
 type CapacityLedger struct {
 	// backendConnections is the configured budget, echoed for the scale subresource.
 	// +optional
@@ -1399,9 +1406,11 @@ type ProxyStatus struct {
 	// +optional
 	ConfigVersion string `json:"configVersion,omitempty"`
 
-	// leasedConnections is the total credit currently leased to replicas. It is the number
-	// that must never exceed allocatable, and it is the failure mode no single-process
-	// pooler can see.
+	// leasedConnections is the total backend-connection credit the fleet holds: replicas
+	// multiplied by the per-replica budget. It is the failure mode no single-process pooler
+	// can see, and until per-replica leases exist it is a static grant rather than a lease —
+	// which is why it can exceed allocatable, and why admission bounds the worst case
+	// instead.
 	// +optional
 	LeasedConnections int32 `json:"leasedConnections,omitempty"`
 }

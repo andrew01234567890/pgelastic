@@ -794,8 +794,16 @@ impl Running<'_> {
         );
         self.session.binding = binding;
         // The statement cache is per instance, so nothing this client prepared
-        // on the source is parsed on the target.
-        self.statements = ClientStatements::new();
+        // on the source is parsed on the target — but the client does not know
+        // that, and its driver still holds the names. Re-interning against the
+        // new instance keeps every name resolvable, and the per-link cache on
+        // the target answers the next `Bind` with a `Parse` of its own. Clearing
+        // the map instead is how a queued client survives the pause and is then
+        // told `26000 prepared statement does not exist`, which is a dropped
+        // transaction wearing the costume of a completed move.
+        let manager = Arc::clone(self.session.binding.manager());
+        self.statements
+            .rebind(|key| manager.intern_statement(key.clone()));
         self.epochs = epochs_of(&self.session);
         self.epochs.mark_unchanged();
         Ok(())

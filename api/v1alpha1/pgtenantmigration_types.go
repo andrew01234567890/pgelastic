@@ -297,6 +297,23 @@ type PgTenantMigrationStatus struct {
 	// +optional
 	PauseDurationMillis *int64 `json:"pauseDurationMillis,omitempty"`
 
+	// clientPauseMillis is how long the proxy actually held the tenant's clients: from the
+	// gate closing to the resume that let them through. It is the number the product's
+	// claim is about, and it is a different number from pauseDurationMillis, which is the
+	// controller's own wall clock over the same phases and includes reconcile latency and
+	// drain polling on either side of the hold. A pool with no proxy queues nobody and
+	// leaves this empty rather than reporting a zero that would read as "no pause".
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ClientPauseMillis *int64 `json:"clientPauseMillis,omitempty"`
+
+	// queuedClients is how many client transactions were waiting at the proxy's gate when
+	// the drain was last observed, summed across the fleet. It is the difference between a
+	// pause and an outage: queued clients are still connected and will run.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	QueuedClients *int64 `json:"queuedClients,omitempty"`
+
 	// verification is the equivalence evidence gathered before the routing flip.
 	// +optional
 	Verification *TenantMigrationVerification `json:"verification,omitempty"`

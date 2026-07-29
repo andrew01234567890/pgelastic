@@ -136,6 +136,7 @@ impl Config {
                  expired would quiesce a tenant nobody can resume",
             ));
         }
+        self.validate_control()?;
         if self.routing.tenant_discriminators.is_empty() {
             return Err(ProxyError::config(
                 "routing.tenantDiscriminators must name at least one input: a connection \
@@ -146,6 +147,42 @@ impl Config {
         if self.stall.interval_ms == 0 || self.stall.confirmations == 0 {
             return Err(ProxyError::config(
                 "stall.intervalMs and stall.confirmations must both be non-zero",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses a control listener nobody has to authenticate to.
+    ///
+    /// The check is here rather than at the listener because a proxy that binds
+    /// the port and only then discovers it cannot verify anyone has already
+    /// exposed every tenant's gate to whoever reaches the pod.
+    fn validate_control(&self) -> Result<()> {
+        let Some(address) = &self.control.address else {
+            return Ok(());
+        };
+        let Some(tls) = &self.control.tls else {
+            return Err(ProxyError::config(format!(
+                "control.address {address:?} needs control.tls: an unauthenticated caller \
+                 can quiesce any tenant, which holds its clients' sockets open with nothing \
+                 behind them"
+            )));
+        };
+        for (field, path) in [
+            ("certificateFile", &tls.certificate_file),
+            ("keyFile", &tls.key_file),
+            ("clientCaFile", &tls.client_ca_file),
+        ] {
+            if !path.exists() {
+                return Err(ProxyError::config(format!(
+                    "control.tls.{field} {} does not exist",
+                    path.display()
+                )));
+            }
+        }
+        if tls.client_name.is_empty() {
+            return Err(ProxyError::config(
+                "control.tls.clientName must name the caller the listener will accept",
             ));
         }
         Ok(())
@@ -360,6 +397,10 @@ pub struct ControlConfig {
     /// quiesce a tenant.
     #[serde(default)]
     pub address: Option<String>,
+    /// The mutual TLS a caller must pass, which is required whenever
+    /// [`address`](Self::address) is set.
+    #[serde(default)]
+    pub tls: Option<ControlTlsConfig>,
     #[serde(default = "default_lease_ttl_ms")]
     pub default_lease_ttl_ms: u64,
     /// The longest lease the API will grant.
@@ -371,10 +412,38 @@ pub struct ControlConfig {
     pub max_lease_ttl_ms: u64,
 }
 
+/// The client certificate the control API authenticates a caller by.
+///
+/// Mandatory whenever the listener is bound at all. Quiescing a tenant holds
+/// its client sockets open with nothing behind them, so an unauthenticated
+/// caller can stall any tenant at will — there is no posture in which serving
+/// these endpoints to whoever connects is acceptable, and the configuration is
+/// shaped so that one cannot be expressed.
+///
+/// A bearer token in this same document was rejected: the document is a Secret
+/// mounted into the pod, so a token in it protects nothing the pod does not
+/// already hold.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ControlTlsConfig {
+    /// The listener's own certificate and key.
+    pub certificate_file: PathBuf,
+    pub key_file: PathBuf,
+    /// The CA a caller's client certificate must chain to.
+    pub client_ca_file: PathBuf,
+    /// The DNS name that certificate must carry.
+    ///
+    /// Checked against the subject alternative names rather than the common
+    /// name: CN-as-identity has been deprecated since RFC 2818 was replaced,
+    /// and cert-manager issues a `Certificate`'s `dnsNames` as SANs.
+    pub client_name: String,
+}
+
 impl Default for ControlConfig {
     fn default() -> Self {
         Self {
             address: None,
+            tls: None,
             default_lease_ttl_ms: default_lease_ttl_ms(),
             max_lease_ttl_ms: default_max_lease_ttl_ms(),
         }
@@ -1154,6 +1223,49 @@ mod tests {
         assert!(config.control.address.is_none());
         assert_eq!(config.control.default_lease_ttl(), Duration::from_secs(15));
         assert_eq!(config.control.max_lease_ttl(), Duration::from_secs(120));
+    }
+
+    /// The gap the listener was never rendered over, closed in the schema so it
+    /// cannot be reopened by a rendering mistake.
+    #[test]
+    fn a_control_listener_without_client_authentication_is_refused() {
+        let source = format!("{MINIMAL}\n[control]\naddress = \"0.0.0.0:9128\"\n");
+        let error = Config::from_str(&source).unwrap_err();
+        assert!(error.to_string().contains("control.tls"), "{error}");
+    }
+
+    #[test]
+    fn control_tls_material_that_is_not_on_disk_is_refused_before_the_port_is_bound() {
+        let source = format!(
+            "{MINIMAL}\n[control]\naddress = \"0.0.0.0:9128\"\n\
+             [control.tls]\ncertificateFile = \"/nope/tls.crt\"\nkeyFile = \"/nope/tls.key\"\n\
+             clientCaFile = \"/nope/ca.crt\"\nclientName = \"operator\"\n"
+        );
+        let error = Config::from_str(&source).unwrap_err();
+        assert!(error.to_string().contains("certificateFile"), "{error}");
+    }
+
+    /// The control section is structural: a change to it has to roll the fleet,
+    /// because a running process cannot rebind a port or reload a trust root.
+    #[test]
+    fn moving_the_control_listener_is_not_something_a_running_process_can_adopt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in ["tls.crt", "tls.key", "ca.crt"] {
+            std::fs::write(dir.path().join(name), "unused").unwrap();
+        }
+        let control = |address: &str| {
+            format!(
+                "{MINIMAL}\n[control]\naddress = \"{address}\"\n[control.tls]\n\
+                 certificateFile = {:?}\nkeyFile = {:?}\nclientCaFile = {:?}\n\
+                 clientName = \"operator\"\n",
+                dir.path().join("tls.crt").display().to_string(),
+                dir.path().join("tls.key").display().to_string(),
+                dir.path().join("ca.crt").display().to_string(),
+            )
+        };
+        let first = Config::from_str(&control("0.0.0.0:9128")).unwrap();
+        let second = Config::from_str(&control("0.0.0.0:9129")).unwrap();
+        assert!(!first.is_dynamic_change(&second));
     }
 
     #[test]

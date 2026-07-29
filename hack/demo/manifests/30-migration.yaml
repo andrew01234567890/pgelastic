@@ -1,0 +1,27 @@
+# The move the demo exists to show: test leaves demo-a for demo-b while a client is writing
+# to it through the pool's Service. Online, so the copy and the catch-up happen while the
+# tenant is still serving and the pause is confined to the quiesce and the flip.
+apiVersion: pgelastic.io/v1alpha1
+kind: PgTenantMigration
+metadata:
+  name: move-test
+spec:
+  tenantRef:
+    name: test
+  targetInstanceRef:
+    name: demo-b
+  strategy: Online
+  preflight:
+    # Catch-up compares the subscriber's lag against this, and the default is zero. A tenant
+    # that is being written to continuously - which is the whole point of the demo - never
+    # reaches zero lag while it is still serving, so an online move of a live tenant sits in
+    # Catchup for ever without it. Whatever is still in flight at this threshold is closed
+    # inside the pause: the cutover will not flip until the subscriber has confirmed the
+    # source's LSN as of the instant the clients were queued.
+    maxSourceLagBytes: 1048576
+  # Long enough that the demo reports the pause it measured rather than aborting on a
+  # budget. The pause is still measured; what is relaxed is the threshold, not the clock.
+  drainTimeout: 5m
+  cutoverTimeout: 10m
+  # The source is kept intact after the cutover so the run can be inspected afterwards.
+  rollbackWindow: 30m

@@ -188,6 +188,66 @@ func TestQuiescingReadsDrainFromPostgresRatherThanTheProxy(t *testing.T) {
 	}
 }
 
+// The gate is the other half of the same claim. PostgreSQL can say that no backend is
+// currently inside a transaction; only the gate can say that no further one may start, and
+// a replica still admitting traffic makes the first answer true for an instant and useless.
+func TestQuiescingIsNotDrainedWhileAReplicaStillAdmitsTraffic(t *testing.T) {
+	sql := runningSQL().scalarAnswer("FROM pg_stat_activity\nWHERE datname", "0")
+	router := &fakeRouter{routed: sourceInstance}
+	router.gate = DrainStatus{Known: true, Quiesced: false, Drained: false, Queued: 4}
+	result := testEngine(sql, router, &fakeShell{}).Step(context.Background(), testRun(quiescing, online))
+	if result.Observation.Drained {
+		t.Fatal("a fleet with a replica still admitting the tenant's traffic was reported drained")
+	}
+	if result.Queued == nil || *result.Queued != 4 {
+		t.Fatalf("the queued clients were not published: %+v", result.Queued)
+	}
+}
+
+func TestQuiescingIsDrainedWhenTheGateAndTheDatabaseAgree(t *testing.T) {
+	sql := runningSQL().scalarAnswer("FROM pg_stat_activity\nWHERE datname", "0")
+	router := &fakeRouter{routed: sourceInstance}
+	router.gate = DrainStatus{Known: true, Quiesced: true, Drained: true}
+	result := testEngine(sql, router, &fakeShell{}).Step(context.Background(), testRun(quiescing, online))
+	if !result.Observation.Drained {
+		t.Fatal("a closed gate over a quiet source was not reported drained")
+	}
+}
+
+// Resume commits and release abandons, and applying the wrong one is how a successful
+// cutover gets rolled back by its own lease expiring a moment later.
+func TestASuccessfulCutoverResumesRatherThanMerelyReleasing(t *testing.T) {
+	sql := runningSQL().scalarAnswer("FROM pg_subscription WHERE subname", "1")
+	router := &fakeRouter{routed: targetInstance}
+	engine := testEngine(sql, router, &fakeShell{})
+	decision := Decide(cutover, Observation{Strategy: online, CutoverComplete: true})
+	if err := engine.Apply(context.Background(), testRun(cutover, online), decision); err != nil {
+		t.Fatal(err)
+	}
+	if !router.resumed {
+		t.Fatal("a committed cutover never resumed, so an expiring lease could still undo it")
+	}
+}
+
+func TestAnAbortReleasesTheHoldWithoutCommittingIt(t *testing.T) {
+	sql := runningSQL().scalarAnswer("FROM pg_subscription WHERE subname", "1")
+	router := &fakeRouter{routed: targetInstance, quiesced: true}
+	run := testRun(quiescing, online)
+	run.AbortRequested = true
+	engine := testEngine(sql, router, &fakeShell{})
+	step := engine.Step(context.Background(), run)
+	decision := Decide(quiescing, step.Observation)
+	if err := engine.Apply(context.Background(), run, decision); err != nil {
+		t.Fatal(err)
+	}
+	if router.resumed {
+		t.Fatal("an abort committed the flip it was abandoning")
+	}
+	if !router.released {
+		t.Fatal("an abort left the tenant's clients queued")
+	}
+}
+
 func TestCutoverFlipsRoutingOnlyAfterVerificationPasses(t *testing.T) {
 	sql, router := runningSQL(), &fakeRouter{routed: sourceInstance}
 	run := testRun(cutover, online)
@@ -337,5 +397,23 @@ func TestAnAbortSkipsTheEffectOfThePhaseItStops(t *testing.T) {
 	testEngine(sql, &fakeRouter{routed: sourceInstance}, &fakeShell{}).Step(context.Background(), run)
 	if sql.ran("CREATE SUBSCRIPTION") >= 0 {
 		t.Fatal("an aborted migration created the subscription it was told not to")
+	}
+}
+
+// An empty answer and an absent one are different facts, and psql tells them apart by
+// printing a newline for the first and nothing for the second. Collapsing them is how a
+// tenant database with no sequences fails its own schema fingerprint - which coalesces to
+// the empty string deliberately - in the middle of a cutover.
+func TestAnEmptyAnswerIsNotAnAbsentOne(t *testing.T) {
+	if rows := parseRows([]byte("")); rows != nil {
+		t.Fatalf("a query that returned nothing produced %#v", rows)
+	}
+	rows := parseRows([]byte("\n"))
+	if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0] != "" {
+		t.Fatalf("one row whose only column is empty parsed as %#v", rows)
+	}
+	rows = parseRows([]byte("a" + fieldSeparator + "b\nc" + fieldSeparator + "d\n"))
+	if len(rows) != 2 || rows[1][1] != "d" {
+		t.Fatalf("two rows parsed as %#v", rows)
 	}
 }

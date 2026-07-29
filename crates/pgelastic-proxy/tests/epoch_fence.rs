@@ -533,6 +533,9 @@ async fn a_commit_whose_outcome_was_never_observed_is_reported_unknown_and_logge
         .expect("reloading");
 
     let client = connect(&proxy, "acme").await;
+
+    await_quorum_clause(&client, "ghost").await;
+
     client.simple_query("BEGIN").await.expect("begin");
     client
         .simple_query("INSERT INTO fence_commits VALUES (1)")
@@ -768,4 +771,31 @@ fn reported(error: &tokio_postgres::Error) -> String {
         || error.to_string(),
         |db| format!("{} {}", db.code().code(), db.message()),
     )
+}
+
+/// Waits until the backend serving `client` reports `expected` as its loaded quorum clause.
+///
+/// `synchronous_standby_names` is `PGC_SIGHUP`, so `pg_reload_conf` returns long before a backend
+/// has picked the new value up. A test that assumes otherwise passes on a fast machine and
+/// fails on a loaded one, because the commit it wanted to stall simply completes first.
+async fn await_quorum_clause(client: &tokio_postgres::Client, expected: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let rows = client
+            .simple_query("SHOW synchronous_standby_names")
+            .await
+            .expect("reading the loaded quorum clause");
+        let loaded = rows.iter().any(|message| {
+            matches!(message, tokio_postgres::SimpleQueryMessage::Row(row)
+                if row.get(0) == Some(expected))
+        });
+        if loaded {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the backend never loaded {expected}, so a commit could not stall"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

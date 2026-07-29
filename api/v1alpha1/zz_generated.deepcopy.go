@@ -1969,6 +1969,16 @@ func (in *PgTenantMigrationStatus) DeepCopyInto(out *PgTenantMigrationStatus) {
 		*out = new(int64)
 		**out = **in
 	}
+	if in.ClientPauseMillis != nil {
+		in, out := &in.ClientPauseMillis, &out.ClientPauseMillis
+		*out = new(int64)
+		**out = **in
+	}
+	if in.QueuedClients != nil {
+		in, out := &in.QueuedClients, &out.QueuedClients
+		*out = new(int64)
+		**out = **in
+	}
 	if in.Verification != nil {
 		in, out := &in.Verification, &out.Verification
 		*out = new(TenantMigrationVerification)

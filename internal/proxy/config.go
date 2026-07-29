@@ -77,6 +77,11 @@ type Config struct {
 	// what decides whether the TLS sections are emitted at all.
 	ClientTLS bool
 	BackendCA bool
+	// Control is set when the control listener's certificates have been reconciled. It is
+	// one flag rather than two because the listener is never rendered without them: the
+	// proxy refuses a control address with no client CA, which is what keeps a rendering
+	// mistake from exposing every tenant's gate.
+	Control bool
 }
 
 // Document is a rendered configuration and the two identities derived from it.
@@ -116,6 +121,7 @@ func (c Config) render(dynamic bool) string {
 	c.renderBackend(&out)
 	c.renderAuth(&out)
 	c.renderDrainAndMetrics(&out)
+	c.renderControl(&out)
 	c.renderRouting(&out, dynamic)
 	c.renderPool(&out, dynamic)
 	c.renderReload(&out)
@@ -186,6 +192,44 @@ func (c Config) renderDrainAndMetrics(out *strings.Builder) {
 	writeString(out, "address", fmt.Sprintf("0.0.0.0:%d", metricsPort(c.Pool)))
 	out.WriteString("\n")
 }
+
+// renderControl writes the lease-bound cutover API's listener.
+//
+// Written into both halves of the document and therefore covered by the structural hash: a
+// listen address and a trust root are things a running process cannot adopt, so changing
+// either has to roll the fleet. That is the opposite of [routing].tenants, which is
+// deliberately excluded so that adding a tenant restarts nothing.
+//
+// It is bound on all interfaces rather than on localhost, because the caller is the
+// operator reaching the replica across the network. What makes that safe is the mutual TLS
+// below and not the bind address: the proxy refuses to serve this port at all without a
+// client CA and a name to check against it.
+func (c Config) renderControl(out *strings.Builder) {
+	if !c.Control {
+		return
+	}
+	out.WriteString("[control]\n")
+	writeString(out, "address", fmt.Sprintf("0.0.0.0:%d", DefaultControlPort))
+	writeInt(out, "defaultLeaseTtlMs", ControlLeaseTTLMillis)
+	writeInt(out, "maxLeaseTtlMs", ControlMaxLeaseTTLMillis)
+	out.WriteString("\n[control.tls]\n")
+	writeString(out, "certificateFile", ControlTLSDir+"/tls.crt")
+	writeString(out, "keyFile", ControlTLSDir+"/tls.key")
+	writeString(out, "clientCaFile", ControlTLSDir+"/ca.crt")
+	writeString(out, "clientName", ControlClientName(c.Pool.Name, c.Pool.Namespace))
+	out.WriteString("\n")
+}
+
+// The lease a cutover holds a tenant under.
+//
+// The ceiling is what bounds how long a killed operator can hold a tenant's clients still,
+// so it is deliberately far above the default and far below anything an operator would call
+// an outage. The default is short because the holder is expected to renew: a controller that
+// dies mid-cutover should release the tenant in seconds, not at the ceiling.
+const (
+	ControlLeaseTTLMillis    = 15_000
+	ControlMaxLeaseTTLMillis = 120_000
+)
 
 func (c Config) renderRouting(out *strings.Builder, dynamic bool) {
 	out.WriteString("[routing]\n")

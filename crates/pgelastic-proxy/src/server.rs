@@ -262,11 +262,24 @@ async fn spawn_availability_paths(
     ));
 
     if let Some(address) = &proxy.config.control.address {
+        // Unwrapped rather than defended against: the configuration refuses an
+        // address without TLS material, so reaching here without it would mean
+        // validation had been bypassed.
+        let tls =
+            proxy.config.control.tls.as_ref().ok_or_else(|| {
+                ProxyError::config("control.address is set but control.tls is not")
+            })?;
+        let authority = crate::tls::ControlAuthority::new(tls)?;
         let listener = TcpListener::bind(crate::config::resolve(address)?).await?;
-        info!(address = %listener.local_addr()?, "control endpoint listening");
+        info!(
+            address = %listener.local_addr()?,
+            client = %tls.client_name,
+            "control endpoint listening, mutual TLS required"
+        );
         tokio::spawn(crate::control::serve(
             listener,
             control,
+            authority,
             shutdown.subscribe(),
         ));
     }

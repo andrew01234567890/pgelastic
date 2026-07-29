@@ -102,6 +102,7 @@ type PgTenantMigrationReconciler struct {
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
+// +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch
 
 // Reconcile advances one migration by at most one phase.
 //
@@ -151,6 +152,9 @@ func (r *PgTenantMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		// litter of a migration that has actually stopped.
 		log.Error(err, "Could not apply the migration decision in full", "phase", string(decision.Phase))
 	}
+	// Read after Apply, because Apply is where the hold ends: the router can only report the
+	// pause once it has stopped imposing it.
+	step.ClientPause = r.clientPause(run.Tenant)
 
 	r.record(&status, object.Generation, run, step, decision)
 	return r.publish(ctx, object, status, ctrl.Result{RequeueAfter: requeueFor(decision.Phase, run.Strategy)})
@@ -315,6 +319,12 @@ func (r *PgTenantMigrationReconciler) record(
 		migrationPauseSeconds.WithLabelValues(run.Tenant.Namespace, string(run.Strategy)).
 			Observe(float64(*step.PauseMillis) / 1000)
 	}
+	if step.ClientPause != nil {
+		status.ClientPauseMillis = ptr.To(step.ClientPause.Milliseconds())
+	}
+	if step.Queued != nil {
+		status.QueuedClients = step.Queued
+	}
 
 	if decision.Phase == pgelasticv1alpha1.TenantMigrationPhaseQuiescing && quiesceStart(status) == nil {
 		// The transition time is stamped from the controller's own clock rather than left to
@@ -384,6 +394,21 @@ func (r *PgTenantMigrationReconciler) reader() client.Reader {
 		return r.APIReader
 	}
 	return r.Client
+}
+
+// clientPause asks the router how long it held the tenant's clients, when it is a router
+// that holds anybody. A BindingRouter queues nobody and reports nothing, which is why this
+// is an optional capability rather than a method every Router has to answer dishonestly.
+func (r *PgTenantMigrationReconciler) clientPause(tenant migration.TenantRef) *time.Duration {
+	reporter, ok := r.Router.(migration.PauseReporter)
+	if !ok {
+		return nil
+	}
+	held, reported := reporter.ClientPause(tenant)
+	if !reported {
+		return nil
+	}
+	return &held
 }
 
 func (r *PgTenantMigrationReconciler) now() time.Time {

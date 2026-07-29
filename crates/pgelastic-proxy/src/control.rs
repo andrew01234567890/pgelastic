@@ -35,12 +35,13 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::ControlConfig;
 use crate::metrics::Metrics;
 use crate::quiesce::{DrainStatus, QuiesceError, QuiesceRegistry};
 use crate::route::{Fleet, InstanceId};
+use crate::tls::ControlAuthority;
 
 /// Largest request body the API will read. Every payload is a handful of short
 /// identifiers.
@@ -156,7 +157,13 @@ impl Control {
     /// Opens the gate and commits the current route.
     pub fn resume(&self, tenant: &str, holder: &str) -> Result<u64, QuiesceError> {
         let gate = self.quiesce.gate(tenant);
+        // Read before the release, which is what clears the clock, and recorded
+        // only once the release succeeded: a refused call held nobody.
+        let held = gate.held_for();
         let released = gate.resume(holder)?;
+        if let Some(held) = held {
+            self.metrics.quiesce_round_trip(held);
+        }
         self.metrics.quiesce_resumed(released);
         info!(
             tenant,
@@ -170,7 +177,11 @@ impl Control {
     /// Releases the lease, rolling the route back if nothing ran on the target.
     pub fn unquiesce(&self, tenant: &str, holder: &str) -> Result<InstanceId, QuiesceError> {
         let gate = self.quiesce.gate(tenant);
+        let held = gate.held_for();
         let rollback = gate.unquiesce(holder)?;
+        if let Some(held) = held {
+            self.metrics.quiesce_round_trip(held);
+        }
         if let Some(source) = rollback {
             self.fleet.set_route(tenant, &source);
         }
@@ -184,6 +195,9 @@ impl Control {
     pub fn reap_expired_leases(&self) {
         for (tenant, expiry) in self.quiesce.reap_expired() {
             self.metrics.quiesce_lease_expired();
+            if let Some(held) = expiry.held {
+                self.metrics.quiesce_round_trip(held);
+            }
             if let Some(source) = expiry.rollback {
                 self.fleet.set_route(&tenant, &source);
                 info!(
@@ -197,22 +211,51 @@ impl Control {
     }
 }
 
-/// Serves the control API until `shutdown` goes true.
-pub async fn serve(listener: TcpListener, control: Control, mut shutdown: watch::Receiver<bool>) {
+/// Serves the control API over mutual TLS until `shutdown` goes true.
+///
+/// There is no plaintext variant. Every endpoint below either holds a tenant's
+/// clients still or decides which instance they run against, so a caller that
+/// has not proved who it is gets `401` and nothing else.
+pub async fn serve(
+    listener: TcpListener,
+    control: Control,
+    authority: Arc<ControlAuthority>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     loop {
         let accepted = tokio::select! {
             result = listener.accept() => result,
             () = wait_true(&mut shutdown) => return,
         };
-        let Ok((socket, _)) = accepted else { continue };
+        let Ok((socket, peer)) = accepted else {
+            continue;
+        };
         let control = control.clone();
+        let authority = Arc::clone(&authority);
         tokio::spawn(async move {
+            let stream = match authority.acceptor().accept(socket).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    debug!(%peer, %error, "a control-plane connection failed to negotiate TLS");
+                    return;
+                }
+            };
+            let identity = authority.authorize(stream.get_ref().1.peer_certificates());
+            if let Some(reason) = identity.refusal() {
+                warn!(%peer, %reason, "a control-plane caller was refused");
+            }
             let service = service_fn(move |request: Request<hyper::body::Incoming>| {
                 let control = control.clone();
-                async move { Ok::<_, std::convert::Infallible>(respond(request, &control).await) }
+                let identity = identity.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(match identity.refusal() {
+                        Some(reason) => unauthorized(&reason),
+                        None => respond(request, &control).await,
+                    })
+                }
             });
             let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(socket), service)
+                .serve_connection(TokioIo::new(stream), service)
                 .await;
         });
     }
@@ -404,6 +447,19 @@ fn percent_decode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The refusal an unauthenticated or untrusted caller gets.
+///
+/// A body rather than a bare close, because the three ways to fail — no
+/// certificate, one this listener does not trust, one belonging to somebody
+/// else — are three different misconfigurations and look identical from the
+/// outside otherwise.
+fn unauthorized(reason: &str) -> Response<Full<Bytes>> {
+    json(
+        StatusCode::UNAUTHORIZED,
+        format!("{{\"error\":{}}}", quote(reason)),
+    )
 }
 
 fn bad_request(message: &str) -> Response<Full<Bytes>> {
@@ -621,5 +677,293 @@ mod tests {
         assert_eq!(param("x=1&tenant=a%2Fb", "tenant").as_deref(), Some("a/b"));
         assert_eq!(param("tenant=a+b", "tenant").as_deref(), Some("a b"));
         assert_eq!(param("holder=x", "tenant"), None);
+    }
+
+    #[test]
+    fn a_resume_records_how_long_the_tenant_was_held() {
+        let control = control();
+        control.quiesce("alpha", "migration", None).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        control.resume("alpha", "migration").unwrap();
+        assert!(
+            round_trip_us(&control.metrics) >= 1000,
+            "the pause a queued client saw was never recorded: {}",
+            control.metrics.render()
+        );
+    }
+
+    #[test]
+    fn an_aborted_cutover_records_the_pause_it_still_cost() {
+        let control = control();
+        control.quiesce("alpha", "migration", None).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        control.unquiesce("alpha", "migration").unwrap();
+        assert!(round_trip_us(&control.metrics) >= 1000);
+    }
+
+    #[test]
+    fn an_expired_lease_records_the_pause_nobody_ended_deliberately() {
+        let control = control();
+        control
+            .quiesce("alpha", "migration", Some(Duration::from_millis(2)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        control.reap_expired_leases();
+        assert!(round_trip_us(&control.metrics) >= 2000);
+    }
+
+    /// A renewal must not restart the clock, or the reported pause is however
+    /// often the operator happened to renew rather than how long clients waited.
+    #[test]
+    fn renewing_the_lease_does_not_shorten_the_pause_that_gets_reported() {
+        let control = control();
+        control.quiesce("alpha", "migration", None).unwrap();
+        std::thread::sleep(Duration::from_millis(4));
+        control.quiesce("alpha", "migration", None).unwrap();
+        control.resume("alpha", "migration").unwrap();
+        assert!(round_trip_us(&control.metrics) >= 4000);
+    }
+
+    fn round_trip_us(metrics: &Metrics) -> i64 {
+        let rendered = metrics.render();
+        for line in rendered.lines() {
+            if let Some(value) = line.strip_prefix("pgelastic_proxy_quiesce_round_trip_max_us ") {
+                return value.trim().parse().expect("a gauge is a number");
+            }
+        }
+        panic!("no quiesce round trip gauge in:\n{rendered}");
+    }
+}
+
+/// The authentication the listener is useless without.
+///
+/// Three callers, one endpoint: the one holding the operator's certificate is
+/// served, and the two that are not are told `401` with the reason rather than
+/// being dropped. The refusals are asserted on the status line a real client
+/// would read, over a real TLS handshake, because the whole point of deferring
+/// the trust decision to the HTTP layer is that it is visible there.
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use crate::config::{Config, ControlTlsConfig};
+    use crate::tls::ControlAuthority;
+    use std::str::FromStr as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// The name the listener will accept, and nothing else.
+    const OPERATOR: &str = "pgelastic-operator.pgelastic-system.svc";
+
+    struct Pki {
+        _dir: tempfile::TempDir,
+        server_cert: std::path::PathBuf,
+        server_key: std::path::PathBuf,
+        ca: std::path::PathBuf,
+        operator: Identity,
+        impostor: Identity,
+        stranger: Identity,
+        roots: rustls::RootCertStore,
+    }
+
+    #[derive(Clone)]
+    struct Identity {
+        chain: Vec<rustls_pki_types::CertificateDer<'static>>,
+        key_der: Vec<u8>,
+    }
+
+    impl Identity {
+        fn key(&self) -> rustls_pki_types::PrivateKeyDer<'static> {
+            rustls_pki_types::PrivateKeyDer::try_from(self.key_der.clone())
+                .expect("a generated key is well formed")
+        }
+    }
+
+    fn pki() -> Pki {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+            KeyPair, KeyUsagePurpose,
+        };
+        crate::tls::install_crypto_provider();
+
+        let authority = |common_name: &str| {
+            let mut params = CertificateParams::new(Vec::new()).expect("CA parameters");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            params
+                .distinguished_name
+                .push(DnType::CommonName, common_name);
+            let key = KeyPair::generate().expect("CA key");
+            let cert = params.self_signed(&key).expect("self-signed CA");
+            (params, key, cert)
+        };
+        let (ca_params, ca_key, ca_cert) = authority("pgelastic control CA");
+        let (other_params, other_key, _other_cert) = authority("somebody else's CA");
+
+        let leaf = |name: &str, usage: ExtendedKeyUsagePurpose, issuer: &Issuer<'_, &KeyPair>| {
+            let mut params = CertificateParams::new(vec![name.to_owned()]).expect("parameters");
+            params.distinguished_name.push(DnType::CommonName, name);
+            params.extended_key_usages = vec![usage];
+            let key = KeyPair::generate().expect("leaf key");
+            let cert = params.signed_by(&key, issuer).expect("signed leaf");
+            (cert, key)
+        };
+
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+        let (server, server_key) = leaf("localhost", ExtendedKeyUsagePurpose::ServerAuth, &issuer);
+        let (operator, operator_key) = leaf(OPERATOR, ExtendedKeyUsagePurpose::ClientAuth, &issuer);
+        // Issued by the same CA, so it is trusted — and still refused, because
+        // trust is not identity.
+        let (impostor, impostor_key) = leaf(
+            "someone-else.pgelastic-system.svc",
+            ExtendedKeyUsagePurpose::ClientAuth,
+            &issuer,
+        );
+        let other_issuer = Issuer::from_params(&other_params, &other_key);
+        let (stranger, stranger_key) =
+            leaf(OPERATOR, ExtendedKeyUsagePurpose::ClientAuth, &other_issuer);
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let write = |name: &str, contents: String| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, contents).expect("write");
+            path
+        };
+        let ca = write("ca.pem", ca_cert.pem());
+        let server_cert = write("server.pem", server.pem());
+        let server_key_path = write("server.key", server_key.serialize_pem());
+
+        let identity = |cert: &rcgen::Certificate, key: &KeyPair| Identity {
+            chain: vec![rustls_pki_types::CertificateDer::from(cert.der().to_vec())],
+            key_der: key.serialize_der(),
+        };
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls_pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .expect("the CA is a root");
+
+        Pki {
+            server_cert,
+            server_key: server_key_path,
+            ca,
+            operator: identity(&operator, &operator_key),
+            impostor: identity(&impostor, &impostor_key),
+            stranger: identity(&stranger, &stranger_key),
+            roots,
+            _dir: dir,
+        }
+    }
+
+    const SINGLE: &str = r#"
+        [listen]
+        address = "127.0.0.1:0"
+
+        [backend]
+        address = "127.0.0.1:5432"
+        user = "postgres"
+    "#;
+
+    fn control() -> Control {
+        let config = Config::from_str(SINGLE).expect("the configuration parses");
+        let metrics = Metrics::new();
+        Control {
+            fleet: crate::route::Fleet::build(&config, &metrics).expect("the fleet builds"),
+            quiesce: QuiesceRegistry::new(),
+            metrics,
+            config: config.control,
+        }
+    }
+
+    /// Starts the listener and answers with the status line one request got.
+    async fn status_for(pki: &Pki, client: Option<&Identity>) -> String {
+        let authority = ControlAuthority::new(&ControlTlsConfig {
+            certificate_file: pki.server_cert.clone(),
+            key_file: pki.server_key.clone(),
+            client_ca_file: pki.ca.clone(),
+            client_name: OPERATOR.to_owned(),
+        })
+        .expect("the control authority builds");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, receiver) = watch::channel(false);
+        tokio::spawn(serve(listener, control(), authority, receiver));
+
+        let builder = rustls::ClientConfig::builder().with_root_certificates(pki.roots.clone());
+        let config = match client {
+            Some(identity) => builder
+                .with_client_auth_cert(identity.chain.clone(), identity.key())
+                .expect("the client identity is usable"),
+            None => builder.with_no_client_auth(),
+        };
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let mut stream = connector.connect(name, socket).await.expect("handshake");
+
+        stream
+            .write_all(b"GET /instances HTTP/1.1\r\nHost: control\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer).await;
+        let _ = shutdown.send(true);
+
+        let text = String::from_utf8_lossy(&answer).into_owned();
+        text.lines().next().unwrap_or_default().to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_caller_with_no_certificate_is_told_why_rather_than_dropped() {
+        let pki = pki();
+        assert_eq!(status_for(&pki, None).await, "HTTP/1.1 401 Unauthorized");
+    }
+
+    #[tokio::test]
+    async fn a_certificate_from_another_authority_is_refused() {
+        let pki = pki();
+        let stranger = pki.stranger.clone();
+        assert_eq!(
+            status_for(&pki, Some(&stranger)).await,
+            "HTTP/1.1 401 Unauthorized"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trusted_certificate_belonging_to_somebody_else_is_refused() {
+        let pki = pki();
+        let impostor = pki.impostor.clone();
+        assert_eq!(
+            status_for(&pki, Some(&impostor)).await,
+            "HTTP/1.1 401 Unauthorized"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_operators_own_certificate_is_served() {
+        let pki = pki();
+        let operator = pki.operator.clone();
+        assert_eq!(status_for(&pki, Some(&operator)).await, "HTTP/1.1 200 OK");
+    }
+
+    #[test]
+    fn every_refusal_names_a_different_cause() {
+        use crate::tls::ControlIdentity;
+        let reasons = [
+            ControlIdentity::Anonymous.refusal().unwrap(),
+            ControlIdentity::Untrusted("bad signature".to_owned())
+                .refusal()
+                .unwrap(),
+            ControlIdentity::WrongName(OPERATOR.to_owned())
+                .refusal()
+                .unwrap(),
+        ];
+        assert!(ControlIdentity::Authorized.refusal().is_none());
+        for (index, reason) in reasons.iter().enumerate() {
+            for other in &reasons[index + 1..] {
+                assert_ne!(reason, other);
+            }
+        }
     }
 }
