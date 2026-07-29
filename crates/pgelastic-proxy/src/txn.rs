@@ -781,8 +781,11 @@ impl Running<'_> {
         if routed == self.session.binding.instance.id {
             return Ok(());
         }
-        let binding =
-            Binding::open(self.session.proxy, self.session.startup, &self.session.tenant)?;
+        let binding = Binding::open(
+            self.session.proxy,
+            self.session.startup,
+            &self.session.tenant,
+        )?;
         debug!(
             tenant = %self.session.tenant,
             from = %self.session.binding.instance.id,

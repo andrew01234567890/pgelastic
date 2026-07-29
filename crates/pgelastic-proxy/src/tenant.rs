@@ -200,7 +200,10 @@ mod tests {
         ]);
         let tenant = resolver
             .resolve(
-                &startup(&[("options", "-c pgelastic.tenant=acme"), ("database", "acme")]),
+                &startup(&[
+                    ("options", "-c pgelastic.tenant=acme"),
+                    ("database", "acme"),
+                ]),
                 "app_user",
             )
             .unwrap();
@@ -227,10 +230,7 @@ mod tests {
 
     #[test]
     fn sni_contributes_nothing_and_lets_the_rest_of_the_list_decide() {
-        let resolver = resolver(&[
-            TenantDiscriminator::Sni,
-            TenantDiscriminator::DatabaseName,
-        ]);
+        let resolver = resolver(&[TenantDiscriminator::Sni, TenantDiscriminator::DatabaseName]);
         let tenant = resolver
             .resolve(&startup(&[("database", "orders")]), "app_user")
             .unwrap();
@@ -273,11 +273,17 @@ mod tests {
             ),
             Some("acme".to_owned())
         );
-        assert_eq!(option_value("-c search_path=public", "pgelastic.tenant"), None);
+        assert_eq!(
+            option_value("-c search_path=public", "pgelastic.tenant"),
+            None
+        );
     }
 
     #[test]
     fn an_empty_value_is_not_a_tenant_name() {
-        assert_eq!(option_value("-c pgelastic.tenant=", "pgelastic.tenant"), None);
+        assert_eq!(
+            option_value("-c pgelastic.tenant=", "pgelastic.tenant"),
+            None
+        );
     }
 }

@@ -1190,9 +1190,8 @@ mod tests {
 
     #[test]
     fn an_instance_that_overrides_nothing_keeps_the_pool_wide_backend_leg() {
-        let source = format!(
-            "{MINIMAL}\n[[instances]]\nname = \"inst-a\"\naddress = \"10.0.0.1:5432\"\n"
-        );
+        let source =
+            format!("{MINIMAL}\n[[instances]]\nname = \"inst-a\"\naddress = \"10.0.0.1:5432\"\n");
         let config = Config::from_str(&source).unwrap();
         let backend = config.instances[0].backend(&config.backend);
         assert_eq!(backend.user, "postgres");
@@ -1239,7 +1238,10 @@ mod tests {
     fn a_configuration_naming_no_discriminator_at_all_is_refused() {
         let source = format!("{MINIMAL}\n[routing]\ntenantDiscriminators = []\n");
         let error = Config::from_str(&source).unwrap_err();
-        assert!(error.to_string().contains("tenantDiscriminators"), "{error}");
+        assert!(
+            error.to_string().contains("tenantDiscriminators"),
+            "{error}"
+        );
     }
 
     #[test]

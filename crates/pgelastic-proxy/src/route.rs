@@ -256,7 +256,10 @@ impl Fleet {
             .iter()
             .filter(|(tenant, id)| current.get(*tenant) != Some(id))
             .count()
-            + current.keys().filter(|tenant| !wanted.contains_key(*tenant)).count();
+            + current
+                .keys()
+                .filter(|tenant| !wanted.contains_key(*tenant))
+                .count();
         *current = wanted;
         drop(current);
         for _ in 0..changed {

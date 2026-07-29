@@ -767,7 +767,6 @@ mod tests {
         assert!(!is_commit(b"SELECT committed_at FROM orders"));
     }
 
-
     // ---- multi-statement simple queries ---------------------------------
 
     /// The whole reason a batch cannot be classified by its first token: the
@@ -776,9 +775,7 @@ mod tests {
     #[test]
     fn a_write_batch_that_opens_with_begin_is_not_a_read() {
         let mut witness = TransactionWitness::new();
-        witness.observe_frontend(&query(
-            "BEGIN; INSERT INTO orders (id) VALUES (1); COMMIT",
-        ));
+        witness.observe_frontend(&query("BEGIN; INSERT INTO orders (id) VALUES (1); COMMIT"));
 
         let state = witness.state(TransactionStatus::Idle);
         assert_eq!(state, InFlight::CommitInDoubt);
@@ -789,14 +786,20 @@ mod tests {
     fn a_write_after_a_read_in_the_same_batch_is_still_a_write() {
         let mut witness = TransactionWitness::new();
         witness.observe_frontend(&query("SELECT 1; DELETE FROM orders"));
-        assert_eq!(witness.state(TransactionStatus::Idle), InFlight::CommitInDoubt);
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::CommitInDoubt
+        );
     }
 
     #[test]
     fn a_read_after_a_write_in_the_same_batch_is_still_a_write() {
         let mut witness = TransactionWitness::new();
         witness.observe_frontend(&query("DELETE FROM orders; SELECT 1"));
-        assert_eq!(witness.state(TransactionStatus::Idle), InFlight::CommitInDoubt);
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::CommitInDoubt
+        );
     }
 
     /// One `CommandComplete` per statement, so the first of them retires
@@ -805,14 +808,18 @@ mod tests {
     #[test]
     fn the_first_command_complete_of_a_batch_does_not_retire_it() {
         let mut witness = TransactionWitness::new();
-        witness.observe_frontend(&query(
-            "BEGIN; INSERT INTO orders (id) VALUES (1); COMMIT",
-        ));
+        witness.observe_frontend(&query("BEGIN; INSERT INTO orders (id) VALUES (1); COMMIT"));
         witness.observe_backend(&complete("BEGIN"));
-        assert_eq!(witness.state(TransactionStatus::Idle), InFlight::CommitInDoubt);
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::CommitInDoubt
+        );
 
         witness.observe_backend(&complete("INSERT 0 1"));
-        assert_eq!(witness.state(TransactionStatus::Idle), InFlight::CommitInDoubt);
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::CommitInDoubt
+        );
 
         witness.observe_backend(&complete("COMMIT"));
         witness.observe_backend(&ready(TransactionStatus::Idle));
@@ -846,7 +853,10 @@ mod tests {
     fn a_single_statement_query_is_still_retired_by_its_command_complete() {
         let mut witness = TransactionWitness::new();
         witness.observe_frontend(&query("INSERT INTO orders (id) VALUES (1)"));
-        assert_eq!(witness.state(TransactionStatus::Idle), InFlight::CommitInDoubt);
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::CommitInDoubt
+        );
         witness.observe_backend(&complete("INSERT 0 1"));
         assert_eq!(witness.state(TransactionStatus::Idle), InFlight::Idle);
     }
@@ -872,10 +882,19 @@ mod tests {
     fn a_semicolon_inside_a_literal_does_not_split_a_statement() {
         assert_eq!(split("SELECT ';'"), vec!["SELECT ';'"]);
         assert_eq!(split("SELECT 'it''s; fine'"), vec!["SELECT 'it''s; fine'"]);
-        assert_eq!(split(r#"SELECT "a;b" FROM t"#), vec![r#"SELECT "a;b" FROM t"#]);
+        assert_eq!(
+            split(r#"SELECT "a;b" FROM t"#),
+            vec![r#"SELECT "a;b" FROM t"#]
+        );
         assert_eq!(split("SELECT $q$a;b$q$"), vec!["SELECT $q$a;b$q$"]);
-        assert_eq!(split("SELECT 1 -- ; not a split\n"), vec!["SELECT 1 -- ; not a split"]);
-        assert_eq!(split("SELECT /* ; /* ; */ ; */ 1"), vec!["SELECT /* ; /* ; */ ; */ 1"]);
+        assert_eq!(
+            split("SELECT 1 -- ; not a split\n"),
+            vec!["SELECT 1 -- ; not a split"]
+        );
+        assert_eq!(
+            split("SELECT /* ; /* ; */ ; */ 1"),
+            vec!["SELECT /* ; /* ; */ ; */ 1"]
+        );
     }
 
     #[test]
@@ -903,7 +922,10 @@ mod tests {
     fn an_empty_query_classifies_as_a_read() {
         let mut witness = TransactionWitness::new();
         witness.observe_frontend(&query(""));
-        assert_eq!(witness.state(TransactionStatus::Idle), InFlight::ReadOnlyTransaction);
+        assert_eq!(
+            witness.state(TransactionStatus::Idle),
+            InFlight::ReadOnlyTransaction
+        );
     }
 
     #[test]
