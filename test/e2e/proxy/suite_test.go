@@ -37,6 +37,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -262,7 +263,15 @@ func (f *forwarder) log() string {
 
 func forward(service string, port int32) *forwarder {
 	GinkgoHelper()
-	pod := serviceEndpoint(service)
+	return forwardPod(serviceEndpoint(service), port)
+}
+
+// forwardPod is forward aimed at one named replica rather than at whichever the Service
+// picks. Two things need it: the control listener, which is per replica and deliberately
+// absent from the Service, and any claim about the fleet as a whole, which cannot be made
+// through a single endpoint because kube-proxy pins a connection to one pod for its life.
+func forwardPod(pod string, port int32) *forwarder {
+	GinkgoHelper()
 
 	transport, upgrader, err := spdy.RoundTripperFor(restConfig)
 	Expect(err).NotTo(HaveOccurred())
@@ -335,6 +344,29 @@ func serviceEndpoint(name string) string {
 	}
 	Fail("the pool Service " + name + " selects no ready Pod")
 	return ""
+}
+
+// readyProxyPods names every replica the Service selects, in a stable order, which is what
+// a fleet-wide claim has to be measured across.
+func readyProxyPods(service string) []string {
+	GinkgoHelper()
+	object := &corev1.Service{}
+	Expect(k8sClient.Get(suiteCtx,
+		client.ObjectKey{Namespace: e2eNamespace, Name: service}, object)).To(Succeed())
+	Expect(object.Spec.Selector).NotTo(BeEmpty(), "the pool Service selects nothing")
+
+	pods := &corev1.PodList{}
+	Expect(k8sClient.List(suiteCtx, pods, client.InNamespace(e2eNamespace),
+		client.MatchingLabels(object.Spec.Selector))).To(Succeed())
+	names := make([]string, 0, len(pods.Items))
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp == nil && podReady(pod) {
+			names = append(names, pod.Name)
+		}
+	}
+	slices.Sort(names)
+	return names
 }
 
 func podReady(pod *corev1.Pod) bool {

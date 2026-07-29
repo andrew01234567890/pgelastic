@@ -226,6 +226,22 @@ impl ClientStatements {
     pub fn clear(&mut self) {
         self.by_name.clear();
     }
+
+    /// Re-interns every name against another cache, keeping the client's names.
+    ///
+    /// A session that follows its tenant to another instance changes which
+    /// statement cache its ids and generated names come from, and those ids are
+    /// per cache: carrying the old entries over would let a link on the new
+    /// instance answer a `Bind` with whatever it happened to have parsed under
+    /// the same id. Dropping them instead is no better - the client's own cache
+    /// still holds the names, so its next `Bind` names a statement this session
+    /// no longer knows and `PostgreSQL` refuses it with 26000. Only the text is
+    /// portable, so the text is what is carried across and re-interned.
+    pub fn rebind(&mut self, mut intern: impl FnMut(&StatementKey) -> Arc<PreparedStatement>) {
+        for statement in self.by_name.values_mut() {
+            *statement = intern(statement.key());
+        }
+    }
 }
 
 /// What must happen before a statement can be bound on a given link.
@@ -375,6 +391,40 @@ mod tests {
         let second = cache.intern(key("SELECT $1::int", &[23]));
         assert_eq!(first.id(), second.id());
         assert_eq!(cache.len(), 1);
+    }
+
+    /// A session that follows its tenant to another instance keeps every name
+    /// its driver still holds, and every name now points at the other cache's
+    /// statement for the same text. Either half missing is a `Bind` the target
+    /// refuses with 26000 while the client believes it was merely paused.
+    #[test]
+    fn following_a_tenant_to_another_instance_keeps_the_clients_names_resolvable() {
+        let mut source = GlobalStatementCache::new();
+        let mut target = GlobalStatementCache::new();
+        // The target has already parsed something else, so its ids are not the
+        // source's ids: carrying the old entry over would resolve to that.
+        let decoy = target.intern(key("SELECT 'somebody else'", &[]));
+
+        let mut client = ClientStatements::new();
+        let name = Bytes::from_static(b"stmtcache_1");
+        client.insert(name.clone(), source.intern(key("SELECT $1::int", &[23])));
+        assert_eq!(client.resolve(&name).map(|s| s.id()), Some(decoy.id()));
+
+        client.rebind(|key| target.intern(key.clone()));
+
+        let rebound = client
+            .resolve(&name)
+            .expect("the client's name still resolves");
+        assert_ne!(
+            rebound.id(),
+            decoy.id(),
+            "the name resolved to another client's statement"
+        );
+        assert_eq!(rebound.key(), &key("SELECT $1::int", &[23]));
+        assert_eq!(
+            rebound.id(),
+            target.intern(key("SELECT $1::int", &[23])).id()
+        );
     }
 
     #[test]

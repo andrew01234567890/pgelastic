@@ -135,6 +135,8 @@ pub struct Expired {
     /// and the route has to go back, `None` when a resume already made the
     /// target authoritative.
     pub rollback: Option<InstanceId>,
+    /// How long the tenant's clients were held.
+    pub held: Option<Duration>,
 }
 
 /// What `drainStatus` answers.
@@ -162,6 +164,13 @@ pub struct TenantGate {
     lease: Mutex<Option<Lease>>,
     in_flight: AtomicU64,
     admitted_while_queued: AtomicU64,
+    /// When the gate closed, or `None` while it is admitting.
+    ///
+    /// Set by the quiesce that actually closes it and by no other. A renewal
+    /// must not restart the clock, or a cutover that renews its lease every
+    /// five seconds would report a five-second pause however long it really
+    /// held the tenant.
+    closed_at: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, Default)]
@@ -183,6 +192,7 @@ impl TenantGate {
             lease: Mutex::new(None),
             in_flight: AtomicU64::new(0),
             admitted_while_queued: AtomicU64::new(0),
+            closed_at: Mutex::new(None),
         })
     }
 
@@ -318,7 +328,12 @@ impl TenantGate {
         };
         *lease = Some(taken.clone());
         drop(lease);
-        self.open.send_replace(false);
+        if self.open.send_replace(false) {
+            *self
+                .closed_at
+                .lock()
+                .expect("a tenant gate is never poisoned") = Some(Instant::now());
+        }
         info!(
             tenant = %self.tenant,
             holder,
@@ -378,19 +393,37 @@ impl TenantGate {
             reverting = live.source.is_some(),
             "the quiesce lease expired without being renewed; the tenant is unquiesced"
         );
+        let held = self.held_for();
         let released = self.open_gate();
         debug!(tenant = %self.tenant, released, "queued transactions released by lease expiry");
         Some(Expired {
             holder: live.holder,
             rollback: live.source,
+            held,
         })
     }
 
     fn open_gate(&self) -> u64 {
         let queued = self.queued();
         self.open.send_replace(true);
+        self.closed_at
+            .lock()
+            .expect("a tenant gate is never poisoned")
+            .take();
         self.pass();
         queued
+    }
+
+    /// How long this tenant has been held, for a caller about to release it.
+    ///
+    /// The client-visible pause a cutover commits to, measured at the only
+    /// place that knows both ends of it. Read before the release rather than
+    /// after, because opening the gate is what clears the clock.
+    pub fn held_for(&self) -> Option<Duration> {
+        self.closed_at
+            .lock()
+            .expect("a tenant gate is never poisoned")
+            .map(|closed| closed.elapsed())
     }
 
     pub fn lease(&self) -> Option<Lease> {

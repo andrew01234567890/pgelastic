@@ -202,9 +202,16 @@ func (v *PgTenantCustomValidator) workloadClassProblems(
 	return workloadClass, nil, nil
 }
 
-// reservationProblems is the reservation ledger. A guarantee that does not fit the pool's
-// remaining allocatable capacity is refused outright rather than quietly cut down to what
-// is left, because a guarantee that can be reduced without telling anyone is not one.
+// reservationProblems is the reservation ledger, plus the cross-replica budget this tenant
+// would join. A guarantee that does not fit the pool's remaining allocatable capacity is
+// refused outright rather than quietly cut down to what is left, because a guarantee that
+// can be reduced without telling anyone is not one.
+//
+// The ledger is now resolved even for a tenant with no guarantee at all, which the guarantee
+// check alone would have skipped: a BestEffort tenant still raises the pool's committed
+// burst, and the fleet-wide worst case is the sum of every ceiling times the replica count.
+// Checking it only when a pool is edited would leave the invariant broken by every tenant
+// added afterwards.
 func (v *PgTenantCustomValidator) reservationProblems(
 	ctx context.Context,
 	resolver policy.Resolver,
@@ -214,25 +221,32 @@ func (v *PgTenantCustomValidator) reservationProblems(
 	workloadClass *pgelasticv1alpha1.PgWorkloadClass,
 ) (field.ErrorList, error) {
 	effective := policy.EffectiveFor(tenant, workloadClass)
-	if effective.Guaranteed == 0 {
-		return nil, nil
-	}
-
 	ledger, err := resolver.LedgerFor(ctx, pool, elasticClass, tenant.Name)
 	if err != nil {
 		return nil, err
 	}
-	if effective.Guaranteed <= ledger.Available {
-		return nil, nil
+
+	problems := field.ErrorList{}
+	if effective.Guaranteed > 0 && effective.Guaranteed > ledger.Available {
+		path := field.NewPath("spec", "workloadClassName")
+		if tenant.Spec.Capacity != nil && tenant.Spec.Capacity.Guaranteed != nil {
+			path = field.NewPath("spec", "capacity", "guaranteed")
+		}
+		problems = append(problems, field.Forbidden(path, fmt.Sprintf(
+			"a guarantee of %d backend connections does not fit PgElasticPool %q: allocatable %d "+
+				"(backendConnections %d less %d%% headroom), reserved %d by %d tenant(s), available %d",
+			effective.Guaranteed, pool.Name, ledger.Allocatable, ledger.BackendConnections,
+			ledger.HeadroomPercent, ledger.Reserved, ledger.Tenants, ledger.Available)))
 	}
 
-	path := field.NewPath("spec", "workloadClassName")
-	if tenant.Spec.Capacity != nil && tenant.Spec.Capacity.Guaranteed != nil {
-		path = field.NewPath("spec", "capacity", "guaranteed")
+	// The ledger excludes this tenant so its previous numbers are not double-counted, so its
+	// own ceiling has to be folded back in before the worst case means anything.
+	joined := ledger
+	joined.CommittedBurst += effective.Burstable
+	joined.Tenants++
+	burstPath := field.NewPath("spec", "workloadClassName")
+	if tenant.Spec.Capacity != nil && tenant.Spec.Capacity.Burstable != nil {
+		burstPath = field.NewPath("spec", "capacity", "burstable")
 	}
-	return field.ErrorList{field.Forbidden(path, fmt.Sprintf(
-		"a guarantee of %d backend connections does not fit PgElasticPool %q: allocatable %d "+
-			"(backendConnections %d less %d%% headroom), reserved %d by %d tenant(s), available %d",
-		effective.Guaranteed, pool.Name, ledger.Allocatable, ledger.BackendConnections,
-		ledger.HeadroomPercent, ledger.Reserved, ledger.Tenants, ledger.Available))}, nil
+	return append(problems, replicaBudgetProblems(pool, joined, burstPath)...), nil
 }

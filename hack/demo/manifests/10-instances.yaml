@@ -4,7 +4,6 @@ apiVersion: pgelastic.io/v1alpha1
 kind: PgInstance
 metadata:
   name: demo-a
-  namespace: pgelastic-demo
 spec:
   poolRef:
     name: demo-pool
@@ -18,7 +17,6 @@ apiVersion: pgelastic.io/v1alpha1
 kind: PgInstance
 metadata:
   name: demo-b
-  namespace: pgelastic-demo
 spec:
   poolRef:
     name: demo-pool

@@ -51,7 +51,26 @@ const tenantCredentialsKey = "password"
 // defaultTenantPriority matches the proxy's own default for a tenant nobody has ranked.
 const defaultTenantPriority int32 = 1000
 
+// The control listener's PKI. cert-manager is already a hard dependency of the webhooks,
+// so this issues certificates rather than adding a dependency.
+const (
+	certManagerGroup   = "cert-manager.io"
+	certManagerVersion = "v1"
+
+	fieldSecret    = "secretName"
+	fieldKey       = "privateKey"
+	fieldIssuerRef = "issuerRef"
+)
+
+// controlPrivateKey is the key every control certificate is issued with. P-256 rather than
+// RSA because these are handshake keys on a hot path and nothing about them needs to
+// outlive the pool.
+func controlPrivateKey() map[string]any {
+	return map[string]any{"algorithm": "ECDSA", "size": int64(256)}
+}
+
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cert-manager.io,resources=issuers;certificates,verbs=get;list;watch;create;update;patch;delete
 
 // reconcileProxy brings the pool's inline proxy fleet into existence and reports what it
 // found. It returns nil when the pool declares no fleet.
@@ -78,6 +97,7 @@ func (r *PgElasticPoolReconciler) reconcileProxy(
 		Instances: instances,
 		Tenants:   proxyTenants(view, instances),
 		Users:     users,
+		Control:   r.certManagerInstalled(),
 	}
 	if tls := pool.Spec.Proxy.TLS; tls != nil {
 		config.ClientTLS = tls.CertificateSecretRef != nil
@@ -89,6 +109,9 @@ func (r *PgElasticPoolReconciler) reconcileProxy(
 		Image:    r.proxyImage(),
 		Document: config.Render(),
 	}
+	if config.Control {
+		builder.ControlTLSSecret = proxy.ControlServerSecretName(pool.Name)
+	}
 	if tls := pool.Spec.Proxy.TLS; tls != nil {
 		if config.ClientTLS {
 			builder.ClientTLSSecret = tls.CertificateSecretRef.Name
@@ -98,10 +121,29 @@ func (r *PgElasticPoolReconciler) reconcileProxy(
 		}
 	}
 
+	if config.Control {
+		if err := r.applyControlPKI(ctx, pool); err != nil {
+			return nil, err
+		}
+	}
 	if err := r.applyProxyObjects(ctx, pool, builder); err != nil {
 		return nil, err
 	}
-	return r.proxyStatus(ctx, pool, builder)
+	return r.proxyStatus(ctx, pool, builder, view)
+}
+
+// certManagerInstalled reports whether the cluster can issue the control listener's
+// certificates.
+//
+// Probed rather than assumed. The listener is refused by the proxy without a client CA and
+// a name to check it against, so a cluster with no cert-manager gets a fleet with no
+// control listener — degraded, and running — rather than one that cannot start. The
+// alternative, rendering the section and hoping, produces pods stuck mounting a Secret that
+// will never exist.
+func (r *PgElasticPoolReconciler) certManagerInstalled() bool {
+	_, err := r.RESTMapper().RESTMapping(
+		schema.GroupKind{Group: certManagerGroup, Kind: "Certificate"}, certManagerVersion)
+	return err == nil
 }
 
 // applyProxyObjects writes the fleet, configuration first.
@@ -139,6 +181,95 @@ func (r *PgElasticPoolReconciler) applyProxyObjects(
 		}
 	}
 	return nil
+}
+
+// applyControlPKI issues the two identities the cutover API needs: the listener's own
+// certificate, and the operator's client certificate.
+//
+// A per-pool CA rather than a cluster-wide issuer. The CA's only job is to say which
+// certificate belongs to the operator for this pool, so scoping it to the pool means a
+// compromised issuer cannot authenticate a cutover on somebody else's tenants. The two
+// leaves carry different DNS names and different extended key usages, which is why "signed
+// by our CA" is not on its own the identity check — the listener also names the caller it
+// will accept.
+func (r *PgElasticPoolReconciler) applyControlPKI(
+	ctx context.Context,
+	pool *pgelasticv1alpha1.PgElasticPool,
+) error {
+	name := pool.Name
+	selfSigned := proxy.ControlSelfSignedIssuerName(name)
+	poolIssuer := proxy.ControlIssuerName(name)
+
+	objects := []*unstructured.Unstructured{
+		issuer(pool, selfSigned, map[string]any{"selfSigned": map[string]any{}}),
+		certificate(pool, proxy.ControlCACertificateName(name), map[string]any{
+			"isCA":         true,
+			"commonName":   proxy.ControlCACertificateName(name),
+			fieldSecret:    proxy.ControlCASecretName(name),
+			fieldKey:       controlPrivateKey(),
+			fieldIssuerRef: issuerRef(selfSigned),
+		}),
+		issuer(pool, poolIssuer, map[string]any{
+			"ca": map[string]any{fieldSecret: proxy.ControlCASecretName(name)},
+		}),
+		certificate(pool, proxy.ControlServerCertificateName(name), map[string]any{
+			fieldSecret:    proxy.ControlServerSecretName(name),
+			"dnsNames":     []any{proxy.ControlServerName(name, pool.Namespace)},
+			"usages":       []any{"server auth", "digital signature", "key encipherment"},
+			fieldKey:       controlPrivateKey(),
+			fieldIssuerRef: issuerRef(poolIssuer),
+		}),
+		certificate(pool, proxy.ControlClientCertificateName(name), map[string]any{
+			fieldSecret:    proxy.ControlClientSecretName(name),
+			"dnsNames":     []any{proxy.ControlClientName(name, pool.Namespace)},
+			"usages":       []any{"client auth", "digital signature", "key encipherment"},
+			fieldKey:       controlPrivateKey(),
+			fieldIssuerRef: issuerRef(poolIssuer),
+		}),
+	}
+	for _, object := range objects {
+		gvk := object.GroupVersionKind()
+		if err := r.applyProxyObject(ctx, pool, object, gvk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func issuer(
+	pool *pgelasticv1alpha1.PgElasticPool,
+	name string,
+	spec map[string]any,
+) *unstructured.Unstructured {
+	return certManagerObject(pool, "Issuer", name, spec)
+}
+
+func certificate(
+	pool *pgelasticv1alpha1.PgElasticPool,
+	name string,
+	spec map[string]any,
+) *unstructured.Unstructured {
+	return certManagerObject(pool, "Certificate", name, spec)
+}
+
+func certManagerObject(
+	pool *pgelasticv1alpha1.PgElasticPool,
+	kind, name string,
+	spec map[string]any,
+) *unstructured.Unstructured {
+	object := &unstructured.Unstructured{}
+	object.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: certManagerGroup, Version: certManagerVersion, Kind: kind,
+	})
+	object.SetName(name)
+	object.SetNamespace(pool.Namespace)
+	object.SetLabels(proxy.Labels(pool.Name))
+	object.Object["spec"] = spec
+	return object
+}
+
+func issuerRef(name string) map[string]any {
+	return map[string]any{"name": name, "kind": "Issuer", "group": certManagerGroup}
 }
 
 func (r *PgElasticPoolReconciler) applyProxyObject(
@@ -313,12 +444,22 @@ func (r *PgElasticPoolReconciler) proxyUsers(
 // for: a fleet half-way through adopting a routing table is not one that has adopted it, and
 // a controller that published the version it had merely written would be reporting its own
 // intent back to itself.
+//
+// leasedConnections is the fleet-wide grant, and today it is a multiplication rather than a
+// lease: every replica reads one configuration document carrying the undivided budget, so
+// the pool has handed out replicas x allocatable. Reporting the arithmetic that is actually
+// in force is the point — a zero there would read as "nothing is leased", which is the one
+// thing that is certainly untrue.
 func (r *PgElasticPoolReconciler) proxyStatus(
 	ctx context.Context,
 	pool *pgelasticv1alpha1.PgElasticPool,
 	builder proxy.Builder,
+	view *poolView,
 ) (*pgelasticv1alpha1.ProxyStatus, error) {
-	status := &pgelasticv1alpha1.ProxyStatus{Replicas: builder.Replicas()}
+	status := &pgelasticv1alpha1.ProxyStatus{
+		Replicas:          builder.Replicas(),
+		LeasedConnections: builder.Replicas() * view.ledger.Allocatable,
+	}
 
 	deployment := &appsv1.Deployment{}
 	key := client.ObjectKey{Namespace: pool.Namespace, Name: proxy.DeploymentName(pool.Name)}

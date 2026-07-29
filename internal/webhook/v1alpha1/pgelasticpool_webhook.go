@@ -22,6 +22,7 @@ import (
 	"slices"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,6 +30,7 @@ import (
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
+	"github.com/andrew01234567890/pgelastic/internal/proxy"
 )
 
 // SetupPgElasticPoolWebhookWithManager registers the webhook for PgElasticPool in the manager.
@@ -111,7 +113,81 @@ func (v *PgElasticPoolCustomValidator) validate(ctx context.Context, pool *pgela
 				ledger.Reserved, ledger.Tenants)))
 	}
 
+	problems = append(problems,
+		replicaBudgetProblems(pool, ledger, field.NewPath("spec", "proxy", "replicas"))...)
+
 	return invalid(pool, problems)
+}
+
+// replicaBudgetProblems is the cross-replica gate.
+//
+// Every proxy replica reads one configuration document carrying the undivided
+// backendConnections budget, so a tenant bursting on N replicas can hold N times its
+// ceiling against PostgreSQL. The reservation ledger above does not see this at all: it
+// sums guarantees pool-wide and has no idea spec.proxy.replicas exists.
+//
+// The worst case is replicas x the sum of every tenant's burstable ceiling, because a
+// tenant cannot exceed its own ceiling on any one replica. It is compared against the pool's
+// declared oversubscription ceiling rather than against allocatable directly, because
+// oversubscription is the product: a pool that publishes maxOversubscriptionRatio is saying
+// how far past allocatable it is willing to commit, and this is that same statement with
+// the fleet size finally counted. A pool that wants the strict reading sets the ratio to 1,
+// and the gate then reduces to replicas x burst <= allocatable.
+//
+// path names the field on the object under admission: the pool's fleet size when a pool is
+// being changed, and the tenant's own ceiling when a tenant is being added. The same
+// invariant is broken from either side, and the error has to point at something the caller
+// can edit.
+func replicaBudgetProblems(
+	pool *pgelasticv1alpha1.PgElasticPool,
+	ledger policy.Ledger,
+	path *field.Path,
+) field.ErrorList {
+	if pool.Spec.Proxy == nil {
+		return nil
+	}
+	replicas := proxy.Replicas(pool)
+	if replicas <= 0 || ledger.CommittedBurst <= 0 {
+		return nil
+	}
+	worstCase := int64(replicas) * int64(ledger.CommittedBurst)
+	ratio, committable := committableConnections(pool, ledger.Allocatable)
+	if worstCase <= committable {
+		return nil
+	}
+	return field.ErrorList{field.Forbidden(path, fmt.Sprintf(
+		"%d proxy replicas each read the whole %d backend-connection budget, so the worst case is "+
+			"%d x %d = %d backend connections against a ceiling of %d (allocatable %d, being "+
+			"backendConnections %d less %d%% headroom, times maxOversubscriptionRatio %s); reduce "+
+			"spec.proxy.replicas, reduce the %d tenant(s) burstable ceilings, or raise the budget",
+		replicas, ledger.BackendConnections, replicas, ledger.CommittedBurst, worstCase,
+		committable, ledger.Allocatable, ledger.BackendConnections, ledger.HeadroomPercent,
+		ratio, ledger.Tenants))}
+}
+
+// defaultOversubscriptionRatio matches the CRD default, applied to a pool stored before the
+// field had one.
+const defaultOversubscriptionRatio = "12"
+
+// committableConnections is how far past allocatable the pool has said it will commit, and
+// the ratio it said it in. An unparsable ratio falls back to the default rather than to no
+// ceiling at all: a malformed string must not be a way to disable the gate.
+func committableConnections(
+	pool *pgelasticv1alpha1.PgElasticPool,
+	allocatable int32,
+) (string, int64) {
+	ratio := pool.Spec.Capacity.MaxOversubscriptionRatio
+	if ratio == "" {
+		ratio = defaultOversubscriptionRatio
+	}
+	quantity, err := resource.ParseQuantity(ratio)
+	if err != nil {
+		quantity = resource.MustParse(defaultOversubscriptionRatio)
+		ratio = defaultOversubscriptionRatio
+	}
+	// Milli scale so a fractional ratio is exact: comparing against a float would decide the
+	// boundary case by rounding.
+	return ratio, int64(allocatable) * quantity.MilliValue() / 1000
 }
 
 // defaultWorkloadClassProblems catches a pool whose default class its own allowlist

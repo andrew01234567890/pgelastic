@@ -44,6 +44,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/metering"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
+	"github.com/andrew01234567890/pgelastic/internal/proxy"
 	webhookv1alpha1 "github.com/andrew01234567890/pgelastic/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
@@ -258,12 +259,27 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgtenant")
 		os.Exit(1)
 	}
+	// The routing table of record, and the fleet that makes a flip immediate, composed
+	// rather than chosen between. status.binding is what a replica that restarts or one
+	// added later resolves the tenant through, so it is written on every path; the control
+	// API is asked only of a pool that has a fleet, and a pool without one migrates through
+	// the binding alone.
+	//
+	// Every read goes through the API reader. The safety property that an abort restores the
+	// source rests on knowing where the tenant is routed now, and quiescing the replicas an
+	// informer cache remembers is quiescing the ones that have already been replaced.
+	migrationRouter := &proxy.ProxyRouter{
+		Binding:   migration.BindingRouter{Client: mgr.GetClient(), Reader: mgr.GetAPIReader()},
+		Reader:    mgr.GetAPIReader(),
+		Endpoints: proxy.PodEndpoints{Reader: mgr.GetAPIReader()},
+		Caller:    &proxy.MutualTLSCaller{Reader: mgr.GetAPIReader()},
+	}
 	if err := (&controller.PgTenantMigrationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 		SQL:    migrationSQL,
 		Shell:  migrationSQL,
-		Router: migration.BindingRouter{Client: mgr.GetClient(), Reader: mgr.GetAPIReader()},
+		Router: migrationRouter,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgtenantmigration")
 		os.Exit(1)

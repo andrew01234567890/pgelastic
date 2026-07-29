@@ -344,3 +344,45 @@ async fn a_quiesce_resume_round_trip_stays_under_a_hundred_milliseconds_under_lo
 
     fleet.proxy.running.shutdown().await;
 }
+
+/// The listener holds every tenant's gate, so who may reach it is part of the
+/// cutover's correctness rather than a deployment detail. Asserted against the
+/// running proxy, not the type: the unit tests prove the verifier, this proves
+/// the listener the fleet actually binds is behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unauthenticated_caller_cannot_quiesce_a_tenant() {
+    let fleet = Fleet::start("").await;
+
+    let refused = fleet
+        .control
+        .request_as(
+            &fleet.control.pki.anonymous_connector(),
+            "POST",
+            "/quiesce",
+            Some(
+                serde_json::json!({ "tenant": "alpha", "holder": "intruder", "ttlMs": 30_000 })
+                    .to_string(),
+            ),
+        )
+        .await;
+
+    assert_eq!(
+        refused.status, 401,
+        "a caller with no certificate was served: {}",
+        refused.body
+    );
+    // The refusal has to say why, or a misconfigured cutover is indistinguishable
+    // from a hung one.
+    assert!(
+        refused.body["error"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("client certificate")),
+        "the refusal names no cause: {}",
+        refused.body
+    );
+    assert_eq!(
+        fleet.control.drain_status("alpha").await["quiesced"],
+        false,
+        "the tenant was quiesced by a caller that proved nothing"
+    );
+}

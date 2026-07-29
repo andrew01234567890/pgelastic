@@ -19,6 +19,7 @@ package migration
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -47,7 +48,9 @@ func (t TenantRef) String() string { return t.Namespace + "/" + t.Name }
 // table and the quiesce flag are control-plane state, and it is the proxy that turns them
 // into held sockets.
 type Router interface {
-	// Quiesce queues new transactions for the tenant and holds its client sockets open.
+	// Quiesce queues new transactions for the tenant and holds its client sockets open. It
+	// is called on every reconcile of a quiesced phase, and a second call by the same holder
+	// renews the hold rather than being refused.
 	Quiesce(ctx context.Context, tenant TenantRef, migration string) error
 	// PreWarm opens and warms backend connections to an instance, so the cutover pause is
 	// not spent establishing them.
@@ -55,10 +58,53 @@ type Router interface {
 	// Route points the tenant's routing entry at an instance. It is called exactly once per
 	// direction: forward at the end of Cutover, back only on a rollback.
 	Route(ctx context.Context, tenant TenantRef, instance string) error
-	// Release lets queued clients through against whatever instance they are routed to.
+	// Resume commits the flip and lets the queued clients through against the instance they
+	// are now routed to. It is the point of no return: after it, an expiring hold can no
+	// longer put the tenant back on its source.
+	Resume(ctx context.Context, tenant TenantRef) error
+	// Release abandons the hold without committing anything. Whatever the flip was, it is
+	// undone, and the queued clients are let through against the source.
 	Release(ctx context.Context, tenant TenantRef) error
 	// RoutedTo reports the instance the routing table names right now.
 	RoutedTo(ctx context.Context, tenant TenantRef) (string, error)
+	// DrainStatus reports what the proxy's own gate knows about the tenant. Known is false
+	// when nothing is holding the tenant's clients, which is the headless case: there is
+	// then no gate to ask and PostgreSQL is the only evidence there is.
+	DrainStatus(ctx context.Context, tenant TenantRef) (DrainStatus, error)
+}
+
+// DrainStatus is the gate's account of one tenant, summed over every replica holding it.
+//
+// It answers a different question from pg_stat_activity, and a stronger one. The database
+// can say that no backend is currently inside a transaction; only the gate can say that no
+// new one may start. Without the second half the first flaps, because a client is free to
+// begin work between the count and the flip.
+type DrainStatus struct {
+	// Known reports whether a gate answered at all.
+	Known bool
+	// Quiesced is true only when every replica holding the tenant has its gate closed. One
+	// replica still admitting traffic is one shard of the tenant's clients still running.
+	Quiesced bool
+	// Queued is how many client transactions are waiting at the gate, fleet-wide.
+	Queued int64
+	// InFlight is how many transactions the proxy still has open on the source.
+	InFlight int64
+	// Drained means the gate is closed everywhere and nothing is still in flight through it.
+	Drained bool
+	// LeaseExpiresIn is the shortest time to expiry across the fleet: the deadline the
+	// holder is actually racing.
+	LeaseExpiresIn time.Duration
+}
+
+// PauseReporter is implemented by a Router that can say how long it held a tenant's clients.
+//
+// Optional rather than part of Router, because a router that never queues anybody has no
+// honest answer to give and reporting zero would read as "there was no pause".
+type PauseReporter interface {
+	// ClientPause reports the hold that ended most recently for this tenant, and whether
+	// there was one. It is consumed once: a pause already published must not be republished
+	// on the next reconcile as though it had happened again.
+	ClientPause(tenant TenantRef) (time.Duration, bool)
 }
 
 // AnnotationQuiescedBy names the migration currently holding a tenant's clients. It is on
@@ -98,6 +144,18 @@ func (r BindingRouter) PreWarm(ctx context.Context, tenant TenantRef, instance s
 // keep a finished migration holding a tenant's clients, which turns a move into an outage.
 func (r BindingRouter) Release(ctx context.Context, tenant TenantRef) error {
 	return r.annotate(ctx, tenant, map[string]string{AnnotationQuiescedBy: "", AnnotationPreWarmTarget: ""})
+}
+
+// Resume is Release here, because a binding write commits the moment it returns: there is
+// no gate to open and so no second step in which the flip could still be undone.
+func (r BindingRouter) Resume(ctx context.Context, tenant TenantRef) error {
+	return r.Release(ctx, tenant)
+}
+
+// DrainStatus reports that there is no gate. A binding is a routing table and not a
+// queueing primitive, so claiming a drain here would be claiming evidence nothing gathered.
+func (BindingRouter) DrainStatus(context.Context, TenantRef) (DrainStatus, error) {
+	return DrainStatus{}, nil
 }
 
 // Route rewrites the binding. It is a status write because the binding is observed state:

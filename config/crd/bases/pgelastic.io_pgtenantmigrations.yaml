@@ -231,6 +231,17 @@ spec:
           status:
             description: status defines the observed state of PgTenantMigration
             properties:
+              clientPauseMillis:
+                description: |-
+                  clientPauseMillis is how long the proxy actually held the tenant's clients: from the
+                  gate closing to the resume that let them through. It is the number the product's
+                  claim is about, and it is a different number from pauseDurationMillis, which is the
+                  controller's own wall clock over the same phases and includes reconcile latency and
+                  drain polling on either side of the hold. A pool with no proxy queues nobody and
+                  leaves this empty rather than reporting a zero that would read as "no pause".
+                format: int64
+                minimum: 0
+                type: integer
               completedAt:
                 description: completedAt is when the migration reached a terminal
                   phase.
@@ -344,6 +355,14 @@ spec:
                 description: publicationName is the publication created on the source.
                 maxLength: 63
                 type: string
+              queuedClients:
+                description: |-
+                  queuedClients is how many client transactions were waiting at the proxy's gate when
+                  the drain was last observed, summed across the fleet. It is the difference between a
+                  pause and an outage: queued clients are still connected and will run.
+                format: int64
+                minimum: 0
+                type: integer
               replicationSlotName:
                 description: |-
                   replicationSlotName is the source slot backing the subscription. Recorded so the

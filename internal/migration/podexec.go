@@ -195,9 +195,16 @@ func (p PodSQL) psql(ctx context.Context, at Endpoint, statement string) ([]byte
 }
 
 // parseRows splits psql's unaligned, tuples-only output into rows and columns.
+//
+// Exactly one trailing newline is stripped, not every one. In -tA output a query that
+// returned nothing prints no bytes at all, while one row whose only column is the empty
+// string prints a single newline - and collapsing the second into the first makes an empty
+// answer indistinguishable from an absent one. That is not hypothetical: the schema
+// fingerprint coalesces to the empty string on purpose, so a tenant database with no
+// sequences produced "no rows" and failed its own verification mid-cutover.
 func parseRows(output []byte) []Row {
-	text := strings.TrimRight(string(output), "\n")
-	if text == "" {
+	text := strings.TrimSuffix(string(output), "\n")
+	if len(output) == 0 {
 		return nil
 	}
 	lines := strings.Split(text, "\n")

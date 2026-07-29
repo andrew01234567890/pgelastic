@@ -49,6 +49,10 @@ type Builder struct {
 	// the rendered document was made under.
 	ClientTLSSecret string
 	BackendCASecret string
+	// ControlTLSSecret carries the control listener's certificate and the CA the operator's
+	// client certificate is checked against. Named exactly when Document renders a
+	// [control] section, because the proxy refuses to boot with one and not the other.
+	ControlTLSSecret string
 }
 
 func (b Builder) name() string      { return b.Pool.Name }
@@ -70,12 +74,7 @@ func (b Builder) meta(name string) metav1.ObjectMeta {
 }
 
 // Replicas is the configured fleet size.
-func (b Builder) Replicas() int32 {
-	if replicas := b.spec().Replicas; replicas != nil {
-		return *replicas
-	}
-	return 3
-}
+func (b Builder) Replicas() int32 { return Replicas(b.Pool) }
 
 // ConfigSecret carries the rendered document.
 func (b Builder) ConfigSecret() *corev1.Secret {
@@ -290,19 +289,18 @@ func (b Builder) container() corev1.Container {
 	container := corev1.Container{
 		Name:  ContainerName,
 		Image: b.Image,
-		Args:  []string{"--config", ConfigPath},
-		Ports: []corev1.ContainerPort{
-			{Name: PortNameClient, ContainerPort: DefaultClientPort, Protocol: corev1.ProtocolTCP},
-			{
-				Name:          PortNameMetrics,
-				ContainerPort: metricsPort(b.Pool),
-				Protocol:      corev1.ProtocolTCP,
-			},
-		},
-		Env:            b.env(),
-		VolumeMounts:   b.volumeMounts(),
-		ReadinessProbe: b.readinessProbe(),
-		Lifecycle:      b.lifecycle(),
+		// The same policy an instance member carries, and for the same reason: pgelastic
+		// pins its images, so re-pulling one on every restart buys nothing and makes a
+		// registry outage able to stop a fleet that has the image on the node already. It
+		// also has to be set explicitly, because Kubernetes defaults a :latest tag to Always
+		// and a fleet whose image was side-loaded onto the node would then never start.
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Args:            []string{"--config", ConfigPath},
+		Ports:           b.ports(),
+		Env:             b.env(),
+		VolumeMounts:    b.volumeMounts(),
+		ReadinessProbe:  b.readinessProbe(),
+		Lifecycle:       b.lifecycle(),
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: ptr.To(false),
 			ReadOnlyRootFilesystem:   ptr.To(true),
@@ -317,6 +315,25 @@ func (b Builder) container() corev1.Container {
 		container.LivenessProbe = b.livenessProbe()
 	}
 	return container
+}
+
+// ports declares the client port, the metrics port, and — only when the control listener
+// has certificates to serve it with — the cutover port. Declaring the control port on a
+// replica that is not listening on it would leave the operator dialling a socket nothing
+// answers, which is indistinguishable from a hung proxy.
+func (b Builder) ports() []corev1.ContainerPort {
+	ports := []corev1.ContainerPort{
+		{Name: PortNameClient, ContainerPort: DefaultClientPort, Protocol: corev1.ProtocolTCP},
+		{Name: PortNameMetrics, ContainerPort: metricsPort(b.Pool), Protocol: corev1.ProtocolTCP},
+	}
+	if b.ControlTLSSecret != "" {
+		ports = append(ports, corev1.ContainerPort{
+			Name:          PortNameControl,
+			ContainerPort: DefaultControlPort,
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
+	return ports
 }
 
 // env carries the two facts the document cannot: how many runtime workers to start, and
@@ -430,6 +447,17 @@ func (b Builder) volumes() []corev1.Volume {
 			},
 		})
 	}
+	if b.ControlTLSSecret != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: "control-tls",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  b.ControlTLSSecret,
+					DefaultMode: ptr.To(int32(0o400)),
+				},
+			},
+		})
+	}
 	return volumes
 }
 
@@ -442,6 +470,10 @@ func (b Builder) volumeMounts() []corev1.VolumeMount {
 	if b.BackendCASecret != "" {
 		mounts = append(mounts,
 			corev1.VolumeMount{Name: "backend-ca", MountPath: BackendCADir, ReadOnly: true})
+	}
+	if b.ControlTLSSecret != "" {
+		mounts = append(mounts,
+			corev1.VolumeMount{Name: "control-tls", MountPath: ControlTLSDir, ReadOnly: true})
 	}
 	return mounts
 }

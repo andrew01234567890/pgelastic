@@ -86,6 +86,13 @@ type StepResult struct {
 	Total        *int32
 	// PauseMillis is set once, on the step that flips routing.
 	PauseMillis *int64
+	// Queued is how many client transactions the proxy is holding at the gate. It is the
+	// difference between a pause and an outage, so it is published rather than only logged.
+	Queued *int64
+	// ClientPause is how long the gate actually held the tenant's clients. It is filled in
+	// by the controller after the effects are applied, because the hold has to have ended
+	// before its length is a fact rather than an estimate.
+	ClientPause *time.Duration
 }
 
 // Engine performs the effect of whichever phase a migration is in and reports what it
@@ -255,18 +262,26 @@ func (e Engine) catchup(ctx context.Context, run Run, result *StepResult) error 
 // quiesce queues the tenant's clients and then establishes that the source has actually
 // gone quiet.
 //
-// The drain evidence is read from pg_stat_activity rather than taken from the proxy. A
-// proxy that believes it has drained and a database with a backend still in a transaction
-// are two different claims, and it is the second one the cutover depends on.
+// Two witnesses, and both are needed. The gate is what makes the reading stable: it is the
+// only thing that can say no further transaction may start, so without it a count of zero
+// is a fact about the instant it was taken and nothing more. pg_stat_activity is what makes
+// it true: a gate that believes it has drained and a database with a backend still inside a
+// transaction are different claims, and the cutover depends on the second. A pool with no
+// proxy has no gate to ask, and then the database is the only evidence there is.
 func (e Engine) quiesce(ctx context.Context, run Run, result *StepResult) error {
 	if err := e.Router.Quiesce(ctx, run.Tenant, run.Migration.String()); err != nil {
+		return err
+	}
+	gate, err := e.Router.DrainStatus(ctx, run.Tenant)
+	if err != nil {
 		return err
 	}
 	inFlight, err := scalarInt64(ctx, e.SQL, run.Plan.Source, inFlightQuery)
 	if err != nil {
 		return err
 	}
-	result.Observation.Drained = inFlight == 0
+	result.Queued = &gate.Queued
+	result.Observation.Drained = inFlight == 0 && (!gate.Known || gate.Drained)
 	return nil
 }
 
@@ -340,7 +355,17 @@ func (e Engine) Apply(ctx context.Context, run Run, decision Decision) error {
 		}
 	}
 	if decision.ReleaseQuiesce {
-		if err := e.Router.Release(ctx, run.Tenant); err != nil {
+		// Resume and release are different endings and the difference is the whole safety
+		// property. Resume commits: the gate opens against the instance the flip named, and
+		// a hold that expires afterwards can no longer undo it. Release abandons: the flip
+		// is rolled back and the queued clients are let through against the source. Which
+		// one applies is exactly what Serving says, so it is read from there rather than
+		// from the phase - every abort, at every phase, names the source.
+		if decision.Serving == ServingTarget {
+			if err := e.Router.Resume(ctx, run.Tenant); err != nil {
+				problems = append(problems, fmt.Errorf("resuming the tenant's clients: %w", err))
+			}
+		} else if err := e.Router.Release(ctx, run.Tenant); err != nil {
 			problems = append(problems, fmt.Errorf("releasing the quiesce: %w", err))
 		}
 	}

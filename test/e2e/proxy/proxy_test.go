@@ -20,8 +20,17 @@ package proxy
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	cryptorand "crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
+	"io"
+	"math/big"
 	"math/rand/v2"
+	"net/http"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -405,6 +414,173 @@ var _ = Describe("the pool's inline proxy fleet", Ordered, func() {
 				"passing through", poolingClients, peak)
 	})
 
+	// The control listener is the one endpoint that can hold a tenant's clients still. An
+	// unauthenticated caller reaching it could stall any tenant at will, which is why the
+	// listener was deliberately never rendered until it could prove who was calling.
+	//
+	// Three callers, one endpoint. The refusals are asserted as 401 rather than as a dropped
+	// connection on purpose: a cutover that cannot authenticate has to be diagnosable.
+	It("serves the cutover API only to the certificate the operator was issued", func() {
+		operator := &corev1.Secret{}
+		Eventually(func() error {
+			return k8sClient.Get(suiteCtx, types.NamespacedName{
+				Namespace: e2eNamespace,
+				Name:      proxyobjects.ControlClientSecretName(poolName),
+			}, operator)
+		}).WithTimeout(3*time.Minute).WithPolling(2*time.Second).Should(Succeed(),
+			"cert-manager never issued the operator's client certificate, so the control "+
+				"listener has no caller it would accept")
+
+		pods := readyProxyPods(proxyobjects.ServiceName(poolName))
+		Expect(pods).NotTo(BeEmpty())
+		control := forwardPod(pods[0], proxyobjects.DefaultControlPort)
+		defer control.close()
+
+		roots := x509.NewCertPool()
+		Expect(roots.AppendCertsFromPEM(operator.Data["ca.crt"])).To(BeTrue(),
+			"the operator's Secret carries no issuing CA, so it cannot verify the listener")
+		identity, err := tls.X509KeyPair(operator.Data["tls.crt"], operator.Data["tls.key"])
+		Expect(err).NotTo(HaveOccurred())
+
+		serverName := proxyobjects.ControlServerName(poolName, e2eNamespace)
+		url := "https://" + control.address + "/instances"
+
+		By("refusing a caller that presents no certificate at all")
+		status, body := controlGet(url, roots, serverName, nil)
+		Expect(status).To(Equal(http.StatusUnauthorized),
+			"an unauthenticated caller reached the cutover API; body: %s", body)
+		Expect(body).To(ContainSubstring("client certificate"))
+
+		By("refusing a certificate issued by an authority the listener does not trust")
+		status, body = controlGet(url, roots, serverName,
+			ptr.To(selfSignedClient(proxyobjects.ControlClientName(poolName, e2eNamespace))))
+		Expect(status).To(Equal(http.StatusUnauthorized),
+			"a certificate from another authority was accepted; body: %s", body)
+
+		By("serving the certificate cert-manager issued for this pool")
+		status, body = controlGet(url, roots, serverName, &identity)
+		Expect(status).To(Equal(http.StatusOK),
+			"the operator's own certificate was refused; body: %s", body)
+		Expect(body).To(ContainSubstring(instanceA),
+			"the instances report does not name the fleet's members: %s", body)
+	})
+
+	// The failure mode no single-process pooler can see. Each replica reads one
+	// configuration document carrying the undivided budget, so N replicas can hold N times
+	// it against PostgreSQL — and the count that matters is the one on the instance, summed
+	// over every replica, which is a question only PostgreSQL can answer.
+	//
+	// Load is driven through one forward per replica rather than through the Service:
+	// kube-proxy pins a connection in conntrack for its life, so clients arriving at one
+	// endpoint would prove nothing about the fleet.
+	It("keeps fleet-wide backend connections inside the pool budget across every replica", func() {
+		pods := readyProxyPods(proxyobjects.ServiceName(poolName))
+		Expect(pods).To(HaveLen(proxyReplicas),
+			"the fleet-wide claim needs every replica, and only %d are ready", len(pods))
+
+		forwards := make([]*forwarder, 0, len(pods))
+		for _, pod := range pods {
+			forwards = append(forwards, forwardPod(pod, 5432))
+		}
+		defer func() {
+			for _, endpoint := range forwards {
+				endpoint.close()
+			}
+		}()
+
+		ctx, cancel := context.WithCancel(suiteCtx)
+		defer cancel()
+
+		var running sync.WaitGroup
+		var statements atomic.Int64
+		// Exactly the tenant's ceiling per replica. One more would be refused outright rather
+		// than queued — that is the admission ladder's tenant-cap rung and it is correct — so
+		// this is the largest load the fleet is supposed to carry, which is what a claim about
+		// the bound has to be measured under.
+		const perReplica = tenantBurstable
+		for _, target := range forwards {
+			for range perReplica {
+				running.Add(1)
+				go func() {
+					defer GinkgoRecover()
+					defer running.Done()
+					connection, err := pgx.Connect(ctx, target.dsn(provision.OpsRole, tenantAlpha))
+					if err != nil {
+						return
+					}
+					defer func() { _ = connection.Close(context.Background()) }()
+					for ctx.Err() == nil {
+						var ignored int
+						if err := connection.QueryRow(ctx, "SELECT 1 FROM pg_sleep(0.02)").
+							Scan(&ignored); err != nil {
+							return
+						}
+						statements.Add(1)
+					}
+				}()
+			}
+		}
+
+		var peak int
+		Eventually(func() int64 { return statements.Load() }).
+			WithTimeout(2*time.Minute).WithPolling(500*time.Millisecond).
+			Should(BeNumerically(">", int64(perReplica)),
+				"the load never started, so the count below is not evidence of anything")
+		var replicasSeen int
+		for range 20 {
+			backends, err := psql(primaryA, "postgres", backendsFor(tenantAlpha))
+			Expect(err).NotTo(HaveOccurred())
+			count, err := strconv.Atoi(backends)
+			Expect(err).NotTo(HaveOccurred())
+			peak = max(peak, count)
+
+			sources, err := psql(primaryA, "postgres", backendSourcesFor(tenantAlpha))
+			Expect(err).NotTo(HaveOccurred())
+			distinct, err := strconv.Atoi(sources)
+			Expect(err).NotTo(HaveOccurred())
+			replicasSeen = max(replicasSeen, distinct)
+
+			time.Sleep(250 * time.Millisecond)
+		}
+
+		cancel()
+		running.Wait()
+
+		fetched := fetchPool()
+		budget := fetched.Spec.Capacity.BackendConnections
+		AddReportEntry("fleet-wide peak backends", fmt.Sprintf(
+			"%d on %s across %d replicas, against a budget of %d",
+			peak, instanceA, len(pods), budget))
+
+		Expect(peak).To(BeNumerically(">", 0),
+			"no backend was ever open, so the fleet was not reaching PostgreSQL")
+		// Otherwise the budget could be respected merely because only one replica was ever
+		// serving, which is the opposite of the thing under test. PostgreSQL answers it: each
+		// replica is a different Pod and so a different client address.
+		Expect(replicasSeen).To(Equal(len(pods)),
+			"backends arrived from %d of %d replicas, so this is not a fleet-wide measurement",
+			replicasSeen, len(pods))
+		Expect(peak).To(BeNumerically("<=", int(budget)),
+			"%d replicas opened %d backend connections on %s against a pool budget of %d; "+
+				"every replica reads the undivided budget, so the fleet multiplied it",
+			len(pods), peak, instanceA, budget)
+		// The admission gate's own arithmetic, observed rather than asserted about itself: a
+		// tenant cannot exceed its ceiling on any one replica, so the fleet cannot exceed
+		// that ceiling times the replica count.
+		Expect(peak).To(BeNumerically("<=", len(pods)*tenantBurstable),
+			"%d backends is past replicas x burstable (%d x %d), which is the bound the "+
+				"cross-replica gate computes admission against",
+			peak, len(pods), tenantBurstable)
+
+		Eventually(func(g Gomega) {
+			status := fetchPool().Status.Proxy
+			g.Expect(status).NotTo(BeNil())
+			g.Expect(status.LeasedConnections).To(BeNumerically(">", 0),
+				"leasedConnections still reads zero, which says nothing is leased while "+
+					"%d replicas each hold the whole budget", len(pods))
+		}).WithTimeout(2 * time.Minute).Should(Succeed())
+	})
+
 	It("scales the fleet when spec.proxy.replicas changes", func() {
 		Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			fetched := &pgelasticv1alpha1.PgElasticPool{}
@@ -686,10 +862,92 @@ func countDatabase(name string) string {
 	return fmt.Sprintf(`SELECT count(*) FROM pg_database WHERE datname = '%s'`, name)
 }
 
+// backendSourcesFor counts how many distinct proxy replicas currently hold a backend on one
+// database. Each replica is its own Pod and so its own client address, which is how a
+// fleet-wide measurement is told apart from one replica's.
+func backendSourcesFor(database string) string {
+	return fmt.Sprintf(
+		`SELECT count(DISTINCT client_addr) FROM pg_stat_activity `+
+			`WHERE datname = '%s' AND usename = '%s'`,
+		database, provision.OpsRole)
+}
+
 // backendsFor counts the backends the proxy currently holds on one database. It is the
 // question the whole pooling claim reduces to, and only PostgreSQL can answer it.
 func backendsFor(database string) string {
 	return fmt.Sprintf(
 		`SELECT count(*) FROM pg_stat_activity WHERE datname = '%s' AND usename = '%s'`,
 		database, provision.OpsRole)
+}
+
+// controlGet issues one request at the control listener and answers with the status and the
+// body, which is where the refusal names its cause.
+//
+// The server name is set explicitly because the request goes through a port-forward on
+// 127.0.0.1 while the listener's certificate carries the fleet's Service name. Verifying it
+// is the point: a listener that presented anything at all would be one the operator could be
+// impersonated to.
+func controlGet(
+	url string,
+	roots *x509.CertPool,
+	serverName string,
+	identity *tls.Certificate,
+) (int, string) {
+	GinkgoHelper()
+	config := &tls.Config{
+		RootCAs:    roots,
+		ServerName: serverName,
+		MinVersion: tls.VersionTLS12,
+	}
+	if identity != nil {
+		config.Certificates = []tls.Certificate{*identity}
+	}
+	caller := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: config},
+	}
+	defer caller.CloseIdleConnections()
+
+	var status int
+	var body string
+	Eventually(func() error {
+		request, err := http.NewRequestWithContext(suiteCtx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		response, err := caller.Do(request)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = response.Body.Close() }()
+		payload, err := io.ReadAll(response.Body)
+		if err != nil {
+			return err
+		}
+		status, body = response.StatusCode, string(payload)
+		return nil
+	}).WithTimeout(2*time.Minute).WithPolling(2*time.Second).Should(Succeed(),
+		"the control listener at %s never answered", url)
+	return status, body
+}
+
+// selfSignedClient is a client certificate carrying the right name and the wrong issuer,
+// which is the misconfiguration the name check alone would miss.
+func selfSignedClient(name string) tls.Certificate {
+	GinkgoHelper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	Expect(err).NotTo(HaveOccurred())
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: name},
+		DNSNames:     []string{name},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(cryptorand.Reader, template, template, &key.PublicKey, key)
+	Expect(err).NotTo(HaveOccurred())
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }

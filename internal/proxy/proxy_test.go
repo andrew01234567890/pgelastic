@@ -427,3 +427,169 @@ func TestTheConfigurationVolumeIsMountedReadOnly(t *testing.T) {
 		t.Fatalf("the configuration is not mounted read-only at %s: %v", ConfigDir, mounts)
 	}
 }
+
+func controlConfig() Config {
+	config := testConfig()
+	config.Control = true
+	return config
+}
+
+func TestTheControlListenerIsRenderedWithMutualTlsOrNotAtAll(t *testing.T) {
+	document := controlConfig().Render().TOML
+	for _, expected := range []string{
+		"[control]\n",
+		`address = "0.0.0.0:9128"`,
+		"[control.tls]\n",
+		`certificateFile = "/etc/pgelastic/control-tls/tls.crt"`,
+		`keyFile = "/etc/pgelastic/control-tls/tls.key"`,
+		`clientCaFile = "/etc/pgelastic/control-tls/ca.crt"`,
+		`clientName = "saas-proxy-control-client.prod.svc"`,
+	} {
+		if !strings.Contains(document, expected) {
+			t.Fatalf("the control section is missing %q:\n%s", expected, document)
+		}
+	}
+}
+
+func TestAPoolWithNoIssuedCertificatesGetsNoControlListener(t *testing.T) {
+	document := testConfig().Render().TOML
+	if strings.Contains(document, "[control]") {
+		t.Fatalf("a control listener was rendered with no certificates to serve it:\n%s", document)
+	}
+}
+
+func TestTheControlSectionRendersIdenticallyAcrossPasses(t *testing.T) {
+	first := controlConfig().Render()
+
+	shuffled := controlConfig()
+	shuffled.Instances[0], shuffled.Instances[1] = shuffled.Instances[1], shuffled.Instances[0]
+	shuffled.Tenants[0], shuffled.Tenants[1] = shuffled.Tenants[1], shuffled.Tenants[0]
+	second := shuffled.Render()
+
+	if control(first.TOML) != control(second.TOML) {
+		t.Fatalf("the same pool rendered two control sections:\n%s\n---\n%s",
+			control(first.TOML), control(second.TOML))
+	}
+	if first.StructuralHash != second.StructuralHash {
+		t.Fatalf("the same pool produced two structural hashes: %q and %q",
+			first.StructuralHash, second.StructuralHash)
+	}
+}
+
+// The control section is structural. A listen address and a trust root are not things a
+// running process can adopt, so turning the listener on has to roll the fleet — which is
+// the opposite of the routing table, and the distinction the split exists to make.
+func TestTurningTheControlListenerOnRollsTheFleet(t *testing.T) {
+	before := testConfig().Render()
+	after := controlConfig().Render()
+
+	if before.StructuralHash == after.StructuralHash {
+		t.Fatal("the control listener appeared without rolling a single pod, so no replica " +
+			"would ever bind it")
+	}
+}
+
+func TestATenantAddedBesideAControlListenerStillRollsNothing(t *testing.T) {
+	before := controlConfig().Render()
+
+	config := controlConfig()
+	config.Tenants = append(config.Tenants,
+		Tenant{Name: "shipping", Instance: testInstance, Burstable: 4, Weight: 100})
+	after := config.Render()
+
+	if before.TOML == after.TOML {
+		t.Fatal("a new tenant did not reach the document the fleet reads")
+	}
+	if before.StructuralHash != after.StructuralHash {
+		t.Fatal("rendering the control section made the routing table structural, so adding " +
+			"a tenant now drops every client on every replica")
+	}
+}
+
+// control extracts the [control] section, so a spec about it is not restated by every other
+// section changing.
+func control(document string) string {
+	start := strings.Index(document, "[control]")
+	if start < 0 {
+		return ""
+	}
+	section, _, _ := strings.Cut(document[start:], "\n[routing]")
+	return section
+}
+
+func TestTheControlPortIsDeclaredOnlyWhenTheListenerIsServed(t *testing.T) {
+	served := Builder{Pool: testPool(), Image: testImage, Document: controlConfig().Render(),
+		ControlTLSSecret: ControlServerSecretName("saas")}
+	deployment, err := served.Deployment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	container := deployment.Spec.Template.Spec.Containers[0]
+	if !hasPort(container.Ports, PortNameControl, DefaultControlPort) {
+		t.Fatalf("the control port is not declared: %+v", container.Ports)
+	}
+
+	silent := Builder{Pool: testPool(), Image: testImage, Document: testConfig().Render()}
+	quiet, err := silent.Deployment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasPort(quiet.Spec.Template.Spec.Containers[0].Ports, PortNameControl, DefaultControlPort) {
+		t.Fatal("a replica that is not listening declared the control port anyway, so the " +
+			"operator would dial a socket nothing answers")
+	}
+}
+
+func TestTheControlCertificatesAreMountedReadOnly(t *testing.T) {
+	builder := Builder{Pool: testPool(), Image: testImage, Document: controlConfig().Render(),
+		ControlTLSSecret: ControlServerSecretName("saas")}
+	deployment, err := builder.Deployment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := deployment.Spec.Template.Spec
+
+	var mounted bool
+	for _, mount := range spec.Containers[0].VolumeMounts {
+		if mount.MountPath == ControlTLSDir {
+			mounted = true
+			if !mount.ReadOnly {
+				t.Fatal("the control listener's private key is mounted writable")
+			}
+		}
+	}
+	if !mounted {
+		t.Fatalf("nothing is mounted at %s, so the listener has no certificate", ControlTLSDir)
+	}
+
+	var volume bool
+	for _, entry := range spec.Volumes {
+		if entry.Secret != nil && entry.Secret.SecretName == ControlServerSecretName("saas") {
+			volume = true
+		}
+	}
+	if !volume {
+		t.Fatal("the control certificate Secret is not projected into the pod")
+	}
+}
+
+// The Service is what every tenant's client connects to. Publishing the cutover API on it
+// would put an endpoint that holds a tenant's sockets still one port away from that tenant.
+func TestTheControlPortIsNeverPublishedOnThePoolService(t *testing.T) {
+	builder := Builder{Pool: testPool(), Image: testImage, Document: controlConfig().Render(),
+		ControlTLSSecret: ControlServerSecretName("saas")}
+	for _, port := range builder.Service().Spec.Ports {
+		if port.Name == PortNameControl || port.Port == DefaultControlPort {
+			t.Fatalf("the pool Service carries the control port: %+v", port)
+		}
+	}
+}
+
+func hasPort(ports []corev1.ContainerPort, name string, number int32) bool {
+	for _, port := range ports {
+		if port.Name == name && port.ContainerPort == number {
+			return true
+		}
+	}
+	return false
+}

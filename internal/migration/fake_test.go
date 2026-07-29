@@ -140,6 +140,8 @@ type fakeRouter struct {
 	quiesced  bool
 	preWarmed string
 	released  bool
+	resumed   bool
+	gate      DrainStatus
 	err       error
 }
 
@@ -167,8 +169,19 @@ func (r *fakeRouter) Release(_ context.Context, _ TenantRef) error {
 	return r.err
 }
 
+func (r *fakeRouter) Resume(_ context.Context, _ TenantRef) error {
+	r.resumed = true
+	r.released = true
+	r.quiesced = false
+	return r.err
+}
+
 func (r *fakeRouter) RoutedTo(_ context.Context, _ TenantRef) (string, error) {
 	return r.routed, r.err
+}
+
+func (r *fakeRouter) DrainStatus(_ context.Context, _ TenantRef) (DrainStatus, error) {
+	return r.gate, r.err
 }
 
 var errFake = errors.New("the source went away")

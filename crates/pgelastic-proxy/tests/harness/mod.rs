@@ -102,6 +102,107 @@ impl Certificates {
     }
 }
 
+/// The name the control API's client certificate carries. A caller without a
+/// certificate, or with one from another authority, is refused with 401 — so the
+/// harness has to be an authenticated caller before it can drive a cutover.
+pub const CONTROL_CLIENT_NAME: &str = "pgelastic-test-operator";
+
+/// The control listener's mutual TLS: one CA, the listener's certificate, and
+/// the caller's.
+pub struct ControlPki {
+    dir: tempfile::TempDir,
+    roots: rustls::RootCertStore,
+    client_chain: Vec<rustls_pki_types::CertificateDer<'static>>,
+    client_key_der: Vec<u8>,
+}
+
+impl ControlPki {
+    pub fn generate() -> Self {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+            KeyPair, KeyUsagePurpose,
+        };
+
+        let mut ca_params = CertificateParams::new(Vec::new()).expect("CA parameters");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "pgelastic control CA");
+        let ca_key = KeyPair::generate().expect("CA key");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+
+        let leaf = |name: &str, usage: ExtendedKeyUsagePurpose| {
+            let mut params = CertificateParams::new(vec![name.to_owned()]).expect("parameters");
+            params.distinguished_name.push(DnType::CommonName, name);
+            params.extended_key_usages = vec![usage];
+            let key = KeyPair::generate().expect("leaf key");
+            let cert = params.signed_by(&key, &issuer).expect("signed leaf");
+            (cert, key)
+        };
+        let (server, server_key) = leaf("localhost", ExtendedKeyUsagePurpose::ServerAuth);
+        let (client, client_key) = leaf(CONTROL_CLIENT_NAME, ExtendedKeyUsagePurpose::ClientAuth);
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("ca.pem"), ca_cert.pem()).expect("write ca");
+        std::fs::write(dir.path().join("server.pem"), server.pem()).expect("write cert");
+        std::fs::write(dir.path().join("server.key"), server_key.serialize_pem())
+            .expect("write key");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls_pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .expect("add ca");
+
+        Self {
+            dir,
+            roots,
+            client_chain: vec![rustls_pki_types::CertificateDer::from(
+                client.der().to_vec(),
+            )],
+            client_key_der: client_key.serialize_der(),
+        }
+    }
+
+    /// The `[control.tls]` section the proxy is configured with.
+    pub fn section(&self) -> String {
+        format!(
+            "[control.tls]\n\
+             certificateFile = \"{cert}\"\n\
+             keyFile = \"{key}\"\n\
+             clientCaFile = \"{ca}\"\n\
+             clientName = \"{CONTROL_CLIENT_NAME}\"\n",
+            cert = self.dir.path().join("server.pem").display(),
+            key = self.dir.path().join("server.key").display(),
+            ca = self.dir.path().join("ca.pem").display(),
+        )
+    }
+
+    fn connector(&self) -> tokio_rustls::TlsConnector {
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(self.roots.clone())
+            .with_client_auth_cert(
+                self.client_chain.clone(),
+                rustls_pki_types::PrivateKeyDer::try_from(self.client_key_der.clone())
+                    .expect("a generated key is well formed"),
+            )
+            .expect("the client identity is usable");
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    /// A connector that trusts the listener but proves nothing about itself,
+    /// for asserting that such a caller is refused rather than served.
+    pub fn anonymous_connector(&self) -> tokio_rustls::TlsConnector {
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(self.roots.clone())
+            .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+}
+
 /// A running `postgres:18`.
 pub struct Postgres {
     _container: ContainerAsync<postgres::Postgres>,
@@ -205,17 +306,24 @@ pub async fn start_postgres_with(extra_conf: &str) -> Postgres {
 /// remembers it for `serverLoginRetry` — so handing the proxy a backend that is
 /// not up yet poisons its pool for the rest of the test.
 async fn await_ready(postgres: &Postgres) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(120);
     let url = postgres.direct_url("pgelastic_readiness");
+    let mut attempts = 0_u32;
     loop {
+        attempts += 1;
         match tokio_postgres::connect(&url, tokio_postgres::NoTls).await {
             Ok((_client, connection)) => {
                 drop(connection);
                 return;
             }
+            // Reports the elapsed time and attempt count because the failure this
+            // produces under a loaded Docker daemon is indistinguishable from a real
+            // startup fault without them.
             Err(error) => assert!(
                 std::time::Instant::now() < deadline,
-                "postgres:18 never became reachable: {error}"
+                "postgres:18 never became reachable after {attempts} attempts over {:?}: {error}",
+                started.elapsed()
             ),
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -584,6 +692,7 @@ impl Fleet {
     ) -> Self {
         let (a, b) = tokio::join!(start_postgres(), start_postgres());
         let control_port = free_port().await;
+        let pki = ControlPki::generate();
         let source = format!(
             "[listen]\n\
              address = \"127.0.0.1:0\"\n\
@@ -604,6 +713,8 @@ impl Fleet {
              address = \"127.0.0.1:{control_port}\"\n\
              defaultLeaseTtlMs = {default_lease_ms}\n\
              \n\
+             {control_tls}\
+             \n\
              [[instances]]\n\
              name = \"inst-a\"\n\
              address = \"{a_addr}\"\n\
@@ -620,10 +731,13 @@ impl Fleet {
              {extra}\n",
             a_addr = a.address(),
             b_addr = b.address(),
+            control_tls = pki.section(),
         );
         let proxy = start_proxy(&source).await;
         let control = Control {
             address: format!("127.0.0.1:{control_port}"),
+            connector: pki.connector(),
+            pki,
         };
         control.await_ready().await;
         Self {
@@ -684,13 +798,17 @@ async fn free_port() -> u16 {
     listener.local_addr().expect("the scratch address").port()
 }
 
-/// A minimal HTTP/1.1 client for the proxy's control API.
+/// A minimal HTTP/1.1-over-mutual-TLS client for the proxy's control API.
 ///
 /// Hand-rolled rather than pulled in: the proxy's own `hyper` carries only the
 /// server half, and a cutover's five calls are a status line and a JSON body
-/// each.
+/// each. The TLS is not optional — the listener refuses an unauthenticated
+/// caller with 401, because quiescing a tenant holds its clients' sockets open
+/// with nothing behind them.
 pub struct Control {
     pub address: String,
+    pub pki: ControlPki,
+    connector: tokio_rustls::TlsConnector,
 }
 
 /// One control-API answer.
@@ -787,11 +905,28 @@ impl Control {
     }
 
     async fn request(&self, method: &str, path: &str, body: Option<String>) -> ControlResponse {
+        self.request_as(&self.connector, method, path, body).await
+    }
+
+    /// The same call made by a caller of the test's choosing, so a spec can ask
+    /// what an unauthenticated one gets.
+    pub async fn request_as(
+        &self,
+        connector: &tokio_rustls::TlsConnector,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+    ) -> ControlResponse {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let mut socket = tokio::net::TcpStream::connect(&self.address)
+        let tcp = tokio::net::TcpStream::connect(&self.address)
             .await
             .expect("the control endpoint must be reachable");
+        let name = rustls_pki_types::ServerName::try_from("localhost").expect("a valid name");
+        let mut socket = connector
+            .connect(name, tcp)
+            .await
+            .expect("the control endpoint must complete a TLS handshake");
         let body = body.unwrap_or_default();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: control\r\nConnection: close\r\n\
