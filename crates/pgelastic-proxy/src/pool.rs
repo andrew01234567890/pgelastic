@@ -1438,11 +1438,14 @@ fn transport_failure(error: &ProxyError) -> bool {
     let ProxyError::Io(io) = error else {
         return false;
     };
+    // Refused, unreachable and timed out all mean nothing answered at that address, which
+    // is what a Service being repointed looks like. A reset is deliberately excluded: it
+    // means something did accept and then killed the connection, which is a different
+    // condition and one far likelier to persist — retrying it just multiplies the load on a
+    // backend that is already failing.
     matches!(
         io.kind(),
         std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::TimedOut
             | std::io::ErrorKind::HostUnreachable
             | std::io::ErrorKind::NetworkUnreachable
@@ -1459,8 +1462,8 @@ mod tests {
     fn a_refused_connect_is_the_service_still_moving_and_is_retried() {
         for kind in [
             std::io::ErrorKind::ConnectionRefused,
-            std::io::ErrorKind::ConnectionReset,
             std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::HostUnreachable,
         ] {
             let error = ProxyError::Io(std::io::Error::new(kind, "endpoint converging"));
             assert!(transport_failure(&error), "{kind:?} must be retried");
@@ -1479,6 +1482,13 @@ mod tests {
                 "no",
             ))),
             "a refusal on the merits is not the transport settling"
+        );
+        assert!(
+            !transport_failure(&ProxyError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "accepted then killed",
+            ))),
+            "something accepted and reset us; that is not an endpoint still arriving"
         );
     }
 
