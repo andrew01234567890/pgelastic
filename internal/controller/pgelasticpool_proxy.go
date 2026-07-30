@@ -95,7 +95,7 @@ func (r *PgElasticPoolReconciler) reconcileProxy(
 	config := proxy.Config{
 		Pool:      pool,
 		Instances: instances,
-		Tenants:   proxyTenants(view, instances),
+		Tenants:   r.proxyTenants(ctx, view, instances),
 		Users:     users,
 		Control:   r.certManagerInstalled(),
 	}
@@ -370,7 +370,9 @@ func (r *PgElasticPoolReconciler) proxyInstances(
 // name is a Kubernetes identifier that nothing on the PostgreSQL wire ever sends. A tenant
 // that has not been placed yet contributes its claim but no route, so its capacity is
 // already reserved while its connections still land on the default instance.
-func proxyTenants(view *poolView, instances []proxy.Instance) []proxy.Tenant {
+func (r *PgElasticPoolReconciler) proxyTenants(
+	ctx context.Context, view *poolView, instances []proxy.Instance,
+) []proxy.Tenant {
 	known := make(map[string]struct{}, len(instances))
 	for _, instance := range instances {
 		known[instance.Name] = struct{}{}
@@ -386,14 +388,26 @@ func proxyTenants(view *poolView, instances []proxy.Instance) []proxy.Tenant {
 		if _, ok := known[bound]; !ok {
 			bound = ""
 		}
-		tenants = append(tenants, proxy.Tenant{
+		rendered := proxy.Tenant{
 			Name:       entry.tenant.Spec.DatabaseName,
 			Instance:   bound,
 			Guaranteed: entry.effective.Guaranteed,
 			Burstable:  entry.effective.Burstable,
 			Weight:     entry.effective.Weight,
 			Priority:   defaultTenantPriority,
-		})
+		}
+		// The identity this tenant's backend sessions run as. Left out when the tenant
+		// controller has not minted it yet, mirroring how an instance whose Secret is absent
+		// is left out rather than rendered with an empty password: the fleet then refuses
+		// that one tenant for a reconcile rather than serving it as the control plane.
+		if credential, ok := r.backendCredentialFor(ctx, entry.tenant); ok {
+			rendered.BackendRole = credential.Role
+			rendered.BackendSaltedPassword = credential.SaltedPassword
+			rendered.BackendSalt = credential.Salt
+			rendered.BackendIterations = credential.Iterations
+			rendered.CredentialGeneration = credential.Generation
+		}
+		tenants = append(tenants, rendered)
 	}
 	return tenants
 }

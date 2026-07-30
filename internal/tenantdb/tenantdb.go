@@ -140,15 +140,25 @@ func Ensure(ctx context.Context, sql SQL, at Endpoint, spec Spec) (State, error)
 	if err != nil {
 		return state, err
 	}
-	if err := ensureCredential(ctx, sql, postgres, spec); err != nil {
-		return state, err
-	}
 	created, err := ensureDatabase(ctx, sql, postgres, spec, state)
 	if err != nil {
 		return state, err
 	}
-	if err := ensureDatabaseGrants(ctx, sql, postgres, spec); err != nil {
-		return state, err
+	// Issued only when something was actually created. Both are idempotent, but a reconcile
+	// loop that re-issued them would write a credential into the instance's log on every pass
+	// and turn a steady-state reconcile into a stream of DDL - and "a second pass issues no
+	// statement that changes anything" is a property worth keeping.
+	//
+	// The cost is that a tenant provisioned before either existed keeps its old posture until
+	// something recreates its role or database. The migration path applies both on the target,
+	// so a move heals one; nothing else does yet.
+	if changed || created {
+		if err := ensureCredential(ctx, sql, postgres, spec); err != nil {
+			return state, err
+		}
+		if err := ensureDatabaseGrants(ctx, sql, postgres, spec); err != nil {
+			return state, err
+		}
 	}
 
 	if changed || created {
