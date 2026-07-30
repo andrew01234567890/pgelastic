@@ -204,7 +204,19 @@ func (e Engine) provision(ctx context.Context, run Run, result *StepResult) erro
 		return err
 	}
 	online := run.Strategy == pgelasticv1alpha1.TenantMigrationOnline
-	if err := ProvisionTarget(ctx, e.SQL, e.Shell, run.Plan, run.Owner, online); err != nil {
+
+	// Whether a half-built target may be discarded and rebuilt is a question about who is
+	// serving the tenant, and only the router can answer it. Provisioning runs strictly before
+	// the flip, so a tenant still routed to the source cannot be reading from the target and a
+	// target left over from an earlier attempt is wreckage. Routed anywhere else - or an
+	// unreadable routing table - and the target is left exactly alone.
+	servingFromSource := false
+	if instance, err := e.Router.RoutedTo(ctx, run.Tenant); err == nil {
+		servingFromSource = instance == run.Plan.Source.Instance
+	}
+	if err := ProvisionTarget(
+		ctx, e.SQL, e.Shell, run.Plan, run.Owner, online, Resettable(servingFromSource),
+	); err != nil {
 		return err
 	}
 	if online {
@@ -227,6 +239,12 @@ func (e Engine) preWarm(ctx context.Context, run Run, result *StepResult) error 
 func (e Engine) copy(ctx context.Context, run Run, result *StepResult) error {
 	if run.Strategy == pgelasticv1alpha1.TenantMigrationOffline {
 		if err := CopyOffline(ctx, e.Shell, run.Plan); err != nil {
+			return err
+		}
+		// The online path folds these into the schema apply's transaction. Offline has no
+		// single transaction to fold them into - pg_restore --jobs cannot be one - so they run
+		// here, immediately after the restore that made them necessary.
+		if err := SettleTargetGrants(ctx, e.SQL, run.Plan, run.Owner); err != nil {
 			return err
 		}
 		if err := DiscardDump(ctx, e.Shell, run.Plan); err != nil {
@@ -370,7 +388,9 @@ func (e Engine) Apply(ctx context.Context, run Run, decision Decision) error {
 		}
 	}
 	if decision.Cleanup {
-		if err := Cleanup(ctx, e.SQL, run.Plan, run.ReplicationRole); err != nil {
+		err := Cleanup(ctx, e.SQL, run.Plan, run.ReplicationRole,
+			DiscardingTarget(decision.DiscardTarget))
+		if err != nil {
 			problems = append(problems, err)
 		}
 		if run.Strategy == pgelasticv1alpha1.TenantMigrationOffline && e.Shell != nil {

@@ -22,6 +22,58 @@ import (
 	"testing"
 )
 
+// The verifier gates the cutover, so what it cannot see cannot be refused. Before ownership and
+// ACLs were part of the fingerprint, a target where every relation belonged to postgres with an
+// empty ACL was byte-identical to a correct source - the gate passed the exact defect the
+// migration had just introduced.
+func TestTheFingerprintCoversOwnershipAndPrivileges(t *testing.T) {
+	joined := strings.Join(schemaFingerprintParts, "\n")
+	for _, want := range []string{"relowner", "relacl", "nspowner", "nspacl", "pg_default_acl"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("the fingerprint never reads %s, so a divergence in it cannot fail the gate", want)
+		}
+	}
+}
+
+// Four normalisations, each of which turns a correct migration into a refused one if it is
+// missing. acldefault reconciles a NULL ACL with the same set written out explicitly; its type
+// code has to come from relkind, because a sequence's default is rwU and a table's is arwdDxtm;
+// the entries are sorted because an ACL array is in grant order; and the control-plane roles
+// are filtered because the replication role holds SELECT on the source for the whole migration
+// and never on the target.
+func TestTheAclFingerprintIsNormalisedRatherThanCompareRaw(t *testing.T) {
+	joined := strings.Join(schemaFingerprintParts, "\n")
+	for _, want := range []string{
+		"acldefault(",
+		// acldefault's first argument is "char", not text. A bare 'r' or a CASE yielding text
+		// is a different type, and PostgreSQL answers "function acldefault(text, oid) does not
+		// exist" - which fails the cutover's own verification gate and parks the migration in
+		// Cutover until its retry budget runs out. Nothing short of a real postmaster catches
+		// it, so the cast is pinned here as well.
+		`END)::"char"`,
+		`'n'::"char"`,
+		`CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END`,
+		`ORDER BY entry COLLATE "C"`,
+		"pgelastic_repl",
+		"'PUBLIC'",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("the ACL fingerprint is missing %q, which makes it compare spellings "+
+				"rather than privileges", want)
+		}
+	}
+}
+
+func TestThePublishedLimitsNoLongerDisclaimWhatIsNowChecked(t *testing.T) {
+	message := LimitsMessage()
+	if strings.Contains(message, "ownership") || strings.Contains(message, "object privileges") {
+		t.Fatalf("the limits still disclaim something the fingerprint now covers: %s", message)
+	}
+	if !strings.Contains(message, "role passwords are never compared") {
+		t.Fatal("the limits do not say that credentials are neither compared nor carried")
+	}
+}
+
 // recordingSQL answers every verifier query the same on both sides unless a per-endpoint
 // override says otherwise, and keeps every statement for inspection.
 type recordingSQL struct {

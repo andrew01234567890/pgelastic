@@ -28,10 +28,18 @@ import (
 // fakes answer, so a spec that scripts a stamp gets its own answer rather than a count.
 const stampQueryFragment = "shobj_description(oid, 'pg_database')"
 
+// roleEnumerationFragment identifies the query that finds the roles a tenant's database
+// depends on, so a spec can script the answer.
+const roleEnumerationFragment = "FROM pg_roles r JOIN closure c ON c.oid = r.oid"
+
+// testReader is a role of the tenant's own: neither the owner nor the superuser, so a grant
+// to it is one the carry has to actually move.
+const testReader = "shop_reader"
+
 func TestTheSchemaCopyCommitsTheWholeSchemaAndItsStampOrNeither(t *testing.T) {
 	plan := testPlan()
 	plan.DumpDir = "/var/lib/postgresql/data/pgelastic-migration/shop_move"
-	command := schemaCopyCommand(plan)
+	command := schemaCopyCommand(plan, "shop", []RoleSpec{{Name: testReader}})
 
 	if !strings.Contains(command, "--single-transaction") {
 		t.Fatalf("the schema is applied statement by statement, so an interrupted copy leaves "+
@@ -102,10 +110,179 @@ func TestAnInterruptedSchemaCopyIsCopiedAgainRatherThanTakenAsDone(t *testing.T)
 	}
 }
 
+// The defect the demo found: every relation arrived owned by postgres with an empty ACL, and
+// the first write through the proxy was refused with 42501.
+func TestTheSchemaCopyCarriesOwnershipAndPrivileges(t *testing.T) {
+	command := schemaCopyCommand(testPlan(), "shop", []RoleSpec{{Name: testReader}})
+	for _, unwanted := range []string{"--no-owner", "--no-privileges"} {
+		if strings.Contains(command, unwanted) {
+			t.Fatalf("the schema copy still passes %s: %s", unwanted, command)
+		}
+	}
+}
+
+// The database's own ACL is the one thing pg_dump cannot bring: it emits datacl only under
+// --create, which neither path uses. Left alone, PUBLIC keeps the CONNECT the default grants
+// it, and on an instance where tenant roles can authenticate that is every tenant able to open
+// a session on every other tenant's database.
+func TestTheSchemaCopyConfinesTheTargetDatabaseToItsOwnRoles(t *testing.T) {
+	command := schemaCopyCommand(testPlan(), "shop", []RoleSpec{{Name: testReader}})
+	for _, want := range []string{
+		"REVOKE ALL ON DATABASE",
+		`GRANT CONNECT, TEMPORARY ON DATABASE "acme" TO "shop"`,
+		`GRANT CONNECT, TEMPORARY ON DATABASE "acme" TO "` + testReader + `"`,
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("the target database's ACL is missing %q: %s", want, command)
+		}
+	}
+	if !strings.Contains(command, `GRANT CONNECT ON DATABASE "acme" TO "pgelastic_ops"`) {
+		t.Fatal("the control plane cannot reach the database it just built")
+	}
+}
+
+// GrantSourceReads opens SELECT to the replication role so pg_dump can read the source, and
+// those grants are live while the dump runs. Now that privileges are carried, they would be
+// applied to the target and become permanent - handing a credential that lives in every
+// member's environment standing read access to the tenant's data.
+func TestTheReplicationRolesTemporaryReadsDoNotBecomePermanent(t *testing.T) {
+	command := schemaCopyCommand(testPlan(), "shop", nil)
+	if !strings.Contains(command, "REVOKE ALL ON ALL TABLES IN SCHEMA") ||
+		!strings.Contains(command, provision.ReplicationRole) {
+		t.Fatalf("the dump's copy of the migration's own grants is never taken back: %s", command)
+	}
+	revokeAt := strings.Index(command, "REVOKE ALL ON ALL TABLES IN SCHEMA")
+	stampAt := strings.Index(command, "COMMENT ON DATABASE")
+	if revokeAt > stampAt {
+		t.Fatal("the revoke lands after the stamp, so a copy could be marked complete with the " +
+			"replication role still holding reads on the tenant's tables")
+	}
+}
+
+// Every carried role has to exist before anything names it. The apply is one transaction, so
+// a single missing grantee fails the whole copy rather than the statement that mentioned it.
+func TestCarriedRolesAreCreatedBeforeTheDatabaseAndTheSchema(t *testing.T) {
+	sql, shell := runningSQL(), &fakeShell{}
+	sql.answer(roleEnumerationFragment, Row{testReader, "f", "t", "-1", ""}).
+		answer("FROM pg_auth_members a")
+	engine := testEngine(sql, &fakeRouter{routed: sourceInstance}, shell)
+
+	if fault := engine.Step(context.Background(), testRun(provisioning, online)).Observation.Fault; fault != nil {
+		t.Fatal(fault)
+	}
+	created := sql.ran(`CREATE ROLE "` + testReader + `"`)
+	if created < 0 {
+		t.Fatal("a role the tenant's objects depend on was never created on the target")
+	}
+	if database := sql.ran("CREATE DATABASE"); database >= 0 && created > database {
+		t.Fatal("the roles were created after the database that is owned by one of them")
+	}
+	statement := sql.statement[created]
+	for _, forbidden := range []string{"SUPERUSER", "CREATEROLE", "CREATEDB", "REPLICATION", "BYPASSRLS"} {
+		if strings.Contains(statement, " "+forbidden) {
+			t.Fatalf("a migration handed a tenant role %s: %s", forbidden, statement)
+		}
+	}
+}
+
+// objectCountFragment is the count of relations in the target's user schemas, which is what
+// separates a database an earlier attempt half-built from one that was only ever created.
+const objectCountFragment = "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+
+// ownedByTenantFragment identifies the question "did we make this database" - the guard that
+// stops the self-heal dropping one somebody else staged under the same name.
+const ownedByTenantFragment = "FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba"
+
+// A target carrying objects but no stamp has exactly one cause: an attempt that applied a
+// schema and then lost its stamp. Nothing recovers from it on its own, because the copy is
+// skipped only when the stamp is there - so every later attempt re-applies the same schema
+// onto its own objects and dies on "already exists" until the retry budget is gone. That is
+// the state the 2026-07-29 nightly reached and could not leave.
+func TestAnUnstampedTargetCarryingObjectsIsRebuiltRatherThanCopiedOnto(t *testing.T) {
+	sql, shell := runningSQL(), &fakeShell{}
+	sql.scalarAnswer("FROM pg_database WHERE datname", "1").
+		scalarAnswer(objectCountFragment, "7").
+		scalarAnswer(ownedByTenantFragment, "1")
+	engine := testEngine(sql, &fakeRouter{routed: sourceInstance}, shell)
+
+	result := engine.Step(context.Background(), testRun(provisioning, online))
+	if result.Observation.Fault != nil {
+		t.Fatalf("an unstamped target with objects on it was not healed: %v", result.Observation.Fault)
+	}
+	if sql.ran("DROP DATABASE") < 0 {
+		t.Fatal("the wreckage of an earlier attempt was copied onto rather than discarded")
+	}
+	if sql.ran("CREATE DATABASE") < 0 {
+		t.Fatal("the target was dropped and never recreated")
+	}
+}
+
+// The guard that stops this rule deleting live tenants. After a successful cutover the ladder
+// clears the stamp deliberately and the tenant serves from exactly that database, so
+// "unstamped and non-empty" on its own would describe a paying tenant.
+func TestATargetTheTenantIsServedFromIsNeverDiscarded(t *testing.T) {
+	sql, shell := runningSQL(), &fakeShell{}
+	sql.scalarAnswer("FROM pg_database WHERE datname", "1").
+		scalarAnswer(objectCountFragment, "7").
+		scalarAnswer(ownedByTenantFragment, "1")
+	engine := testEngine(sql, &fakeRouter{routed: targetInstance}, shell)
+
+	engine.Step(context.Background(), testRun(provisioning, online))
+	if sql.ran("DROP DATABASE") >= 0 {
+		t.Fatal("a database the tenant is being served from was dropped")
+	}
+}
+
+// The self-heal drops a database, so it has to be sure the database is ours. Ownership is the
+// evidence: ProvisionTarget creates the target OWNER the tenant, so one owned by anybody else
+// was staged by somebody else - a human restoring into it, most likely - and dropping it would
+// destroy work nobody asked us to touch. The copy then fails on it loudly, which is the right
+// answer to a name collision.
+func TestADatabaseSomebodyElseCreatedIsNeverDiscarded(t *testing.T) {
+	sql, shell := runningSQL(), &fakeShell{}
+	sql.scalarAnswer("FROM pg_database WHERE datname", "1").
+		scalarAnswer(objectCountFragment, "7").
+		scalarAnswer(ownedByTenantFragment, "0")
+	engine := testEngine(sql, &fakeRouter{routed: sourceInstance}, shell)
+
+	engine.Step(context.Background(), testRun(provisioning, online))
+	if sql.ran("DROP DATABASE") >= 0 {
+		t.Fatal("a database this migration did not create was dropped")
+	}
+}
+
+func TestAStampedTargetIsNeverDiscarded(t *testing.T) {
+	sql, shell := runningSQL(), &fakeShell{}
+	sql.scalarAnswer("FROM pg_database WHERE datname", "1").
+		scalarAnswer(objectCountFragment, "7").
+		scalarAnswer(ownedByTenantFragment, "1").
+		scalarAnswer(stampQueryFragment, "1")
+	engine := testEngine(sql, &fakeRouter{routed: sourceInstance}, shell)
+
+	engine.Step(context.Background(), testRun(provisioning, online))
+	if sql.ran("DROP DATABASE") >= 0 {
+		t.Fatal("a target whose schema copy had committed was discarded")
+	}
+}
+
+// PostgreSQL refuses to drop a database that still owns a subscription however the connections
+// are behaving, so WITH (FORCE) is not enough on its own.
+func TestTheTargetsSubscriptionsAreRemovedBeforeItIsDropped(t *testing.T) {
+	sql := newFakeSQL().answer("SELECT subname FROM pg_subscription", Row{"pgelastic_sub_move"})
+	if err := DropTargetDatabase(context.Background(), sql, targetAt); err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{"DISABLE", "slot_name = NONE", "DROP SUBSCRIPTION"} {
+		if index := sql.ran(fragment); index < 0 || index > sql.ran("DROP DATABASE") {
+			t.Fatalf("%q did not run before the database was dropped", fragment)
+		}
+	}
+}
+
 func TestTheCleanupLadderTakesTheStampOffTheDatabaseItHandsOver(t *testing.T) {
 	plan := testPlan()
 	sql := cleanableSQL().scalarAnswer(stampQueryFragment, "1")
-	if err := Cleanup(context.Background(), sql, plan, provision.ReplicationRole); err != nil {
+	if err := Cleanup(context.Background(), sql, plan, provision.ReplicationRole, false); err != nil {
 		t.Fatal(err)
 	}
 	if sql.ran("COMMENT ON DATABASE") < 0 {
@@ -115,7 +292,7 @@ func TestTheCleanupLadderTakesTheStampOffTheDatabaseItHandsOver(t *testing.T) {
 
 func TestAnUnstampedTargetIsLeftAloneByTheCleanupLadder(t *testing.T) {
 	sql := cleanableSQL().scalarAnswer(stampQueryFragment, "0")
-	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole); err != nil {
+	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole, false); err != nil {
 		t.Fatal(err)
 	}
 	if sql.ran("COMMENT ON DATABASE") >= 0 {

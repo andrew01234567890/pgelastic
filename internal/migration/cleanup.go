@@ -65,13 +65,17 @@ var LadderOrder = []LadderStep{
 	StepClearSchemaStamp,
 }
 
+// DiscardingTarget says the caller is about to drop the target database outright, which makes
+// StepClearSchemaStamp not merely pointless but harmful. See Cleanup.
+type DiscardingTarget bool
+
 // Cleanup runs the whole ladder and never stops early.
 //
 // A failure on one rung is recorded and the next rung still runs, because the rung that
 // matters most - dropping the slot - is near the end. A ladder that aborted on the first
 // error would routinely leave a slot pinning the source primary's WAL, which is the
 // failure this whole path exists to prevent.
-func Cleanup(ctx context.Context, sql SQL, plan Plan, role string) error {
+func Cleanup(ctx context.Context, sql SQL, plan Plan, role string, discarding DiscardingTarget) error {
 	// After a successful cutover the source database has been fenced, and the two rungs that
 	// have to run inside it cannot open a session any more. That is not a failure: the fenced
 	// database is dropped wholesale when the rollback window closes, and dropping it takes
@@ -82,6 +86,17 @@ func Cleanup(ctx context.Context, sql SQL, plan Plan, role string) error {
 	var problems []error
 	for _, step := range LadderOrder {
 		if !sourceOpen && stepNeedsSourceDatabase(step) {
+			continue
+		}
+		// The stamp is the only evidence that a target's schema was copied in full. On a path
+		// that discards the database it buys nothing, because the database is going; and if the
+		// drop then fails, clearing it first has converted recoverable litter into a database
+		// that is fully schema'd, unstamped, and permanently un-retryable - the next migration
+		// of this tenant re-runs the copy onto its own objects and dies on "already exists"
+		// until its retry budget is spent. That is not hypothetical: one flaky exec is enough,
+		// because ifSubscriptionExists fails closed, the ladder never stops early, and
+		// DROP DATABASE is refused while a subscription is still defined in it.
+		if step == StepClearSchemaStamp && discarding {
 			continue
 		}
 		if err := runStep(ctx, sql, plan, role, step); err != nil {

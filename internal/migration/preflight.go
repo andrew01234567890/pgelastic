@@ -56,6 +56,16 @@ const (
 	// synchronized_standby_slots the subscriber can consume changes no standby has flushed
 	// - after which the synced slot is behind the subscriber and rows are lost in silence.
 	CheckFailoverSlotStack CheckName = "FailoverSlotStack"
+	// CheckTenantRoleAttributes refuses to carry a role holding an attribute a tenant should
+	// never have. A migration is not a route by which a tenant acquires SUPERUSER, and
+	// CREATEROLE in particular would let it mint cluster-global roles of its own on the far
+	// side - which is the one attribute that defeats every naming scheme above it.
+	CheckTenantRoleAttributes CheckName = "TenantRoleAttributes"
+	// CheckDatabaseConnectPrivilege refuses a source database that still lets PUBLIC connect.
+	// Roles are cluster-global, so on an instance where tenant roles can authenticate, PUBLIC
+	// CONNECT means every tenant's role can open a session on this tenant's database. Refusing
+	// here means the migration is never asked to carry that posture forward.
+	CheckDatabaseConnectPrivilege CheckName = "DatabaseConnectPrivilege"
 )
 
 // Check is one gate's verdict. Detail is written for a human reading a condition message at
@@ -158,6 +168,8 @@ func RunPreflight(ctx context.Context, sql SQL, in PreflightInput) PreflightResu
 		checkStorageHeadroom(ctx, sql, in),
 		checkSourceUtilization(ctx, sql, in),
 		checkTenantIsCold(in),
+		checkTenantRoleAttributes(ctx, sql, in.Source),
+		checkDatabaseConnectPrivilege(ctx, sql, in.Source),
 	}
 	if in.RequireReplicaIdentity {
 		checks = append(checks, checkReplicaIdentity(ctx, sql, in.Source))
@@ -349,6 +361,62 @@ func checkTenantIsCold(in PreflightInput) Check {
 				"exactly the resource that is already scarce")
 	}
 	return passed(CheckTenantIsCold, "the tenant has stayed cold for the whole observation window")
+}
+
+// privilegedRoleQuery finds carried roles holding an attribute no tenant role should have.
+// Reads pg_roles, never pg_authid: nothing here needs a credential, and asking for one would
+// make a preflight check a place where credentials are read.
+const privilegedRoleQuery = `SELECT r.rolname || ':' || concat_ws(',',
+    CASE WHEN r.rolsuper THEN 'SUPERUSER' END,
+    CASE WHEN r.rolcreatedb THEN 'CREATEDB' END,
+    CASE WHEN r.rolcreaterole THEN 'CREATEROLE' END,
+    CASE WHEN r.rolreplication THEN 'REPLICATION' END,
+    CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END)
+  FROM pg_roles r
+ WHERE r.rolname = ANY (%s)
+   AND (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls)
+ ORDER BY 1`
+
+func checkTenantRoleAttributes(ctx context.Context, sql SQL, source Endpoint) Check {
+	roles, err := EnumerateTenantRoles(ctx, sql, source)
+	if err != nil {
+		return failed(CheckTenantRoleAttributes, err.Error())
+	}
+	if len(roles) == 0 {
+		return passed(CheckTenantRoleAttributes, "the tenant's database depends on no roles of its own")
+	}
+	names := make([]string, 0, len(roles))
+	for _, role := range roles {
+		names = append(names, role.Name)
+	}
+	offenders, err := firstColumn(ctx, sql, source, fmt.Sprintf(privilegedRoleQuery, textArray(names)))
+	if err != nil {
+		return failed(CheckTenantRoleAttributes, err.Error())
+	}
+	if len(offenders) > 0 {
+		return failed(CheckTenantRoleAttributes, fmt.Sprintf(
+			"these roles hold attributes a tenant role must not carry onto another instance: %s",
+			strings.Join(offenders, ", ")))
+	}
+	return passed(CheckTenantRoleAttributes, fmt.Sprintf(
+		"all %d carried role(s) are unprivileged", len(roles)))
+}
+
+const publicConnectQuery = `SELECT count(*)::text FROM pg_database d,
+  aclexplode(coalesce(d.datacl, acldefault('d'::"char", d.datdba))) e
+ WHERE d.datname = current_database() AND e.grantee = 0 AND e.privilege_type = 'CONNECT'`
+
+func checkDatabaseConnectPrivilege(ctx context.Context, sql SQL, source Endpoint) Check {
+	granted, err := scalarInt64(ctx, sql, source, publicConnectQuery)
+	if err != nil {
+		return failed(CheckDatabaseConnectPrivilege, err.Error())
+	}
+	if granted > 0 {
+		return failed(CheckDatabaseConnectPrivilege,
+			"PUBLIC holds CONNECT on this database, so every role on the target instance could "+
+				"open a session on it; REVOKE CONNECT ON DATABASE ... FROM PUBLIC first")
+	}
+	return passed(CheckDatabaseConnectPrivilege, "PUBLIC cannot connect to this database")
 }
 
 func passed(name CheckName, detail string) Check {

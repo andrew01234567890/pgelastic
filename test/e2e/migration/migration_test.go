@@ -54,6 +54,10 @@ const (
 	sizingClass = "dev-1"
 	// tenantDatabase is both the PgTenant name and its database.
 	tenantDatabase = "acme"
+	// tenantReader is a second role of the tenant's own, holding grants the migration has to
+	// carry. Without a role that is neither the owner nor the superuser, every ACL in the
+	// database would be a default one and the carry would have nothing to prove.
+	tenantReader = "acme_reader"
 	// neighbourDatabase is a second tenant, pinned to the other instance and never moved.
 	// It is what makes "the tenant that was migrated was paused" a claim with a control:
 	// without it, a latency spike everybody saw would be indistinguishable from one only the
@@ -170,10 +174,30 @@ func publishStorage(name string) {
 func seedTenant(instance string) {
 	GinkgoHelper()
 	exec(instance, "postgres", fmt.Sprintf(
-		`CREATE ROLE %s LOGIN; CREATE DATABASE %s OWNER %s TEMPLATE template0`,
-		tenantDatabase, tenantDatabase, tenantDatabase))
+		`CREATE ROLE %s LOGIN; CREATE ROLE %s NOLOGIN;
+		 CREATE DATABASE %s OWNER %s TEMPLATE template0`,
+		tenantDatabase, tenantReader, tenantDatabase, tenantDatabase))
 
-	exec(instance, tenantDatabase, `
+	// PUBLIC loses CONNECT here for the same reason a provisioned tenant does: roles are
+	// cluster-global, so leaving it would let every other tenant's role on the target open a
+	// session on this database. Preflight refuses a source that still grants it.
+	exec(instance, "postgres", fmt.Sprintf(
+		`REVOKE ALL ON DATABASE %s FROM PUBLIC;
+		 GRANT CONNECT, TEMPORARY ON DATABASE %s TO %s;
+		 GRANT CONNECT, TEMPORARY ON DATABASE %s TO %s;
+		 GRANT CONNECT ON DATABASE %s TO %s`,
+		tenantDatabase,
+		tenantDatabase, tenantDatabase,
+		tenantDatabase, tenantReader,
+		tenantDatabase, provision.OpsRole))
+
+	// Created as the tenant rather than as the superuser, and with grants a real tenant would
+	// make. That is what gives the migration something to carry: seeded as postgres with no
+	// ACLs, source and target agree in the broken state and no divergence exists to detect.
+	// Each grant below is a distinct catalog - relacl, attacl, nspacl, pg_default_acl - and
+	// each is carried by a different part of the dump.
+	exec(instance, tenantDatabase, fmt.Sprintf(`
+SET ROLE %s;
 CREATE TABLE orders (
   id bigserial PRIMARY KEY,
   customer text NOT NULL,
@@ -186,7 +210,15 @@ CREATE TABLE line_items (
   sku text NOT NULL,
   quantity int NOT NULL
 );
-CREATE INDEX line_items_order_id_idx ON line_items (order_id)`)
+CREATE INDEX line_items_order_id_idx ON line_items (order_id);
+CREATE SCHEMA reports AUTHORIZATION %s;
+GRANT SELECT ON orders TO %s;
+GRANT SELECT (sku, quantity) ON line_items TO %s;
+GRANT USAGE ON SCHEMA reports TO %s;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO %s;
+RESET ROLE`,
+		tenantDatabase, tenantDatabase,
+		tenantReader, tenantReader, tenantReader, tenantReader))
 
 	exec(instance, tenantDatabase, fmt.Sprintf(`
 INSERT INTO orders (customer, amount, placed_at)
@@ -691,6 +723,62 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 					"rather than a move of somebody else's tenant", report.duringMax)
 		})
 
+		// The defect the demo found, asserted from PostgreSQL's own catalogs on the far side.
+		// Every relation used to arrive owned by postgres with an empty ACL, because both
+		// pg_dump commands were passed --no-owner --no-privileges - and the verifier could not
+		// see it, because its fingerprint read neither relowner nor relacl. The first write a
+		// real client made through the proxy was then refused with 42501.
+		It("carried the tenant's ownership and grants onto the target", func() {
+			owners := query(instanceB, tenantDatabase,
+				`SELECT count(*)::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+				 WHERE c.relkind = 'r' AND n.nspname = 'public'
+				   AND pg_get_userbyid(c.relowner) <> '`+tenantDatabase+`'`)
+			Expect(owners).To(Equal("0"),
+				"relations arrived on the target owned by somebody other than the tenant")
+
+			Expect(query(instanceB, tenantDatabase,
+				`SELECT has_table_privilege('`+tenantReader+`', 'public.orders', 'SELECT')::text`)).
+				To(Equal("true"), "the reader's table grant did not survive the move")
+
+			Expect(query(instanceB, tenantDatabase,
+				`SELECT has_column_privilege('`+tenantReader+`', 'public.line_items', 'sku', 'SELECT')::text`)).
+				To(Equal("true"), "the reader's column grant did not survive the move")
+
+			Expect(query(instanceB, tenantDatabase,
+				`SELECT count(*)::text FROM pg_namespace
+				 WHERE nspname = 'reports' AND pg_get_userbyid(nspowner) = '`+tenantDatabase+`'`)).
+				To(Equal("1"), "the tenant's schema did not arrive owned by the tenant")
+
+			Expect(query(instanceB, tenantDatabase,
+				`SELECT count(*)::text FROM pg_default_acl`)).NotTo(Equal("0"),
+				"the tenant's default privileges were dropped, so tables it creates after the "+
+					"move silently will not carry the grants its configuration says they should")
+		})
+
+		// GrantSourceReads opens SELECT to the replication role so pg_dump can read the source,
+		// and those grants are live while the dump runs. Carrying privileges without taking
+		// them back would hand a credential that lives in every member's environment standing
+		// read access to the tenant's data - a worse outcome than the bug being fixed.
+		It("did not bake the migration's own credential into the tenant's schema", func() {
+			Expect(query(instanceB, tenantDatabase,
+				`SELECT count(*)::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+				 WHERE c.relkind IN ('r','S') AND `+migration.UserSchemaPredicate+`
+				   AND has_table_privilege('`+provision.ReplicationRole+`', c.oid, 'SELECT')`)).
+				To(Equal("0"),
+					"the replication role kept read access to every table it was granted for the dump")
+		})
+
+		// Roles are cluster-global, so a target that still lets PUBLIC connect is one every
+		// other tenant's role on that instance can open a session on.
+		It("left the target database reachable only by the tenant's own roles", func() {
+			Expect(query(instanceB, "postgres",
+				`SELECT count(*)::text FROM pg_database d,
+				   aclexplode(coalesce(d.datacl, acldefault('d'::"char", d.datdba))) e
+				 WHERE d.datname = '`+tenantDatabase+`' AND e.grantee = 0
+				   AND e.privilege_type = 'CONNECT'`)).To(Equal("0"),
+				"PUBLIC can connect to the migrated database")
+		})
+
 		It("opened a failover-enabled slot rather than one a failover would destroy", func() {
 			// The slot is dropped by the cleanup ladder on success, so what is checked here is
 			// the durable evidence: the migration recorded the slot it owned, and the source
@@ -838,8 +926,8 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 		})
 
 		It("treats a target that already carries the schema as a satisfied precondition", func() {
-			Expect(migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true)).To(Succeed())
-			Expect(migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true)).
+			Expect(migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true, false)).To(Succeed())
+			Expect(migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true, false)).
 				To(Succeed(), "a second provisioning pass failed on the schema it had itself copied")
 
 			Expect(relationCount("line_items")).To(Equal("1"))
@@ -852,7 +940,7 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 			exec(instanceB, "postgres", fmt.Sprintf(`CREATE DATABASE %q TEMPLATE template0`, probeDatabase))
 			exec(instanceB, probeDatabase, `CREATE TABLE orders (id bigint)`)
 
-			err := migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true)
+			err := migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true, false)
 			Expect(err).To(HaveOccurred(), "a copy onto a relation that already exists reported success")
 			Expect(err.Error()).To(ContainSubstring("already exists"))
 
@@ -862,7 +950,7 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 				"a copy that did not commit stamped the database as though it had")
 
 			exec(instanceB, probeDatabase, `DROP TABLE orders`)
-			Expect(migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true)).
+			Expect(migration.ProvisionTarget(suiteCtx, sql, sql, probe, tenantDatabase, true, false)).
 				To(Succeed(), "the retry did not converge")
 			Expect(relationCount("line_items")).To(Equal("1"))
 			Expect(schemaStampOf(probeDatabase)).To(Equal(probe.SchemaStamp))

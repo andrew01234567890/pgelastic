@@ -72,6 +72,12 @@ const VerifierSetup = `SET search_path = pg_catalog; ` +
 //     write that arrives afterwards.
 //   - Pre-existing corruption: a source whose data was already wrong produces a target that
 //     is equivalently wrong, and this verifier will pass it.
+//
+// Ownership and object privileges are deliberately absent from this list: they are compared,
+// by the acl, schema and default-privilege parts of the schema fingerprint. They were absent
+// before as well, but then the omission was a false claim rather than a true one - the verdict
+// said nothing about them and checked nothing either. Understating what a verdict covers is
+// the failure this list exists to prevent, so the entries below are the ones that remain.
 var VerifierLimits = []string{
 	"ctid, xmin, xmax and cmin/cmax differ after any logical copy and are not compared",
 	"TOAST storage layout and compression method are not observable through the value",
@@ -80,6 +86,9 @@ var VerifierLimits = []string{
 	"planner statistics are not copied and are not compared",
 	"nothing written after the checksum LSN is covered by the verdict",
 	"a source that was already corrupt yields an equivalently corrupt target that passes",
+	"role passwords are never compared, and are never carried between instances",
+	"privileges held by the control plane's own roles are excluded from the comparison",
+	"privileges on objects outside the tenant's user schemas are not compared",
 }
 
 // LimitsMessage renders the limits for a condition message.
@@ -307,6 +316,61 @@ var schemaFingerprintParts = []string{
 	`SELECT 'sequence:' || schemaname || '.' || sequencename || ':' || data_type::text || ':' ||
 	   increment_by::text || ':' || min_value::text || ':' || max_value::text
 	 FROM pg_sequences`,
+
+	// Ownership and privileges. Without these the verdict was blind to exactly the thing this
+	// migration now carries: a target where every relation is owned by postgres with an empty
+	// ACL fingerprinted identically to a source where the tenant owned everything.
+	//
+	// Four things make the comparison mean something rather than merely differ:
+	//
+	//   - relacl NULL is not "no privileges", it is "the default for this kind and owner". A
+	//     restored object may hold that same set written out explicitly. Both sides are pushed
+	//     through acldefault() so the two spellings agree.
+	//   - acldefault's type code comes from relkind, because 's' (sequence) grants rwU while
+	//     'r' grants arwdDxtm. Using one for the other is a mismatch on every sequence, for ever.
+	//   - the entries are sorted. An ACL array is in grant order, so two identical privilege
+	//     sets granted in a different order would hash differently.
+	//   - the control-plane roles are filtered out. The replication role holds SELECT on the
+	//     source for the whole migration and never on the target, so leaving it in would make
+	//     every migration fail its own gate. PUBLIC (grantee 0) is kept, because whether PUBLIC
+	//     can reach a tenant's database is precisely what the datacl carry is about - and
+	//     pg_get_userbyid(0) is not 'public', it is 'unknown (OID=0)', so it is spelled here.
+	`SELECT 'acl:' || n.nspname || '.' || c.relname || ':' || pg_get_userbyid(c.relowner) || ':' ||
+	   coalesce((SELECT string_agg(entry, ',' ORDER BY entry COLLATE "C") FROM (
+	     SELECT CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(e.grantee) END ||
+	            ':' || e.privilege_type || ':' || e.is_grantable::text ||
+	            ':' || pg_get_userbyid(e.grantor) AS entry
+	       FROM aclexplode(coalesce(c.relacl,
+	              acldefault((CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END)::"char", c.relowner))) e
+	      WHERE e.grantee = 0 OR pg_get_userbyid(e.grantee) NOT IN
+	            ('postgres', 'pgelastic_ops', 'pgelastic_repl', 'pgelastic_rewind')
+	   ) entries), '')
+	 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+	 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f') AND ` + UserSchemaPredicate,
+
+	`SELECT 'schema:' || n.nspname || ':' || pg_get_userbyid(n.nspowner) || ':' ||
+	   coalesce((SELECT string_agg(entry, ',' ORDER BY entry COLLATE "C") FROM (
+	     SELECT CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(e.grantee) END ||
+	            ':' || e.privilege_type AS entry
+	       FROM aclexplode(coalesce(n.nspacl, acldefault('n'::"char", n.nspowner))) e
+	      WHERE e.grantee = 0 OR pg_get_userbyid(e.grantee) NOT IN
+	            ('postgres', 'pgelastic_ops', 'pgelastic_repl', 'pgelastic_rewind')
+	   ) entries), '')
+	 FROM pg_namespace n WHERE ` + UserSchemaPredicate,
+
+	// Default privileges break the future rather than the present: without them, tables the
+	// tenant creates after the move silently do not get the grants its configuration says they
+	// should. Note defaclobjtype spells sequences 'S' where acldefault spells them 's'.
+	`SELECT 'default:' || pg_get_userbyid(d.defaclrole) || ':' ||
+	   coalesce(n.nspname, '') || ':' || d.defaclobjtype::text || ':' ||
+	   coalesce((SELECT string_agg(entry, ',' ORDER BY entry COLLATE "C") FROM (
+	     SELECT CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(e.grantee) END ||
+	            ':' || e.privilege_type AS entry
+	       FROM aclexplode(d.defaclacl) e
+	      WHERE e.grantee = 0 OR pg_get_userbyid(e.grantee) NOT IN
+	            ('postgres', 'pgelastic_ops', 'pgelastic_repl', 'pgelastic_rewind')
+	   ) entries), '')
+	 FROM pg_default_acl d LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace`,
 }
 
 func (v Verifier) schemaFingerprint(ctx context.Context, at Endpoint) (string, error) {
