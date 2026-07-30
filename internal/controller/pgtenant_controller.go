@@ -43,6 +43,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/metering"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
 	"github.com/andrew01234567890/pgelastic/internal/placement"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
@@ -351,7 +352,16 @@ func (r *PgTenantReconciler) provision(
 		return err
 	}
 
+	// Minted before the role is created, because the role is created with it. A tenant whose
+	// credential cannot be written is left unprovisioned rather than provisioned passwordless:
+	// a role the proxy cannot authenticate as is a tenant nobody can reach, and it would look
+	// exactly like a working one from the outside.
+	credential, err := r.ensureBackendCredential(ctx, tenant, scramIterationsOf(resolved))
+	if err != nil {
+		return err
+	}
 	spec := tenantSpecOf(tenant, connectionLimitOf(resolved))
+	spec.Verifier = credential.Verifier
 	state, err := tenantdb.Ensure(ctx, r.SQL, tenantEndpoint(tenant, host.Name), spec)
 	if err != nil {
 		r.notServing(status, tenant.Generation, tenantdb.ReasonProvisioningFailed, err.Error())
@@ -472,20 +482,30 @@ func tenantEndpoint(tenant *pgelasticv1alpha1.PgTenant, instance string) tenantd
 
 func tenantSpecOf(tenant *pgelasticv1alpha1.PgTenant, connectionLimit int32) tenantdb.Spec {
 	return tenantdb.Spec{
-		Database:        tenant.Spec.DatabaseName,
-		Owner:           ptr.Deref(tenant.Spec.Owner, tenant.Spec.DatabaseName),
+		Database: tenant.Spec.DatabaseName,
+		// Derived from the tenant's identity rather than taken from spec.owner. Roles are
+		// cluster-global, so two tenants that chose the same owner would otherwise share one -
+		// and now that these roles carry credentials, sharing one is a merge of two identities
+		// rather than an untidy privilege union. spec.owner survives as the readable prefix.
+		Owner:           migration.BackendRoleName(tenant.Namespace, tenant.Name),
 		ConnectionLimit: connectionLimit,
 	}
 }
 
-// connectionLimitOf mirrors the effective burstable ceiling onto the tenant's role. The
-// proxy is where the ceiling is really enforced; this is the backstop for a client that
-// reached PostgreSQL some other way.
-func connectionLimitOf(resolved resolution) int32 {
-	if resolved.effective.Burstable <= 0 {
-		return tenantdb.NoConnectionLimit
-	}
-	return resolved.effective.Burstable
+// connectionLimitOf leaves the tenant's role uncapped, deliberately.
+//
+// It used to mirror the effective burstable ceiling as an in-database backstop, which was
+// harmless while nothing ever logged in as that role. Now that the proxy authenticates as it,
+// every backend the fleet opens counts against rolconnlimit - and N replicas each entitled to
+// hold up to burstable would breach a limit of burstable by a factor of N, with
+// "too many connections for role" arriving at whichever client happened to be last.
+//
+// The proxy's own ledger is the ceiling that means anything: it is fleet-wide, it is the number
+// the capacity model is built on, and it is enforced before a backend is opened rather than
+// after. A per-role limit that is only correct for a single-replica fleet is not a backstop,
+// it is a second limiter that disagrees with the first.
+func connectionLimitOf(_ resolution) int32 {
+	return tenantdb.NoConnectionLimit
 }
 
 // candidatesFor charges each instance with the tenants already bound to it, so that an
