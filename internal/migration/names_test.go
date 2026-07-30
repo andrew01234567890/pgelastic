@@ -45,10 +45,18 @@ func TestTwoTenantsOfTheSameNameGetDifferentRoles(t *testing.T) {
 	}
 }
 
-// The digest is over the tenant's identity rather than over spec.owner, so renaming the
-// readable part cannot rename the role that owns every object in the database.
-func TestTheRoleNameIsStableAcrossItsReadablePart(t *testing.T) {
-	if BackendRoleName("alpha", "acme") != BackendRoleName("alpha", "acme") {
-		t.Fatal("the derivation is not deterministic")
+// The name is a function of the tenant's identity and nothing else. spec.owner is not an
+// input, so editing it cannot rename the role that owns every object in the database - and two
+// tenants in one namespace still get their own role.
+func TestTheRoleNameIsAFunctionOfTheTenantIdentityAlone(t *testing.T) {
+	acme := BackendRoleName("alpha", "acme")
+	if acme != BackendRoleName("alpha", "acme") {
+		t.Fatal("the derivation is not deterministic, so a reconcile could rename a live role")
+	}
+	if acme == BackendRoleName("alpha", "globex") {
+		t.Fatal("two tenants in one namespace derived the same role")
+	}
+	if !strings.Contains(acme, "acme") {
+		t.Fatalf("the role is not identifiable as the tenant's in \\du or pg_stat_activity: %s", acme)
 	}
 }

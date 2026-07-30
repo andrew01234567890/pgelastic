@@ -224,6 +224,11 @@ func (c *Cluster) apply(statement string) error {
 		return c.dropDatabase(names)
 	case strings.HasPrefix(statement, "DROP ROLE"):
 		return c.dropRole(names)
+	case strings.HasPrefix(statement, "REVOKE "), strings.HasPrefix(statement, "GRANT "):
+		// Recorded rather than modelled. What these say is asserted by reading the statements
+		// back, and modelling an ACL well enough to answer questions about it would be
+		// modelling the part of PostgreSQL the e2e exists to ask.
+		return nil
 	default:
 		return fmt.Errorf(`syntax error at or near "%s"`, statement)
 	}
@@ -259,12 +264,21 @@ func (c *Cluster) createDatabase(names []string) error {
 var connectionLimitPattern = regexp.MustCompile(`CONNECTION LIMIT (-?\d+)`)
 
 func (c *Cluster) alterRole(statement string, names []string) error {
-	match := connectionLimitPattern.FindStringSubmatch(statement)
-	if len(names) != 1 || match == nil {
+	if len(names) != 1 {
 		return fmt.Errorf(`syntax error at or near "%s"`, statement)
 	}
 	if _, ok := c.roles[names[0]]; !ok {
 		return fmt.Errorf(`role "%s" does not exist`, names[0])
+	}
+	// A credential is accepted and not stored. What the fake could say about a verifier is
+	// only what it was handed; whether PostgreSQL accepts the form, and whether the proxy can
+	// then authenticate against it, is a question for a real postmaster.
+	if strings.Contains(statement, " PASSWORD ") {
+		return nil
+	}
+	match := connectionLimitPattern.FindStringSubmatch(statement)
+	if match == nil {
+		return fmt.Errorf(`syntax error at or near "%s"`, statement)
 	}
 	limit, err := strconv.ParseInt(match[1], 10, 32)
 	if err != nil {
