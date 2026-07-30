@@ -454,6 +454,63 @@ func (r *PgElasticPoolReconciler) proxyUsers(
 			Password: password,
 		})
 	}
+
+	contained, err := r.containedUsers(ctx, pool, view)
+	if err != nil {
+		return nil, err
+	}
+	return append(users, contained...), nil
+}
+
+// containedUsers collects the PgTenantUser logins for the pool's tenants.
+//
+// This is the contained-user half: a login that exists in pgelastic scoped to a PgTenant rather
+// than in pg_authid scoped to a cluster, so two tenants may each have a user called `app` and
+// they are different identities. Each one carries the tenant it belongs to, which is what the
+// proxy compares against the tenant a connection resolves to.
+//
+// A login with no credentials Secret contributes nothing rather than being admitted without
+// one: a user the proxy cannot challenge is a user it would have to let in.
+func (r *PgElasticPoolReconciler) containedUsers(
+	ctx context.Context,
+	pool *pgelasticv1alpha1.PgElasticPool,
+	view *poolView,
+) ([]proxy.User, error) {
+	logins := &pgelasticv1alpha1.PgTenantUserList{}
+	if err := r.List(ctx, logins, client.InNamespace(pool.Namespace)); err != nil {
+		return nil, err
+	}
+	databases := map[string]string{}
+	for i := range view.tenants {
+		tenant := view.tenants[i].tenant
+		databases[tenant.Name] = tenant.Spec.DatabaseName
+	}
+
+	users := make([]proxy.User, 0, len(logins.Items))
+	for i := range logins.Items {
+		login := &logins.Items[i]
+		database, ours := databases[login.Spec.TenantRef.Name]
+		if !ours || login.Spec.CredentialsSecretRef == nil {
+			continue
+		}
+		secret := &corev1.Secret{}
+		key := client.ObjectKey{Namespace: pool.Namespace, Name: login.Spec.CredentialsSecretRef.Name}
+		if err := r.Get(ctx, key, secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		password := string(secret.Data[tenantCredentialsKey])
+		if password == "" {
+			continue
+		}
+		users = append(users, proxy.User{
+			Name:     login.Spec.UserName,
+			Tenant:   database,
+			Password: password,
+		})
+	}
 	return users, nil
 }
 

@@ -131,3 +131,16 @@ const ScratchDir = provision.DataMountPath + "/pgelastic-migration"
 func DumpDir(namespace, name string) string {
 	return ScratchDir + "/" + transliterate(namespace) + "_" + transliterate(name)
 }
+
+// TenantUserRoleName is the cluster-global name of one of a tenant's logins.
+//
+// Namespaced by the same digest as the tenant's own role, and for the same reason: two tenants
+// may each have a user called `app`, and Azure's contained-user model requires those to be
+// wholly independent identities. PostgreSQL cannot give that - pg_authid is shared - so the
+// name has to carry it, or one tenant's `app` and another's become one role with the union of
+// both their privileges.
+func TenantUserRoleName(namespace, tenant, user string) string {
+	digest := sha256.Sum256([]byte(namespace + "/" + tenant))
+	return BackendRolePrefix + transliterate(tenant) + "_" +
+		hex.EncodeToString(digest[:4]) + "_" + transliterate(user)
+}

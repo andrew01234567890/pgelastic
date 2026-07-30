@@ -115,6 +115,9 @@ var _ = BeforeSuite(func() {
 	err = SetupPgTenantWebhookWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
+	err = SetupPgTenantUserWebhookWithManager(mgr)
+	Expect(err).NotTo(HaveOccurred())
+
 	err = SetupPgWorkloadClassWebhookWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 

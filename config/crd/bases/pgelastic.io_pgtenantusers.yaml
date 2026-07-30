@@ -1,0 +1,251 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgtenantusers.pgelastic.io
+spec:
+  group: pgelastic.io
+  names:
+    categories:
+    - pgelastic
+    kind: PgTenantUser
+    listKind: PgTenantUserList
+    plural: pgtenantusers
+    shortNames:
+    - pgtu
+    singular: pgtenantuser
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.tenantRef.name
+      name: Tenant
+      type: string
+    - jsonPath: .spec.userName
+      name: User
+      type: string
+    - jsonPath: .status.roleName
+      name: Role
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: PgTenantUser is one login inside a tenant's database.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              PgTenantUserSpec is one login inside a tenant's database.
+
+              This is Azure SQL's contained database user, reproduced on PostgreSQL - where it cannot exist
+              natively, because pg_authid is a shared catalog and there is no such thing as a user scoped
+              to one database. Azure states the property this kind exists to give back: "The identity is
+              confined to the database. The identity is independent (in all aspects) from a user who has
+              the same name and the same password in another database in the same server."
+
+              pgelastic reproduces it above PostgreSQL rather than inside it. The proxy is already the
+              authentication boundary, so the credential lives in pgelastic's control plane scoped to a
+              PgTenant, and the PostgreSQL role it maps to is named after the tenant's identity so two
+              tenants' users of the same name cannot become one role.
+
+              **What is not here is the point.** There is no field for SUPERUSER, CREATEDB, CREATEROLE,
+              REPLICATION or BYPASSRLS, and no way to name a role outside this tenant. A PgTenantUser is
+              structurally incapable of granting access beyond its own tenant, which is what makes it safe
+              to let a tenant's own operators create them: the containment is the API's shape rather than a
+              rule a webhook has to keep enforcing correctly for ever.
+
+              Azure's own caveat is why that matters: "database owners and database users who have the
+              ALTER ANY USER permission can grant access to the database... reduces the access control of
+              highly privileged server logins and expands the access control to include highly privileged
+              database users". Containment moves the trust boundary onto whoever can mint users, so here it
+              is bounded by Kubernetes RBAC on this kind rather than by an in-database permission.
+            properties:
+              connectionLimit:
+                description: |-
+                  ConnectionLimit bounds sessions this user may hold, as an in-database backstop. The
+                  proxy's ledger is the enforcement point. -1 leaves it uncapped, which is the default.
+                format: int32
+                minimum: -1
+                type: integer
+              credentialsSecretRef:
+                description: |-
+                  CredentialsSecretRef holds the login's password, in the same namespace.
+
+                  A login with no credentials Secret authenticates nobody and is reported not ready rather
+                  than admitted: a user the proxy cannot challenge is one it would have to let in.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              login:
+                default: true
+                description: |-
+                  Login is whether this user may open a session. False makes it a group role - something to
+                  grant to, and to hold grants, without anybody authenticating as it.
+                type: boolean
+              memberOf:
+                description: |-
+                  MemberOf names other users **of the same tenant** whose privileges this one inherits.
+
+                  Same-tenant is enforced rather than conventional. A membership reaching outside the
+                  tenant is the one thing this kind could otherwise express that would breach containment,
+                  so it is refused at admission.
+                items:
+                  type: string
+                maxItems: 32
+                type: array
+                x-kubernetes-list-type: set
+              tenantRef:
+                description: |-
+                  TenantRef is the tenant this login belongs to, in the same namespace. A login is
+                  meaningless without one: the tenant is what decides which database it reaches and which
+                  PostgreSQL role it becomes.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              userName:
+                description: |-
+                  UserName is the name a client sends in its startup packet.
+
+                  Unique within the tenant rather than within the cluster, which is the containment
+                  property: two tenants may each have a user called `app`, and they are different
+                  identities with different credentials that cannot reach each other's data.
+                maxLength: 63
+                pattern: ^[a-z_][a-z0-9_]*$
+                type: string
+            required:
+            - tenantRef
+            - userName
+            type: object
+          status:
+            description: PgTenantUserStatus is what the login actually is on the instance
+              hosting its tenant.
+            properties:
+              conditions:
+                description: Conditions carry Accepted and Ready.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: ObservedGeneration is the spec generation this status
+                  describes.
+                format: int64
+                type: integer
+              phase:
+                default: Pending
+                description: Phase is a display-only summary of the conditions.
+                enum:
+                - Pending
+                - Ready
+                - Failed
+                type: string
+              roleName:
+                description: |-
+                  RoleName is the PostgreSQL role this login maps to.
+
+                  Published rather than left to be recomputed, because it is what appears in pg_stat_activity,
+                  in log_line_prefix and in relowner - so anybody reading those needs to be able to get from
+                  the role back to the object without knowing the derivation.
+                maxLength: 63
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

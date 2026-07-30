@@ -134,11 +134,20 @@ rules:
   - pginstances/status
   - pgtenantmigrations/status
   - pgtenants/status
+  - pgtenantusers/status
   - pgworkloadclasses/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - pgelastic.io
+  resources:
+  - pgtenantusers
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - policy
   resources:
