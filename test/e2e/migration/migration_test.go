@@ -213,7 +213,7 @@ CREATE TABLE line_items (
 CREATE INDEX line_items_order_id_idx ON line_items (order_id);
 CREATE SCHEMA reports AUTHORIZATION %s;
 GRANT SELECT ON orders TO %s;
-GRANT SELECT (customer, amount) ON line_items TO %s;
+GRANT SELECT (sku, quantity) ON line_items TO %s;
 GRANT USAGE ON SCHEMA reports TO %s;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO %s;
 RESET ROLE`,
@@ -741,7 +741,7 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 				To(Equal("true"), "the reader's table grant did not survive the move")
 
 			Expect(query(instanceB, tenantDatabase,
-				`SELECT has_column_privilege('`+tenantReader+`', 'public.line_items', 'customer', 'SELECT')::text`)).
+				`SELECT has_column_privilege('`+tenantReader+`', 'public.line_items', 'sku', 'SELECT')::text`)).
 				To(Equal("true"), "the reader's column grant did not survive the move")
 
 			Expect(query(instanceB, tenantDatabase,
