@@ -36,7 +36,43 @@ func passingSource() *fakeSQL {
 		answer("SELECT extname FROM pg_extension", Row{AlwaysInstalledExtensions[0]}).
 		scalarAnswer("FROM pg_database d WHERE d.datname = current_database()", "UTF8|C|C|b|C.UTF-8|").
 		scalarAnswer("pg_database_size", "1048576").
-		scalarAnswer("FROM pg_stat_activity WHERE backend_type", "12")
+		scalarAnswer("FROM pg_stat_activity WHERE backend_type", "12").
+		answer(roleEnumerationFragment).
+		answer("CASE WHEN r.rolsuper THEN 'SUPERUSER' END").
+		scalarAnswer("e.grantee = 0 AND e.privilege_type = 'CONNECT'", "0")
+}
+
+// A migration must not be a route by which a tenant acquires an attribute it was never
+// granted. CREATEROLE is the sharpest of them: a role that holds it can mint cluster-global
+// roles of its own on the far side, which defeats every naming rule above it.
+func TestPreflightRefusesToCarryAPrivilegedRole(t *testing.T) {
+	sql := passingSource().
+		answer(roleEnumerationFragment, Row{"shop_admin", "t", "t", "-1", ""}).
+		answer("CASE WHEN r.rolsuper THEN 'SUPERUSER' END", Row{"shop_admin:CREATEROLE"})
+
+	result := RunPreflight(context.Background(), sql, passingInput())
+	if result.Passed() {
+		t.Fatal("a role holding CREATEROLE was carried onto another instance")
+	}
+	if !strings.Contains(result.Message(), "shop_admin") {
+		t.Fatalf("the refusal does not name the role that caused it: %s", result.Message())
+	}
+}
+
+// Roles are cluster-global, so PUBLIC CONNECT on a tenant's database means every other
+// tenant's role on the target instance can open a session on it. Refused here rather than
+// carried forward.
+func TestPreflightRefusesASourceThatLetsPublicConnect(t *testing.T) {
+	sql := passingSource().
+		scalarAnswer("e.grantee = 0 AND e.privilege_type = 'CONNECT'", "1")
+
+	result := RunPreflight(context.Background(), sql, passingInput())
+	if result.Passed() {
+		t.Fatal("a database every role could connect to was accepted for migration")
+	}
+	if !strings.Contains(result.Message(), "PUBLIC") {
+		t.Fatalf("the refusal does not say what is wrong: %s", result.Message())
+	}
 }
 
 func passingInput() PreflightInput {

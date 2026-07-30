@@ -62,6 +62,10 @@ type CopyProgress struct {
 // Done reports whether every relation has finished its initial sync.
 func (p CopyProgress) Done() bool { return p.Total > 0 && p.Copied >= p.Total }
 
+// Resettable says the tenant is provably still served by the source, so a target left over
+// from an earlier attempt is wreckage rather than a database anybody is reading.
+type Resettable bool
+
 // ProvisionTarget creates the tenant's database on the target with the source's collation
 // tuple, and copies the schema when the caller asks for it.
 //
@@ -76,15 +80,39 @@ func (p CopyProgress) Done() bool { return p.Total > 0 && p.Copied >= p.Total }
 // inside it, so the stamp is present if and only if the whole schema is.
 func ProvisionTarget(
 	ctx context.Context, sql SQL, shell Shell, plan Plan, owner string, copySchema bool,
+	mayReset Resettable,
 ) error {
 	postgres := plan.Target.WithDatabase("postgres")
 	if err := ensureOwnerRole(ctx, sql, postgres, owner); err != nil {
+		return err
+	}
+	// Every role the tenant's database depends on has to exist before anything names it. The
+	// database is created OWNER <owner>, and the schema apply carries ALTER ... OWNER TO and
+	// GRANT ... TO for the rest - inside one transaction, so a single missing role fails the
+	// whole copy rather than the one statement that mentioned it.
+	roles, err := EnumerateTenantRoles(ctx, sql, plan.Source)
+	if err != nil {
+		return err
+	}
+	if err := EnsureTenantRoles(ctx, sql, postgres, roles); err != nil {
+		return err
+	}
+	if err := CarryMemberships(ctx, sql, plan.Source, postgres, roles); err != nil {
 		return err
 	}
 	exists, err := scalarInt64(ctx, sql, postgres, fmt.Sprintf(
 		`SELECT count(*)::text FROM pg_database WHERE datname = %s`, QuoteLiteral(plan.Target.Database)))
 	if err != nil {
 		return err
+	}
+	if exists != 0 && copySchema && bool(mayReset) {
+		discarded, err := resetUnstampedTarget(ctx, sql, plan)
+		if err != nil {
+			return err
+		}
+		if discarded {
+			exists = 0
+		}
 	}
 	if exists == 0 {
 		create := fmt.Sprintf(`CREATE DATABASE %s TEMPLATE template0`, QuoteIdentifier(plan.Target.Database))
@@ -106,11 +134,49 @@ func ProvisionTarget(
 	if copied {
 		return nil
 	}
-	output, err := shell.Run(ctx, plan.Target, []string{"sh", "-c", schemaCopyCommand(plan)})
+	output, err := shell.Run(ctx, plan.Target,
+		[]string{"sh", "-c", schemaCopyCommand(plan, owner, roles)})
 	if err != nil {
 		return fmt.Errorf("copying the schema onto the target: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+// resetUnstampedTarget discards a target that carries objects but no stamp, and reports
+// whether it did.
+//
+// That combination has exactly one cause: an earlier attempt that applied part or all of a
+// schema and then lost its stamp - or never committed one. Nothing else produces it, and
+// nothing recovers from it on its own: the copy is skipped only when the stamp is present, so
+// every later attempt re-applies the same schema onto its own objects and dies on "already
+// exists" until the retry budget is gone.
+//
+// Dropped and recreated rather than emptied, because the drop is the only action that also
+// clears default privileges, extensions, non-public schemas and database-level grants. The
+// same reasoning is already written down for the offline path's --clean --if-exists.
+//
+// The caller has established that the tenant is still served by the source, so nothing is
+// reading this database. A stamped target is a satisfied precondition and is never touched:
+// after a successful cutover the ladder clears the stamp deliberately and the tenant is
+// serving from exactly this database, which is why "unstamped and non-empty" alone would be a
+// rule that deletes live tenants.
+func resetUnstampedTarget(ctx context.Context, sql SQL, plan Plan) (bool, error) {
+	stamped, err := SchemaCopied(ctx, sql, plan)
+	if err != nil || stamped {
+		return false, err
+	}
+	objects, err := scalarInt64(ctx, sql, plan.Target, fmt.Sprintf(
+		`SELECT count(*)::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE c.relkind IN ('r','p','v','m','S','f') AND %s`, UserSchemaPredicate))
+	if err != nil || objects == 0 {
+		return false, err
+	}
+	if err := DropTargetDatabase(ctx, sql, plan.Target); err != nil {
+		return false, fmt.Errorf(
+			"discarding an unstamped target carrying %d object(s) from an earlier attempt: %w",
+			objects, err)
+	}
+	return true, nil
 }
 
 // schemaStampQuery asks whether the target carries a stamp, rather than asking what the
@@ -170,17 +236,26 @@ func ensureOwnerRole(ctx context.Context, sql SQL, postgres Endpoint, owner stri
 // leaves the whole schema and the stamp, or it leaves the database exactly as it found it.
 // Without them a copy interrupted part-way would leave objects behind that the retry then
 // failed on - which is not a retry at all, only a slower way to exhaust the budget.
-func schemaCopyCommand(plan Plan) string {
+//
+// The dump no longer strips owners and privileges, so the tenant's objects arrive owned by the
+// roles that owned them and carrying the grants they carried. Two sections are appended ahead
+// of the stamp, inside the same transaction, so that they are part of the same atom: the
+// database's own ACL, which pg_dump emits only under --create, and the removal of the
+// replication role's temporary reads, which the dump would otherwise have made permanent.
+func schemaCopyCommand(plan Plan, owner string, roles []RoleSpec) string {
 	file := plan.DumpDir + ".schema.sql"
-	stamp := fmt.Sprintf(`COMMENT ON DATABASE %s IS %s;`,
-		QuoteIdentifier(plan.Target.Database), QuoteLiteral(plan.SchemaStamp))
+	trailer := strings.Join(append(
+		append(databaseGrantsFor(plan.Target.Database, owner, roles), revokeReplicationGrantsSQL()),
+		fmt.Sprintf(`COMMENT ON DATABASE %s IS %s`,
+			QuoteIdentifier(plan.Target.Database), QuoteLiteral(plan.SchemaStamp)),
+	), ";\n") + ";"
 	return fmt.Sprintf(
-		`set -e; mkdir -p %s; pg_dump --schema-only --no-owner --no-privileges `+
+		`set -e; mkdir -p %s; pg_dump --schema-only `+
 			`--quote-all-identifiers --file=%s --dbname=%s; printf '%%s\n' %s >> %s; `+
 			`psql --set=ON_ERROR_STOP=1 --single-transaction --quiet --host=%s --username=postgres `+
 			`--dbname=%s --file=%s; rm -f %s`,
 		shellQuote(ScratchDir), shellQuote(file), shellQuote(plan.SourceConnInfo),
-		shellQuote(stamp), shellQuote(file),
+		shellQuote(trailer), shellQuote(file),
 		shellQuote(socketDir), shellQuote(plan.Target.Database), shellQuote(file), shellQuote(file))
 }
 
@@ -318,8 +393,44 @@ func DropSourceDatabase(ctx context.Context, sql SQL, source Endpoint) error {
 // DropTargetDatabase removes the copy a migration was building. It runs on every departure
 // from the happy path, because a half-built target is a database that stopped receiving
 // changes at an arbitrary instant and looks exactly like a complete one.
+//
+// Any subscription still defined in the target is removed first. WITH (FORCE) terminates
+// backends, which is what people expect it to solve, but PostgreSQL refuses to drop a database
+// that still owns a subscription whatever the connections are doing - dropdb counts
+// pg_subscription and raises object_in_use. So a cleanup ladder that failed to drop the
+// subscription, for any reason including one flaky exec, would otherwise leave a database that
+// can never be dropped and can never be re-provisioned.
 func DropTargetDatabase(ctx context.Context, sql SQL, target Endpoint) error {
+	if err := dropSubscriptionsIn(ctx, sql, target); err != nil {
+		return err
+	}
 	return dropDatabase(ctx, sql, target)
+}
+
+// dropSubscriptionsIn detaches and drops every subscription defined in a database, in the
+// order the ladder uses: a subscription dropped without SET (slot_name = NONE) first can block
+// indefinitely trying to reach a publisher that may no longer be there.
+func dropSubscriptionsIn(ctx context.Context, sql SQL, at Endpoint) error {
+	names, err := firstColumn(ctx, sql, at, `SELECT subname FROM pg_subscription ORDER BY 1`)
+	if err != nil {
+		// A database that cannot be read is one that may not exist, which is the ordinary case
+		// on a path that is about to issue DROP DATABASE IF EXISTS.
+		return nil //nolint:nilerr // the drop itself reports anything that actually matters
+	}
+	for _, name := range names {
+		quoted := QuoteIdentifier(name)
+		for _, statement := range []string{
+			`ALTER SUBSCRIPTION ` + quoted + ` DISABLE`,
+			`ALTER SUBSCRIPTION ` + quoted + ` SET (slot_name = NONE)`,
+			`DROP SUBSCRIPTION ` + quoted,
+		} {
+			if err := sql.Exec(ctx, at, statement); err != nil {
+				return fmt.Errorf("removing subscription %s before dropping %s: %w",
+					name, at.Database, err)
+			}
+		}
+	}
+	return nil
 }
 
 func dropDatabase(ctx context.Context, sql SQL, at Endpoint) error {

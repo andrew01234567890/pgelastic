@@ -69,7 +69,7 @@ func offlineDumpCommand(plan Plan, jobs int32) string {
 	// pg_dump creates the dump directory but not its parent, so the scratch root is made
 	// first rather than left to fail on a fresh volume.
 	return fmt.Sprintf(`set -e; mkdir -p %s; rm -rf %s; `+
-		`pg_dump --format=directory --jobs=%s --no-owner --no-privileges `+
+		`pg_dump --format=directory --jobs=%s `+
 		`--quote-all-identifiers --file=%s --dbname=%s`,
 		shellQuote(ScratchDir), shellQuote(plan.DumpDir), strconv.FormatInt(int64(jobs), 10),
 		shellQuote(plan.DumpDir), shellQuote(plan.SourceConnInfo))
@@ -84,8 +84,12 @@ func offlineDumpCommand(plan Plan, jobs int32) string {
 // of them - so the retry budget would be spent re-running a command that could never succeed.
 // The drops are safe because the target database holds nothing but what this migration is
 // restoring into it.
+//
+// Neither --no-owner nor --no-privileges appears on either command. The flag is accepted by
+// pg_dump and pg_restore both, so stripping on either end is enough to lose ownership and ACLs
+// - which is why removing it from only one of them would have changed nothing observable.
 func offlineRestoreCommand(plan Plan, jobs int32) string {
-	return fmt.Sprintf(`pg_restore --jobs=%s --no-owner --no-privileges --exit-on-error `+
+	return fmt.Sprintf(`pg_restore --jobs=%s --exit-on-error `+
 		`--clean --if-exists --host=%s --username=postgres --dbname=%s %s`,
 		strconv.FormatInt(int64(jobs), 10), shellQuote(socketDir),
 		shellQuote(plan.Target.Database), shellQuote(plan.DumpDir))

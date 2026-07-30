@@ -71,6 +71,13 @@ func newScriptedSQL() *scriptedSQL {
 		"SHOW sync_replication_slots":               {{"on"}},
 		"SHOW primary_slot_name":                    {{"pgelastic_pg_src_1"}},
 		"SHOW primary_conninfo":                     {{"host=pg-src-1 dbname=postgres"}},
+		// The roles a tenant's database depends on, the attributes they hold, and whether
+		// PUBLIC can still connect to it. A source with no roles of its own and no PUBLIC
+		// CONNECT is the ordinary case and the one that may be moved.
+		"FROM pg_roles r JOIN closure c ON c.oid = r.oid": {},
+		"CASE WHEN r.rolsuper THEN 'SUPERUSER' END":       {},
+		"e.grantee = 0 AND e.privilege_type = 'CONNECT'":  {{"0"}},
+		"FROM pg_auth_members a":                          {},
 		// Provisioning, copying, catchup and cutover.
 		"FROM pg_namespace n WHERE":                    {{"public"}},
 		"FROM pg_database WHERE datname":               {{"0"}},

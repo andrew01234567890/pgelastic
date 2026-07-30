@@ -44,7 +44,7 @@ func cleanableSQL() *fakeSQL {
 
 func TestTheCleanupLadderRunsInTheOneOrderThatCannotHang(t *testing.T) {
 	sql := cleanableSQL()
-	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole); err != nil {
+	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole, false); err != nil {
 		t.Fatal(err)
 	}
 	sequence := []string{
@@ -69,7 +69,7 @@ func TestTheCleanupLadderRunsInTheOneOrderThatCannotHang(t *testing.T) {
 
 func TestTheSlotIsDetachedBeforeTheSubscriptionIsDropped(t *testing.T) {
 	sql := cleanableSQL()
-	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole); err != nil {
+	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole, false); err != nil {
 		t.Fatal(err)
 	}
 	// DROP SUBSCRIPTION on a still-attached subscription tries to drop the slot over the
@@ -84,7 +84,7 @@ func TestTheSlotIsDetachedBeforeTheSubscriptionIsDropped(t *testing.T) {
 // end, so a ladder that aborted on the first error would routinely never reach it.
 func TestTheLadderStillDropsTheSlotAfterAnEarlierRungFails(t *testing.T) {
 	sql := cleanableSQL().fail("ALTER SUBSCRIPTION", errFake)
-	err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole)
+	err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole, false)
 	if err == nil {
 		t.Fatal("a failing rung was reported as success")
 	}
@@ -101,7 +101,7 @@ func TestTheLadderIsANoOpWhenTheSubscriptionIsAlreadyGone(t *testing.T) {
 		scalarAnswer("FROM pg_subscription WHERE subname", "0").
 		scalarAnswer("shobj_description(oid, 'pg_database')", "0").
 		answer("FROM pg_namespace n WHERE", Row{userSchema})
-	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole); err != nil {
+	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole, false); err != nil {
 		t.Fatal(err)
 	}
 	if sql.ran("DROP SUBSCRIPTION") >= 0 {
@@ -114,7 +114,7 @@ func TestTheLadderIsANoOpWhenTheSubscriptionIsAlreadyGone(t *testing.T) {
 
 func TestTheLadderRevokesTheReadsItOpened(t *testing.T) {
 	sql := cleanableSQL()
-	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole); err != nil {
+	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := sql.sawAll(
@@ -131,7 +131,7 @@ func TestTheLadderRevokesTheReadsItOpened(t *testing.T) {
 // inside it cannot, and the slot rung - the one that matters - still must.
 func TestTheLadderSkipsTheFencedSourceWithoutReportingAFailure(t *testing.T) {
 	sql := cleanableSQL().scalarAnswer("bool_or(datallowconn)", "false")
-	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole); err != nil {
+	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole, false); err != nil {
 		t.Fatalf("a fenced source was reported as a cleanup failure: %v", err)
 	}
 	if sql.ran("pg_drop_replication_slot") < 0 {
@@ -139,6 +139,33 @@ func TestTheLadderSkipsTheFencedSourceWithoutReportingAFailure(t *testing.T) {
 	}
 	if sql.ran("DROP PUBLICATION") >= 0 {
 		t.Fatal("the ladder opened a session on a database that refuses connections")
+	}
+}
+
+// The stamp is the only record that a target's schema was copied in full, and the ladder
+// clears it last. On a path that is about to drop the database that buys nothing - and if the
+// drop then fails, it has turned recoverable litter into a database that is fully schema'd,
+// unstamped and impossible to provision onto ever again.
+func TestTheStampSurvivesALadderThatIsAboutToDiscardTheTarget(t *testing.T) {
+	sql := cleanableSQL().scalarAnswer("shobj_description(oid, 'pg_database')", "1")
+	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole, true); err != nil {
+		t.Fatal(err)
+	}
+	if sql.ran("COMMENT ON DATABASE") >= 0 {
+		t.Fatal("the ladder cleared the stamp on a target it was about to drop")
+	}
+	if sql.ran("pg_drop_replication_slot") < 0 {
+		t.Fatal("skipping the stamp rung stopped the ladder reaching the slot")
+	}
+}
+
+func TestTheStampIsStillClearedWhenTheTargetIsBeingKept(t *testing.T) {
+	sql := cleanableSQL().scalarAnswer("shobj_description(oid, 'pg_database')", "1")
+	if err := Cleanup(context.Background(), sql, testPlan(), provision.ReplicationRole, false); err != nil {
+		t.Fatal(err)
+	}
+	if sql.ran("COMMENT ON DATABASE") < 0 {
+		t.Fatal("a tenant was handed a database still carrying the machinery that built it")
 	}
 }
 
