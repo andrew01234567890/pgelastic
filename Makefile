@@ -134,7 +134,7 @@ test-e2e-instance: manifests generate install-e2e load-instance-images ## Provis
 # stands a proxy fleet up as well, because the claim it exists to check - clients queued and
 # never dropped - is about a client's socket at that fleet and cannot be made without one.
 .PHONY: test-e2e-migration
-test-e2e-migration: manifests generate install-e2e load-data-plane-images ## Move a tenant between two real PostgreSQL 18 instances.
+test-e2e-migration: manifests generate install-e2e install-cert-manager load-data-plane-images ## Move a tenant between two real PostgreSQL 18 instances.
 	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) \
 	PGELASTIC_PROXY_IMG=$(PROXY_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
 	go test -tags=e2e ./test/e2e/migration/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
@@ -168,7 +168,7 @@ test-e2e-tenantdb: manifests generate install-e2e load-instance-images ## Create
 # through the pool" by connecting to the pool's Service and running a query, rather than by
 # reading what the operator believes about the fleet it created.
 .PHONY: test-e2e-proxy
-test-e2e-proxy: manifests generate install-e2e load-data-plane-images ## Route a client to its tenant's database through a real proxy fleet.
+test-e2e-proxy: manifests generate install-e2e install-cert-manager load-data-plane-images ## Route a client to its tenant's database through a real proxy fleet.
 	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) \
 	PGELASTIC_PROXY_IMG=$(PROXY_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
 	go test -tags=e2e ./test/e2e/proxy/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
@@ -189,7 +189,7 @@ test-e2e-proxy: manifests generate install-e2e load-data-plane-images ## Route a
 RESTART_LABEL_FILTER ?= $(if $(E2E_LABEL_FILTER),$(E2E_LABEL_FILTER),!multinode && !coexistence)
 
 .PHONY: test-e2e-restart
-test-e2e-restart: manifests generate install-e2e load-data-plane-images ## Roll a real 3-node instance under load and assert no client saw an error.
+test-e2e-restart: manifests generate install-e2e install-cert-manager load-data-plane-images ## Roll a real 3-node instance under load and assert no client saw an error.
 	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) \
 	PGELASTIC_PROXY_IMG=$(PROXY_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
 	go test -tags=e2e ./test/e2e/restart/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
@@ -201,11 +201,37 @@ test-e2e-restart: manifests generate install-e2e load-data-plane-images ## Roll 
 # first - `make docker-build deploy IMG=...` - because the spec fails, deliberately, if
 # there is nothing running for it to coexist with.
 .PHONY: test-e2e-coexistence
-test-e2e-coexistence: manifests generate install-e2e load-data-plane-images ## Prove two pgelastic operators can share one cluster.
+test-e2e-coexistence: manifests generate install-e2e install-cert-manager load-data-plane-images ## Prove two pgelastic operators can share one cluster.
 	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) \
 	PGELASTIC_PROXY_IMG=$(PROXY_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
 	go test -tags=e2e ./test/e2e/restart/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
 		-ginkgo.label-filter='coexistence'
+
+# cert-manager issues the certificates the proxy fleet's control listener presents and the
+# operator's client presents back to it. Without it the operator degrades to a fleet with no
+# control listener at all, so a suite that stands a fleet up and then expects a cutover needs
+# cert-manager present rather than absent.
+#
+# It is installed here rather than in the scaffold suite's BeforeSuite because that suite runs
+# only under `make test-e2e`, while every suite that actually needs cert-manager runs outside
+# it - which is why the nightly ran for months against a cluster that never had it.
+CERT_MANAGER_VERSION ?= v1.20.2
+CERT_MANAGER_URL ?= https://github.com/cert-manager/cert-manager/releases/download/$(CERT_MANAGER_VERSION)/cert-manager.yaml
+
+.PHONY: install-cert-manager
+install-cert-manager: ## Install cert-manager into E2E_CONTEXT unless it is already there.
+ifneq ($(CERT_MANAGER_INSTALL_SKIP),true)
+	@if "$(KUBECTL)" --context=$(E2E_CONTEXT) get crd certificates.cert-manager.io >/dev/null 2>&1; then \
+		echo "cert-manager is already installed in $(E2E_CONTEXT)."; \
+	else \
+		echo "Installing cert-manager $(CERT_MANAGER_VERSION) into $(E2E_CONTEXT)..."; \
+		"$(KUBECTL)" --context=$(E2E_CONTEXT) apply -f $(CERT_MANAGER_URL); \
+	fi
+	@# Waited for unconditionally, because "the CRDs exist" and "the webhook will answer" are
+	@# different facts and a Certificate created between them is rejected rather than queued.
+	"$(KUBECTL)" --context=$(E2E_CONTEXT) wait deployment.apps/cert-manager-webhook \
+		--for=condition=Available --namespace=cert-manager --timeout=5m
+endif
 
 .PHONY: install-e2e
 install-e2e: manifests kustomize ## Install CRDs into E2E_CONTEXT.

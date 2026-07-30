@@ -62,7 +62,7 @@ impl Proxy {
             .transpose()?;
         let iterations = NonZeroU32::new(config.auth.scram_iterations)
             .ok_or_else(|| ProxyError::config("auth.scramIterations must be non-zero"))?;
-        let mut verifiers = HashMap::new();
+        let mut users = HashMap::new();
         for user in &config.auth.users {
             let verifier = match (&user.verifier, &user.password) {
                 (Some(secret), _) => ScramVerifier::parse(secret)
@@ -80,7 +80,13 @@ impl Proxy {
                     )));
                 }
             };
-            verifiers.insert(user.name.as_bytes().to_vec(), verifier);
+            users.insert(
+                user.name.as_bytes().to_vec(),
+                crate::handshake::UserRecord {
+                    verifier,
+                    tenant: user.tenant.clone(),
+                },
+            );
         }
 
         let permits = Arc::new(Semaphore::new(config.listen.max_client_connections.max(1)));
@@ -89,7 +95,7 @@ impl Proxy {
         metrics.in_doubt(fleet.default_instance().fence.fence.in_doubt().len());
 
         Ok(Arc::new(Self {
-            auth: Arc::new(ClientAuth::new(verifiers, iterations)?),
+            auth: Arc::new(ClientAuth::new(users, iterations)?),
             tenant: TenantResolver::new(&config.routing),
             config,
             acceptor,
@@ -120,6 +126,17 @@ const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 #[derive(Debug)]
 pub struct Running {
     pub address: SocketAddr,
+    /// Where the control listener actually bound, when one is configured.
+    ///
+    /// Reported rather than assumed, because a configured port of 0 means "any
+    /// free one" and only the kernel knows which. A caller that wants an
+    /// ephemeral port and has to guess it instead has to bind a scratch socket,
+    /// read its port and close it - and anything else on the host may take that
+    /// port in the gap. That race is not hypothetical: it is what made this
+    /// field necessary.
+    pub control_address: Option<SocketAddr>,
+    /// Where the epoch push endpoint bound, on the same reasoning.
+    pub push_address: Option<SocketAddr>,
     shutdown: watch::Sender<bool>,
     idle: mpsc::Receiver<std::convert::Infallible>,
     accept: tokio::task::JoinHandle<()>,
@@ -156,13 +173,15 @@ pub async fn spawn(proxy: Arc<Proxy>, shutdown: watch::Sender<bool>) -> Result<R
 
     let (alive, idle) = mpsc::channel::<std::convert::Infallible>(1);
     let receiver = shutdown.subscribe();
-    spawn_fence_paths(&proxy, &shutdown).await?;
-    spawn_availability_paths(&proxy, &shutdown).await?;
+    let push_address = spawn_fence_paths(&proxy, &shutdown).await?;
+    let control_address = spawn_availability_paths(&proxy, &shutdown).await?;
     let accept = tokio::spawn(accept_loop(proxy, listener, receiver, alive));
 
     info!(%address, "proxy listening");
     Ok(Running {
         address,
+        control_address,
+        push_address,
         shutdown,
         idle,
         accept,
@@ -175,7 +194,10 @@ pub async fn spawn(proxy: Arc<Proxy>, shutdown: watch::Sender<bool>) -> Result<R
 ///
 /// The verify path needs nothing started: it runs inside every checkout, which
 /// is what makes it the one that survives a partition.
-async fn spawn_fence_paths(proxy: &Arc<Proxy>, shutdown: &watch::Sender<bool>) -> Result<()> {
+async fn spawn_fence_paths(
+    proxy: &Arc<Proxy>,
+    shutdown: &watch::Sender<bool>,
+) -> Result<Option<SocketAddr>> {
     for instance in proxy.fleet.instances() {
         tokio::spawn(sweep_loop(
             Arc::clone(instance),
@@ -201,9 +223,12 @@ async fn spawn_fence_paths(proxy: &Arc<Proxy>, shutdown: &watch::Sender<bool>) -
     // default one. A fleet learns the other instances' epochs over the pull
     // path, which is the one that has to work regardless.
     let default = proxy.fleet.default_instance();
+    let mut push_address = None;
     if let Some(address) = &proxy.config.fence.push_address {
         let listener = TcpListener::bind(crate::config::resolve(address)?).await?;
-        info!(address = %listener.local_addr()?, "epoch push endpoint listening");
+        let bound = listener.local_addr()?;
+        info!(address = %bound, "epoch push endpoint listening");
+        push_address = Some(bound);
         tokio::spawn(crate::epoch::admin::serve(
             listener,
             Arc::clone(&default.fence.fence),
@@ -221,7 +246,7 @@ async fn spawn_fence_paths(proxy: &Arc<Proxy>, shutdown: &watch::Sender<bool>) -
             shutdown.subscribe(),
         ));
     }
-    Ok(())
+    Ok(push_address)
 }
 
 /// Starts write-stall detection and the control API.
@@ -232,7 +257,7 @@ async fn spawn_fence_paths(proxy: &Arc<Proxy>, shutdown: &watch::Sender<bool>) -
 async fn spawn_availability_paths(
     proxy: &Arc<Proxy>,
     shutdown: &watch::Sender<bool>,
-) -> Result<()> {
+) -> Result<Option<SocketAddr>> {
     if proxy.config.stall.enabled {
         for instance in proxy.fleet.instances() {
             tokio::spawn(crate::stall::probe_loop(
@@ -261,6 +286,7 @@ async fn spawn_availability_paths(
         shutdown.subscribe(),
     ));
 
+    let mut control_address = None;
     if let Some(address) = &proxy.config.control.address {
         // Unwrapped rather than defended against: the configuration refuses an
         // address without TLS material, so reaching here without it would mean
@@ -271,11 +297,13 @@ async fn spawn_availability_paths(
             })?;
         let authority = crate::tls::ControlAuthority::new(tls)?;
         let listener = TcpListener::bind(crate::config::resolve(address)?).await?;
+        let bound = listener.local_addr()?;
         info!(
-            address = %listener.local_addr()?,
+            address = %bound,
             client = %tls.client_name,
             "control endpoint listening, mutual TLS required"
         );
+        control_address = Some(bound);
         tokio::spawn(crate::control::serve(
             listener,
             control,
@@ -283,7 +311,7 @@ async fn spawn_availability_paths(
             shutdown.subscribe(),
         ));
     }
-    Ok(())
+    Ok(control_address)
 }
 
 /// The shortest lease sweep interval, so a very short TTL cannot turn the
@@ -432,6 +460,23 @@ async fn serve(
             return Err(error);
         }
     };
+    // Authenticating and choosing a tenant read different parts of the same
+    // startup packet, so proving one says nothing about the other. Until they
+    // are related here, a client holding one tenant's password reaches any
+    // tenant it can name - which is the whole of what "the identity is confined
+    // to the database" has to mean.
+    //
+    // Refused as an authentication failure, with the same error and the same
+    // metrics as a wrong password, because the alternative tells the caller that
+    // the credential was good and only the tenant was wrong. That is an oracle
+    // for which tenants exist and which login belongs to which.
+    if !proxy.auth.admits(&user, tenant.as_str()) {
+        proxy.metrics.client_auth(AuthOutcome::Failure);
+        proxy.metrics.client_rejected(RejectReason::Handshake);
+        let error = ProxyError::AuthenticationFailed;
+        handshake::report(&mut session.stream, Some(&user), &error).await;
+        return Err(error);
+    }
     // The route is read here only to decide the pool key's shape and to serve a
     // session-mode client. A transaction-mode client re-reads it at every
     // checkout, which is what lets a cutover move it without it reconnecting.

@@ -425,6 +425,90 @@ async fn an_unknown_user_fails_identically_to_a_wrong_password() {
     );
 }
 
+/// Two logins, each bound to its own tenant, discriminated by database name -
+/// the shape the operator renders for a pool fronting many tenants.
+fn two_tenants() -> String {
+    format!(
+        "\n[routing]\ntenantDiscriminators = [\"DatabaseName\"]\n\
+         \n[auth]\nscramIterations = 4096\n\n\
+         [[auth.users]]\nname = \"alpha\"\ntenant = \"alpha\"\npassword = \"{TENANT_PASSWORD}\"\n\n\
+         [[auth.users]]\nname = \"beta\"\ntenant = \"beta\"\npassword = \"{TENANT_PASSWORD}\"\n"
+    )
+}
+
+/// One attempt with a password that is actually correct, so the only thing
+/// under test is which tenant the client named.
+async fn attempt_as(
+    port: u16,
+    user: &str,
+    password: &str,
+    database: &str,
+) -> Option<(String, String)> {
+    let outcome = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user={user} password={password} dbname={database}"),
+        tokio_postgres::NoTls,
+    )
+    .await;
+    match outcome {
+        Ok((client, connection)) => {
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            assert_eq!(
+                client
+                    .query_one("SELECT 1 AS reached", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, i32>(0),
+                1
+            );
+            None
+        }
+        Err(error) => {
+            let db = error.as_db_error().expect("a SQLSTATE-carrying error");
+            Some((db.code().code().to_owned(), db.message().to_owned()))
+        }
+    }
+}
+
+/// Holding a tenant's password must not be enough to reach another tenant.
+///
+/// Authenticating and choosing a tenant read different fields of the same
+/// startup packet, so proving one says nothing about the other. Before these
+/// were related, a client could authenticate as `alpha` and name `beta`'s
+/// database in the same packet and be routed into it - the whole of the claim
+/// that a tenant's identity is confined to its own database, false.
+///
+/// The refusal is asserted to be *indistinguishable from a wrong password*,
+/// because a distinct error would answer "does this tenant exist, and is this
+/// login one of its own" for anyone who asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_login_cannot_reach_a_tenant_it_is_not_bound_to() {
+    let pg = start_postgres().await;
+    let proxy = start_proxy(&config_for(&pg, &two_tenants())).await;
+
+    assert!(
+        attempt_as(proxy.port(), "alpha", TENANT_PASSWORD, "alpha")
+            .await
+            .is_none(),
+        "a login must still reach its own tenant"
+    );
+
+    let crossed = attempt_as(proxy.port(), "alpha", TENANT_PASSWORD, "beta")
+        .await
+        .expect("alpha must not reach beta merely by naming it");
+    let wrong = attempt_as(proxy.port(), "alpha", "definitely-wrong", "alpha")
+        .await
+        .expect("a wrong password must fail");
+
+    assert_eq!(crossed.0, "28P01");
+    assert_eq!(
+        crossed, wrong,
+        "reaching for another tenant must be indistinguishable from getting the password \
+         wrong, or the error is an oracle for which tenants exist and who belongs to them"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_backend_leg_runs_over_tls_when_configured() {
     let pg = start_postgres().await;

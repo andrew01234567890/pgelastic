@@ -57,6 +57,11 @@ var deployedOperator = client.ObjectKey{
 // Deployment's generation advances on every rewrite, a second ReplicaSet appears to serve
 // the template it prefers, and the Pods turn over as the two ReplicaSets are scaled against
 // each other. Reading only one of them would leave a way for the fight to hide.
+//
+// A Pod is identified by its UID and its restart count together, because the two failures
+// they catch are different ones: a replaced Pod gets a new UID, and a replica whose
+// container the kubelet restarted in place keeps the UID it had. Both drop every client
+// socket the replica was holding, so identity alone would let the second one through.
 type fleetShape struct {
 	generation  int64
 	replicaSets []string
@@ -97,12 +102,21 @@ func observeFleet() fleetShape {
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.DeletionTimestamp.IsZero() {
-			identities = append(identities, string(pod.UID))
+			identities = append(identities,
+				fmt.Sprintf("%s restarts=%d", pod.UID, containerRestarts(pod)))
 		}
 	}
 	slices.Sort(identities)
 
 	return fleetShape{generation: deployment.Generation, replicaSets: live, pods: identities}
+}
+
+func containerRestarts(pod *corev1.Pod) int32 {
+	total := int32(0)
+	for _, status := range pod.Status.ContainerStatuses {
+		total += status.RestartCount
+	}
+	return total
 }
 
 // requireDeployedOperator fails the spec unless another pgelastic operator is serving on

@@ -45,18 +45,27 @@ impl ClientSession {
     }
 }
 
+/// One login: what proves it, and which tenant it is allowed to be.
+#[derive(Debug, Clone)]
+pub struct UserRecord {
+    pub verifier: ScramVerifier,
+    /// The tenant this login is bound to. Empty binds it to none, which is the
+    /// single-tenant development shape.
+    pub tenant: String,
+}
+
 /// Everything the client leg needs to authenticate a peer.
 #[derive(Debug)]
 pub struct ClientAuth {
-    verifiers: HashMap<Vec<u8>, ScramVerifier>,
+    users: HashMap<Vec<u8>, UserRecord>,
     mock: MockSecret,
     iterations: NonZeroU32,
 }
 
 impl ClientAuth {
-    pub fn new(verifiers: HashMap<Vec<u8>, ScramVerifier>, iterations: NonZeroU32) -> Result<Self> {
+    pub fn new(users: HashMap<Vec<u8>, UserRecord>, iterations: NonZeroU32) -> Result<Self> {
         Ok(Self {
-            verifiers,
+            users,
             mock: MockSecret::generate()?,
             iterations,
         })
@@ -68,7 +77,7 @@ impl ClientAuth {
     /// A development affordance, and the reason `listen.requireTls` exists: it
     /// is the only thing standing between an open listener and the backend.
     pub fn is_trust(&self) -> bool {
-        self.verifiers.is_empty()
+        self.users.is_empty()
     }
 
     /// The verifier to run the exchange against.
@@ -78,10 +87,36 @@ impl ClientAuth {
     /// work, with exactly the same message as a wrong password, so the proxy
     /// cannot be used to enumerate tenants.
     fn verifier_for(&self, user: &[u8]) -> ScramVerifier {
-        self.verifiers
-            .get(user)
-            .cloned()
-            .unwrap_or_else(|| self.mock.verifier_for(user, self.iterations))
+        self.users.get(user).map_or_else(
+            || self.mock.verifier_for(user, self.iterations),
+            |record| record.verifier.clone(),
+        )
+    }
+
+    /// Whether an authenticated login may act as the tenant it asked for.
+    ///
+    /// Proving a password and choosing a tenant read two different parts of the
+    /// startup packet, so a proxy that checks only the first will route a
+    /// client holding tenant A's password into tenant B's database the moment
+    /// it names B. This is the check that relates them, and it is the whole of
+    /// the claim that a tenant's identity is confined to its own database.
+    ///
+    /// Trust mode admits everything, unchanged: with no logins configured there
+    /// is no authenticated identity to bind, and `listen.requireTls` is already
+    /// documented as the only thing standing between that listener and the
+    /// backend. A login with no tenant is likewise unbound, which is what the
+    /// single-tenant shape wants.
+    pub fn admits(&self, user: &[u8], tenant: &str) -> bool {
+        if self.is_trust() {
+            return true;
+        }
+        match self.users.get(user) {
+            Some(record) => record.tenant.is_empty() || record.tenant == tenant,
+            // Unreachable behind a successful exchange, because an unknown user
+            // gets the mock verifier and cannot complete one. Refusing rather
+            // than admitting keeps that true if it ever stops being.
+            None => false,
+        }
     }
 }
 
@@ -601,16 +636,23 @@ mod tests {
     }
 
     fn auth_with(users: &[(&str, &str)]) -> Arc<ClientAuth> {
-        let verifiers = users
+        auth_with_tenants(&users.iter().map(|(n, p)| (*n, *p, "")).collect::<Vec<_>>())
+    }
+
+    fn auth_with_tenants(users: &[(&str, &str, &str)]) -> Arc<ClientAuth> {
+        let records = users
             .iter()
-            .map(|(name, password)| {
+            .map(|(name, password, tenant)| {
                 (
                     name.as_bytes().to_vec(),
-                    ScramVerifier::generate(password).unwrap(),
+                    UserRecord {
+                        verifier: ScramVerifier::generate(password).unwrap(),
+                        tenant: (*tenant).to_owned(),
+                    },
                 )
             })
             .collect();
-        Arc::new(ClientAuth::new(verifiers, NonZeroU32::new(4096).unwrap()).unwrap())
+        Arc::new(ClientAuth::new(records, NonZeroU32::new(4096).unwrap()).unwrap())
     }
 
     /// Everything a client can observe about one authentication attempt.
@@ -791,6 +833,33 @@ mod tests {
             authentication_failed_message(b"alice")
         );
         assert!(!authentication_failed_message(b"alice").contains("exist"));
+    }
+
+    #[test]
+    fn a_login_may_act_only_as_the_tenant_it_is_bound_to() {
+        let auth = auth_with_tenants(&[("alice", "hunter2", "alpha"), ("bob", "hunter2", "beta")]);
+        assert!(auth.admits(b"alice", "alpha"));
+        // The whole point: alice authenticates perfectly well and still may not
+        // be beta, because the password proves who she is and not what she may
+        // reach.
+        assert!(!auth.admits(b"alice", "beta"));
+        assert!(auth.admits(b"bob", "beta"));
+        assert!(!auth.admits(b"bob", "alpha"));
+    }
+
+    #[test]
+    fn an_unbound_login_and_trust_mode_are_both_left_alone() {
+        assert!(auth_with_tenants(&[("alice", "hunter2", "")]).admits(b"alice", "anything"));
+
+        let trust = auth_with(&[]);
+        assert!(trust.is_trust());
+        assert!(trust.admits(b"nobody", "anything"));
+    }
+
+    #[test]
+    fn a_login_that_is_not_configured_at_all_is_refused() {
+        let auth = auth_with_tenants(&[("alice", "hunter2", "alpha")]);
+        assert!(!auth.admits(b"mallory", "alpha"));
     }
 
     #[tokio::test]

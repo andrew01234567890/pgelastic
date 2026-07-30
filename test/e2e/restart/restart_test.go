@@ -42,6 +42,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 	proxyobjects "github.com/andrew01234567890/pgelastic/internal/proxy"
+	"github.com/andrew01234567890/pgelastic/test/e2e/certcheck"
 )
 
 const (
@@ -256,13 +257,7 @@ func awaitFleet(replicas int32) {
 		g.Expect(deployment.Status.ReadyReplicas).To(Equal(replicas))
 	}, "10m", "5s").Should(Succeed())
 
-	Eventually(func() error {
-		return k8sClient.Get(suiteCtx, client.ObjectKey{
-			Namespace: e2eNamespace, Name: proxyobjects.ControlClientSecretName(poolName),
-		}, &corev1.Secret{})
-	}, "5m", "5s").Should(Succeed(),
-		"cert-manager never issued the operator's control certificate, so no roll could "+
-			"reach the fleet's gate")
+	certcheck.AwaitControlClientSecret(suiteCtx, k8sClient, e2eNamespace, poolName)
 }
 
 func makeTenant(name string) *pgelasticv1alpha1.PgTenant {
@@ -520,6 +515,7 @@ func rollOnce(what string, trigger func(), expectedIncrease int) {
 
 	observer := watch(instanceA)
 	defer observer.close()
+	fleetBefore := observeFleet()
 
 	trigger()
 	// Waiting for every member to have been recreated, rather than for the operator to say
@@ -562,9 +558,21 @@ func rollOnce(what string, trigger func(), expectedIncrease int) {
 				"redundancy it started with", evidence.StreamingMembers)
 	}, "5m", "5s").Should(Succeed())
 
+	// Asserted before the clients are, because a replica that goes away takes every socket
+	// held through it with it, and at the client that is indistinguishable from the drop the
+	// next assertion is looking for. Rolling an instance is not allowed to touch the fleet
+	// in front of it, so naming that first means the report accuses the cause rather than
+	// the symptom.
+	By("the proxy fleet in front of the instance was never replaced")
+	fleetAfter := observeFleet()
+	Expect(fleetAfter).To(Equal(fleetBefore),
+		"the replicas serving the pool changed while the instance rolled: was %s, now %s",
+		fleetBefore, fleetAfter)
+
 	By("no client on the rolled instance saw an error")
 	Expect(heldReport.failures).To(BeEmpty(),
-		"a client was dropped rather than queued: %v", heldReport.failures)
+		"a client was dropped rather than queued:\n%s\nthe port-forward it held said:\n%s",
+		heldReport.failureSummary(), heldReport.forwardLog)
 	Expect(heldReport.duringCount).To(BeNumerically(">", 0),
 		"no statement was issued during the roll, so nothing was measured")
 
@@ -600,7 +608,8 @@ func rollOnce(what string, trigger func(), expectedIncrease int) {
 
 	By("the neighbour instance was untouched")
 	Expect(neighbourReport.failures).To(BeEmpty(),
-		"a tenant on the other instance saw an error: %v", neighbourReport.failures)
+		"a tenant on the other instance saw an error:\n%s\nthe port-forward it held said:\n%s",
+		neighbourReport.failureSummary(), neighbourReport.forwardLog)
 	Expect(neighbourReport.duringMax).To(BeNumerically("<", neighbourDisturbanceCeiling),
 		"the neighbour's worst statement was %s, so this was a fleet-wide stall rather than "+
 			"one instance being rolled", neighbourReport.duringMax)
