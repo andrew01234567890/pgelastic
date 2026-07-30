@@ -342,6 +342,17 @@ impl ProxyUnderTest {
         self.running.address
     }
 
+    /// Where the epoch push endpoint bound.
+    ///
+    /// Asked of the listener rather than chosen in advance, so a test never
+    /// reserves a port, releases it, and races whatever takes it next.
+    pub fn push_port(&self) -> u16 {
+        self.running
+            .push_address
+            .expect("the push endpoint must report where it bound")
+            .port()
+    }
+
     pub fn port(&self) -> u16 {
         self.running.address.port()
     }
@@ -691,7 +702,6 @@ impl Fleet {
         extra: &str,
     ) -> Self {
         let (a, b) = tokio::join!(start_postgres(), start_postgres());
-        let control_port = free_port().await;
         let pki = ControlPki::generate();
         let source = format!(
             "[listen]\n\
@@ -710,7 +720,7 @@ impl Fleet {
              mode = \"transaction\"\n\
              \n\
              [control]\n\
-             address = \"127.0.0.1:{control_port}\"\n\
+             address = \"127.0.0.1:0\"\n\
              defaultLeaseTtlMs = {default_lease_ms}\n\
              \n\
              {control_tls}\
@@ -734,8 +744,15 @@ impl Fleet {
             control_tls = pki.section(),
         );
         let proxy = start_proxy(&source).await;
+        // Read back rather than chosen: the listener binds port 0 and reports
+        // what it got, so no port is ever reserved and released for something
+        // else on the host to take in between.
         let control = Control {
-            address: format!("127.0.0.1:{control_port}"),
+            address: proxy
+                .running
+                .control_address
+                .expect("the control listener must report where it bound")
+                .to_string(),
             connector: pki.connector(),
             pki,
         };
@@ -791,12 +808,11 @@ impl Fleet {
     }
 }
 
-pub async fn free_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("binding a scratch port");
-    listener.local_addr().expect("the scratch address").port()
-}
+// There is deliberately no free_port helper. Reserving a port, closing the
+// socket and then asking the proxy to bind it is a race against everything else
+// on the host, and it is the race that turned a green suite red under CI load
+// with `Address already in use`. Every listener binds port 0 and reports what it
+// got instead.
 
 /// A minimal HTTP/1.1-over-mutual-TLS client for the proxy's control API.
 ///

@@ -135,13 +135,6 @@ async fn push(port: u16, epoch: u64) -> String {
     answer
 }
 
-async fn free_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("binding for a free port");
-    listener.local_addr().expect("a bound address").port()
-}
-
 // ---- the partition case: the pull path with nothing else -----------------
 
 /// The one that matters. Watch and push are both switched off, so the only way
@@ -291,12 +284,11 @@ fn regressions(proxy: &ProxyUnderTest) -> u64 {
 #[tokio::test]
 async fn every_old_epoch_socket_is_severed_before_any_new_checkout_succeeds() {
     let pg = postgres_at_epoch(1).await;
-    let admin = free_port().await;
 
     let proxy = harness::start_proxy(&harness::config_for(
         &pg,
         &format!(
-            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:{admin}\"\n\n\
+            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:0\"\n\n\
              [pool]\nmode = \"transaction\"\nbackendConnections = 4\n"
         ),
     ))
@@ -308,7 +300,7 @@ async fn every_old_epoch_socket_is_severed_before_any_new_checkout_succeeds() {
     }
     assert!(held_backends(&pg).await >= 1);
 
-    let answer = push(admin, 9).await;
+    let answer = push(proxy.push_port(), 9).await;
     assert!(answer.contains("\"outcome\":\"advanced\""), "{answer}");
 
     let elapsed = await_backends(&pg, 0, SETTLE).await;
@@ -340,16 +332,23 @@ async fn every_old_epoch_socket_is_severed_before_any_new_checkout_succeeds() {
 #[tokio::test]
 async fn a_push_below_the_current_epoch_is_answered_without_lowering_it() {
     let pg = postgres_at_epoch(1).await;
-    let admin = free_port().await;
     let proxy = harness::start_proxy(&harness::config_for(
         &pg,
-        &format!("{LEASE}\n[fence]\npushAddress = \"127.0.0.1:{admin}\"\n"),
+        &format!("{LEASE}\n[fence]\npushAddress = \"127.0.0.1:0\"\n"),
     ))
     .await;
 
-    assert!(push(admin, 7).await.contains("\"outcome\":\"advanced\""));
-    assert!(push(admin, 7).await.contains("\"outcome\":\"unchanged\""));
-    let regressed = push(admin, 3).await;
+    assert!(
+        push(proxy.push_port(), 7)
+            .await
+            .contains("\"outcome\":\"advanced\"")
+    );
+    assert!(
+        push(proxy.push_port(), 7)
+            .await
+            .contains("\"outcome\":\"unchanged\"")
+    );
+    let regressed = push(proxy.push_port(), 3).await;
     assert!(
         regressed.contains("\"outcome\":\"regressed\""),
         "{regressed}"
@@ -365,11 +364,10 @@ async fn a_push_below_the_current_epoch_is_answered_without_lowering_it() {
 #[tokio::test]
 async fn a_read_only_transaction_on_the_old_epoch_is_allowed_to_finish() {
     let pg = postgres_at_epoch(1).await;
-    let admin = free_port().await;
     let proxy = harness::start_proxy(&harness::config_for(
         &pg,
         &format!(
-            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:{admin}\"\n\n\
+            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:0\"\n\n\
              [pool]\nmode = \"transaction\"\nbackendConnections = 4\n"
         ),
     ))
@@ -388,7 +386,7 @@ async fn a_read_only_transaction_on_the_old_epoch_is_allowed_to_finish() {
             .map(|_| ())
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
-    push(admin, 5).await;
+    push(proxy.push_port(), 5).await;
 
     let outcome = reader.await.expect("the reader task");
     assert!(
@@ -404,11 +402,10 @@ async fn a_read_only_transaction_on_the_old_epoch_is_allowed_to_finish() {
 #[tokio::test]
 async fn a_session_idle_in_transaction_is_reset_immediately() {
     let pg = postgres_at_epoch(1).await;
-    let admin = free_port().await;
     let proxy = harness::start_proxy(&harness::config_for(
         &pg,
         &format!(
-            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:{admin}\"\n\n\
+            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:0\"\n\n\
              [pool]\nmode = \"transaction\"\nbackendConnections = 4\n"
         ),
     ))
@@ -419,7 +416,7 @@ async fn a_session_idle_in_transaction_is_reset_immediately() {
     client.simple_query("SELECT 1").await.expect("a read");
     assert_eq!(held_backends(&pg).await, 1);
 
-    push(admin, 5).await;
+    push(proxy.push_port(), 5).await;
     let severed_in = await_backends(&pg, 0, SETTLE).await;
     assert!(
         severed_in < FENCE_DEADLINE * 4,
@@ -443,11 +440,10 @@ async fn a_session_idle_in_transaction_is_reset_immediately() {
 #[tokio::test]
 async fn an_uncommitted_write_transaction_is_reset_and_leaves_nothing_behind() {
     let pg = postgres_at_epoch(1).await;
-    let admin = free_port().await;
     let proxy = harness::start_proxy(&harness::config_for(
         &pg,
         &format!(
-            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:{admin}\"\n\n\
+            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:0\"\n\n\
              [pool]\nmode = \"transaction\"\nbackendConnections = 4\n"
         ),
     ))
@@ -466,7 +462,7 @@ async fn an_uncommitted_write_transaction_is_reset_and_leaves_nothing_behind() {
         .await
         .expect("the insert");
 
-    push(admin, 5).await;
+    push(proxy.push_port(), 5).await;
     await_backends(&pg, 0, SETTLE).await;
 
     let error = client
@@ -499,14 +495,13 @@ async fn an_uncommitted_write_transaction_is_reset_and_leaves_nothing_behind() {
 #[tokio::test]
 async fn a_commit_whose_outcome_was_never_observed_is_reported_unknown_and_logged() {
     let pg = postgres_at_epoch(1).await;
-    let admin = free_port().await;
     let dir = tempfile::TempDir::new().expect("a temp dir");
     let log_path = dir.path().join("in-doubt.jsonl");
 
     let proxy = harness::start_proxy(&harness::config_for(
         &pg,
         &format!(
-            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:{admin}\"\n\
+            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:0\"\n\
              inDoubtLog = \"{log}\"\n\n\
              [pool]\nmode = \"transaction\"\nbackendConnections = 4\n",
             log = log_path.display()
@@ -544,7 +539,7 @@ async fn a_commit_whose_outcome_was_never_observed_is_reported_unknown_and_logge
 
     let committer = tokio::spawn(async move { client.simple_query("COMMIT").await });
     tokio::time::sleep(Duration::from_millis(500)).await;
-    push(admin, 5).await;
+    push(proxy.push_port(), 5).await;
 
     let error = committer
         .await
@@ -606,11 +601,10 @@ async fn a_commit_whose_outcome_was_never_observed_is_reported_unknown_and_logge
 #[tokio::test]
 async fn a_bound_session_is_fenced_even_though_it_never_touches_the_pool() {
     let pg = postgres_at_epoch(1).await;
-    let admin = free_port().await;
     let proxy = harness::start_proxy(&harness::config_for(
         &pg,
         &format!(
-            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:{admin}\"\nrequireEpoch = true\n\n\
+            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:0\"\nrequireEpoch = true\n\n\
              [pool]\nmode = \"session\"\n"
         ),
     ))
@@ -624,7 +618,7 @@ async fn a_bound_session_is_fenced_even_though_it_never_touches_the_pool() {
         .expect("a read inside the transaction");
     assert_eq!(held_backends(&pg).await, 1);
 
-    push(admin, 5).await;
+    push(proxy.push_port(), 5).await;
     let severed_in = await_backends(&pg, 0, SETTLE).await;
     assert!(
         severed_in < FENCE_DEADLINE * 4,
@@ -661,11 +655,10 @@ async fn a_bound_session_is_fenced_even_though_it_never_touches_the_pool() {
 #[tokio::test]
 async fn the_fence_completes_within_the_reaction_deadline_under_load() {
     let pg = postgres_at_epoch(1).await;
-    let admin = free_port().await;
     let proxy = harness::start_proxy(&harness::config_for(
         &pg,
         &format!(
-            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:{admin}\"\n\n\
+            "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:0\"\n\n\
              [pool]\nmode = \"transaction\"\nbackendConnections = 16\n"
         ),
     ))
@@ -683,7 +676,7 @@ async fn the_fence_completes_within_the_reaction_deadline_under_load() {
     );
 
     let started = Instant::now();
-    push(admin, 5).await;
+    push(proxy.push_port(), 5).await;
     await_backends(&pg, 0, SETTLE).await;
     let wall = started.elapsed();
 

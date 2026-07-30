@@ -27,13 +27,13 @@ const MIGRATION: &str = "pgelastic-migration";
 /// it writes `currentPrimary`. It addresses the default instance, which is
 /// `inst-a` — so `inst-b` is a bystander whose epoch never moves.
 async fn fleet_with_push() -> (Fleet, u16) {
-    let admin = harness::free_port().await;
-    let fleet = Fleet::start_sized(
-        8,
-        8,
-        &format!("[fence]\npushAddress = \"127.0.0.1:{admin}\"\n"),
-    )
-    .await;
+    let fleet = Fleet::start_sized(8, 8, "[fence]\npushAddress = \"127.0.0.1:0\"\n").await;
+    let admin = fleet
+        .proxy
+        .running
+        .push_address
+        .expect("the push endpoint must report where it bound")
+        .port();
     (fleet, admin)
 }
 
