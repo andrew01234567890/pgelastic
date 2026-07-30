@@ -89,6 +89,27 @@ func transliterate(name string) string {
 	return builder.String()
 }
 
+// BackendRolePrefix marks every role pgelastic owns on a tenant's behalf.
+const BackendRolePrefix = "pgt_"
+
+// BackendRoleName is the cluster-global name of the role a tenant's backend sessions run as.
+//
+// Namespaced because PostgreSQL roles are cluster-global and pg_authid is a shared catalog, so
+// two tenants that happen to choose the same spec.owner would otherwise share one role - a
+// silent privilege union with no error, and, once tenant roles carry credentials, a merge of
+// two identities. Azure recovers the same property by containment: a database user there is
+// "independent (in all aspects) from a user who has the same name and the same password in
+// another database in the same server". PostgreSQL has no containment to lean on, so the name
+// has to carry it.
+//
+// The digest is over the tenant's namespace and name rather than over spec.owner, so editing
+// the readable part never renames the role that owns every object in the database. Truncation
+// therefore cannot cause a collision: a fixed-width digest is the last thing in the name, and
+// identifiers are silently truncated at 63 bytes rather than rejected.
+func BackendRoleName(namespace, name string) string {
+	return objectName(BackendRolePrefix, namespace, name)
+}
+
 // SchemaStampPrefix marks a target database whose schema copy has committed. It is a
 // prefix rather than an exact value because any pgelastic stamp answers the only question
 // asked of it - has a complete copy of this tenant's schema already been applied here -
