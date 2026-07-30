@@ -56,6 +56,22 @@ type Tenant struct {
 	Weight               int32
 	Priority             int32
 	MaxClientConnections int32
+	// BackendRole is the PostgreSQL role this tenant's backend sessions run as, and
+	// BackendSaltedPassword the client half of the SCRAM credential that proves it. The proxy
+	// is the SCRAM client on that leg, so a server-side verifier would be useless to it.
+	//
+	// Empty until the tenant controller has published them. The fleet refuses such a tenant
+	// rather than falling back to the instance identity: a fallback would put tenant SQL back
+	// on pgelastic_ops at exactly the moment nobody is watching, which is a config-propagation
+	// lag rather than a state anybody would notice.
+	BackendRole           string
+	BackendSaltedPassword string
+	BackendSalt           string
+	BackendIterations     int32
+	// CredentialGeneration makes a rotation evict the links opened under the old credential.
+	// It is part of the pool key, so a bump means the old key is unreachable from any new
+	// binding and its links drain out rather than being handed to somebody.
+	CredentialGeneration int32
 }
 
 // User is one SCRAM identity the proxy authenticates a client against.
@@ -124,7 +140,7 @@ func (c Config) render(dynamic bool) string {
 	var out strings.Builder
 	c.renderListen(&out)
 	c.renderBackend(&out)
-	c.renderAuth(&out)
+	c.renderAuth(&out, dynamic)
 	c.renderDrainAndMetrics(&out)
 	c.renderControl(&out)
 	c.renderRouting(&out, dynamic)
@@ -171,11 +187,23 @@ func (c Config) renderBackend(out *strings.Builder) {
 	out.WriteString("\n")
 }
 
-func (c Config) renderAuth(out *strings.Builder) {
+// renderAuth writes the pool's SCRAM posture, and the logins themselves only into the dynamic
+// half.
+//
+// scramIterations stays structural because it is part of every verifier rather than a tunable:
+// changing it invalidates every credential derived under the old one, which is a different
+// process rather than a document a running one can adopt. The logins are the opposite. A pool
+// exists to have tenants added to it, and leaving them structural meant onboarding one rolled
+// every replica and dropped every other tenant's clients - the exact outcome renderControl's
+// own comment says [routing].tenants is excluded to avoid.
+func (c Config) renderAuth(out *strings.Builder, dynamic bool) {
 	out.WriteString("[auth]\n")
 	writeInt(out, "scramIterations", int64(scramIterations(c.Pool)))
 	out.WriteString("\n")
 
+	if !dynamic {
+		return
+	}
 	users := slices.Clone(c.Users)
 	slices.SortFunc(users, func(a, b User) int { return strings.Compare(a.Name, b.Name) })
 	for _, user := range users {
@@ -295,6 +323,20 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 		// per-tenant cap was configured".
 		if tenant.MaxClientConnections > 0 {
 			writeInt(out, "maxClientConnections", int64(tenant.MaxClientConnections))
+		}
+		// The identity this tenant's backend sessions run as, and the credential that proves
+		// it. Here rather than in [[instances]] because that half is structural: a credential
+		// rotation there would roll the whole fleet, and the point of rotating is that nobody
+		// notices. Omitted together when the tenant controller has not published them yet -
+		// the fleet refuses such a tenant rather than falling back to the instance identity,
+		// so a partial rollout costs one tenant one reconcile instead of running every tenant
+		// as the control plane.
+		if tenant.BackendRole != "" && tenant.BackendSaltedPassword != "" {
+			writeString(out, "backendRole", tenant.BackendRole)
+			writeString(out, "backendSaltedPassword", tenant.BackendSaltedPassword)
+			writeString(out, "backendSalt", tenant.BackendSalt)
+			writeInt(out, "backendIterations", int64(tenant.BackendIterations))
+			writeInt(out, "credentialGeneration", int64(tenant.CredentialGeneration))
 		}
 		out.WriteString("\n")
 	}

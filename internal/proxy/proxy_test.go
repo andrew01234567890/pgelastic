@@ -31,7 +31,10 @@ import (
 const (
 	testImage    = "proxy:test"
 	testInstance = "pg-a"
-	testOpsRole  = "ops"
+	// testTenant is a tenant added by a spec rather than present in the fixture, which is
+	// what makes "adding one" observable.
+	testTenant  = "shipping"
+	testOpsRole = "ops"
 )
 
 func testPool() *pgelasticv1alpha1.PgElasticPool {
@@ -82,7 +85,7 @@ func TestAddingATenantRewritesTheDocumentWithoutRollingTheFleet(t *testing.T) {
 
 	config := testConfig()
 	config.Tenants = append(config.Tenants,
-		Tenant{Name: "shipping", Instance: testInstance, Burstable: 4, Weight: 100})
+		Tenant{Name: testTenant, Instance: testInstance, Burstable: 4, Weight: 100})
 	after := config.Render()
 
 	if before.TOML == after.TOML {
@@ -92,6 +95,38 @@ func TestAddingATenantRewritesTheDocumentWithoutRollingTheFleet(t *testing.T) {
 		t.Fatalf("a new tenant changed the pod template hash from %q to %q, "+
 			"which restarts every replica and drops every client on it",
 			before.StructuralHash, after.StructuralHash)
+	}
+}
+
+// A pool exists to have tenants added to it, and every login used to be structural - so
+// onboarding one restarted every replica and dropped every other tenant's clients. The same
+// applies to rotating a backend credential, which is a thing whose whole point is that nobody
+// notices it happen.
+func TestNeitherALoginNorACredentialRollsTheFleet(t *testing.T) {
+	for name, mutate := range map[string]func(*Config){
+		"a new login": func(c *Config) {
+			c.Users = append(c.Users, User{Name: testTenant, Tenant: testTenant, Password: "hunter2"})
+		},
+		"a rotated backend credential": func(c *Config) {
+			c.Tenants[0].BackendRole = "pgt_acme_a1b2c3d4"
+			c.Tenants[0].BackendSaltedPassword = "c2FsdGVk"
+			c.Tenants[0].BackendSalt = "c2FsdA=="
+			c.Tenants[0].BackendIterations = 4096
+			c.Tenants[0].CredentialGeneration = 7
+		},
+	} {
+		before := testConfig().Render()
+		config := testConfig()
+		mutate(&config)
+		after := config.Render()
+
+		if before.TOML == after.TOML {
+			t.Fatalf("%s did not reach the document the fleet reads", name)
+		}
+		if before.StructuralHash != after.StructuralHash {
+			t.Fatalf("%s changed the pod template hash from %q to %q, which restarts every "+
+				"replica and drops every client on it", name, before.StructuralHash, after.StructuralHash)
+		}
 	}
 }
 
@@ -506,7 +541,7 @@ func TestATenantAddedBesideAControlListenerStillRollsNothing(t *testing.T) {
 
 	config := controlConfig()
 	config.Tenants = append(config.Tenants,
-		Tenant{Name: "shipping", Instance: testInstance, Burstable: 4, Weight: 100})
+		Tenant{Name: testTenant, Instance: testInstance, Burstable: 4, Weight: 100})
 	after := config.Render()
 
 	if before.TOML == after.TOML {
