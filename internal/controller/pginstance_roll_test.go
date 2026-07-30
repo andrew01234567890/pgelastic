@@ -19,7 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -510,4 +512,78 @@ func backdateRollStep(instance *pgelasticv1alpha1.PgInstance, by time.Duration) 
 	fetched := refetch(instance)
 	fetched.Status.Roll.StartedAt = &metav1.Time{Time: time.Now().Add(-by)}
 	Expect(k8sClient.Status().Update(ctx, fetched)).To(Succeed())
+}
+
+// fitToRoll is what stands between a rolling restart and a stalled instance, and the gate that
+// mattered was missing: it asked whether commits were already stalling, never whether removing
+// this member would start them stalling.
+func TestFitToRollRefusesTheLastStreamingStandby(t *testing.T) {
+	pods := []corev1.Pod{readyRollPod("rq-1"), readyRollPod("rq-2"), readyRollPod("rq-3")}
+	instance := &pgelasticv1alpha1.PgInstance{
+		Spec: pgelasticv1alpha1.PgInstanceSpec{
+			HighAvailability: &pgelasticv1alpha1.InstanceHighAvailability{Replicas: ptrTo(int32(3))},
+		},
+		Status: pgelasticv1alpha1.PgInstanceStatus{
+			CurrentPrimary: "rq-1",
+			QuorumEvidence: &pgelasticv1alpha1.QuorumEvidence{
+				NumSync:          1,
+				VotingMembers:    []string{"rq-2", "rq-3"},
+				StreamingMembers: []string{"rq-3"},
+				ObservedAt:       &metav1.Time{Time: time.Now()},
+			},
+		},
+	}
+
+	// rq-3 is the only standby still streaming: rq-2 was rolled a moment ago and is Ready
+	// without having caught up. Nothing is stalling yet, which is precisely the trap.
+	fit, why := fitToRoll(instance, pods, ha.Decision{}, "rq-3")
+	if fit {
+		t.Fatal("the roll removed the only streaming standby, which stalls every commit")
+	}
+	if !strings.Contains(why, "rq-3") || !strings.Contains(why, "stall") {
+		t.Fatalf("the refusal does not say which member it is waiting on or why: %q", why)
+	}
+
+	// The one that is not streaming costs nothing to take, so the roll may proceed on it.
+	if fit, why := fitToRoll(instance, pods, ha.Decision{}, "rq-2"); !fit {
+		t.Fatalf("the roll refused a member whose absence changes no quorum: %q", why)
+	}
+}
+
+// Evidence the primary stopped refreshing describes a cluster that may have moved, and the
+// decision it gates is the one whose cost is a stalled instance.
+func TestFitToRollRefusesStaleQuorumEvidence(t *testing.T) {
+	pods := []corev1.Pod{readyRollPod("rs-1"), readyRollPod("rs-2"), readyRollPod("rs-3")}
+	instance := &pgelasticv1alpha1.PgInstance{
+		Spec: pgelasticv1alpha1.PgInstanceSpec{
+			HighAvailability: &pgelasticv1alpha1.InstanceHighAvailability{Replicas: ptrTo(int32(3))},
+		},
+		Status: pgelasticv1alpha1.PgInstanceStatus{
+			CurrentPrimary: "rs-1",
+			QuorumEvidence: &pgelasticv1alpha1.QuorumEvidence{
+				NumSync:          1,
+				VotingMembers:    []string{"rs-2", "rs-3"},
+				StreamingMembers: []string{"rs-2", "rs-3"},
+				ObservedAt:       &metav1.Time{Time: time.Now().Add(-10 * time.Minute)},
+			},
+		},
+	}
+	fit, why := fitToRoll(instance, pods, ha.Decision{}, "rs-2")
+	if fit {
+		t.Fatal("a member was removed on a record older than the roll's own steps")
+	}
+	if !strings.Contains(why, "too old") {
+		t.Fatalf("the refusal does not say the evidence was stale: %q", why)
+	}
+}
+
+func readyRollPod(name string) corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
 }

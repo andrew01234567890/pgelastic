@@ -328,6 +328,7 @@ func (s *Supervisor) runPostmaster(ctx context.Context, signals chan os.Signal) 
 			case CommandSwitchover:
 				s.stop(context.WithoutCancel(ctx), CauseSwitchover)
 				<-exited
+				s.releasePrimaryLease(context.WithoutCancel(ctx))
 				return outcomeStop, nil
 			case CommandRejoin:
 				s.stop(context.WithoutCancel(ctx), CauseSwitchover)

@@ -275,6 +275,30 @@ func (s *Supervisor) leaseManager() *LeaseManager {
 	return s.lease
 }
 
+// releasePrimaryLease hands the lease back after a planned handover, once the postmaster it
+// protected is confirmed gone.
+//
+// A successor may not take a *held* lease until it has gone unrenewed for a full leaseDuration,
+// so without this every planned switchover costs 15 seconds of nothing happening - and the
+// successor's promotion budget is leaseDuration + 3*retryPeriod, which is 21 seconds and is
+// almost exactly the client-visible pause the restart e2e measures. Releasing stamps the short
+// validity instead, so the successor sees an unheld lease on its next two-second poll.
+//
+// After the stop and never before it. The lease is the mutual exclusion that stops two
+// postmasters believing they are primary, so handing it back while this one might still be
+// running is precisely what it exists to prevent.
+//
+// A failure to release is logged and no more. The lease expiring on its own is the path this
+// short-circuits, not one it replaces: the successor still gets there, just fifteen seconds
+// later, and a handover that has already stopped its postmaster must not be turned into an
+// error by the optimisation that was meant to speed it up.
+func (s *Supervisor) releasePrimaryLease(ctx context.Context) {
+	if err := s.leaseManager().Release(ctx); err != nil {
+		logf.FromContext(ctx).Error(err, "releasing the primary lease after a planned handover; "+
+			"the successor will wait for it to expire instead", "member", s.options.Member)
+	}
+}
+
 func (s *Supervisor) noteRenewal(failingSince time.Time) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
