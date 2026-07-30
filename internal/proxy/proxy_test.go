@@ -130,6 +130,32 @@ func TestNeitherALoginNorACredentialRollsTheFleet(t *testing.T) {
 	}
 }
 
+// The defect the restart suite found on its first ever CI run. An instance's allocatable
+// capacity is withheld whenever it leaves Ready, so every rolling restart moves this number -
+// and while it was structural, rolling ONE instance restarted the entire proxy fleet. The
+// neighbour tenant, on the other instance, saw 2078 errors from a restart that had nothing to
+// do with it.
+func TestRollingOneInstanceDoesNotRollTheFleet(t *testing.T) {
+	serving := testConfig()
+	serving.Instances[0].BackendConnections = 60
+	before := serving.Render()
+
+	// What a member going down looks like from here: the operator withholds the capacity.
+	rolling := testConfig()
+	rolling.Instances[0].BackendConnections = 0
+	after := rolling.Render()
+
+	if before.TOML == after.TOML {
+		t.Fatal("the capacity change never reached the document at all")
+	}
+
+	if before.StructuralHash != after.StructuralHash {
+		t.Fatalf("an instance's capacity changing moved the pod template hash from %q to %q, "+
+			"so restarting one instance restarts every proxy replica and drops every client "+
+			"of every tenant in the pool", before.StructuralHash, after.StructuralHash)
+	}
+}
+
 func TestMovingATenantToAnotherInstanceDoesNotRollTheFleet(t *testing.T) {
 	before := testConfig().Render()
 
