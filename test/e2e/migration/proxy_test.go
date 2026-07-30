@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -223,10 +224,11 @@ type probe struct {
 	forward  *forwarder
 	cancel   context.CancelFunc
 	finished chan struct{}
+	opened   time.Time
 
 	mu        sync.Mutex
 	latencies []time.Duration
-	failures  []string
+	failures  []probeFailure
 	// servers is every distinct backend address this one socket was served by, in the order
 	// they were first seen. A client that was queued and then released against another
 	// instance answers from a different address on the same socket, which is the difference
@@ -238,6 +240,17 @@ type probe struct {
 	during []time.Duration
 }
 
+// probeFailure is one failed statement and how far into the probe's life it failed.
+//
+// The offset is what makes a wall of identical errors readable: a client that loses its
+// connection fails identically for every statement it attempts afterwards, so the only
+// facts that distinguish one report from another are when the first one happened and how
+// many followed.
+type probeFailure struct {
+	at   time.Duration
+	text string
+}
+
 // startProbe opens the connection and begins asking. The interval is short enough that a
 // sub-second pause is still sampled several times either side of itself.
 func startProbe(name, user, database string, interval time.Duration) *probe {
@@ -246,7 +259,13 @@ func startProbe(name, user, database string, interval time.Duration) *probe {
 	Expect(err).NotTo(HaveOccurred(), "forwarding the pool Service for %s", name)
 
 	ctx, cancel := context.WithCancel(suiteCtx)
-	p := &probe{name: name, forward: forward, cancel: cancel, finished: make(chan struct{})}
+	p := &probe{
+		name:     name,
+		forward:  forward,
+		cancel:   cancel,
+		finished: make(chan struct{}),
+		opened:   time.Now(),
+	}
 
 	var connection *pgx.Conn
 	Eventually(func() error {
@@ -292,7 +311,8 @@ func (p *probe) record(elapsed time.Duration, server string, err error) {
 		p.during = append(p.during, elapsed)
 	}
 	if err != nil {
-		p.failures = append(p.failures, err.Error())
+		p.failures = append(p.failures,
+			probeFailure{at: time.Since(p.opened), text: err.Error()})
 	}
 }
 
@@ -318,7 +338,7 @@ func (p *probe) report() probeReport {
 		name:        p.name,
 		servers:     append([]string(nil), p.servers...),
 		statements:  len(p.latencies),
-		failures:    append([]string(nil), p.failures...),
+		failures:    append([]probeFailure(nil), p.failures...),
 		maxOverall:  maxOf(p.latencies),
 		beforeP50:   percentile(before, 50),
 		beforeP99:   percentile(before, 99),
@@ -326,6 +346,11 @@ func (p *probe) report() probeReport {
 		duringP99:   percentile(p.during, 99),
 		duringMax:   maxOf(p.during),
 		duringCount: len(p.during),
+		// Carried alongside the failures because the two are only meaningful together: a
+		// port-forward that died takes the connection with it, and the client cannot tell
+		// that apart from the proxy dropping it. The journal is the only place that says
+		// which one happened.
+		forwardLog: p.forward.log(),
 	}
 }
 
@@ -333,7 +358,7 @@ type probeReport struct {
 	name        string
 	servers     []string
 	statements  int
-	failures    []string
+	failures    []probeFailure
 	maxOverall  time.Duration
 	beforeP50   time.Duration
 	beforeP99   time.Duration
@@ -341,6 +366,7 @@ type probeReport struct {
 	duringP99   time.Duration
 	duringMax   time.Duration
 	duringCount int
+	forwardLog  string
 }
 
 func (r probeReport) String() string {
@@ -349,6 +375,35 @@ func (r probeReport) String() string {
 			"during p50=%s p99=%s max=%s (%d samples)",
 		r.name, r.statements, len(r.failures), r.servers, r.beforeP50, r.beforeP99,
 		r.duringP50, r.duringP99, r.duringMax, r.duringCount)
+}
+
+// failureSummary collapses the failures into one line per distinct error.
+//
+// Written this way because the unabridged list cost a red run its evidence: a probe that
+// loses its connection reports the same error for every one of the thousands of statements
+// it attempts afterwards, and a Ginkgo failure message that long is dropped whole by the CI
+// log rather than truncated. The count and the first offset carry everything the repetition
+// carried, in a few hundred bytes.
+func (r probeReport) failureSummary() string {
+	if len(r.failures) == 0 {
+		return "no statement failed"
+	}
+	distinct := make([]string, 0, 4)
+	counts := map[string]int{}
+	first := map[string]time.Duration{}
+	for _, failure := range r.failures {
+		if _, seen := counts[failure.text]; !seen {
+			distinct = append(distinct, failure.text)
+			first[failure.text] = failure.at
+		}
+		counts[failure.text]++
+	}
+	lines := make([]string, 0, len(distinct))
+	for _, text := range distinct {
+		lines = append(lines, fmt.Sprintf("  %d statements, from %s into the probe: %s",
+			counts[text], first[text].Round(time.Millisecond), text))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func maxOf(samples []time.Duration) time.Duration {

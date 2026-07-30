@@ -656,7 +656,8 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 			GinkgoWriter.Printf("\n=== %s\n=== %s\n", heldReport, neighbourReport)
 
 			Expect(heldReport.failures).To(BeEmpty(),
-				"the client was dropped rather than queued: %v", heldReport.failures)
+				"the client was dropped rather than queued:\n%s\nthe port-forward it held "+
+					"said:\n%s", heldReport.failureSummary(), heldReport.forwardLog)
 			Expect(heldReport.duringCount).To(BeNumerically(">", 0),
 				"no statement was issued during the cutover, so nothing was measured")
 			Expect(heldReport.duringMax).To(BeNumerically(">", heldReport.beforeP99*10),
@@ -679,7 +680,9 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 			report := lastNeighbourReport
 			Expect(report.duringCount).To(BeNumerically(">", 0))
 			Expect(report.failures).To(BeEmpty(),
-				"the neighbour was disturbed by somebody else's migration: %v", report.failures)
+				"the neighbour was disturbed by somebody else's migration:\n%s\nthe "+
+					"port-forward it held said:\n%s",
+				report.failureSummary(), report.forwardLog)
 			Expect(report.servers).To(HaveLen(1),
 				"the neighbour was moved by somebody else's migration; it was served by %v",
 				report.servers)
