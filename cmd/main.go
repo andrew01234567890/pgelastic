@@ -321,6 +321,7 @@ func main() {
 		webhooks := map[string]func(ctrl.Manager) error{
 			"PgElasticPool":   webhookv1alpha1.SetupPgElasticPoolWebhookWithManager,
 			"PgTenant":        webhookv1alpha1.SetupPgTenantWebhookWithManager,
+			"PgTenantUser":    webhookv1alpha1.SetupPgTenantUserWebhookWithManager,
 			"PgWorkloadClass": webhookv1alpha1.SetupPgWorkloadClassWebhookWithManager,
 		}
 		for _, kind := range slices.Sorted(maps.Keys(webhooks)) {

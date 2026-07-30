@@ -112,6 +112,8 @@ const envProxyImage = "PGELASTIC_PROXY_IMAGE"
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools/finalizers,verbs=update
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pginstances,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenants,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenantusers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenantusers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenantmigrations,verbs=get;list;watch;create
 // The recorder is client-go's events.EventRecorder, which writes events.k8s.io/v1 rather
 // than core/v1. Granting only the core group leaves every automatic-action and refusal

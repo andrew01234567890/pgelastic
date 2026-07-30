@@ -60,3 +60,33 @@ func TestTheRoleNameIsAFunctionOfTheTenantIdentityAlone(t *testing.T) {
 		t.Fatalf("the role is not identifiable as the tenant's in \\du or pg_stat_activity: %s", acme)
 	}
 }
+
+// Azure's contained-user model requires two same-named users in different databases to be
+// wholly independent identities. PostgreSQL cannot give that - pg_authid is shared - so the
+// name carries it, or one tenant's `app` and another's become one role holding the union of
+// both their privileges.
+func TestTwoTenantsUsersOfTheSameNameAreDifferentRoles(t *testing.T) {
+	alpha := TenantUserRoleName("prod", "acme", "app")
+	beta := TenantUserRoleName("prod", "globex", "app")
+	if alpha == beta {
+		t.Fatalf("two tenants' users called app derived one role: %s", alpha)
+	}
+	if len(alpha) > 63 {
+		t.Fatalf("the derived role name is %d bytes: %s", len(alpha), alpha)
+	}
+	for _, want := range []string{"acme", "app"} {
+		if !strings.Contains(alpha, want) {
+			t.Fatalf("the role is not identifiable in pg_stat_activity: %s", alpha)
+		}
+	}
+}
+
+// A tenant's own users must be distinct from each other too, and from the tenant's owner role.
+func TestATenantsUsersAreDistinctFromEachOtherAndFromItsOwner(t *testing.T) {
+	app := TenantUserRoleName("prod", "acme", "app")
+	reporting := TenantUserRoleName("prod", "acme", "reporting")
+	owner := BackendRoleName("prod", "acme")
+	if app == reporting || app == owner || reporting == owner {
+		t.Fatalf("a tenant's roles collided: %s %s %s", app, reporting, owner)
+	}
+}
