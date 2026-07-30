@@ -333,7 +333,7 @@ func awaitFleet(replicas int32) {
 // PostgreSQL which database answered.
 func currentDatabaseThrough(database string) string {
 	GinkgoHelper()
-	forward, err := forwardPod(serviceEndpointPod(), proxyobjects.DefaultClientPort)
+	forward, err := forwardPod(serviceEndpointPod(0), proxyobjects.DefaultClientPort)
 	Expect(err).NotTo(HaveOccurred())
 	defer forward.close()
 
@@ -626,11 +626,14 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 		// Nothing here reads the operator's own account of its pause. That number is measured
 		// by the thing under suspicion; this one is measured by the client.
 		It("carries the tenant onto the target with its clients queued and never dropped", func() {
+			// On different replicas, deliberately: two probes sharing one Pod make the pair
+			// one observation, and a replica that goes away then reads as every tenant in
+			// the pool having been dropped.
 			held := startProbe("the migrated tenant", provision.OpsRole,
-				tenantDatabase, probeInterval)
+				tenantDatabase, 0, probeInterval)
 			defer held.stop()
 			neighbour := startProbe("the neighbour on the other instance", provision.OpsRole,
-				neighbourDatabase, probeInterval)
+				neighbourDatabase, 1, probeInterval)
 			defer neighbour.stop()
 
 			// A baseline first. "During the cutover" is only a meaningful window if there is

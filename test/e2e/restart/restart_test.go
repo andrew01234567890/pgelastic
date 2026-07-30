@@ -20,6 +20,7 @@ package restart
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,6 +87,11 @@ const (
 	// a member restart and long relative to one exec, so the ordering it records is real
 	// without the sampling itself becoming the load.
 	sampleInterval = 2 * time.Second
+	// fleetSample is how often the proxy fleet is looked at during a roll. A replacement
+	// under maxSurge zero takes seconds, so this is several looks at every one of them - and
+	// a rewrite of the fleet's configuration is caught even if the fleet settles back onto
+	// the shape it started with.
+	fleetSample = 500 * time.Millisecond
 	// neighbourDisturbanceCeiling is the worst statement the untouched tenant may see: far
 	// above any normal statement, far below the pause the rolled instance's clients show.
 	neighbourDisturbanceCeiling = 500 * time.Millisecond
@@ -502,11 +508,15 @@ func rollOnce(what string, trigger func(), expectedIncrease int) {
 	Expect(ask(primaryBefore, "SELECT pg_is_in_recovery()")).To(Equal("f"),
 		"the member the operator calls primary has to be the one PostgreSQL calls primary")
 
+	// On different replicas, deliberately. Both tenants forwarded to the same Pod makes the
+	// two probes one observation: that Pod going away ends both at the same moment, and the
+	// report then says every tenant in the pool was dropped whether the fleet moved or a
+	// single replica was replaced. On two replicas the pair separates those.
 	held := startProbe("the rolled instance's tenant", provision.OpsRole,
-		tenantDatabase, probeInterval)
+		tenantDatabase, 0, probeInterval)
 	defer held.stop()
 	neighbour := startProbe("the neighbour on the other instance", provision.OpsRole,
-		neighbourDatabase, probeInterval)
+		neighbourDatabase, 1, probeInterval)
 	defer neighbour.stop()
 
 	time.Sleep(baselineWindow)
@@ -515,7 +525,11 @@ func rollOnce(what string, trigger func(), expectedIncrease int) {
 
 	observer := watch(instanceA)
 	defer observer.close()
-	fleetBefore := observeFleet()
+	// Sampled throughout rather than compared at the ends. A fleet that rolled and settled
+	// back onto the same ReplicaSet reads as unchanged from the ends alone, and every client
+	// it was carrying is still gone.
+	fleet := watchFleet(fleetSample)
+	defer fleet.close()
 
 	trigger()
 	// Waiting for every member to have been recreated, rather than for the operator to say
@@ -563,11 +577,32 @@ func rollOnce(what string, trigger func(), expectedIncrease int) {
 	// next assertion is looking for. Rolling an instance is not allowed to touch the fleet
 	// in front of it, so naming that first means the report accuses the cause rather than
 	// the symptom.
+	//
+	// The configuration is asserted before the Pods, and separately, because it is the cause
+	// and they are the consequence. The proxy Deployment's Pod template carries the
+	// structural half of the rendered document as an annotation, so anything an instance roll
+	// publishes into that half rewrites the template and the rollout that follows drops every
+	// client on the pool - on every tenant of every instance, including the ones the roll
+	// never touched. A changed hash names the value that moved; a changed Pod set only says
+	// somebody died.
 	By("the proxy fleet in front of the instance was never replaced")
-	fleetAfter := observeFleet()
-	Expect(fleetAfter).To(Equal(fleetBefore),
-		"the replicas serving the pool changed while the instance rolled: was %s, now %s",
-		fleetBefore, fleetAfter)
+	shapes := fleet.close()
+	hashes := make([]string, 0, len(shapes))
+	for _, shape := range shapes {
+		if !slices.Contains(hashes, shape.configHash) {
+			hashes = append(hashes, shape.configHash)
+		}
+	}
+	Expect(hashes).To(HaveLen(1),
+		"rolling the instance rewrote the proxy fleet's structural configuration %d times, "+
+			"and every rewrite replaces every replica and drops every client on the pool. "+
+			"The hashes seen were %v, in this sequence:\n%s",
+		len(hashes)-1, hashes, journalOf(shapes))
+	Expect(shapes).To(HaveLen(1),
+		"the replicas serving the pool changed while the instance rolled, without the "+
+			"configuration having moved - so this is the fleet being replaced for some other "+
+			"reason, or an eviction this suite did not cause:\n%s",
+		journalOf(shapes))
 
 	By("no client on the rolled instance saw an error")
 	Expect(heldReport.failures).To(BeEmpty(),

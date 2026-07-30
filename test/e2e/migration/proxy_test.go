@@ -253,9 +253,17 @@ type probeFailure struct {
 
 // startProbe opens the connection and begins asking. The interval is short enough that a
 // sub-second pause is still sampled several times either side of itself.
-func startProbe(name, user, database string, interval time.Duration) *probe {
+//
+// replica picks which of the fleet's Pods the client is forwarded to, and callers are
+// expected to spread their probes across the fleet rather than take the default. Two probes
+// sharing one replica cannot distinguish a fleet that moved from a single replica that was
+// evicted: the shared Pod going away kills both at the same moment and both report the same
+// dropped connection, which reads as a pool-wide fault whatever caused it. Forwarded to
+// different Pods, "both stopped together" means the fleet, and "one stopped" means one
+// replica.
+func startProbe(name, user, database string, replica int, interval time.Duration) *probe {
 	GinkgoHelper()
-	forward, err := forwardPod(serviceEndpointPod(), proxyobjects.DefaultClientPort)
+	forward, err := forwardPod(serviceEndpointPod(replica), proxyobjects.DefaultClientPort)
 	Expect(err).NotTo(HaveOccurred(), "forwarding the pool Service for %s", name)
 
 	ctx, cancel := context.WithCancel(suiteCtx)
@@ -430,9 +438,14 @@ func percentile(samples []time.Duration, which int) time.Duration {
 }
 
 // serviceEndpointPod names one Pod the pool's Service actually selects.
-func serviceEndpointPod() string {
+//
+// The index is taken modulo the fleet so a caller may ask for more probes than there are
+// replicas without having to know how many there are; it wraps rather than failing, because
+// a fleet of one is a legitimate shape and the caller's assertion is about clients, not
+// about replica count.
+func serviceEndpointPod(which int) string {
 	GinkgoHelper()
 	pods := readyProxyPods()
 	Expect(pods).NotTo(BeEmpty(), "the pool Service selects no ready replica")
-	return pods[0]
+	return pods[which%len(pods)]
 }

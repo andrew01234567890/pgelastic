@@ -571,14 +571,20 @@ func (r *PgInstanceReconciler) publishStatus(
 	roll rollState,
 ) error {
 	capacity := builder.Capacity
+	// Derived once and used for both, because the capacity decision is made on the phase
+	// being published rather than on the one published last time. Reading them from
+	// different passes let a member's Pod disappear in this reconcile and the capacity
+	// answer for it arrive in the next, which is a lag in exactly the value that must not
+	// move at all.
+	phase := phaseOf(instance, groups, pods, decision, builder.Replicas())
 	status := map[string]any{
 		fieldObservedGeneration: instance.Generation,
-		fieldPhase:              string(phaseOf(instance, groups, pods, decision, builder.Replicas())),
+		fieldPhase:              string(phase),
 		"capacity": map[string]any{
 			"maxConnections":   int64(capacity.MaxConnections),
 			"reservedForAdmin": int64(capacity.SuperuserReserved + capacity.Reserved),
 			"replicationSlots": int64(capacity.ReplicationSlots),
-			"allocatable":      int64(allocatableOf(instance, capacity, roll, decision)),
+			"allocatable":      int64(allocatableOf(instance, phase, capacity, roll, decision)),
 		},
 		"storage": map[string]any{
 			"allocated": instance.Spec.Storage.Size.String(),
@@ -603,53 +609,75 @@ func (r *PgInstanceReconciler) publishStatus(
 		client.FieldOwner("pgelastic-operator"), client.ForceOwnership)
 }
 
-// allocatableOf publishes zero while the instance is not yet serving all its members.
-// A re-cloning or half-built instance must not have its headroom counted as available:
-// quorum-gated failover is impossible while it is at reduced redundancy, so promising
-// tenants that capacity would be promising something the instance cannot honour.
+// allocatableOf publishes what tenants may draw on, and withholds it only where the
+// instance is genuinely not carrying them. A re-cloning or half-built instance must not have
+// its headroom counted as available: quorum-gated failover is impossible while it is at
+// reduced redundancy, so promising tenants that capacity would be promising something the
+// instance cannot honour.
 //
-// A rolling restart is the one exception, and it is not a nicety. This number is part of
-// the proxy fleet's *structural* configuration, so every time it moves the fleet's Pod
+// A rolling restart is not one of those cases, and that is not a nicety. This number is
+// part of the proxy fleet's *structural* configuration, so every time it moves the fleet's Pod
 // template changes and the rollout that follows drops every client on the pool - including
 // the clients of instances the roll never touched. An instance whose allocatable collapsed
 // to zero for each member restart would roll the fleet several times per roll, which is a
 // rolling restart that produces exactly the outcome it exists to prevent. It ran, and the
 // held probes recorded 1426 dropped statements on the rolled instance and 857 on its
-// untouched neighbour before this exception existed.
+// untouched neighbour before the exception existed; it ran again with the exception written
+// as a list of publishing phases, and recorded 2527 and 2078.
 //
 // Publishing the capacity through a roll is also the truthful answer. A roll takes one
 // member away at a time, on purpose, for as long as one restart takes; the instance is
 // serving every tenant it had, on the same number of connections, throughout. What the
 // zero is for is a member rebuilding itself for minutes to hours with no end in sight.
-// The test is which phases *withhold* the capacity, not which ones publish it. Listing the
-// publishing phases leaves every transient phase zeroing a structural value, and a roll
-// passes through several of them: the window between the last member restarting and the
-// instance reporting Ready again zeroed this, rewrote the fleet's Pod template, and churned
-// proxy Pods through the end of every roll. Observed directly — the rendered document
-// gained and lost `backendConnections = 50` every few seconds while the fleet rolled.
+//
+// So the rule is the one the paragraph above states and the code did not follow: the test is
+// which states *withhold* the capacity, never which ones publish it. An allow-list of serving
+// phases leaves every transient phase zeroing a structural value, and it failed twice for the
+// same reason both times. A roll restarts a member by deleting its Pod; phaseOf reports fewer
+// Pods than replicas as Bootstrapping, before it looks at readiness at all; and Bootstrapping
+// is not a phase any list of serving states would contain. So every member restart zeroed
+// this twice, and a three-member roll rewrote the fleet's Pod template up to six times.
+// Observed directly — the rendered document gained and lost `backendConnections = 50` every
+// few seconds while the fleet rolled.
+//
+// Withholding does not even do what it was written to do. renderInstances omits the key when
+// it is zero, and an instance that declares no budget of its own inherits the pool-wide one,
+// so the transient zero does not withhold this instance's capacity — it silently raises the
+// instance's backend ceiling to the pool's for as long as it lasts. One more reason the
+// answer is to keep the number still rather than to pick a better moment to move it.
+//
+// The two states that withhold are therefore stated positively:
+//
+//   - An instance that has never served. status.currentPrimary is written by the member that
+//     took the role, last in the promotion sequence, and nothing ever clears it - a failover
+//     names its candidate in targetPrimary instead. So an empty one is the durable fact "this
+//     instance has not carried a tenant yet", which is what a half-built instance is, and it
+//     does not depend on which phase a half-built instance happens to report today.
+//   - A member rebuilding itself outside a roll. That is the minutes-to-hours case the zero
+//     was written for: reduced redundancy with no bounded end, and no operator action pacing
+//     it. Inside a roll it is one member being restarted on purpose, which is the case above.
+//
+// Plus the two that are not about capacity at all: split brain, where two members both
+// believe they hold the role, and an instance being taken apart.
 func allocatableOf(
 	instance *pgelasticv1alpha1.PgInstance,
+	phase pgelasticv1alpha1.InstancePhase,
 	capacity pgconf.Capacity,
 	roll rollState,
 	decision ha.Decision,
 ) int32 {
-	_ = roll
-	if decision.SplitBrain {
+	switch {
+	case decision.SplitBrain:
 		return 0
-	}
-	// Ready, Degraded and FailingOver all describe an instance that is carrying its tenants
-	// right now, on the same number of connections. A roll passes through the latter two on
-	// every member, so admitting only Ready made this value flap for the length of every
-	// roll. Anything else — half-built, rebuilding, being taken apart, or a phase this
-	// function has not been taught — withholds, because an unrecognised state is not
-	// evidence of capacity.
-	switch instance.Status.Phase {
-	case pgelasticv1alpha1.InstancePhaseReady,
-		pgelasticv1alpha1.InstancePhaseDegraded,
-		pgelasticv1alpha1.InstancePhaseFailingOver:
-		return capacity.Allocatable
+	case instance.Status.CurrentPrimary == "":
+		return 0
+	case phase == pgelasticv1alpha1.InstancePhaseDraining,
+		phase == pgelasticv1alpha1.InstancePhaseTerminating:
+		return 0
+	case phase == pgelasticv1alpha1.InstancePhaseRecloning && !roll.active:
+		return 0
 	default:
-		return 0
+		return capacity.Allocatable
 	}
 }
 

@@ -124,6 +124,30 @@ func TestAddingAnInstanceRollsTheFleet(t *testing.T) {
 	}
 }
 
+// An instance's connection budget is structural, and this states it so the operator side
+// can be held to never moving it for a transient reason.
+//
+// A replica builds one pool per instance at start-up and sizes its budget ledger then, so
+// the running process genuinely cannot adopt a new number - which is why this is the one
+// direction of the split that cannot simply be relaxed. The consequence is that the value
+// has to be stable at the source: every time it moves, the fleet's Pod template changes and
+// the rollout that follows takes every client socket on the pool with it, on every tenant of
+// every instance. That is what allocatableOf's roll exception exists to guarantee, and this
+// is the assertion that says why it matters here rather than only in the controller.
+func TestAnInstanceCapacityChangeRollsTheFleet(t *testing.T) {
+	config := testConfig()
+	config.Instances[0].BackendConnections = 50
+	before := config.Render()
+
+	config.Instances[0].BackendConnections = 0
+	after := config.Render()
+
+	if before.StructuralHash == after.StructuralHash {
+		t.Fatal("an instance's backend budget left the pod template unchanged; if that is " +
+			"now deliberate, the reload path has to adopt it and this test says so")
+	}
+}
+
 func TestEveryInstanceCarriesItsOwnCredentials(t *testing.T) {
 	document := testConfig().Render().TOML
 	if !strings.Contains(document, `password = "a"`) ||

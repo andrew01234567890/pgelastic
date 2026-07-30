@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -53,19 +54,27 @@ var deployedOperator = client.ObjectKey{
 
 // fleetShape is what "nobody else is writing to this fleet" is measured as.
 //
-// A second operator rewriting the proxy Deployment shows up in all three at once: the
-// Deployment's generation advances on every rewrite, a second ReplicaSet appears to serve
-// the template it prefers, and the Pods turn over as the two ReplicaSets are scaled against
-// each other. Reading only one of them would leave a way for the fight to hide.
+// A second operator rewriting the proxy Deployment shows up in all four at once: the
+// structural half of the rendered configuration is what the two of them disagree about and
+// it is carried on the Pod template as an annotation, the Deployment's generation advances
+// on every rewrite, a second ReplicaSet appears to serve the template it prefers, and the
+// Pods turn over as the two ReplicaSets are scaled against each other. Reading only one of
+// them would leave a way for the fight to hide.
+//
+// configHash is also the sharpest thing a roll can be held to. It is the value the rollout
+// is a consequence of, so it moves before any Pod does: a spec that watches it accuses the
+// configuration that changed rather than the replica that went away because of it.
 type fleetShape struct {
+	configHash  string
 	generation  int64
 	replicaSets []string
 	pods        []string
 }
 
 func (s fleetShape) String() string {
-	return fmt.Sprintf("generation=%d replicaSets=[%s] pods=[%s]",
-		s.generation, strings.Join(s.replicaSets, " "), strings.Join(s.pods, " "))
+	return fmt.Sprintf("configHash=%s generation=%d replicaSets=[%s] pods=[%s]",
+		s.configHash, s.generation, strings.Join(s.replicaSets, " "),
+		strings.Join(s.pods, " "))
 }
 
 // observeFleet reads the fleet straight from the API server. Nothing here goes through the
@@ -73,15 +82,28 @@ func (s fleetShape) String() string {
 // believes about this Deployment.
 func observeFleet() fleetShape {
 	GinkgoHelper()
+	shape, err := readFleet()
+	Expect(err).NotTo(HaveOccurred())
+	return shape
+}
+
+// readFleet is observeFleet without the assertions, so a sampler running on its own
+// goroutine can call it. Gomega's failure handler belongs to the spec's goroutine, and a
+// transient read error from a background sampler is not a verdict on anything.
+func readFleet() (fleetShape, error) {
 	deployment := &appsv1.Deployment{}
-	Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
+	if err := k8sClient.Get(suiteCtx, client.ObjectKey{
 		Namespace: e2eNamespace, Name: proxyobjects.DeploymentName(poolName),
-	}, deployment)).To(Succeed())
+	}, deployment); err != nil {
+		return fleetShape{}, err
+	}
 
 	selector := client.MatchingLabels(proxyobjects.Selector(poolName))
 	replicaSets := &appsv1.ReplicaSetList{}
-	Expect(k8sClient.List(suiteCtx, replicaSets, client.InNamespace(e2eNamespace), selector)).
-		To(Succeed())
+	if err := k8sClient.List(suiteCtx, replicaSets,
+		client.InNamespace(e2eNamespace), selector); err != nil {
+		return fleetShape{}, err
+	}
 	live := make([]string, 0, len(replicaSets.Items))
 	for i := range replicaSets.Items {
 		set := &replicaSets.Items[i]
@@ -92,7 +114,10 @@ func observeFleet() fleetShape {
 	slices.Sort(live)
 
 	pods := &corev1.PodList{}
-	Expect(k8sClient.List(suiteCtx, pods, client.InNamespace(e2eNamespace), selector)).To(Succeed())
+	if err := k8sClient.List(suiteCtx, pods,
+		client.InNamespace(e2eNamespace), selector); err != nil {
+		return fleetShape{}, err
+	}
 	identities := make([]string, 0, len(pods.Items))
 	for i := range pods.Items {
 		pod := &pods.Items[i]
@@ -102,7 +127,84 @@ func observeFleet() fleetShape {
 	}
 	slices.Sort(identities)
 
-	return fleetShape{generation: deployment.Generation, replicaSets: live, pods: identities}
+	return fleetShape{
+		configHash:  deployment.Spec.Template.Annotations[proxyobjects.AnnotationConfigHash],
+		generation:  deployment.Generation,
+		replicaSets: live,
+		pods:        identities,
+	}, nil
+}
+
+// fleetWatch samples the fleet for as long as it is open and keeps every distinct shape it
+// saw, in the order it saw them.
+//
+// Comparing the two ends is not enough and the reason is not hypothetical: a fleet that
+// rolled and settled back onto the same ReplicaSet with the same replica count ends where it
+// started, and every client it was carrying is gone. What has to be asserted is that the
+// fleet never moved, not that it came back.
+type fleetWatch struct {
+	mu     sync.Mutex
+	seen   []fleetShape
+	stop   chan struct{}
+	closed chan struct{}
+	once   sync.Once
+}
+
+// watchFleet begins sampling. The interval is short relative to a rollout: with maxSurge
+// zero a replacement takes seconds, so this is several looks at every one of them.
+func watchFleet(every time.Duration) *fleetWatch {
+	w := &fleetWatch{stop: make(chan struct{}), closed: make(chan struct{})}
+	w.sample()
+	go func() {
+		defer close(w.closed)
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-w.stop:
+				return
+			case <-ticker.C:
+				w.sample()
+			}
+		}
+	}()
+	return w
+}
+
+func (w *fleetWatch) sample() {
+	shape, err := readFleet()
+	if err != nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.seen) > 0 && fmt.Sprint(w.seen[len(w.seen)-1]) == fmt.Sprint(shape) {
+		return
+	}
+	w.seen = append(w.seen, shape)
+}
+
+// close stops sampling, takes one final look, and reports every distinct shape observed. A
+// fleet nothing touched reports exactly one.
+func (w *fleetWatch) close() []fleetShape {
+	w.once.Do(func() {
+		close(w.stop)
+		<-w.closed
+		w.sample()
+	})
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]fleetShape(nil), w.seen...)
+}
+
+// journalOf renders a sequence of observations one per line, so a failure shows what the
+// fleet did rather than only that it did something.
+func journalOf(shapes []fleetShape) string {
+	lines := make([]string, 0, len(shapes))
+	for i, shape := range shapes {
+		lines = append(lines, fmt.Sprintf("  %d. %s", i+1, shape))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // requireDeployedOperator fails the spec unless another pgelastic operator is serving on
