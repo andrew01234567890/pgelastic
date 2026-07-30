@@ -43,6 +43,11 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
 )
 
+// anySource is pg_hba's spelling of "from anywhere". It is a default rather than a
+// confinement: the CIDR a pod dials from is a property of the cluster's CNI that the operator
+// cannot derive, so a real deployment configures it.
+const anySource = "all"
+
 // requeueInterval paces the provisioning ladder. Members are created one per reconcile and
 // each waits for the one before it, so the loop needs a heartbeat rather than only edges.
 const requeueInterval = 5 * time.Second
@@ -899,7 +904,21 @@ func (r *PgInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// "all" until the operator is told the pod CIDR. It admits only the replication
 		// and ops roles, both of which authenticate with SCRAM; the deny-by-default
 		// catch-all still refuses every tenant role from every address.
-		r.PeerSources = []string{"all"}
+		r.PeerSources = []string{anySource}
+	}
+	if r.ProxySources == nil {
+		// Unset until now, which meant RenderHBA emitted no proxy rule at all and the
+		// deny-by-default catch-all refused every client. That was survivable only while
+		// tenant roles were passwordless and nothing ever authenticated as one; the moment
+		// the proxy dials backends as the tenant, a missing rule is a pool nobody can reach.
+		//
+		// "all" is a default rather than a confinement, and it is deliberately not presented
+		// as one: the CIDR the proxy's pods dial from is a property of the cluster's CNI that
+		// the operator cannot derive, so it has to be configured. What this default buys is
+		// that tenant roles authenticate at all, over SCRAM, which is strictly better than a
+		// listener nothing can reach - and the containment those roles actually rest on is
+		// the per-database ACL, not this list.
+		r.ProxySources = []string{anySource}
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pgelasticv1alpha1.PgInstance{}).
