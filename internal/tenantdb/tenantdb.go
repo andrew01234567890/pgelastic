@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 )
 
@@ -78,7 +79,23 @@ type Spec struct {
 	// ConnectionLimit mirrors the tenant's effective burstable ceiling onto the role as
 	// an in-database backstop. The proxy is the enforcement point; this only bounds what
 	// a client that got past the proxy can hold. NoConnectionLimit leaves it uncapped.
+	//
+	// Set to NoConnectionLimit once the proxy authenticates as this role: every backend the
+	// fleet opens then counts against it, and N replicas each holding up to burstable would
+	// breach it by a factor of N with "too many connections for role". The proxy's own ledger
+	// is the ceiling that matters.
 	ConnectionLimit int32
+	// Verifier is the SCRAM-SHA-256 credential the role authenticates with, in PostgreSQL's
+	// own stored form. Empty leaves the role passwordless, which is what it was before the
+	// proxy dialled backends as the tenant.
+	//
+	// The verifier rather than the password, so the plaintext never crosses the exec channel
+	// and the same bytes land on every instance this tenant is provisioned on - which is what
+	// lets a migration re-establish the credential on a target without copying pg_authid.
+	Verifier string
+	// Readers are the tenant's other roles that must be able to reach the database. The owner
+	// is always granted; this is everything else.
+	Readers []string
 }
 
 // State is what the catalog currently says about a tenant's objects.
@@ -126,6 +143,22 @@ func Ensure(ctx context.Context, sql SQL, at Endpoint, spec Spec) (State, error)
 	created, err := ensureDatabase(ctx, sql, postgres, spec, state)
 	if err != nil {
 		return state, err
+	}
+	// Issued only when something was actually created. Both are idempotent, but a reconcile
+	// loop that re-issued them would write a credential into the instance's log on every pass
+	// and turn a steady-state reconcile into a stream of DDL - and "a second pass issues no
+	// statement that changes anything" is a property worth keeping.
+	//
+	// The cost is that a tenant provisioned before either existed keeps its old posture until
+	// something recreates its role or database. The migration path applies both on the target,
+	// so a move heals one; nothing else does yet.
+	if changed || created {
+		if err := ensureCredential(ctx, sql, postgres, spec); err != nil {
+			return state, err
+		}
+		if err := ensureDatabaseGrants(ctx, sql, postgres, spec); err != nil {
+			return state, err
+		}
 	}
 
 	if changed || created {
@@ -228,15 +261,66 @@ func ensureRole(ctx context.Context, sql SQL, postgres Endpoint, spec Spec, stat
 	if state.RoleExists {
 		return false, nil
 	}
-	// LOGIN with no password, exactly as the migration path creates it: password_encryption
-	// is scram-sha-256 throughout, so a role with no password cannot authenticate over TCP
-	// at all. This creates the ownership the database needs without minting a credential
-	// that is not this controller's to mint.
-	err := sql.Exec(ctx, postgres, fmt.Sprintf(`CREATE ROLE %s LOGIN`, migration.QuoteIdentifier(spec.Owner)))
+	// Every privileged attribute is spelled out and denied rather than left to the default,
+	// because the tenant's role is now the whole privilege surface a client reaches: nothing
+	// runs as pgelastic_ops on a tenant's behalf any more. NOCREATEROLE is the sharpest of
+	// them - a role that holds it can mint cluster-global roles of its own, which defeats the
+	// namespacing that keeps two tenants' identities apart.
+	err := sql.Exec(ctx, postgres, fmt.Sprintf(
+		`CREATE ROLE %s LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`,
+		migration.QuoteIdentifier(spec.Owner)))
 	if err != nil && !alreadyExists(err) {
 		return false, fmt.Errorf("creating the tenant role %q: %w", spec.Owner, err)
 	}
 	return true, nil
+}
+
+// ensureCredential sets the role's password from a pre-computed verifier.
+//
+// Re-issued on every pass rather than compared first: the stored verifier is not readable
+// without superuser access to pg_authid, and asking for it would make this a place where
+// credentials are read rather than written. ALTER ROLE ... PASSWORD with an identical verifier
+// is a no-op in effect, so the cost of re-issuing is one statement.
+func ensureCredential(ctx context.Context, sql SQL, postgres Endpoint, spec Spec) error {
+	if spec.Verifier == "" {
+		return nil
+	}
+	statement := fmt.Sprintf(`ALTER ROLE %s PASSWORD %s`,
+		migration.QuoteIdentifier(spec.Owner), migration.QuoteLiteral(spec.Verifier))
+	if err := sql.Exec(ctx, postgres, statement); err != nil {
+		return fmt.Errorf("setting the credential on role %q: %w", spec.Owner, err)
+	}
+	return nil
+}
+
+// ensureDatabaseGrants confines the tenant's database to the tenant's own roles.
+//
+// The default datacl grants CONNECT and TEMPORARY to PUBLIC. Roles are cluster-global, so once
+// tenant roles can authenticate that means every tenant's role can open a session on every
+// other tenant's database. Revoking it and granting back only this tenant's roles - plus the
+// ops role, which the control plane reaches the database as - is what confines a tenant.
+//
+// Issued every pass. It is idempotent, and a tenant whose database was created before this
+// existed would otherwise keep the open posture for ever.
+func ensureDatabaseGrants(ctx context.Context, sql SQL, postgres Endpoint, spec Spec) error {
+	database := migration.QuoteIdentifier(spec.Database)
+	statements := []string{fmt.Sprintf(`REVOKE ALL ON DATABASE %s FROM PUBLIC`, database)}
+	for _, role := range append([]string{spec.Owner}, spec.Readers...) {
+		if role == "" {
+			continue
+		}
+		statements = append(statements, fmt.Sprintf(
+			`GRANT CONNECT, TEMPORARY ON DATABASE %s TO %s`, database, migration.QuoteIdentifier(role)))
+	}
+	statements = append(statements, fmt.Sprintf(`GRANT CONNECT ON DATABASE %s TO %s`,
+		database, migration.QuoteIdentifier(provision.OpsRole)))
+
+	for _, statement := range statements {
+		if err := sql.Exec(ctx, postgres, statement); err != nil {
+			return fmt.Errorf("confining database %q to its own roles: %w", spec.Database, err)
+		}
+	}
+	return nil
 }
 
 func ensureDatabase(ctx context.Context, sql SQL, postgres Endpoint, spec Spec, state State) (bool, error) {

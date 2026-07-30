@@ -230,6 +230,24 @@ func BootstrapRoles(ctx context.Context, conn *pgx.Conn, replicationPassword, op
 			provision.OpsRole),
 		upsertRole(provision.RewindRole, rewindPassword, ""),
 	)
+	// The maintenance databases stop admitting PUBLIC.
+	//
+	// Harmless while tenant roles were passwordless and could not open a session anywhere.
+	// Once the proxy authenticates as them it is a cross-tenant leak: a tenant role locked out
+	// of every tenant database could still connect to postgres and read pg_database for every
+	// tenant's database name, pg_roles for every tenant's role names, pg_shdescription for the
+	// migration stamps that name them, and pg_stat_activity for who is connected where. None
+	// of that is its own data, and none of it needs a single privilege to read.
+	//
+	// template1 is included because a database created from it inherits its ACL, so leaving it
+	// open would hand the same opening to every database made afterwards.
+	for _, database := range []string{"postgres", "template1"} {
+		statements = append(statements,
+			fmt.Sprintf(`REVOKE CONNECT ON DATABASE %s FROM PUBLIC`, database),
+			fmt.Sprintf(`GRANT CONNECT ON DATABASE %s TO %s, %s, %s`,
+				database, provision.OpsRole, provision.ReplicationRole, provision.RewindRole),
+		)
+	}
 	// pg_rewind reads the source's data directory over an ordinary connection, so the role
 	// it dials as needs exactly these four functions and nothing else. Granting it a
 	// predefined role instead, or superuser, would hand file-read access far wider than the

@@ -237,6 +237,20 @@ impl Config {
         structural.config_version = String::new();
         structural.routing.tenants.clear();
         structural.pool.tenants.clear();
+        // A pool exists to have tenants added to it, and every login used to sit in this half -
+        // so onboarding one restarted every replica and dropped every other tenant's clients.
+        // `auth.scram_iterations` deliberately stays: it is part of every verifier rather than
+        // a tunable, so changing it invalidates every credential derived under the old value,
+        // which is a different process rather than a document a running one can adopt.
+        structural.auth.users.clear();
+        // An instance's allocatable capacity moves whenever that instance rolls, because the
+        // operator withholds it while a member is not serving. Leaving it here meant rolling
+        // one instance restarted the whole fleet and dropped every client of every tenant on
+        // every *other* instance. Which instances exist, and how they are dialled, stay
+        // structural - those a running process genuinely cannot adopt.
+        for instance in &mut structural.instances {
+            instance.backend_connections = None;
+        }
         structural
     }
 
@@ -547,6 +561,17 @@ pub struct ServerTlsConfig {
     pub key_file: PathBuf,
 }
 
+/// A SCRAM secret already derived, so the backend leg does not repeat the KDF.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaltedSecret {
+    /// `SaltedPassword`, base64. `ClientKey` and `ServerKey` both derive from it.
+    pub salted_password: String,
+    /// The parameters it was derived under, without which it means nothing.
+    pub salt: String,
+    pub iterations: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BackendConfig {
@@ -554,6 +579,10 @@ pub struct BackendConfig {
     pub user: String,
     #[serde(default)]
     pub password: Option<String>,
+    /// Preferred over `password` when present: the proxy then never holds a
+    /// plaintext it could replay, and every backend open saves a PBKDF2.
+    #[serde(default)]
+    pub salted_password: Option<SaltedSecret>,
     #[serde(default)]
     pub database: Option<String>,
     #[serde(default = "default_connect_seconds")]
@@ -859,6 +888,53 @@ pub struct TenantConfig {
     pub priority: u32,
     #[serde(default = "default_tenant_max_client_connections")]
     pub max_client_connections: u32,
+    /// The `PostgreSQL` role this tenant's backend sessions run as.
+    ///
+    /// Empty until the operator has provisioned it. A tenant without one is
+    /// refused rather than served on the instance identity: falling back would
+    /// put tenant SQL back on the control plane's own role at exactly the
+    /// moment nobody is watching, and `session_user` is what an audit trail
+    /// records.
+    #[serde(default)]
+    pub backend_role: String,
+    /// The client half of the tenant's SCRAM credential, base64. On the backend
+    /// leg the proxy is the SCRAM *client*, so a server-side verifier would be
+    /// useless to it - what it needs is `SaltedPassword`, from which `ClientKey`
+    /// and `ServerKey` both derive.
+    ///
+    /// Supplying it directly also removes a PBKDF2 from every backend open,
+    /// which is on the thundering-herd path the connect gate exists to bound.
+    #[serde(default)]
+    pub backend_salted_password: String,
+    /// The parameters that secret was derived under. `SaltedPassword` means
+    /// nothing without them.
+    #[serde(default)]
+    pub backend_salt: String,
+    #[serde(default)]
+    pub backend_iterations: u32,
+    /// Bumped whenever the operator re-issues the credential. It is part of the
+    /// pool key, so a bump makes links opened under the old one unreachable
+    /// from any new binding; they drain out rather than being handed on.
+    #[serde(default)]
+    pub credential_generation: u64,
+}
+
+impl Default for TenantConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            guaranteed: 0,
+            burstable: 0,
+            weight: default_weight(),
+            priority: default_priority(),
+            max_client_connections: default_tenant_max_client_connections(),
+            backend_role: String::new(),
+            backend_salted_password: String::new(),
+            backend_salt: String::new(),
+            backend_iterations: 0,
+            credential_generation: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]

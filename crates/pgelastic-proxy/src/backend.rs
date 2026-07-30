@@ -244,9 +244,19 @@ async fn sasl(
     };
 
     let parsed = ScramClient::parse_server_first(&server_first)?;
-    let salted = kdf
-        .salted_password(password, parsed.salt.clone(), parsed.iterations)
-        .await?;
+    // A credential the operator already derived is used as it is. The server's salt and
+    // iteration count are still checked against the ones it was derived under, because a
+    // SaltedPassword produced with different parameters answers the challenge wrongly and the
+    // only error PostgreSQL gives for that says "password authentication failed" - which is
+    // indistinguishable from the credential simply being wrong, and would send whoever reads
+    // it looking in the wrong place.
+    let salted = match presalted(config, &parsed)? {
+        Some(secret) => secret,
+        None => {
+            kdf.salted_password(password, parsed.salt.clone(), parsed.iterations)
+                .await?
+        }
+    };
     let final_message = client.client_final(&server_first, &salted)?;
     write_frontend(
         stream,
@@ -288,6 +298,51 @@ fn password(config: &BackendConfig) -> Result<Zeroizing<String>> {
     })
 }
 
+/// The already-derived secret, when one is configured and the server agrees about the
+/// parameters it was derived under.
+///
+/// Disagreement is refused rather than papered over by re-deriving. A `SaltedPassword`
+/// computed under a different salt or iteration count answers the challenge wrongly, and all
+/// `PostgreSQL` says about that is "password authentication failed" - identical to the
+/// credential simply being wrong, which sends whoever reads it looking in the wrong place.
+fn presalted(
+    config: &BackendConfig,
+    parsed: &crate::scram::message::ServerFirst,
+) -> Result<Option<Zeroizing<crate::scram::crypto::Key>>> {
+    use base64::Engine as _;
+    let Some(secret) = &config.salted_password else {
+        return Ok(None);
+    };
+    let decode = |value: &str, what: &str| {
+        base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .map_err(|e| {
+                ProxyError::config(format!(
+                    "the backend credential's {what} is not base64: {e}"
+                ))
+            })
+    };
+    let salt = decode(&secret.salt, "salt")?;
+    if salt != parsed.salt || secret.iterations != parsed.iterations.get() {
+        return Err(ProxyError::config(format!(
+            "the credential configured for backend user {:?} was derived under different SCRAM \
+             parameters than the server offers, so it cannot authenticate: configured {} \
+             iterations, the server asked for {}",
+            config.user, secret.iterations, parsed.iterations
+        )));
+    }
+    let raw = decode(&secret.salted_password, "salted password")?;
+    let key: crate::scram::crypto::Key = raw.as_slice().try_into().map_err(|_| {
+        ProxyError::config(format!(
+            "the backend credential for user {:?} is {} bytes, not {}",
+            config.user,
+            raw.len(),
+            crate::scram::crypto::KEY_LEN
+        ))
+    })?;
+    Ok(Some(Zeroizing::new(key)))
+}
+
 fn describe(fields: &pgelastic_wire::Fields) -> String {
     let text = |value: Option<&Bytes>| {
         value.map_or_else(String::new, |v| String::from_utf8_lossy(v).into_owned())
@@ -301,6 +356,7 @@ mod tests {
 
     fn config() -> BackendConfig {
         BackendConfig {
+            salted_password: None,
             address: "127.0.0.1:5432".to_owned(),
             user: "proxy".to_owned(),
             password: None,

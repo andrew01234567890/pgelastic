@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/tenantdb"
 	"github.com/andrew01234567890/pgelastic/internal/tenantdb/tenantdbtest"
 )
@@ -86,9 +87,13 @@ var _ = Describe("PgTenant database provisioning", Ordered, func() {
 
 		reconcileNow(reconciler, tenant)
 
-		Expect(cluster.HasRole("prov_happy")).To(BeTrue())
+		// The role is derived from the tenant's identity rather than named after its
+		// database, so two tenants that chose the same spec.owner cannot share one - which,
+		// now that these roles carry credentials, would be a merge of two identities.
+		role := migration.BackendRoleName(namespace, "prov-happy")
+		Expect(cluster.HasRole(role)).To(BeTrue())
 		Expect(cluster.HasDatabase("prov_happy")).To(BeTrue())
-		Expect(cluster.OwnerOf("prov_happy")).To(Equal("prov_happy"))
+		Expect(cluster.OwnerOf("prov_happy")).To(Equal(role))
 
 		fetched := refetch(tenant)
 		ready := conditionOf(fetched.Status.Conditions, pgelasticv1alpha1.ConditionReady)
@@ -108,12 +113,17 @@ var _ = Describe("PgTenant database provisioning", Ordered, func() {
 		Expect(refetch(tenant).Finalizers).To(ContainElement(TenantDatabaseFinalizer))
 	})
 
-	It("mirrors the effective burstable ceiling onto the role", func() {
+	// Deliberately uncapped. rolconnlimit was a harmless backstop while nothing logged in as
+	// the tenant's role; now that the proxy authenticates as it, every backend the fleet opens
+	// counts against it, and N replicas each entitled to burstable would breach a limit of
+	// burstable by a factor of N. The proxy's own ledger is the ceiling that means anything.
+	It("leaves the role uncapped, because the fleet is what bounds it", func() {
 		tenant := createTenant("prov-limit", "prov_limit", nil)
 
 		reconcileNow(reconciler, tenant)
 
-		Expect(cluster.ConnectionLimit("prov_limit")).To(Equal(burstable))
+		role := migration.BackendRoleName(namespace, "prov-limit")
+		Expect(cluster.ConnectionLimit(role)).To(Equal(tenantdb.NoConnectionLimit))
 	})
 
 	It("issues no statement that changes anything on a second pass", func() {
@@ -184,7 +194,7 @@ var _ = Describe("PgTenant database provisioning", Ordered, func() {
 		reconcileNow(reconciler, tenant)
 
 		Expect(cluster.HasDatabase("prov_retain")).To(BeTrue())
-		Expect(cluster.HasRole("prov_retain")).To(BeTrue())
+		Expect(cluster.HasRole(migration.BackendRoleName(namespace, "prov-retain"))).To(BeTrue())
 		Expect(cluster.Ran("DROP")).To(Equal(0))
 		Eventually(func() bool { return present(tenant) }).Should(BeFalse())
 	})
@@ -200,7 +210,7 @@ var _ = Describe("PgTenant database provisioning", Ordered, func() {
 		reconcileNow(reconciler, tenant)
 
 		Expect(cluster.HasDatabase("prov_delete")).To(BeFalse())
-		Expect(cluster.HasRole("prov_delete")).To(BeFalse())
+		Expect(cluster.HasRole(migration.BackendRoleName(namespace, "prov-delete"))).To(BeFalse())
 		Eventually(func() bool { return present(tenant) }).Should(BeFalse())
 	})
 

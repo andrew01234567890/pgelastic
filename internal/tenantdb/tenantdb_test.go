@@ -246,3 +246,63 @@ func indexOf(statements []string, fragment string) int {
 	}
 	return -1
 }
+
+// The default datacl grants CONNECT and TEMPORARY to PUBLIC. Roles are cluster-global, so once
+// tenant roles can authenticate that means every tenant's role can open a session on every
+// other tenant's database.
+func TestTheDatabaseIsConfinedToTheTenantsOwnRoles(t *testing.T) {
+	cluster := tenantdbtest.NewCluster()
+	spec := spec()
+	spec.Readers = []string{"acme_reader"}
+	if _, err := tenantdb.Ensure(context.Background(), cluster, endpoint(), spec); err != nil {
+		t.Fatal(err)
+	}
+	statements := strings.Join(cluster.Statements(), "\n")
+	for _, want := range []string{
+		`REVOKE ALL ON DATABASE "acme_prod" FROM PUBLIC`,
+		`GRANT CONNECT, TEMPORARY ON DATABASE "acme_prod" TO "acme_prod"`,
+		`GRANT CONNECT, TEMPORARY ON DATABASE "acme_prod" TO "acme_reader"`,
+		`GRANT CONNECT ON DATABASE "acme_prod" TO "pgelastic_ops"`,
+	} {
+		if !strings.Contains(statements, want) {
+			t.Fatalf("provisioning never issued %q:\n%s", want, statements)
+		}
+	}
+}
+
+// The verifier rather than the password, so the plaintext never crosses the exec channel and
+// the same bytes land on every instance this tenant is ever provisioned on.
+func TestTheRoleIsGivenItsCredentialAsAStoredVerifier(t *testing.T) {
+	cluster := tenantdbtest.NewCluster()
+	spec := spec()
+	spec.Verifier = "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy"
+	if _, err := tenantdb.Ensure(context.Background(), cluster, endpoint(), spec); err != nil {
+		t.Fatal(err)
+	}
+	statements := strings.Join(cluster.Statements(), "\n")
+	if !strings.Contains(statements, `ALTER ROLE "acme_prod" PASSWORD 'SCRAM-SHA-256$4096:`) {
+		t.Fatalf("the role was never given its credential:\n%s", statements)
+	}
+}
+
+// The tenant's role is now the whole privilege surface a client reaches, so every privileged
+// attribute is denied explicitly rather than left to the default.
+func TestTheTenantRoleIsCreatedWithNoPrivilegedAttribute(t *testing.T) {
+	cluster := tenantdbtest.NewCluster()
+	if _, err := tenantdb.Ensure(context.Background(), cluster, endpoint(), spec()); err != nil {
+		t.Fatal(err)
+	}
+	var create string
+	for _, statement := range cluster.Statements() {
+		if strings.HasPrefix(statement, "CREATE ROLE") {
+			create = statement
+		}
+	}
+	for _, want := range []string{
+		"NOSUPERUSER", "NOCREATEDB", "NOCREATEROLE", "NOREPLICATION", "NOBYPASSRLS",
+	} {
+		if !strings.Contains(create, want) {
+			t.Fatalf("the tenant role was created without %s: %s", want, create)
+		}
+	}
+}
