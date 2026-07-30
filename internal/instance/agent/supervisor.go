@@ -59,6 +59,16 @@ const observeInterval = 2 * time.Second
 // it simply learns of it sooner.
 const handoverInterval = 250 * time.Millisecond
 
+// localReadTimeout bounds one look at this member's own postmaster: connect, observe, converge
+// the synchronous clause, read the collation contract.
+//
+// It is deliberately its own constant rather than the observe cadence it used to borrow. While
+// the cadence was fixed the two were the same number by coincidence, and the coincidence reads
+// like a rule - so the obvious tidy-up, making the timeout track the chosen cadence, would give
+// this work 250ms during exactly the handover it must not be starved in. observe() returning
+// early skips reconcileRole, and a primary that skips reconcileRole stops renewing its lease.
+const localReadTimeout = 2 * time.Second
+
 // Command is an instruction delivered to the supervisor's inner loop from outside the
 // signal path.
 type Command int
@@ -484,7 +494,7 @@ func (s *Supervisor) observe(ctx context.Context) {
 		return
 	}
 
-	connectCtx, cancel := context.WithTimeout(ctx, observeInterval)
+	connectCtx, cancel := context.WithTimeout(ctx, localReadTimeout)
 	defer cancel()
 	conn, err := Connect(connectCtx, s.options.SocketDir, provision.PostgresPort)
 	if err != nil {
