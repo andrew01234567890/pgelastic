@@ -403,7 +403,7 @@ func checkTenantRoleAttributes(ctx context.Context, sql SQL, source Endpoint) Ch
 }
 
 const publicConnectQuery = `SELECT count(*)::text FROM pg_database d,
-  aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) e
+  aclexplode(coalesce(d.datacl, acldefault('d'::"char", d.datdba))) e
  WHERE d.datname = current_database() AND e.grantee = 0 AND e.privilege_type = 'CONNECT'`
 
 func checkDatabaseConnectPrivilege(ctx context.Context, sql SQL, source Endpoint) Check {

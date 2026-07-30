@@ -45,6 +45,13 @@ func TestTheAclFingerprintIsNormalisedRatherThanCompareRaw(t *testing.T) {
 	joined := strings.Join(schemaFingerprintParts, "\n")
 	for _, want := range []string{
 		"acldefault(",
+		// acldefault's first argument is "char", not text. A bare 'r' or a CASE yielding text
+		// is a different type, and PostgreSQL answers "function acldefault(text, oid) does not
+		// exist" - which fails the cutover's own verification gate and parks the migration in
+		// Cutover until its retry budget runs out. Nothing short of a real postmaster catches
+		// it, so the cast is pinned here as well.
+		`END)::"char"`,
+		`'n'::"char"`,
 		`CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END`,
 		`ORDER BY entry COLLATE "C"`,
 		"pgelastic_repl",

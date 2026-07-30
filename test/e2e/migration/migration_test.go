@@ -773,7 +773,7 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 		It("left the target database reachable only by the tenant's own roles", func() {
 			Expect(query(instanceB, "postgres",
 				`SELECT count(*)::text FROM pg_database d,
-				   aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) e
+				   aclexplode(coalesce(d.datacl, acldefault('d'::"char", d.datdba))) e
 				 WHERE d.datname = '`+tenantDatabase+`' AND e.grantee = 0
 				   AND e.privilege_type = 'CONNECT'`)).To(Equal("0"),
 				"PUBLIC can connect to the migrated database")

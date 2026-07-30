@@ -341,7 +341,7 @@ var schemaFingerprintParts = []string{
 	            ':' || e.privilege_type || ':' || e.is_grantable::text ||
 	            ':' || pg_get_userbyid(e.grantor) AS entry
 	       FROM aclexplode(coalesce(c.relacl,
-	              acldefault(CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END, c.relowner))) e
+	              acldefault((CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END)::"char", c.relowner))) e
 	      WHERE e.grantee = 0 OR pg_get_userbyid(e.grantee) NOT IN
 	            ('postgres', 'pgelastic_ops', 'pgelastic_repl', 'pgelastic_rewind')
 	   ) entries), '')
@@ -352,7 +352,7 @@ var schemaFingerprintParts = []string{
 	   coalesce((SELECT string_agg(entry, ',' ORDER BY entry COLLATE "C") FROM (
 	     SELECT CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(e.grantee) END ||
 	            ':' || e.privilege_type AS entry
-	       FROM aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) e
+	       FROM aclexplode(coalesce(n.nspacl, acldefault('n'::"char", n.nspowner))) e
 	      WHERE e.grantee = 0 OR pg_get_userbyid(e.grantee) NOT IN
 	            ('postgres', 'pgelastic_ops', 'pgelastic_repl', 'pgelastic_rewind')
 	   ) entries), '')
