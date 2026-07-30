@@ -332,8 +332,14 @@ func requestRestart(name, value string) {
 
 // sample is one instant's answer from one member, as PostgreSQL and the kubelet gave it.
 type sample struct {
-	at         time.Time
-	reachable  bool
+	at        time.Time
+	reachable bool
+	// probed is whether the member was actually asked. A kubectl exec that times out or whose
+	// transport fails produced no answer, and that is missing data rather than evidence the
+	// member is down - a member whose postmaster has genuinely stopped still has a running
+	// agent that answers, and answers unhealthy. Conflating the two made the redundancy
+	// minimum a measure of how the apiserver was feeling as much as of the instance.
+	probed     bool
 	inRecovery bool
 	podUID     types.UID
 	podReady   bool
@@ -393,6 +399,7 @@ func (w *watcher) sampleOne(member string) {
 		taken.podReady = podReady(pod)
 	}
 	if report, err := (execProber{runner: runner}).Probe(suiteCtx, member, ""); err == nil {
+		taken.probed = true
 		taken.reachable = report.Healthy
 		taken.inRecovery = report.InRecovery
 	}
@@ -466,10 +473,18 @@ func (w *watcher) worstRedundancy() (int, time.Time) {
 	for _, taken := range w.samples {
 		rounds = max(rounds, len(taken))
 	}
+	// A round in which any member could not be asked at all is not counted. It says nothing
+	// about redundancy: the answer is missing, not negative. Counting it would report a
+	// transport hiccup as a lost quorum, which is a false alarm on an assertion whose whole
+	// value is that it has twice caught a real one.
+	unanswered := map[int]bool{}
 	for round := range rounds {
 		for _, taken := range w.samples {
 			if round < len(taken) {
 				when[round] = taken[round].at
+				if !taken[round].probed {
+					unanswered[round] = true
+				}
 				if taken[round].reachable {
 					byRound[round]++
 				}
@@ -478,6 +493,9 @@ func (w *watcher) worstRedundancy() (int, time.Time) {
 	}
 	worst, at := 3, time.Time{}
 	for round := range rounds {
+		if unanswered[round] {
+			continue
+		}
 		if byRound[round] < worst {
 			worst, at = byRound[round], when[round]
 		}
