@@ -1238,7 +1238,18 @@ pub fn pool_key(
         },
         replication,
         configured_mode: config.pool.mode.into(),
-        credentials: CredentialGeneration::new(0),
+        // Fed from the tenant's own entry, so re-issuing a credential makes every link opened
+        // under the old one unreachable from any new binding: they drain out through
+        // serverLifetime rather than being handed to somebody holding a secret PostgreSQL no
+        // longer accepts.
+        credentials: CredentialGeneration::new(
+            config
+                .pool
+                .tenants
+                .iter()
+                .find(|t| t.name == tenant)
+                .map_or(0, |t| t.credential_generation),
+        ),
     }))
 }
 
@@ -1534,6 +1545,7 @@ mod tests {
                 weight: 100,
                 priority: 1_000,
                 max_client_connections: 10,
+                ..TenantConfig::default()
             }],
             ..PoolConfig::default()
         };
@@ -1560,6 +1572,7 @@ mod tests {
                 weight: 100,
                 priority: 1_000,
                 max_client_connections: 10,
+                ..TenantConfig::default()
             }],
             ..PoolConfig::default()
         };
@@ -1625,6 +1638,7 @@ mod tests {
                 weight: 100,
                 priority: 1_000,
                 max_client_connections: 10,
+                ..TenantConfig::default()
             }],
             ..PoolConfig::default()
         }
