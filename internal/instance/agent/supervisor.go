@@ -41,8 +41,23 @@ import (
 )
 
 // observeInterval is how often the agent re-reads its own postmaster and republishes its
-// member status.
+// member status while nothing is happening.
 const observeInterval = 2 * time.Second
+
+// handoverInterval is how often it does so while a role change is in flight.
+//
+// The steady-state interval is a bargain about API chatter: nothing is waiting on the answer, so
+// two seconds costs nothing. During a handover that bargain inverts, because this loop is on the
+// critical path three separate times - the outgoing primary noticing it must hand over, the
+// successor noticing it must promote, and the successor publishing that it has - and every client
+// of the instance is held at the proxy for the sum of them. Two seconds of politeness each way was
+// most of an eight-second pause.
+//
+// A role change is a bounded, rare, explicitly-signalled window, so polling hard through it costs
+// a few extra reads of one Pod's own postmaster and nothing else. It is not a shorter timeout and
+// changes no deadline: everything that was waiting for evidence still waits for the same evidence,
+// it simply learns of it sooner.
+const handoverInterval = 250 * time.Millisecond
 
 // Command is an instruction delivered to the supervisor's inner loop from outside the
 // signal path.
@@ -125,6 +140,10 @@ type Supervisor struct {
 	// lease is this member's hold on the promotion Lease, created on first use because a
 	// member that never becomes a primary never needs one.
 	lease *LeaseManager
+	// roleChanging is whether the CR says a handover is in flight. It selects the observe
+	// cadence and nothing else: it makes the loop look sooner, never act differently.
+	roleChanging bool
+
 	// leaseUnverifiedSince records when renewals started failing to reach the API server.
 	// It is reported rather than acted on: failing to verify the lease is not losing it.
 	leaseUnverifiedSince time.Time
@@ -299,8 +318,10 @@ func (s *Supervisor) runPostmaster(ctx context.Context, signals chan os.Signal) 
 		state.Role = RoleUnknown
 	})
 
-	ticker := time.NewTicker(observeInterval)
-	defer ticker.Stop()
+	// A timer rather than a ticker, so the cadence can be chosen again after every observation
+	// rather than fixed when the loop starts.
+	timer := time.NewTimer(observeInterval)
+	defer timer.Stop()
 
 	for {
 		select {
@@ -339,10 +360,47 @@ func (s *Supervisor) runPostmaster(ctx context.Context, signals chan os.Signal) 
 				<-exited
 				return outcomeRestart, nil
 			}
-		case <-ticker.C:
+		case <-timer.C:
 			s.observe(ctx)
+			timer.Reset(s.observeCadence())
 		}
 	}
+}
+
+// observeCadence is how long to wait before looking again.
+//
+// Fast while this instance is in the middle of a role change, ordinary otherwise. The condition
+// is the one the design already defines as the total signal for "a handover is in flight, freeze
+// everything" - targetPrimary naming somebody other than the member currently holding the role -
+// so this needs no new state and cannot disagree with the rest of the machinery about whether a
+// handover is happening.
+func (s *Supervisor) observeCadence() time.Duration {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.roleChanging {
+		return handoverInterval
+	}
+	return observeInterval
+}
+
+// noteRoleChange records whether a role change is in flight, so the next cadence can be chosen
+// from what the CR said rather than from a guess.
+func (s *Supervisor) noteRoleChange(inFlight bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.roleChanging = inFlight
+}
+
+// roleChangeInFlight reads the total signal: targetPrimary naming somebody other than the member
+// currently holding the role.
+//
+// An unreadable CR answers false. Not being able to read it proves nothing about whether a
+// handover is happening, and the cost of being wrong in that direction is one ordinary tick.
+func roleChangeInFlight(instance *pgelasticv1alpha1.PgInstance) bool {
+	if instance == nil {
+		return false
+	}
+	return ha.FailoverInProgress(instance.Status.CurrentPrimary, instance.Status.TargetPrimary)
 }
 
 func (s *Supervisor) postgresBinary() string {
@@ -458,6 +516,7 @@ func (s *Supervisor) observe(ctx context.Context) {
 		}
 	}
 	instance := s.fetchInstance(ctx)
+	s.noteRoleChange(roleChangeInFlight(instance))
 	s.requestRestartIfPending(ctx, observation, instance)
 	s.report(ctx, observation)
 	s.publishPrimaryState(ctx, instance, observation, contract)
