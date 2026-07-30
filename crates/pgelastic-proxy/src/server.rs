@@ -314,6 +314,61 @@ async fn spawn_availability_paths(
     Ok(control_address)
 }
 
+impl Proxy {
+    /// The backend configuration a tenant's sessions dial with.
+    ///
+    /// The instance supplies the address and the TLS posture; the tenant supplies the identity
+    /// and the credential. That split is the whole change: `session_user` on the far side
+    /// becomes the tenant's own role rather than the control plane's, so `pg_stat_activity`,
+    /// `log_line_prefix` and any audit extension attribute a statement to whoever ran it.
+    /// `SET ROLE` could not have done this - it moves `current_user` and leaves `session_user`
+    /// alone, and `session_user` is the one auditing follows.
+    ///
+    /// A tenant with no credential is refused rather than dialled on the instance identity. The
+    /// fallback is the dangerous option: it would put tenant SQL back on `pgelastic_ops`
+    /// silently, during a config-propagation lag, which is exactly when nobody is looking.
+    pub fn backend_for(
+        &self,
+        instance: &crate::route::Instance,
+        tenant: &str,
+    ) -> Result<crate::config::BackendConfig> {
+        let Some(entry) = self.config.pool.tenants.iter().find(|t| t.name == tenant) else {
+            // Not an error: a tenant with no [[pool.tenants]] entry at all is the
+            // single-tenant shape, which has no per-tenant identity to assume.
+            return Ok(instance.backend.clone());
+        };
+        if entry.backend_role.is_empty() {
+            return Ok(instance.backend.clone());
+        }
+        if entry.backend_salted_password.is_empty() {
+            return Err(ProxyError::config(format!(
+                "tenant {tenant:?} names backend role {:?} but carries no credential for it; \
+                 refusing rather than dialling as the control plane's own role",
+                entry.backend_role
+            )));
+        }
+        let mut backend = instance.backend.clone();
+        backend.user.clone_from(&entry.backend_role);
+        backend.salted_password = Some(crate::config::SaltedSecret {
+            salted_password: entry.backend_salted_password.clone(),
+            salt: entry.backend_salt.clone(),
+            iterations: entry.backend_iterations,
+        });
+        Ok(backend)
+    }
+
+    /// The credential generation a tenant's pooled links are keyed on, so a rotation makes the
+    /// old ones unreachable rather than reusable.
+    pub fn credential_generation(&self, tenant: &str) -> u64 {
+        self.config
+            .pool
+            .tenants
+            .iter()
+            .find(|t| t.name == tenant)
+            .map_or(0, |t| t.credential_generation)
+    }
+}
+
 /// The shortest lease sweep interval, so a very short TTL cannot turn the
 /// sweeper into a spin loop.
 const REAP_FLOOR: std::time::Duration = std::time::Duration::from_millis(10);
@@ -481,15 +536,19 @@ async fn serve(
     // session-mode client. A transaction-mode client re-reads it at every
     // checkout, which is what lets a cutover move it without it reconnecting.
     let instance = proxy.fleet.route(&tenant);
-    let key =
-        match crate::pool::pool_key(&proxy.config, &instance.backend, &session.startup, &tenant) {
-            Ok(key) => key,
-            Err(error) => {
-                proxy.metrics.client_rejected(RejectReason::Handshake);
-                handshake::report(&mut session.stream, Some(&user), &error).await;
-                return Err(error);
-            }
-        };
+    let key = match crate::pool::pool_key(
+        &proxy.config,
+        &proxy.backend_for(&instance, &tenant)?,
+        &session.startup,
+        &tenant,
+    ) {
+        Ok(key) => key,
+        Err(error) => {
+            proxy.metrics.client_rejected(RejectReason::Handshake);
+            handshake::report(&mut session.stream, Some(&user), &error).await;
+            return Err(error);
+        }
+    };
 
     // A replication connection is forced to session mode by the pool key
     // itself: a walsender stream has no transaction boundaries to release on,
@@ -536,7 +595,7 @@ async fn bound(
     let _holding = proxy.quiesce.gate(tenant).hold();
 
     let mut link = match backend::connect(
-        &instance.backend,
+        &proxy.backend_for(instance, tenant)?,
         instance.tls.as_ref(),
         &proxy.kdf,
         &session.startup,
