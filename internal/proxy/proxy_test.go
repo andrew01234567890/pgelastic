@@ -160,6 +160,18 @@ func TestAPasswordWithAQuoteInItStillParsesAsTOML(t *testing.T) {
 	}
 }
 
+// A login is only confined to its tenant if the document says which tenant that is. The proxy
+// authenticates against auth.users[].name and resolves the tenant from a different part of the
+// startup packet, so an unbound login reaches whatever it names.
+func TestEveryLoginIsBoundToTheTenantItMayAct(t *testing.T) {
+	config := testConfig()
+	config.Users = []User{{Name: "acme_owner", Tenant: "acme", Password: "hunter2"}}
+	document := config.Render().TOML
+	if !strings.Contains(document, `tenant = "acme"`) {
+		t.Fatalf("a login was rendered with no tenant to be confined to:\n%s", document)
+	}
+}
+
 func TestTheDiscriminatorsRenderedAreTheOnesThePoolAskedFor(t *testing.T) {
 	config := testConfig()
 	config.Pool.Spec.Proxy.Routing = &pgelasticv1alpha1.ProxyRouting{

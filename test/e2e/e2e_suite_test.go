@@ -30,12 +30,8 @@ import (
 	"github.com/andrew01234567890/pgelastic/test/utils"
 )
 
-var (
-	// managerImage is the manager image to be built and loaded for testing.
-	managerImage = "example.com/pgelastic:v0.0.1"
-	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
-	shouldCleanupCertManager = false
-)
+// managerImage is the manager image to be built and loaded for testing.
+var managerImage = "example.com/pgelastic:v0.0.1"
 
 // TestE2E runs the e2e test suite to validate the solution in an isolated environment.
 // The default setup requires Kind and CertManager.
@@ -65,9 +61,11 @@ var _ = BeforeSuite(func() {
 	setupCertManager()
 })
 
-var _ = AfterSuite(func() {
-	teardownCertManager()
-})
+// CertManager is deliberately left installed. `make test-e2e` runs this suite first and then
+// chains the suites that stand a proxy fleet up, and those need cert-manager to issue the
+// fleet's control-listener certificates - so uninstalling it here would pull the dependency
+// out from under everything that runs next. Nothing leaks: cleanup-test-e2e deletes the whole
+// Kind cluster.
 
 // Disable kubectl kuberc by default for test isolation.
 // This prevents local kubectl configurations from affecting test behavior.
@@ -98,21 +96,6 @@ func setupCertManager() {
 		return
 	}
 
-	// Mark for cleanup before installation to handle interruptions and partial installs.
-	shouldCleanupCertManager = true
-
 	By("installing CertManager")
 	Expect(utils.InstallCertManager()).To(Succeed(), "Failed to install CertManager")
-}
-
-// teardownCertManager uninstalls CertManager if it was installed by setupCertManager.
-// This ensures we only remove what we installed.
-func teardownCertManager() {
-	if !shouldCleanupCertManager {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping CertManager cleanup (not installed by this suite)\n")
-		return
-	}
-
-	By("uninstalling CertManager")
-	utils.UninstallCertManager()
 }

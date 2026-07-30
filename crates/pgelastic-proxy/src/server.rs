@@ -62,7 +62,7 @@ impl Proxy {
             .transpose()?;
         let iterations = NonZeroU32::new(config.auth.scram_iterations)
             .ok_or_else(|| ProxyError::config("auth.scramIterations must be non-zero"))?;
-        let mut verifiers = HashMap::new();
+        let mut users = HashMap::new();
         for user in &config.auth.users {
             let verifier = match (&user.verifier, &user.password) {
                 (Some(secret), _) => ScramVerifier::parse(secret)
@@ -80,7 +80,13 @@ impl Proxy {
                     )));
                 }
             };
-            verifiers.insert(user.name.as_bytes().to_vec(), verifier);
+            users.insert(
+                user.name.as_bytes().to_vec(),
+                crate::handshake::UserRecord {
+                    verifier,
+                    tenant: user.tenant.clone(),
+                },
+            );
         }
 
         let permits = Arc::new(Semaphore::new(config.listen.max_client_connections.max(1)));
@@ -89,7 +95,7 @@ impl Proxy {
         metrics.in_doubt(fleet.default_instance().fence.fence.in_doubt().len());
 
         Ok(Arc::new(Self {
-            auth: Arc::new(ClientAuth::new(verifiers, iterations)?),
+            auth: Arc::new(ClientAuth::new(users, iterations)?),
             tenant: TenantResolver::new(&config.routing),
             config,
             acceptor,
@@ -432,6 +438,23 @@ async fn serve(
             return Err(error);
         }
     };
+    // Authenticating and choosing a tenant read different parts of the same
+    // startup packet, so proving one says nothing about the other. Until they
+    // are related here, a client holding one tenant's password reaches any
+    // tenant it can name - which is the whole of what "the identity is confined
+    // to the database" has to mean.
+    //
+    // Refused as an authentication failure, with the same error and the same
+    // metrics as a wrong password, because the alternative tells the caller that
+    // the credential was good and only the tenant was wrong. That is an oracle
+    // for which tenants exist and which login belongs to which.
+    if !proxy.auth.admits(&user, tenant.as_str()) {
+        proxy.metrics.client_auth(AuthOutcome::Failure);
+        proxy.metrics.client_rejected(RejectReason::Handshake);
+        let error = ProxyError::AuthenticationFailed;
+        handshake::report(&mut session.stream, Some(&user), &error).await;
+        return Err(error);
+    }
     // The route is read here only to decide the pool key's shape and to serve a
     // session-mode client. A transaction-mode client re-reads it at every
     // checkout, which is what lets a cutover move it without it reconnecting.

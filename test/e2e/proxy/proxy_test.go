@@ -52,6 +52,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	proxyobjects "github.com/andrew01234567890/pgelastic/internal/proxy"
+	"github.com/andrew01234567890/pgelastic/test/e2e/certcheck"
 )
 
 const (
@@ -418,15 +419,13 @@ var _ = Describe("the pool's inline proxy fleet", Ordered, func() {
 	// Three callers, one endpoint. The refusals are asserted as 401 rather than as a dropped
 	// connection on purpose: a cutover that cannot authenticate has to be diagnosable.
 	It("serves the cutover API only to the certificate the operator was issued", func() {
+		certcheck.AwaitControlClientSecret(suiteCtx, k8sClient, e2eNamespace, poolName)
+
 		operator := &corev1.Secret{}
-		Eventually(func() error {
-			return k8sClient.Get(suiteCtx, types.NamespacedName{
-				Namespace: e2eNamespace,
-				Name:      proxyobjects.ControlClientSecretName(poolName),
-			}, operator)
-		}).WithTimeout(3*time.Minute).WithPolling(2*time.Second).Should(Succeed(),
-			"cert-manager never issued the operator's client certificate, so the control "+
-				"listener has no caller it would accept")
+		Expect(k8sClient.Get(suiteCtx, types.NamespacedName{
+			Namespace: e2eNamespace,
+			Name:      proxyobjects.ControlClientSecretName(poolName),
+		}, operator)).To(Succeed())
 
 		pods := readyProxyPods(proxyobjects.ServiceName(poolName))
 		Expect(pods).NotTo(BeEmpty())

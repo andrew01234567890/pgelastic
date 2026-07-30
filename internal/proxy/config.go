@@ -61,6 +61,11 @@ type Tenant struct {
 // User is one SCRAM identity the proxy authenticates a client against.
 type User struct {
 	Name string
+	// Tenant is the tenant this login belongs to, and the only one it may reach. The proxy
+	// authenticates a client against Name and resolves its tenant from a different part of the
+	// same startup packet, so without this the two are unrelated and a client holding one
+	// tenant's password reaches any tenant it can name.
+	Tenant string
 	// Verifier is a PostgreSQL rolpassword SCRAM secret. Preferred over Password: the proxy
 	// then never holds anything it could replay against the backend.
 	Verifier string
@@ -176,6 +181,7 @@ func (c Config) renderAuth(out *strings.Builder) {
 	for _, user := range users {
 		out.WriteString("[[auth.users]]\n")
 		writeString(out, "name", user.Name)
+		writeString(out, "tenant", user.Tenant)
 		if user.Verifier != "" {
 			writeString(out, "verifier", user.Verifier)
 		} else {

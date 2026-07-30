@@ -40,6 +40,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 	proxyobjects "github.com/andrew01234567890/pgelastic/internal/proxy"
+	"github.com/andrew01234567890/pgelastic/test/e2e/certcheck"
 )
 
 const (
@@ -325,13 +326,7 @@ func awaitFleet(replicas int32) {
 
 	// The operator's client certificate is what every control call is made under, so a fleet
 	// that is up but unreachable has to fail here rather than inside a cutover.
-	Eventually(func() error {
-		return k8sClient.Get(suiteCtx, client.ObjectKey{
-			Namespace: e2eNamespace, Name: proxyobjects.ControlClientSecretName(poolName),
-		}, &corev1.Secret{})
-	}, "5m", "5s").Should(Succeed(),
-		"cert-manager never issued the operator's control certificate, so no cutover could "+
-			"reach the fleet's gate")
+	certcheck.AwaitControlClientSecret(suiteCtx, k8sClient, e2eNamespace, poolName)
 }
 
 // currentDatabaseThrough opens one connection through the pool's Service and asks
@@ -446,10 +441,43 @@ func awaitPhase(name string, phase pgelasticv1alpha1.TenantMigrationPhase) *pgel
 	GinkgoHelper()
 	Eventually(func(g Gomega) {
 		object := fetchMigration(name)
+		stopIfSettledElsewhere(name, object, phase)
 		g.Expect(object.Status.Phase).To(Equal(phase),
 			"migration %s is in %s: %s", name, object.Status.Phase, conditionSummary(object))
 	}, "6m", "1s").Should(Succeed())
 	return fetchMigration(name)
+}
+
+// awaitReached waits until a migration has reached or passed a phase.
+func awaitReached(name string, phase pgelasticv1alpha1.TenantMigrationPhase) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		object := fetchMigration(name)
+		stopIfSettledElsewhere(name, object, phase)
+		g.Expect(reached(object.Status.Phase, phase)).To(BeTrue(),
+			"still in %s: %s", object.Status.Phase, conditionSummary(object))
+	}, "5m", "1s").Should(Succeed())
+}
+
+// stopIfSettledElsewhere ends the poll the moment a migration settles somewhere it can never
+// leave, instead of waiting out a timeout that then blames the clock.
+//
+// A terminal phase is by definition the last one, so a spec still waiting for a different phase
+// is waiting for something that cannot happen. Every failure of this class previously cost the
+// full Eventually budget and was reported as "Timed out", with the real cause - which is in the
+// conditions - visible only to whoever thought to read past the timeout. That is how a
+// one-line schema-copy fault presented as a mysterious stuck nightly.
+func stopIfSettledElsewhere(
+	name string,
+	object *pgelasticv1alpha1.PgTenantMigration,
+	wanted pgelasticv1alpha1.TenantMigrationPhase,
+) {
+	current := object.Status.Phase
+	if !migration.Terminal(current) || current == wanted || reached(current, wanted) {
+		return
+	}
+	StopTrying(fmt.Sprintf("migration %s settled in %s and can never reach %s: %s",
+		name, current, wanted, conditionSummary(object))).Now()
 }
 
 // probePlan aims one schema copy at a scratch database on the target, so the copy can be
@@ -871,11 +899,7 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 
 			exec(instanceB, tenantDatabase, `DROP TABLE orders`)
 
-			Eventually(func(g Gomega) {
-				current := fetchMigration(name)
-				g.Expect(reached(current.Status.Phase, pgelasticv1alpha1.TenantMigrationPhaseCopying)).
-					To(BeTrue(), "still in %s: %s", current.Status.Phase, conditionSummary(current))
-			}, "5m", "1s").Should(Succeed())
+			awaitReached(name, pgelasticv1alpha1.TenantMigrationPhaseCopying)
 
 			annotate(name, migrationAbortAnnotation, "stopped by the e2e suite after the retry recovered")
 			aborted := awaitPhase(name, pgelasticv1alpha1.TenantMigrationPhaseAborted)
@@ -907,11 +931,7 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 				object := makeMigration(name, instanceB, pgelasticv1alpha1.TenantMigrationOnline)
 				Expect(k8sClient.Create(suiteCtx, object)).To(Succeed())
 
-				Eventually(func(g Gomega) {
-					current := fetchMigration(name)
-					g.Expect(reached(current.Status.Phase, phase)).To(BeTrue(),
-						"still in %s: %s", current.Status.Phase, conditionSummary(current))
-				}, "5m", "100ms").Should(Succeed())
+				awaitReached(name, phase)
 
 				// The phase actually reached is recorded rather than assumed: a reconcile loop
 				// can pass through a phase between two polls, and a spec that claimed to have
@@ -1021,6 +1041,12 @@ const migrationAbortAnnotation = "pgelastic.io/abort"
 // phaseOrder is the online strategy's order, used to decide whether a migration has reached
 // or passed a phase. A reconcile loop can move through a phase between two polls, so a spec
 // that waited for exact equality would hang on a migration that had already gone further.
+//
+// Failed, Aborted and RolledBack are deliberately absent. They are endings rather than
+// positions, so giving them an index would make "has it got this far" answerable about them -
+// and answerable wrongly, since an index past Completed would read as having passed every
+// phase. A migration that settles in one is instead caught by stopIfSettledElsewhere, which
+// ends the wait rather than ranking the ending.
 var phaseOrder = []pgelasticv1alpha1.TenantMigrationPhase{
 	pgelasticv1alpha1.TenantMigrationPhasePreflight,
 	pgelasticv1alpha1.TenantMigrationPhaseProvisioning,

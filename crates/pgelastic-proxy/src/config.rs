@@ -620,6 +620,17 @@ impl Default for AuthConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UserConfig {
     pub name: String,
+    /// The tenant this login belongs to, and the only one it may reach.
+    ///
+    /// Authenticating and choosing a tenant are two separate acts on two
+    /// separate inputs: the password proves who the client is, the
+    /// discriminators say which tenant it asked for. Without this field nothing
+    /// relates them, and a client holding one tenant's password can name
+    /// another tenant's database in the same startup packet and be routed
+    /// there. Empty means the login is not bound to a tenant, which only the
+    /// single-tenant development shape should ever be.
+    #[serde(default)]
+    pub tenant: String,
     /// A `PostgreSQL` `rolpassword` SCRAM secret. Preferred: the proxy then
     /// never holds a password it could replay.
     #[serde(default)]

@@ -42,6 +42,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 	proxyobjects "github.com/andrew01234567890/pgelastic/internal/proxy"
+	"github.com/andrew01234567890/pgelastic/test/e2e/certcheck"
 )
 
 const (
@@ -256,13 +257,7 @@ func awaitFleet(replicas int32) {
 		g.Expect(deployment.Status.ReadyReplicas).To(Equal(replicas))
 	}, "10m", "5s").Should(Succeed())
 
-	Eventually(func() error {
-		return k8sClient.Get(suiteCtx, client.ObjectKey{
-			Namespace: e2eNamespace, Name: proxyobjects.ControlClientSecretName(poolName),
-		}, &corev1.Secret{})
-	}, "5m", "5s").Should(Succeed(),
-		"cert-manager never issued the operator's control certificate, so no roll could "+
-			"reach the fleet's gate")
+	certcheck.AwaitControlClientSecret(suiteCtx, k8sClient, e2eNamespace, poolName)
 }
 
 func makeTenant(name string) *pgelasticv1alpha1.PgTenant {

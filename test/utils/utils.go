@@ -35,10 +35,6 @@ const (
 	defaultKindCluster = "kind"
 )
 
-func warnError(err error) {
-	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
-}
-
 // Run executes the provided command within this context
 func Run(cmd *exec.Cmd) (string, error) {
 	dir, _ := GetProjectDir()
@@ -59,27 +55,11 @@ func Run(cmd *exec.Cmd) (string, error) {
 	return string(output), nil
 }
 
-// UninstallCertManager uninstalls the cert manager
-func UninstallCertManager() {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url)
-	if _, err := Run(cmd); err != nil {
-		warnError(err)
-	}
-
-	// Delete leftover leases in kube-system (not cleaned by default)
-	kubeSystemLeases := []string{
-		"cert-manager-cainjector-leader-election",
-		"cert-manager-controller",
-	}
-	for _, lease := range kubeSystemLeases {
-		cmd = exec.Command("kubectl", "delete", "lease", lease,
-			"-n", "kube-system", "--ignore-not-found", "--force", "--grace-period=0")
-		if _, err := Run(cmd); err != nil {
-			warnError(err)
-		}
-	}
-}
+// Nothing uninstalls cert-manager. Every suite that stands a proxy fleet up needs it to issue
+// the fleet's control-listener certificates, and those suites run after this one under
+// `make test-e2e`, so removing it would take the dependency out from under them. The Kind
+// cluster is deleted wholesale by cleanup-test-e2e, which reclaims it along with everything
+// else.
 
 // InstallCertManager installs the cert manager bundle.
 func InstallCertManager() error {

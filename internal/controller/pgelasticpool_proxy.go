@@ -432,7 +432,13 @@ func (r *PgElasticPoolReconciler) proxyUsers(
 		if tenant.Spec.Owner != nil && *tenant.Spec.Owner != "" {
 			name = *tenant.Spec.Owner
 		}
-		users = append(users, proxy.User{Name: name, Password: password})
+		// Bound to the same name proxyTenants routes on, because the proxy compares the two: a
+		// login authenticated here may act as this tenant and no other.
+		users = append(users, proxy.User{
+			Name:     name,
+			Tenant:   tenant.Spec.DatabaseName,
+			Password: password,
+		})
 	}
 	return users, nil
 }
