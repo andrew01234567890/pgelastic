@@ -144,3 +144,53 @@ func TestWriteStalledIsFalseWithoutASynchronousQuorum(t *testing.T) {
 		t.Fatal("an instance with no synchronous quorum cannot stall on one")
 	}
 }
+
+// The case that actually happened. WriteStalled is retrospective, so during the window where a
+// just-rolled standby is Ready but not yet caught up it reports nothing wrong - and a roll that
+// asks only that removes the one standby still streaming, taking the instance to zero.
+func TestWouldStallRefusesRemovingTheLastStreamingStandby(t *testing.T) {
+	evidence := anyOneEvidence()
+	evidence.StreamingMembers = []string{memberThree}
+
+	if WriteStalled(evidence) {
+		t.Fatal("one streaming standby satisfies ANY 1, so nothing is stalling yet - which is " +
+			"exactly why the retrospective check cannot gate a roll")
+	}
+	if !WouldStall(evidence, memberThree) {
+		t.Fatal("removing the only streaming standby would stall every commit")
+	}
+	// The member that is already not streaming costs nothing to remove.
+	if WouldStall(evidence, memberTwo) {
+		t.Fatal("removing a standby that is not streaming cannot change what is streaming")
+	}
+}
+
+func TestWouldStallAllowsARollWhileTheQuorumHasRoomToSpare(t *testing.T) {
+	evidence := anyOneEvidence()
+	for _, member := range []string{memberTwo, memberThree} {
+		if WouldStall(evidence, member) {
+			t.Fatalf("with both standbys streaming and ANY 1, removing %s leaves one", member)
+		}
+	}
+}
+
+func TestWouldStallIsFalseWithoutASynchronousQuorum(t *testing.T) {
+	if WouldStall(Evidence{}, memberTwo) {
+		t.Fatal("an instance with no synchronous quorum has no commits to stall")
+	}
+}
+
+// A record with no timestamp is stale rather than fresh: "nobody said when" and "somebody said
+// just now" must not be the same answer to a question whose cost is a stalled instance.
+func TestEvidenceStaleTreatsAnUnstampedRecordAsTooOld(t *testing.T) {
+	if !EvidenceStale(Evidence{}, evidenceObservedAt, time.Minute) {
+		t.Fatal("a record that never said when it was taken was accepted as current")
+	}
+	fresh := anyOneEvidence()
+	if EvidenceStale(fresh, fresh.ObservedAt.Add(30*time.Second), time.Minute) {
+		t.Fatal("a record inside the window was rejected")
+	}
+	if !EvidenceStale(fresh, fresh.ObservedAt.Add(90*time.Second), time.Minute) {
+		t.Fatal("a record past the window was accepted")
+	}
+}

@@ -72,6 +72,16 @@ type rollState struct {
 // two, and every reconcile spent not noticing is a second of clients held for nothing.
 const rollRequeue = time.Second
 
+// rollEvidenceMaxAge is how old the quorum record may be for the roll to remove a member on it.
+//
+// Much shorter than ha.MaxEvidenceAge, and for the opposite reason. That one gates a failover and
+// is measured against the failing instant, because the primary is the only writer and its record
+// stops being refreshed exactly when the failover needs it. Here the primary is alive and writing
+// continuously, so "now" is the right reference and five minutes would be meaningless: the roll's
+// own steps are seconds apart, and a record older than several of them describes a cluster that
+// has already moved.
+const rollEvidenceMaxAge = 30 * time.Second
+
 // reconcileRoll restarts the members that are not running the current configuration, one
 // at a time, replicas before the primary.
 //
@@ -553,6 +563,20 @@ func fitToRoll(
 		return false, rejoining.Name + " is rebuilding itself onto the primary's history"
 	case ha.WriteStalled(evidence):
 		return false, "commits are already stalling on the synchronous quorum"
+	case ha.EvidenceStale(evidence, time.Now(), rollEvidenceMaxAge):
+		// The primary refreshes this record continuously while it is alive, so a stale one
+		// during a roll means the picture is older than the roll's own steps. Deciding to
+		// remove a member from it is deciding about a cluster that has since moved.
+		return false, "the quorum evidence is too old to remove a member on"
+	case ha.WouldStall(evidence, target):
+		// The question the roll actually has, and not the one WriteStalled answers. With
+		// ANY 1 over two standbys, WriteStalled stays false while either one streams - so a
+		// member that has just been rolled and is Ready but not yet caught up leaves exactly
+		// one streaming standby, and removing that one takes the instance to zero. Every
+		// commit then blocks until a standby returns.
+		return false, fmt.Sprintf(
+			"%s is the last standby still streaming; removing it would stall every commit "+
+				"until another has caught up", target)
 	}
 	return true, ""
 }

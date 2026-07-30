@@ -149,3 +149,48 @@ func WriteStalled(evidence Evidence) bool {
 	}
 	return len(evidence.StreamingMembers) < int(evidence.NumSync)
 }
+
+// WouldStall reports whether taking one member away would block commits.
+//
+// This is the question a rolling restart has, and it is not the one WriteStalled answers.
+// WriteStalled is retrospective - it says commits are stalling *now* - and a roll that asks only
+// that will happily remove the last streaming standby, because right up until the moment it does
+// so nothing is stalling at all.
+//
+// The case is not hypothetical and it is not an edge. With ANY 1 over two standbys, NumSync is 1,
+// so WriteStalled stays false while either standby streams. A member that has just been rolled is
+// Ready long before it has caught up, so during that window exactly one standby streams -
+// WriteStalled says fine, and removing that one takes the instance to zero. Under dataDurability
+// Required every commit then blocks until a standby returns, which is a rolling restart that
+// stops the database committing.
+//
+// Membership is by name and the target is excluded whether or not it is currently streaming, so
+// the answer is about the state the instance would be left in rather than the one it is in.
+func WouldStall(evidence Evidence, member string) bool {
+	if evidence.NumSync <= 0 {
+		return false
+	}
+	remaining := 0
+	for _, streaming := range evidence.StreamingMembers {
+		if streaming != member {
+			remaining++
+		}
+	}
+	return remaining < int(evidence.NumSync)
+}
+
+// EvidenceStale reports whether a quorum record is too old to decide anything with.
+//
+// Evidence is a photograph of the synchronous set at the instant a member reported it. Deciding
+// to disrupt a member from a photograph taken long enough ago is deciding about a cluster that
+// may have moved, and the decision this gates - remove a member - is the one whose cost is a
+// stalled instance. Refusing is recoverable; the roll simply waits for a fresher record.
+//
+// A record with no timestamp is treated as stale rather than fresh, because "nobody said when"
+// and "somebody said just now" must not be the same answer.
+func EvidenceStale(evidence Evidence, now time.Time, maxAge time.Duration) bool {
+	if evidence.ObservedAt.IsZero() {
+		return true
+	}
+	return now.Sub(evidence.ObservedAt) > maxAge
+}

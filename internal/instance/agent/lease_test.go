@@ -236,3 +236,30 @@ func TestReleasingALeaseWeDoNotHoldChangesNothing(t *testing.T) {
 		t.Fatalf("holderIdentity was %q", *held.Spec.HolderIdentity)
 	}
 }
+
+// Release existed, was documented for exactly this, and had no caller outside these tests - so
+// every planned switchover waited out the full leaseDuration for a lease nobody was holding any
+// more. The successor's promotion budget is leaseDuration + 3*retryPeriod, which is where the
+// restart e2e's ~21-second client-visible pause came from.
+//
+// This asserts the wiring rather than the mechanics: that the planned-handover path reaches
+// Release at all. What Release then does is covered above.
+func TestAPlannedHandoverReleasesTheLeaseRatherThanLettingItExpire(t *testing.T) {
+	built := fakeClient(existingLease(holderOne, 0, time.Hour))
+	supervisor := &Supervisor{lease: managerFor(built)}
+
+	supervisor.releasePrimaryLease(context.Background())
+
+	released := &coordinationv1.Lease{}
+	if err := built.Get(context.Background(), client.ObjectKey{
+		Namespace: leaseNamespace, Name: leaseName}, released); err != nil {
+		t.Fatal(err)
+	}
+	if released.Spec.HolderIdentity == nil || *released.Spec.HolderIdentity != "" {
+		t.Fatalf("the outgoing primary still holds the lease: %v", released.Spec.HolderIdentity)
+	}
+	if released.Spec.LeaseDurationSeconds == nil || *released.Spec.LeaseDurationSeconds > 5 {
+		t.Fatalf("the lease was handed back with a long validity, so the successor still waits: %v",
+			released.Spec.LeaseDurationSeconds)
+	}
+}
