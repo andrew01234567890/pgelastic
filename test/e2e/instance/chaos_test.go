@@ -709,6 +709,12 @@ var _ = Describe("Chaos: a three-node instance under real failures", Ordered, Se
 		mustChaosQuery(primary, fmt.Sprintf(
 			"CREATE ROLE %s LOGIN PASSWORD %s", oracleRole, quoteSQLLiteral(oraclePassword)))
 		mustChaosQuery(primary, fmt.Sprintf("GRANT CREATE, USAGE ON SCHEMA public TO %s", oracleRole))
+		// Declared rather than inherited from PUBLIC. Bootstrap revokes PUBLIC's CONNECT on the
+		// maintenance databases, because once tenant roles can authenticate, a role locked out
+		// of every tenant database could still read every tenant's name out of postgres. The
+		// oracle writes to postgres by design, so it says so.
+		mustChaosQuery(primary, fmt.Sprintf(
+			"GRANT CONNECT ON DATABASE %s TO %s", oracleDatabase, oracleRole))
 	})
 
 	It("survives the primary Pod being deleted with no grace period", func() {
