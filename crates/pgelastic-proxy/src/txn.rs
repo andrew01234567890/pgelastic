@@ -64,6 +64,13 @@ const CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub struct Binding {
     pub instance: Arc<Instance>,
+    /// The backend configuration this session actually dials with: the instance's address and
+    /// TLS posture, but the *tenant's* identity and credential.
+    ///
+    /// Built once per binding rather than per checkout, and re-derived whenever the routing
+    /// table moves the tenant - the credential is a property of the tenant, so it is the same
+    /// on either instance during a migration.
+    pub backend: Arc<crate::config::BackendConfig>,
     pub key: PoolKey,
     pub tenant: pgelastic_capacity::TenantId,
     pub client: pgelastic_capacity::ClientId,
@@ -77,7 +84,8 @@ impl Binding {
         tenant_name: &str,
     ) -> Result<Self> {
         let instance = proxy.fleet.route(tenant_name);
-        let key = crate::pool::pool_key(&proxy.config, &instance.backend, startup, tenant_name)?;
+        let backend = Arc::new(proxy.backend_for(&instance, tenant_name)?);
+        let key = crate::pool::pool_key(&proxy.config, &backend, startup, tenant_name)?;
         let tenant = instance
             .pools
             .ensure_tenant(tenant_name)
@@ -88,6 +96,7 @@ impl Binding {
             .map_err(admission_error)?;
         Ok(Self {
             instance,
+            backend,
             key,
             tenant,
             client,
@@ -123,7 +132,7 @@ pub async fn bootstrap_greeting(
         return Err(crate::server::write_stalled(&binding.instance.id, health));
     }
     let connector = Connector {
-        backend: &binding.instance.backend,
+        backend: &binding.backend,
         tls: binding.instance.tls.as_ref(),
         kdf,
         startup,
@@ -909,7 +918,7 @@ impl Running<'_> {
         }
 
         let connector = Connector {
-            backend: &instance.backend,
+            backend: &self.session.binding.backend,
             tls: instance.tls.as_ref(),
             kdf: &self.session.proxy.kdf,
             startup: self.session.startup,
