@@ -146,7 +146,7 @@ func (c Config) render(dynamic bool) string {
 	c.renderRouting(&out, dynamic)
 	c.renderPool(&out, dynamic)
 	c.renderReload(&out)
-	c.renderInstances(&out)
+	c.renderInstances(&out, dynamic)
 	return out.String()
 }
 
@@ -353,12 +353,21 @@ func (c Config) renderReload(out *strings.Builder) {
 	out.WriteString("\n")
 }
 
-func (c Config) renderInstances(out *strings.Builder) {
+func (c Config) renderInstances(out *strings.Builder, dynamic bool) {
 	for _, instance := range c.sortedInstances() {
 		out.WriteString("[[instances]]\n")
 		writeString(out, "name", instance.Name)
 		writeString(out, "address", instance.Address)
-		if instance.BackendConnections > 0 {
+		// An instance's allocatable capacity belongs in the dynamic half, and it is the roll
+		// that proves why. It is derived from the member's published capacity, which the
+		// operator withholds whenever the instance leaves Ready - so every rolling restart
+		// moves this number, and while it was structural, rolling ONE instance changed the pod
+		// template hash and restarted the entire proxy fleet. Every client of every tenant on
+		// every other instance was dropped by a restart that had nothing to do with them.
+		//
+		// Which instance a fleet fronts, and how it dials it, are still structural: those are
+		// things a running process cannot adopt.
+		if dynamic && instance.BackendConnections > 0 {
 			writeInt(out, "backendConnections", int64(instance.BackendConnections))
 		}
 		writeString(out, "user", instance.User)

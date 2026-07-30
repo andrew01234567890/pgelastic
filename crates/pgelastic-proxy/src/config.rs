@@ -243,6 +243,14 @@ impl Config {
         // a tunable, so changing it invalidates every credential derived under the old value,
         // which is a different process rather than a document a running one can adopt.
         structural.auth.users.clear();
+        // An instance's allocatable capacity moves whenever that instance rolls, because the
+        // operator withholds it while a member is not serving. Leaving it here meant rolling
+        // one instance restarted the whole fleet and dropped every client of every tenant on
+        // every *other* instance. Which instances exist, and how they are dialled, stay
+        // structural - those a running process genuinely cannot adopt.
+        for instance in &mut structural.instances {
+            instance.backend_connections = None;
+        }
         structural
     }
 
