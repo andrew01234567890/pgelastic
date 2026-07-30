@@ -106,7 +106,7 @@ func ProvisionTarget(
 		return err
 	}
 	if exists != 0 && copySchema && bool(mayReset) {
-		discarded, err := resetUnstampedTarget(ctx, sql, plan)
+		discarded, err := resetUnstampedTarget(ctx, sql, plan, owner)
 		if err != nil {
 			return err
 		}
@@ -160,10 +160,24 @@ func ProvisionTarget(
 // after a successful cutover the ladder clears the stamp deliberately and the tenant is
 // serving from exactly this database, which is why "unstamped and non-empty" alone would be a
 // rule that deletes live tenants.
-func resetUnstampedTarget(ctx context.Context, sql SQL, plan Plan) (bool, error) {
+func resetUnstampedTarget(ctx context.Context, sql SQL, plan Plan, owner string) (bool, error) {
 	stamped, err := SchemaCopied(ctx, sql, plan)
 	if err != nil || stamped {
 		return false, err
+	}
+	// Only a database this migration would itself have created is ever discarded. Ownership is
+	// the evidence: ProvisionTarget creates the target OWNER the tenant, so a database owned by
+	// anybody else is one somebody else made - a human staging a restore, most likely - and
+	// dropping it would destroy work nobody asked us to touch. Such a target is left alone and
+	// the copy fails on it loudly, which is the correct outcome for a name collision.
+	if owner != "" {
+		ours, err := scalarInt64(ctx, sql, plan.Target.WithDatabase("postgres"), fmt.Sprintf(
+			`SELECT count(*)::text FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba
+			 WHERE d.datname = %s AND r.rolname = %s`,
+			QuoteLiteral(plan.Target.Database), QuoteLiteral(owner)))
+		if err != nil || ours == 0 {
+			return false, err
+		}
 	}
 	objects, err := scalarInt64(ctx, sql, plan.Target, fmt.Sprintf(
 		`SELECT count(*)::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

@@ -189,6 +189,10 @@ func TestCarriedRolesAreCreatedBeforeTheDatabaseAndTheSchema(t *testing.T) {
 // separates a database an earlier attempt half-built from one that was only ever created.
 const objectCountFragment = "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
 
+// ownedByTenantFragment identifies the question "did we make this database" - the guard that
+// stops the self-heal dropping one somebody else staged under the same name.
+const ownedByTenantFragment = "FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba"
+
 // A target carrying objects but no stamp has exactly one cause: an attempt that applied a
 // schema and then lost its stamp. Nothing recovers from it on its own, because the copy is
 // skipped only when the stamp is there - so every later attempt re-applies the same schema
@@ -197,7 +201,8 @@ const objectCountFragment = "FROM pg_class c JOIN pg_namespace n ON n.oid = c.re
 func TestAnUnstampedTargetCarryingObjectsIsRebuiltRatherThanCopiedOnto(t *testing.T) {
 	sql, shell := runningSQL(), &fakeShell{}
 	sql.scalarAnswer("FROM pg_database WHERE datname", "1").
-		scalarAnswer(objectCountFragment, "7")
+		scalarAnswer(objectCountFragment, "7").
+		scalarAnswer(ownedByTenantFragment, "1")
 	engine := testEngine(sql, &fakeRouter{routed: sourceInstance}, shell)
 
 	result := engine.Step(context.Background(), testRun(provisioning, online))
@@ -218,7 +223,8 @@ func TestAnUnstampedTargetCarryingObjectsIsRebuiltRatherThanCopiedOnto(t *testin
 func TestATargetTheTenantIsServedFromIsNeverDiscarded(t *testing.T) {
 	sql, shell := runningSQL(), &fakeShell{}
 	sql.scalarAnswer("FROM pg_database WHERE datname", "1").
-		scalarAnswer(objectCountFragment, "7")
+		scalarAnswer(objectCountFragment, "7").
+		scalarAnswer(ownedByTenantFragment, "1")
 	engine := testEngine(sql, &fakeRouter{routed: targetInstance}, shell)
 
 	engine.Step(context.Background(), testRun(provisioning, online))
@@ -227,10 +233,29 @@ func TestATargetTheTenantIsServedFromIsNeverDiscarded(t *testing.T) {
 	}
 }
 
+// The self-heal drops a database, so it has to be sure the database is ours. Ownership is the
+// evidence: ProvisionTarget creates the target OWNER the tenant, so one owned by anybody else
+// was staged by somebody else - a human restoring into it, most likely - and dropping it would
+// destroy work nobody asked us to touch. The copy then fails on it loudly, which is the right
+// answer to a name collision.
+func TestADatabaseSomebodyElseCreatedIsNeverDiscarded(t *testing.T) {
+	sql, shell := runningSQL(), &fakeShell{}
+	sql.scalarAnswer("FROM pg_database WHERE datname", "1").
+		scalarAnswer(objectCountFragment, "7").
+		scalarAnswer(ownedByTenantFragment, "0")
+	engine := testEngine(sql, &fakeRouter{routed: sourceInstance}, shell)
+
+	engine.Step(context.Background(), testRun(provisioning, online))
+	if sql.ran("DROP DATABASE") >= 0 {
+		t.Fatal("a database this migration did not create was dropped")
+	}
+}
+
 func TestAStampedTargetIsNeverDiscarded(t *testing.T) {
 	sql, shell := runningSQL(), &fakeShell{}
 	sql.scalarAnswer("FROM pg_database WHERE datname", "1").
 		scalarAnswer(objectCountFragment, "7").
+		scalarAnswer(ownedByTenantFragment, "1").
 		scalarAnswer(stampQueryFragment, "1")
 	engine := testEngine(sql, &fakeRouter{routed: sourceInstance}, shell)
 
