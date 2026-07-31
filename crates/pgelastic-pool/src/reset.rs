@@ -164,6 +164,15 @@ impl fmt::Display for ResetStep {
     }
 }
 
+impl fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unscrubbable(reason) => write!(f, "unscrubbable state: {}", reason.as_str()),
+            Self::ResetDisabled => f.write_str("the reset policy forbids scrubbing this link"),
+        }
+    }
+}
+
 /// Why a link is being closed instead of returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CloseReason {

@@ -124,6 +124,57 @@ impl From<crate::epoch::Observation> for EpochOutcome {
     }
 }
 
+/// Why the proxy closed a backend link rather than returning it to the pool.
+///
+/// Wider than [`pgelastic_pool::CloseReason`], which names only the two the reset ladder
+/// decides. Every path that closes a link by choice names itself here, so a pool that is
+/// churning connections says which of eight reasons it is churning them for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendCloseReason {
+    /// The link is tainted and the policy forbids scrubbing it.
+    ResetDisabled,
+    /// State no scrub removes, and the client that made it has gone.
+    Unscrubbable,
+    /// The release gate refused it for a reason a scrub cannot fix.
+    Disqualified,
+    /// A step of the reset ladder errored.
+    ResetFailed,
+    /// Scrubbed, and still not eligible to be checked in.
+    StillBlocked,
+    /// The backend went away, or was left in a state nothing can recover.
+    Abandoned,
+    /// Handed back deliberately while the epoch fence holds it.
+    FenceHeld,
+    /// A key change, a superseded epoch, or a connection that never opened.
+    Lifecycle,
+}
+
+impl BackendCloseReason {
+    pub const ALL: [Self; 8] = [
+        Self::ResetDisabled,
+        Self::Unscrubbable,
+        Self::Disqualified,
+        Self::ResetFailed,
+        Self::StillBlocked,
+        Self::Abandoned,
+        Self::FenceHeld,
+        Self::Lifecycle,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ResetDisabled => "reset_disabled",
+            Self::Unscrubbable => "unscrubbable",
+            Self::Disqualified => "disqualified",
+            Self::ResetFailed => "reset_failed",
+            Self::StillBlocked => "still_blocked",
+            Self::Abandoned => "abandoned",
+            Self::FenceHeld => "fence_held",
+            Self::Lifecycle => "lifecycle",
+        }
+    }
+}
+
 /// The actions that end a client's session, which is what the severed counter
 /// is about. `HoldForResume` is deliberately not one of them and is counted on
 /// its own.
@@ -167,6 +218,7 @@ pub struct Metrics {
     admission_dequeued: AtomicU64,
     admission_denied: [AtomicU64; ERROR_CODES.len()],
     pins: [AtomicU64; pgelastic_pool::PinReason::ALL.len()],
+    closes: [AtomicU64; BackendCloseReason::ALL.len()],
     /// The elastic/pinned split, refreshed from the pool manager's ledger.
     budget: [AtomicI64; 3],
     primary_epoch: AtomicI64,
@@ -317,6 +369,21 @@ impl Metrics {
             .position(|known| *known == code)
             .unwrap_or(0);
         self.admission_denied[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a link closed by choice, and why.
+    ///
+    /// The reason was previously discarded at the call site and `backend_closed` is a gauge
+    /// decrement with no label, so a pool closing every link it took -- which is what
+    /// `resetPolicy = "none"` does to a tainted one -- looked from outside exactly like a pool
+    /// reusing them. The only tell was `checkouts_total{source="reused"}` collapsing, and
+    /// nothing named the cause.
+    pub fn backend_close(&self, reason: BackendCloseReason) {
+        let index = BackendCloseReason::ALL
+            .iter()
+            .position(|known| *known == reason)
+            .unwrap_or(0);
+        self.closes[index].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn pinned(&self, reason: pgelastic_pool::PinReason) {
@@ -722,6 +789,30 @@ impl Metrics {
         );
     }
 
+    /// Why links are being closed rather than returned.
+    ///
+    /// Its own function because `render_pooling` is at its line limit, and because this is the
+    /// one series that distinguishes a pool churning connections from a pool reusing them.
+    fn render_closes(&self, out: &mut String) {
+        let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        counter(
+            out,
+            "pgelastic_proxy_backends_closed_total",
+            "Backend links closed by the proxy rather than returned to the pool, by cause.",
+            &labelled(&BackendCloseReason::ALL.map(|reason| {
+                (
+                    format!("reason=\"{}\"", reason.as_str()),
+                    load(
+                        &self.closes[BackendCloseReason::ALL
+                            .iter()
+                            .position(|known| *known == reason)
+                            .unwrap_or(0)],
+                    ),
+                )
+            })),
+        );
+    }
+
     /// The pooling half of the exposition.
     fn render_pooling(&self, out: &mut String) {
         let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
@@ -792,6 +883,7 @@ impl Metrics {
                 )
             })),
         );
+        self.render_closes(out);
         gauge(
             out,
             "pgelastic_proxy_backend_budget",

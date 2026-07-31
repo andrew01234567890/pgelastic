@@ -360,6 +360,53 @@ async fn scrubbable_session_state_never_survives_a_handoff() {
 /// Nothing here is announced by the server. Under the default policy the only thing that can
 /// notice this state is the scan of the statement text, so if that scan stops working this
 /// test fails and its neighbour does not.
+/// One backend that refuses to scrub anything.
+const ONE_RESET_NONE: &str = "\
+[pool]
+mode = \"transaction\"
+backendConnections = 1
+resetPolicy = \"none\"
+";
+
+/// `resetPolicy = "none"` does not skip the scrub, it closes any link that would have needed
+/// one — so a pool set to it churns a connection per transaction. That was invisible: the
+/// reason was dropped at the call site, and `backend_closed` is a gauge decrement with no
+/// label, so it looked exactly like a pool reusing its links.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_the_policy_refuses_to_scrub_is_closed_and_says_why() {
+    let stack = stack_with(ONE_RESET_NONE).await;
+    let client = stack.connect().await;
+
+    // Reported, so the link taints whatever the statement scan does.
+    client
+        .batch_execute("SET TimeZone TO 'Pacific/Auckland'")
+        .await
+        .unwrap();
+    // A second statement, so the release that follows the first has happened.
+    client.simple_query("SELECT 1").await.unwrap();
+
+    let rendered = stack.proxy.metrics.render();
+    let closed = rendered
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("pgelastic_proxy_backends_closed_total{reason=\"reset_disabled\"} ")
+        })
+        .and_then(|count| count.trim().parse::<u64>().ok())
+        .expect("the close-reason series is always exposed, even at zero");
+
+    // More than one, and the second is the interesting one: the replacement link is checked
+    // out, the variable cache re-issues the `SET` to match what the client was told, and that
+    // taints it too. Under this policy the pool churns a connection per transaction.
+    assert!(
+        closed >= 1,
+        "a link closed because the policy would not scrub it must say so: {rendered}"
+    );
+    assert!(
+        rendered.contains("pgelastic_proxy_backends_closed_total{reason=\"abandoned\"} 0"),
+        "every close reason is exposed at zero, so a dashboard does not have to wait for one"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unreported_session_state_never_survives_a_handoff() {
     let stack = stack_with(ONE).await;

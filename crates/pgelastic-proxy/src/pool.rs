@@ -1149,7 +1149,7 @@ impl PoolManager {
     /// The capacity slot is released all the same. A slot is fungible, so the
     /// next client to be granted it simply opens a new link — which is the whole
     /// reason the physical account and the capacity account are separate.
-    pub fn discard(&self, checkout: Checkout) {
+    pub fn discard(&self, checkout: Checkout, reason: crate::metrics::BackendCloseReason) {
         let Checkout {
             server,
             conn,
@@ -1169,6 +1169,7 @@ impl PoolManager {
         drop(inner);
 
         self.metrics.backend_closed();
+        self.metrics.backend_close(reason);
         tokio::spawn(conn.close());
     }
 

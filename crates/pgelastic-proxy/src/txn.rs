@@ -434,7 +434,8 @@ impl Running<'_> {
                     self.manager().publish_budget();
                     return Err(superseded_error(opened_under, current));
                 }
-                self.manager().discard(checkout);
+                self.manager()
+                    .discard(checkout, crate::metrics::BackendCloseReason::FenceHeld);
                 self.session.metrics.backend_held();
                 self.manager().publish_budget();
                 Ok(())
@@ -862,7 +863,8 @@ impl Running<'_> {
         if let Some(checkout) = self.take_checkout() {
             self.session.route.set(None);
             if hold {
-                self.manager().discard(checkout);
+                self.manager()
+                    .discard(checkout, crate::metrics::BackendCloseReason::Lifecycle);
                 self.session.metrics.backend_held();
             } else {
                 self.manager().sever(checkout, FenceAction::DrainThenClose);
@@ -1097,7 +1099,8 @@ impl Running<'_> {
                 debug!(?flags, "a link is disqualified from reuse and is closed");
                 let checkout = self.take_checkout().expect("just observed");
                 self.session.route.set(None);
-                self.manager().discard(checkout);
+                self.manager()
+                    .discard(checkout, crate::metrics::BackendCloseReason::Disqualified);
                 self.manager().publish_budget();
                 Ok(())
             }
@@ -1161,10 +1164,21 @@ impl Running<'_> {
                 client_gone: false,
             },
         );
-        if plan.disposition() != ResetDisposition::Reuse {
+        if let ResetDisposition::Close(reason) = plan.disposition() {
             let checkout = self.take_checkout().expect("just observed");
+            // Logged rather than silently discarded, as its three siblings below already are.
+            // A pool closing every link it takes and one reusing them look identical from
+            // outside: the only tell was `checkouts_total{source="reused"}` going to nothing,
+            // and nothing named the cause.
+            debug!(
+                %reason,
+                policy = ?self.reset_policy,
+                taint = ?checkout.conn.link.taint(),
+                "the reset policy will not scrub this link, so it is closed rather than reused"
+            );
             self.session.route.set(None);
-            self.manager().discard(checkout);
+            self.manager()
+                .discard(checkout, crate::metrics::BackendCloseReason::ResetDisabled);
             self.manager().publish_budget();
             return Ok(());
         }
@@ -1185,7 +1199,8 @@ impl Running<'_> {
                 debug!(%error, %step, "the reset ladder failed; the link is closed");
                 if let Some(checkout) = self.take_checkout() {
                     self.session.route.set(None);
-                    self.manager().discard(checkout);
+                    self.manager()
+                        .discard(checkout, crate::metrics::BackendCloseReason::ResetFailed);
                     self.manager().publish_budget();
                 }
                 return Ok(());
@@ -1212,7 +1227,8 @@ impl Running<'_> {
                 debug!(%block, "a scrubbed link still cannot be checked in; closing it");
                 let checkout = self.take_checkout().expect("just observed");
                 self.session.route.set(None);
-                self.manager().discard(checkout);
+                self.manager()
+                    .discard(checkout, crate::metrics::BackendCloseReason::StillBlocked);
                 self.manager().publish_budget();
             }
         }
@@ -1244,7 +1260,8 @@ impl Running<'_> {
     fn abandon(&mut self) {
         if let Some(checkout) = self.take_checkout() {
             self.session.route.set(None);
-            self.manager().discard(checkout);
+            self.manager()
+                .discard(checkout, crate::metrics::BackendCloseReason::Abandoned);
             self.manager().publish_budget();
         }
     }
