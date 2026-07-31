@@ -186,6 +186,22 @@ func TestArchivingIsWiredEvenWithNoRepository(t *testing.T) {
 	}
 }
 
+// `pgbackrest backup` reads archive_command out of the running postmaster and refuses to
+// start unless it mentions pgbackrest, because it has no other way to convince itself that
+// WAL is reaching its repository. Ours names the agent, which runs pgbackrest a moment later.
+//
+// Every base backup failed with "archive_command ... must contain pgbackrest" until the
+// command said so. This is asserted because the thing satisfying the check is a trailing
+// shell comment, which is exactly the sort of thing that gets tidied away by somebody who
+// cannot see what it is for.
+func TestArchiveCommandSatisfiesPgBackRestsOwnCheck(t *testing.T) {
+	command := backupBuilder(nil).AgentConfig().Postgres.ArchiveCommand
+	if !strings.Contains(command, "pgbackrest") {
+		t.Errorf("archive_command = %q; pgbackrest refuses to take a base backup unless it "+
+			"contains %q", command, "pgbackrest")
+	}
+}
+
 // The spool holds WAL-sized files, so it belongs on the volume that was sized for WAL and
 // whose exhaustion is already a first-class condition - and outside pg_wal, which
 // PostgreSQL owns.

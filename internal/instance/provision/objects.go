@@ -61,6 +61,23 @@ const bootstrapContainer = "bootstrap"
 // policy to, repeated here for an object that never went through admission.
 const defaultRetentionWindow = "30d"
 
+// archiveCommand hands a finished segment to the agent, which pushes it with pgBackRest.
+//
+// The trailing comment is load-bearing, however much it does not look it. `pgbackrest backup`
+// reads archive_command out of the running postmaster and refuses to start unless the string
+// contains "pgbackrest" - it has no other way to satisfy itself that WAL is reaching its
+// repository. Ours names the agent, which shells out to pgbackrest a moment later, so the
+// check is looking for the wrong thing and every base backup failed with
+// "archive_command ... must contain pgbackrest" before this comment existed.
+//
+// The alternative was --no-archive-check on every backup, which switches off the same option's
+// other half: the wait that confirms the WAL spanning the backup actually arrived in the
+// repository. That half is the one that makes a base backup restorable, so it stays.
+func archiveCommand() string {
+	return fmt.Sprintf("%s wal-archive --segment %%p --name %%f # runs pgbackrest archive-push",
+		AgentBinary)
+}
+
 // verbGet is spelled once so an RBAC rule cannot lose a verb to a typo.
 const (
 	verbGet    = "get"
@@ -171,7 +188,7 @@ func (b Builder) AgentConfig() AgentConfig {
 		Port:                     PostgresPort,
 		LogDirectory:             LogDir,
 		LogFilename:              LogFileName,
-		ArchiveCommand:           fmt.Sprintf("%s wal-archive --segment %%p --name %%f", AgentBinary),
+		ArchiveCommand:           archiveCommand(),
 		ArchiveTimeout:           ArchiveTimeout,
 		WALVolumeBytes:           spec.Storage.WALVolume.Size.Value(),
 		SynchronousCommit:        string(synchronousCommit(spec)),
