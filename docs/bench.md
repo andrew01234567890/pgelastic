@@ -281,7 +281,8 @@ Recorded here rather than discovered later:
 ## The Go arm
 
 A Go proxy did not exist when the arms above were measured, so those tables have no Go
-column. `test/bench/cmd/goproxy/` is a ~330-line spike written to fill it: accept, trust auth
+column. `test/bench/cmd/goproxy/` **was** a ~330-line spike written to fill it, deleted after
+round two — see the closing section for why. It was: accept, trust auth
 on the client leg, a fixed pool of backends hijacked from `pgconn`, the same 64 KiB inline /
 16 KiB streaming relay split as the Rust proxy, and a backend released at `ReadyForQuery`
 carrying `'I'`.

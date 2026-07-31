@@ -16,10 +16,7 @@ limitations under the License.
 
 package bench
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
 
 // The reference arm exists to say whether the Rust-versus-Go question matters at all. It
 // must never turn into a threshold: pgbouncer has no epoch fence, no tenant routing, no
@@ -77,19 +74,45 @@ func TestReferenceRowsFollowTheWorkloadsOwnAxis(t *testing.T) {
 			if rows[0].Axis != want {
 				t.Errorf("axis = %s, want %s", rows[0].Axis, want)
 			}
-			if !strings.Contains(rows[0].Reason, "c=64") {
-				t.Errorf("reason %q should name the concurrency it describes", rows[0].Reason)
+			if rows[0].Concurrency != 64 {
+				t.Errorf("row describes %d clients, want 64: a table of rows all labelled "+
+					"identically cannot be read", rows[0].Concurrency)
 			}
 		})
 	}
 }
 
-func TestReferenceRowsStopAtTheShorterSweep(t *testing.T) {
+// Rows are paired by client count, not by position in the list. Two sweeps that visited
+// different concurrencies would otherwise be lined up against each other in order, reporting
+// 64 clients of one arm against 256 of the other.
+func TestReferenceRowsPairByConcurrencyRatherThanPosition(t *testing.T) {
+	at := func(clients int) Point {
+		return Point{Concurrency: clients, Throughput: sample(1000, 990, 1010)}
+	}
+	reference := Report{Workload: WorkloadThroughput, Points: []Point{at(1), at(8), at(64)}}
+	// Same points, opposite order, and one the reference never visited.
+	arm := Report{Workload: WorkloadThroughput, Points: []Point{at(64), at(8), at(256)}}
+
+	rows := ReferenceRows(reference, arm)
+
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2: only 8 and 64 were swept by both", len(rows))
+	}
+	for _, row := range rows {
+		if row.Concurrency != 8 && row.Concurrency != 64 {
+			t.Errorf("row at %d clients: neither arm swept that against the other", row.Concurrency)
+		}
+	}
+}
+
+func TestReferenceRowsRefuseADifferentWorkload(t *testing.T) {
 	point := Point{Concurrency: 1, Throughput: sample(1000, 990, 1010)}
-	reference := Report{Workload: WorkloadThroughput, Points: []Point{point, point, point}}
+	reference := Report{Workload: WorkloadChurn, Points: []Point{point}}
 	arm := Report{Workload: WorkloadThroughput, Points: []Point{point}}
 
-	if rows := ReferenceRows(reference, arm); len(rows) != 1 {
-		t.Errorf("got %d rows, want 1: an arm that swept fewer points has nothing to say about the rest", len(rows))
+	rows := ReferenceRows(reference, arm)
+
+	if len(rows) != 1 || rows[0].Verdict != Inconclusive {
+		t.Fatalf("comparing churn against throughput must refuse, got %+v", rows)
 	}
 }

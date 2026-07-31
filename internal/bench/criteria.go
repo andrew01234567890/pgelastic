@@ -115,11 +115,16 @@ func (s Sample) SpreadRatio() float64 {
 
 // Result is one row of the decision table.
 type Result struct {
-	Axis      Axis    `json:"axis"`
-	Verdict   Verdict `json:"verdict"`
-	Ratio     float64 `json:"ratio"`
-	Threshold float64 `json:"threshold"`
-	Reason    string  `json:"reason"`
+	Axis Axis `json:"axis"`
+	// Concurrency is the client count this row describes.
+	//
+	// Without it a sweep of four points across four axes emits sixteen rows labelled
+	// identically, and the reader cannot tell which is which.
+	Concurrency int     `json:"concurrency,omitempty"`
+	Verdict     Verdict `json:"verdict"`
+	Ratio       float64 `json:"ratio"`
+	Threshold   float64 `json:"threshold"`
+	Reason      string  `json:"reason"`
 }
 
 // HigherIsBetter judges an axis where Go must reach a fraction of Rust's number: churn rate,

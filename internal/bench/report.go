@@ -69,7 +69,13 @@ type Report struct {
 	DurationMs  int64        `json:"durationMs"`
 	WarmupMs    int64        `json:"warmupMs"`
 	Repetitions int          `json:"repetitions"`
-	Points      []Point      `json:"points"`
+	// SimpleProtocol records how the statements were sent.
+	//
+	// Two reports that differ here are not comparable and never were, but until this field
+	// existed nothing in the artifact said so - they were separated only by a filename
+	// convention that a caller could forget to apply.
+	SimpleProtocol bool    `json:"simpleProtocol"`
+	Points         []Point `json:"points"`
 }
 
 // Sweep runs every concurrency point the requested number of times.
@@ -86,13 +92,14 @@ func Sweep(ctx context.Context, env Environment, target string, cfg RunConfig,
 	}
 
 	report := Report{
-		Environment: env,
-		Target:      target,
-		Workload:    cfg.Workload,
-		Query:       cfg.Query,
-		DurationMs:  cfg.Duration.Milliseconds(),
-		WarmupMs:    cfg.Warmup.Milliseconds(),
-		Repetitions: repetitions,
+		Environment:    env,
+		Target:         target,
+		Workload:       cfg.Workload,
+		Query:          cfg.EffectiveQuery(),
+		SimpleProtocol: cfg.SimpleProtocol,
+		DurationMs:     cfg.Duration.Milliseconds(),
+		WarmupMs:       cfg.Warmup.Milliseconds(),
+		Repetitions:    repetitions,
 	}
 
 	for _, concurrency := range concurrencies {
@@ -171,37 +178,103 @@ func summarize(values []float64) Sample {
 // Direct is required rather than optional, because the latency rows are expressed as the
 // latency each proxy adds over talking to PostgreSQL itself.
 func Compare(direct, rust, golang Report) []Result {
+	if mismatch := incomparable(direct, rust, golang); mismatch != nil {
+		return []Result{*mismatch}
+	}
+
 	var results []Result
 	rig := rust.Environment.Rig
+	goPoints := byConcurrency(golang)
+	directPoints := byConcurrency(direct)
 
-	for i, rustPoint := range rust.Points {
-		if i >= len(golang.Points) {
-			break
+	for _, rustPoint := range rust.Points {
+		// Paired by client count, not by position. Two sweeps that visited different
+		// concurrencies would otherwise be compared point-for-point down the list, reporting
+		// a verdict on 64 clients against 256.
+		goPoint, ok := goPoints[rustPoint.Concurrency]
+		if !ok {
+			results = append(results, missingPoint(rust.Workload, rustPoint.Concurrency, "go"))
+			continue
 		}
-		goPoint := golang.Points[i]
 
 		switch rust.Workload {
 		case WorkloadChurn:
-			results = append(results, HigherIsBetter(AxisChurn, rustPoint.Throughput, goPoint.Throughput))
+			results = append(results, at(rustPoint,
+				HigherIsBetter(AxisChurn, rustPoint.Throughput, goPoint.Throughput)))
 		case WorkloadThroughput:
-			results = append(results, HigherIsBetter(AxisThroughput, rustPoint.Throughput, goPoint.Throughput))
+			results = append(results, at(rustPoint,
+				HigherIsBetter(AxisThroughput, rustPoint.Throughput, goPoint.Throughput)))
 		case WorkloadBulk:
-			results = append(results, HigherIsBetter(AxisBulk, rustPoint.MBPerSec, goPoint.MBPerSec))
+			results = append(results, at(rustPoint,
+				HigherIsBetter(AxisBulk, rustPoint.MBPerSec, goPoint.MBPerSec)))
 		case WorkloadDensity:
 			// Density is decided from resident memory read outside the process, which the
 			// driver cannot see. The connection count is reported so a proxy that refused
 			// connections is not credited with having held them cheaply.
-			results = append(results, HigherIsBetter(AxisDensity, rustPoint.Throughput, goPoint.Throughput))
+			results = append(results, at(rustPoint,
+				HigherIsBetter(AxisDensity, rustPoint.Throughput, goPoint.Throughput)))
 		case WorkloadLatency:
-			if i < len(direct.Points) {
-				directPoint := direct.Points[i]
-				results = append(results,
-					AddedLatency(rig, AxisP99, directPoint.P99Micros, rustPoint.P99Micros, goPoint.P99Micros),
-					AddedLatency(rig, AxisP999, directPoint.P999Micros, rustPoint.P999Micros, goPoint.P999Micros))
+			directPoint, ok := directPoints[rustPoint.Concurrency]
+			if !ok {
+				results = append(results, missingPoint(rust.Workload, rustPoint.Concurrency, "direct"))
+				continue
 			}
+			results = append(results,
+				at(rustPoint, AddedLatency(rig, AxisP99,
+					directPoint.P99Micros, rustPoint.P99Micros, goPoint.P99Micros)),
+				at(rustPoint, AddedLatency(rig, AxisP999,
+					directPoint.P999Micros, rustPoint.P999Micros, goPoint.P999Micros)))
 		}
 	}
 	return results
+}
+
+// incomparable refuses two reports that are not measuring the same thing.
+//
+// The package already promises that a result whose environment differs from another's is not
+// comparable to it and that the report says so. Nothing checked it, so a churn report passed
+// as one arm against a throughput report as the other produced verdicts.
+func incomparable(direct, rust, golang Report) *Result {
+	for _, other := range []Report{direct, golang} {
+		if other.Workload != "" && other.Workload != rust.Workload {
+			return &Result{
+				Verdict: Inconclusive,
+				Reason: fmt.Sprintf("these arms measured different workloads (%s and %s), "+
+					"so there is nothing to compare", rust.Workload, other.Workload),
+			}
+		}
+		if other.SimpleProtocol != rust.SimpleProtocol {
+			return &Result{
+				Verdict: Inconclusive,
+				Reason: "these arms used different wire protocols, so one of them was doing " +
+					"prepared-statement work the other was not",
+			}
+		}
+	}
+	return nil
+}
+
+func byConcurrency(report Report) map[int]Point {
+	points := make(map[int]Point, len(report.Points))
+	for _, point := range report.Points {
+		points[point.Concurrency] = point
+	}
+	return points
+}
+
+func missingPoint(workload WorkloadName, concurrency int, arm string) Result {
+	return Result{
+		Concurrency: concurrency,
+		Verdict:     Inconclusive,
+		Reason: fmt.Sprintf("the %s arm did not sweep %d clients for %s",
+			arm, concurrency, workload),
+	}
+}
+
+// at labels a result with the client count it describes, so a table of them is readable.
+func at(point Point, result Result) Result {
+	result.Concurrency = point.Concurrency
+	return result
 }
 
 // Against measures an arm against a reference implementation and deliberately produces no
@@ -223,22 +296,31 @@ func Against(axis Axis, reference, arm Sample) Result {
 
 // ReferenceRows compares one arm to the reference across whatever axis its workload measures.
 func ReferenceRows(reference, arm Report) []Result {
+	if reference.Workload != arm.Workload || reference.SimpleProtocol != arm.SimpleProtocol {
+		return []Result{{
+			Verdict: Inconclusive,
+			Reason:  "the reference arm did not measure the same thing as this one",
+		}}
+	}
+
 	var results []Result
-	for i, referencePoint := range reference.Points {
-		if i >= len(arm.Points) {
-			break
+	armPoints := byConcurrency(arm)
+	for _, referencePoint := range reference.Points {
+		// Paired by client count for the same reason Compare is: two sweeps that visited
+		// different concurrencies would otherwise be lined up by position.
+		armPoint, ok := armPoints[referencePoint.Concurrency]
+		if !ok {
+			continue
 		}
-		axis, refSample, armSample := AxisThroughput, referencePoint.Throughput, arm.Points[i].Throughput
+		axis, refSample, armSample := AxisThroughput, referencePoint.Throughput, armPoint.Throughput
 		switch reference.Workload {
 		case WorkloadChurn:
 			axis = AxisChurn
 		case WorkloadBulk:
 			axis = AxisBulk
-			refSample, armSample = referencePoint.MBPerSec, arm.Points[i].MBPerSec
+			refSample, armSample = referencePoint.MBPerSec, armPoint.MBPerSec
 		}
-		row := Against(axis, refSample, armSample)
-		row.Reason = fmt.Sprintf("c=%d: %s", referencePoint.Concurrency, row.Reason)
-		results = append(results, row)
+		results = append(results, at(referencePoint, Against(axis, refSample, armSample)))
 	}
 	return results
 }
