@@ -99,7 +99,12 @@ jobs:
       contents: read
     name: backup and PITR e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Ninety rather than sixty. The suite provisions three real three-node instances in
+    # sequence - the archive source, an instance recovered to a point in time, and the
+    # throwaway a tenant restore recovers into - plus an object store. On the two cores a
+    # hosted runner gives, that is comfortably over an hour's work, and a job that times out
+    # tells you nothing at all about what it was testing.
+    timeout-minutes: 90
     env:
       KIND_CLUSTER: pgelastic-backup
     steps:
