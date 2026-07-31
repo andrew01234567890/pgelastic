@@ -190,6 +190,71 @@ func TestACompletedRestoreStaysCompleted(t *testing.T) {
 	}
 }
 
+// A copy that failed half way is terminal, and has to survive the phase projection to say
+// so. It carries an error, and the Preflight case is written in terms of an error, so
+// without the terminal check first a failed restore reports itself as a planning problem -
+// sending whoever reads it to check a spec that was never the trouble.
+func TestAFailedRestoreStaysFailed(t *testing.T) {
+	status := &pgelasticv1alpha1.PgRestoreStatus{
+		Phase: pgelasticv1alpha1.RestorePhaseFailed,
+		Error: "pg_restore exited 1 half way through loading the tenant",
+	}
+	if got := restorePhase(status); got != pgelasticv1alpha1.RestorePhaseFailed {
+		t.Fatalf("phase = %q, want it to stay Failed", got)
+	}
+
+	restore := &pgelasticv1alpha1.PgRestore{ObjectMeta: metav1.ObjectMeta{Generation: 3}}
+	conditions := restoreConditions(restore, status)
+
+	// Accepted stays true: this restore was planned and then went wrong during the copy,
+	// which is a different thing from one that could never have been planned.
+	if accepted := findCondition(conditions, pgelasticv1alpha1.ConditionAccepted); accepted == nil ||
+		accepted.Status != metav1.ConditionTrue {
+		t.Errorf("accepted = %v, want True", accepted)
+	}
+	// Nothing is still converging towards a restore that has ended.
+	if progressing := findCondition(conditions,
+		pgelasticv1alpha1.ConditionProgressing); progressing == nil ||
+		progressing.Status != metav1.ConditionFalse {
+		t.Errorf("progressing = %v, want False", progressing)
+	}
+	ready := findCondition(conditions, pgelasticv1alpha1.ConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse {
+		t.Fatalf("ready = %v, want False", ready)
+	}
+	if ready.Reason != pgelasticv1alpha1.ReasonRestoreFailed {
+		t.Errorf("reason = %q, want %q", ready.Reason, pgelasticv1alpha1.ReasonRestoreFailed)
+	}
+	if ready.Message != status.Error {
+		t.Errorf("message = %q, want what went wrong", ready.Message)
+	}
+}
+
+// Both terminal phases have to be recognised as terminal, because converge asks this before
+// it does anything else. A tenant restore that reached here again rebuilt its recovery
+// instance and ran pg_restore --clean over the live tenant a second time.
+func TestBothEndingsAreTerminal(t *testing.T) {
+	for _, phase := range []pgelasticv1alpha1.RestorePhase{
+		pgelasticv1alpha1.RestorePhaseCompleted,
+		pgelasticv1alpha1.RestorePhaseFailed,
+	} {
+		if !isTerminalRestore(phase) {
+			t.Errorf("%s is not terminal, so a restore in it is reconciled again", phase)
+		}
+	}
+	for _, phase := range []pgelasticv1alpha1.RestorePhase{
+		"",
+		pgelasticv1alpha1.RestorePhasePreflight,
+		pgelasticv1alpha1.RestorePhaseRecovering,
+		pgelasticv1alpha1.RestorePhaseExtracting,
+		pgelasticv1alpha1.RestorePhaseLoading,
+	} {
+		if isTerminalRestore(phase) {
+			t.Errorf("%q is terminal, so a restore in it would never make progress", phase)
+		}
+	}
+}
+
 // An instance recovering from a repository has that repository configured so it can read
 // from it. It carries its source's system identifier, so it addresses the source's stanza
 // while running on a forked timeline: a backup taken from here lands in somebody else's
