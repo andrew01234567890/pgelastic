@@ -757,6 +757,15 @@ than leaving it to a backstop that configuration can switch off.
 Its throughput effect is the inconclusive result above. It ships as a correctness change with
 one fewer acquisition, and **no performance claim**, because the rig could not resolve one.
 
+That leaves three acquisitions per transaction — `try_lease`, the fused sever-and-claim, and
+`check_in` — where the plan set a floor of two, by also fusing `try_lease` into the claim.
+**That second fusion was not done, and the reason is the result above.** The first lock removal
+produced no effect this rig could resolve, so there is no evidence that the second would either,
+and it is a more invasive change to the checkout path than the first. Reducing lock traffic was
+justified by a performance argument; the measurement withdrew the argument. Reopen it with a rig
+that can resolve a few percent, or with a profile showing the manager lock is contended — not on
+the reasoning that fewer acquisitions must be faster.
+
 ### Zero-copy relay: measured against the traffic, and dropped
 
 The plan carried this as the remaining lever: the read side is already zero-copy, the copies are
