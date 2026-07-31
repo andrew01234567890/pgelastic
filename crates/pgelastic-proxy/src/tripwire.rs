@@ -12,11 +12,32 @@
 //! ever be handed on, which is a one-way door that can be taken too often
 //! without harm.
 
-use pgelastic_pool::PinReason;
+use pgelastic_pool::{PinReason, Taint, TaintSet};
 
-/// The first tripwire `sql` fires, if any.
-pub fn scan(sql: &[u8]) -> Option<PinReason> {
+/// What one statement's text implies about the link that ran it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scan {
+    /// State no reset removes. The link may never be handed on.
+    pub pin: Option<PinReason>,
+    /// State a reset *does* remove, but which `PostgreSQL` will not report.
+    ///
+    /// `Taint::SessionParameter` is otherwise fed only by `ParameterStatus`, and the server
+    /// sends that for its `GUC_REPORT` set alone — so `search_path`, `role`, `statement_timeout`
+    /// and every custom variable are invisible to it. Under a policy that scrubs only what it
+    /// believes is dirty, invisible means it survives to the next client on the same pool key.
+    pub taint: TaintSet,
+}
+
+/// Everything `sql` implies about its link, in one pass.
+pub fn scan(sql: &[u8]) -> Scan {
     let tokens = tokenize(sql);
+    Scan {
+        pin: pin_reason(&tokens),
+        taint: taint_of(sql),
+    }
+}
+
+fn pin_reason(tokens: &[&[u8]]) -> Option<PinReason> {
     let has = |word: &str| {
         tokens
             .iter()
@@ -53,6 +74,55 @@ pub fn scan(sql: &[u8]) -> Option<PinReason> {
     None
 }
 
+/// Session state a scrub would remove but the server never announces.
+///
+/// Position matters, and it is the whole difference between this being useful and being a
+/// permanent `DISCARD ALL`: `SET` is a session assignment only when it opens a statement.
+/// Matching it anywhere would fire on every `UPDATE ... SET ...`, i.e. on every write.
+///
+/// Over-eager in every other respect, deliberately. A statement separator inside a string
+/// literal splits a statement that did not need splitting, and the cost of a false positive is
+/// one `DISCARD ALL` — exactly what the previous default did unconditionally. The cost of a
+/// false negative is another client reading this one's `search_path`.
+fn taint_of(sql: &[u8]) -> TaintSet {
+    let mut taint = TaintSet::new();
+
+    for statement in sql.split(|byte| *byte == b';') {
+        let tokens = tokenize(statement);
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+        let is = |token: &[u8], word: &str| token.eq_ignore_ascii_case(word.as_bytes());
+        let second = tokens.get(1);
+
+        // `SET LOCAL` reverts when the transaction ends, and the link is released at exactly
+        // that boundary, so it is gone before anybody else could see it. Excluding it matters:
+        // it is the recommended way to carry a tenant id for row-level security, and tainting
+        // it would scrub every transaction of the users who most need this to be cheap.
+        let set_local = is(first, "set") && second.is_some_and(|token| is(token, "local"));
+
+        if (is(first, "set") && !set_local) || is(first, "reset") {
+            taint.insert(Taint::SessionParameter);
+        }
+        // `PREPARE TRANSACTION` is a two-phase commit and already pins.
+        if is(first, "prepare") && !second.is_some_and(|token| is(token, "transaction")) {
+            taint.insert(Taint::PreparedStatement);
+        }
+        if is(first, "declare") {
+            taint.insert(Taint::Cursor);
+        }
+        for token in &tokens {
+            if is(token, "set_config") {
+                taint.insert(Taint::SessionParameter);
+            }
+            if is(token, "nextval") || is(token, "setval") {
+                taint.insert(Taint::Sequence);
+            }
+        }
+    }
+    taint
+}
+
 /// Whether a token names an advisory lock held for the session.
 ///
 /// `pg_advisory_xact_lock` and friends release at commit, so they are ordinary
@@ -78,7 +148,69 @@ mod tests {
     use super::*;
 
     fn scanned(sql: &str) -> Option<PinReason> {
-        scan(sql.as_bytes())
+        scan(sql.as_bytes()).pin
+    }
+
+    fn tainted(sql: &str) -> TaintSet {
+        scan(sql.as_bytes()).taint
+    }
+
+    /// The single most likely way to get this scan wrong: `SET` is a session assignment only
+    /// when it opens a statement, and matching it anywhere would taint every write.
+    #[test]
+    fn an_update_with_a_set_clause_is_not_a_session_parameter_assignment() {
+        assert!(tainted("UPDATE orders SET total = 10 WHERE id = 1").is_clean());
+        assert!(
+            tainted("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2").is_clean()
+        );
+        assert!(tainted("SELECT * FROM settings").is_clean());
+    }
+
+    #[test]
+    fn a_session_assignment_the_server_never_reports_is_still_seen() {
+        for sql in [
+            "SET search_path TO audit",
+            "set ROLE snoop",
+            "RESET search_path",
+            "SELECT set_config('app.tenant', '42', false)",
+        ] {
+            assert!(
+                tainted(sql).contains(Taint::SessionParameter),
+                "{sql} leaves state PostgreSQL will not announce"
+            );
+        }
+    }
+
+    /// `SET LOCAL` reverts when the transaction ends, and the link is released at exactly that
+    /// boundary. Tainting it would scrub every transaction of the row-level-security users who
+    /// most need this to be cheap.
+    #[test]
+    fn a_transaction_scoped_assignment_is_not_a_taint() {
+        assert!(tainted("SET LOCAL app.current_tenant = '42'").is_clean());
+        assert!(tainted("BEGIN; SET LOCAL app.tenant = '7'; SELECT 1; COMMIT").is_clean());
+    }
+
+    #[test]
+    fn sql_level_prepare_and_declare_taint_without_pinning() {
+        let prepared = scan(b"PREPARE p AS SELECT 1");
+        assert!(prepared.taint.contains(Taint::PreparedStatement));
+        assert_eq!(prepared.pin, None, "an ordinary PREPARE is scrubbable");
+
+        let cursor = scan(b"DECLARE c CURSOR FOR SELECT 1");
+        assert!(cursor.taint.contains(Taint::Cursor));
+        assert_eq!(cursor.pin, None);
+
+        // Two-phase commit is a different thing and keeps its pin.
+        assert_eq!(
+            scan(b"PREPARE TRANSACTION 'tx1'").pin,
+            Some(PinReason::PreparedTransaction)
+        );
+    }
+
+    #[test]
+    fn a_sequence_call_taints_the_link() {
+        assert!(tainted("SELECT nextval('s')").contains(Taint::Sequence));
+        assert!(tainted("SELECT setval('s', 1)").contains(Taint::Sequence));
     }
 
     #[test]

@@ -468,6 +468,29 @@ func TestTheWorkerCountIsDeclaredRatherThanDerivedFromTheHost(t *testing.T) {
 	}
 }
 
+// DiscardAll used to be served by the switch's default arm rather than named by it, so
+// flipping that arm to dirtyTracked would have rendered dirtyTracked for an operator who
+// asked for discardAll - silently, on the setting that decides how much session state is
+// scrubbed between clients.
+func TestEveryResetModeRendersTheOneItNames(t *testing.T) {
+	for mode, want := range map[pgelasticv1alpha1.ResetPolicy]string{
+		pgelasticv1alpha1.ResetNone:         "none",
+		pgelasticv1alpha1.ResetDirtyTracked: "dirtyTracked",
+		pgelasticv1alpha1.ResetSmartDiscard: "smartDiscard",
+		pgelasticv1alpha1.ResetDiscardAll:   "discardAll",
+		pgelasticv1alpha1.ResetVerified:     "verified",
+	} {
+		if got := resetPolicy(&pgelasticv1alpha1.PoolingConfig{ResetMode: mode}); got != want {
+			t.Errorf("resetMode %q rendered %q, want %q", mode, got, want)
+		}
+	}
+
+	// An unset mode takes the default, which the API server also supplies.
+	if got := resetPolicy(nil); got != "dirtyTracked" {
+		t.Errorf("an absent pooling block rendered %q, want dirtyTracked", got)
+	}
+}
+
 func TestTheFleetCanReadItsOwnConfigurationAndNoOtherSecret(t *testing.T) {
 	role := Builder{Pool: testPool(), Image: testImage}.Role()
 	var secretRule *int

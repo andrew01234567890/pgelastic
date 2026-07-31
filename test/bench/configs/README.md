@@ -8,6 +8,11 @@ Every file here is rendered against the same PostgreSQL (`pgebench-pg` on the `p
 Docker bridge) with the same credentials, the same pool size and the same frame limits. The
 only thing that varies between files is the one axis named in the filename.
 
+Every file pins `resetPolicy` explicitly rather than taking the default, and now has to: the
+shipped default moved from `discardAll` to `dirtyTracked`, and the numbers published in
+`docs/bench.md` were all taken under `discardAll`. Pinning keeps them reproducible. A sweep of
+the new default belongs in a fresh set of arms, not in a silent redefinition of the old ones.
+
 | File | Pool mode | `fence.verifyAtCheckout` | Role |
 |---|---|---|---|
 | `txn-fence-off.toml` | transaction | `false` | **Primary decision number.** Proxy overhead in isolation. |

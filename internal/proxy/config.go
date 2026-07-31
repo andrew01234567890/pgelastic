@@ -475,7 +475,7 @@ func poolMode(pooling *pgelasticv1alpha1.PoolingConfig) string {
 
 func resetPolicy(pooling *pgelasticv1alpha1.PoolingConfig) string {
 	if pooling == nil || pooling.ResetMode == "" {
-		return "discardAll"
+		return "dirtyTracked"
 	}
 	switch pooling.ResetMode {
 	case pgelasticv1alpha1.ResetNone:
@@ -486,8 +486,14 @@ func resetPolicy(pooling *pgelasticv1alpha1.PoolingConfig) string {
 		return "smartDiscard"
 	case pgelasticv1alpha1.ResetVerified:
 		return "verified"
-	default:
+	case pgelasticv1alpha1.ResetDiscardAll:
 		return "discardAll"
+	default:
+		// Explicit rather than folded into the default arm. DiscardAll used to be served by
+		// it, so changing the fallback without naming it would have rendered dirtyTracked for
+		// an operator who asked for discardAll - silently, on the setting that decides how
+		// much session state is scrubbed between clients.
+		return "dirtyTracked"
 	}
 }
 

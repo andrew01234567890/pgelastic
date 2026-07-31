@@ -350,6 +350,89 @@ async fn scrubbable_session_state_never_survives_a_handoff() {
     assert_eq!(row.get::<_, i32>(5), 0, "a LISTEN registration leaked");
 }
 
+/// The same guarantee as its neighbour, with every parameter `PostgreSQL` reports removed.
+///
+/// That distinction is the whole point. `scrubbable_session_state_never_survives_a_handoff`
+/// also sets `TimeZone`, which is `GUC_REPORT` — so the link taints from the `ParameterStatus`
+/// alone and the policy escalates to a full scrub. Its `search_path` and `SET ROLE` assertions
+/// have therefore never been load-bearing: they would pass with no statement scanning at all.
+///
+/// Nothing here is announced by the server. Under the default policy the only thing that can
+/// notice this state is the scan of the statement text, so if that scan stops working this
+/// test fails and its neighbour does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreported_session_state_never_survives_a_handoff() {
+    let stack = stack_with(ONE).await;
+    let observer = stack.observer("pgelastic_probe").await;
+    observer
+        .batch_execute(
+            "CREATE ROLE lurker NOLOGIN; GRANT lurker TO pgelastic; CREATE SCHEMA hidden;",
+        )
+        .await
+        .unwrap();
+
+    let alice = stack.connect().await;
+    let poisoned = pid(&alice).await;
+    let default_path: String = alice
+        .query_one("SELECT current_setting('search_path')", &[])
+        .await
+        .unwrap()
+        .get(0);
+
+    // Deliberately no `SET search_path` and no `SET ROLE`. PostgreSQL 18 reports both, so
+    // either would taint the link through its `ParameterStatus` and scrub it whether or not
+    // anything read the statement text — which is the trap this test exists to avoid falling
+    // into. A custom variable and a SQL-level PREPARE are announced by nothing.
+    alice
+        .batch_execute(
+            "SELECT set_config('app.current_tenant', 'acme', false); \
+             PREPARE alice_hidden AS SELECT 1;",
+        )
+        .await
+        .unwrap();
+
+    let bob = stack.connect().await;
+    assert_eq!(
+        pid(&bob).await,
+        poisoned,
+        "the pool did not reuse the one backend it has, so this proves nothing"
+    );
+
+    let row = bob
+        .query_one(
+            "SELECT current_user::text, \
+                    current_setting('search_path'), \
+                    current_setting('app.current_tenant', true), \
+                    (SELECT count(*)::int FROM pg_catalog.pg_prepared_statements \
+                     WHERE name = 'alice_hidden')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        row.get::<_, String>(0),
+        "pgelastic",
+        "SET ROLE leaked: the server never reports `role`, so only the statement scan sees it"
+    );
+    assert_eq!(
+        row.get::<_, String>(1),
+        default_path,
+        "a search_path leaked: the server never reports it either"
+    );
+    assert!(
+        row.get::<_, Option<String>>(2)
+            .is_none_or(|value| value.is_empty()),
+        "a custom variable leaked — this is the row-level-security idiom, so the next client \
+         would read this one's tenant id"
+    );
+    assert_eq!(
+        row.get::<_, i32>(3),
+        0,
+        "a SQL-level PREPARE leaked: it is not a protocol Parse, so nothing else would notice it"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unscrubbable_state_pins_its_client_and_is_invisible_to_everybody_else() {
     let stack = stack_with(FOUR).await;

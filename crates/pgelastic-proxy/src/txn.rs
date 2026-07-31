@@ -615,11 +615,20 @@ impl Running<'_> {
 
     /// Everything decided from statement text, in one place.
     ///
-    /// Pinning is the only thing SQL text is ever consulted for: it decides
-    /// whether a link may be handed on at all, never when it is handed on.
+    /// Two separable questions, and neither is about *when* a link is released — that is the
+    /// backend's `ReadyForQuery` byte and nothing else. Pinning decides whether a link may be
+    /// handed on at all. Tainting decides whether it must be scrubbed first, and exists
+    /// because the server announces only its `GUC_REPORT` parameters: without reading the SQL,
+    /// a `SET search_path` is invisible and would survive to whoever gets the link next.
     fn on_sql(&mut self, sql: &Bytes) {
-        if let Some(reason) = crate::tripwire::scan(sql) {
+        let scan = crate::tripwire::scan(sql);
+        if let Some(reason) = scan.pin {
             self.pin(reason);
+        }
+        if !scan.taint.is_clean()
+            && let Some(checkout) = self.checkout.as_mut()
+        {
+            checkout.conn.link.add_taints(scan.taint);
         }
     }
 

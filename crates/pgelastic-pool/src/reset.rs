@@ -69,6 +69,11 @@ impl TaintSet {
         self.0 |= taint.bit();
     }
 
+    /// Folds another set in. Taints only ever accumulate until a scrub clears them.
+    pub fn union(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
     pub fn contains(self, taint: Taint) -> bool {
         self.0 & taint.bit() != 0
     }

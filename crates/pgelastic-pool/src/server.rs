@@ -263,6 +263,15 @@ impl ServerLink {
         self.taint.insert(taint);
     }
 
+    /// Records state the server will not announce.
+    ///
+    /// `ParameterStatus` covers only `GUC_REPORT` parameters, so a `SET search_path`, a
+    /// `SET ROLE` or any custom variable reaches the link without the link knowing. The
+    /// caller reads that out of the statement text and folds it in here.
+    pub fn add_taints(&mut self, taints: TaintSet) {
+        self.taint.union(taints);
+    }
+
     /// Records unscrubbable state. The first reason wins: it is the one that
     /// explains why the link left the elastic budget.
     pub fn set_pin(&mut self, reason: PinReason) {
