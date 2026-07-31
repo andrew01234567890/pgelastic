@@ -53,6 +53,13 @@ type Point struct {
 	P999Micros Sample `json:"p999Micros"`
 	MBPerSec   Sample `json:"mbPerSecond,omitempty"`
 
+	// What the pooler spent. Empty when nothing was sampled, which `undersampled` turns into
+	// a visible INCONCLUSIVE row rather than silence.
+	CPUMicrosPerOp  Sample `json:"cpuMicrosPerOp,omitempty"`
+	CPUCoresPeak    Sample `json:"cpuCoresPeak,omitempty"`
+	WorkingSetBytes Sample `json:"workingSetBytes,omitempty"`
+	BytesPerConn    Sample `json:"bytesPerConnection,omitempty"`
+
 	// Errors and Overruns are summed across repetitions. A point with either is reported
 	// with them rather than quietly averaged, because a saturated or failing cell describes
 	// a different system than the one the sweep meant to measure.
@@ -74,8 +81,14 @@ type Report struct {
 	// Two reports that differ here are not comparable and never were, but until this field
 	// existed nothing in the artifact said so - they were separated only by a filename
 	// convention that a caller could forget to apply.
-	SimpleProtocol bool    `json:"simpleProtocol"`
-	Points         []Point `json:"points"`
+	SimpleProtocol bool `json:"simpleProtocol"`
+	// Pooler names the container that was sampled, and PoolerCPUSet the pinning it actually
+	// got - read from its cgroup rather than from whatever the caller believes it asked for,
+	// so "pinned to four cores" is a recorded fact rather than a claim.
+	Pooler       string   `json:"pooler,omitempty"`
+	PoolerCPUSet string   `json:"poolerCpuSet,omitempty"`
+	Warnings     []string `json:"warnings,omitempty"`
+	Points       []Point  `json:"points"`
 }
 
 // Sweep runs every concurrency point the requested number of times.
@@ -85,10 +98,33 @@ type Report struct {
 func Sweep(ctx context.Context, env Environment, target string, cfg RunConfig,
 	concurrencies []int, repetitions int, progress io.Writer,
 ) (Report, error) {
+	return SweepWithProbe(ctx, env, target, cfg, concurrencies, repetitions, progress, "")
+}
+
+// SweepWithProbe is Sweep with the pooler's resources sampled for the whole run.
+//
+// The probe's lifetime is the sweep's, not a cell's: an earlier CPU figure was wrong because
+// sampling was something a person did once, at a moment that turned out to be the
+// single-client phase. Cells attribute themselves out of it afterwards.
+func SweepWithProbe(ctx context.Context, env Environment, target string, cfg RunConfig,
+	concurrencies []int, repetitions int, progress io.Writer, pooler string,
+) (Report, error) {
 	if repetitions < MinRuns {
 		return Report{}, fmt.Errorf(
 			"%d repetitions is fewer than the %d the criteria require; a verdict from it would be withheld anyway",
 			repetitions, MinRuns)
+	}
+
+	var warnings []string
+	if pooler != "" {
+		probe, why := NewResourceProbe(ctx, pooler)
+		if probe == nil {
+			warnings = append(warnings, "no resource sampling: "+why)
+		}
+		defer probe.Stop()
+		cfg.Probe = probe
+		// Read before the first cell opens anything, while the pooler is genuinely idle.
+		cfg.IdleWorkingSet = probe.WorkingSet()
 	}
 
 	report := Report{
@@ -127,6 +163,11 @@ func Sweep(ctx context.Context, env Environment, target string, cfg RunConfig,
 		}
 		report.Points = append(report.Points, point)
 	}
+	if cfg.Probe != nil {
+		report.Pooler = pooler
+		report.PoolerCPUSet = cfg.Probe.CPUSet()
+	}
+	report.Warnings = warnings
 	return report, nil
 }
 
@@ -136,6 +177,22 @@ func summarizePoint(point *Point) {
 	point.P99Micros = summarize(pluck(point.Repetitions, func(c Cell) float64 { return c.P99Micros }))
 	point.P999Micros = summarize(pluck(point.Repetitions, func(c Cell) float64 { return c.P999Micros }))
 	point.MBPerSec = summarize(pluck(point.Repetitions, func(c Cell) float64 { return c.MBPerSec }))
+	point.CPUMicrosPerOp = summarizeResource(point.Repetitions, func(r *Resource) float64 { return r.CPUMicrosPerOp })
+	point.CPUCoresPeak = summarizeResource(point.Repetitions, func(r *Resource) float64 { return r.CPUCoresPeak })
+	point.WorkingSetBytes = summarizeResource(point.Repetitions, func(r *Resource) float64 { return r.WorkingSetMean })
+	point.BytesPerConn = summarizeResource(point.Repetitions, func(r *Resource) float64 { return r.BytesPerConn })
+}
+
+// summarizeResource skips cells with no sampling, so a partly-sampled sweep reports the runs
+// it has rather than a set of zeros mixed in with them.
+func summarizeResource(cells []Cell, of func(*Resource) float64) Sample {
+	values := make([]float64, 0, len(cells))
+	for _, cell := range cells {
+		if cell.Resource != nil {
+			values = append(values, of(cell.Resource))
+		}
+	}
+	return summarize(values)
 }
 
 func pluck(cells []Cell, of func(Cell) float64) []float64 {
@@ -197,6 +254,13 @@ func Compare(direct, rust, golang Report) []Result {
 			continue
 		}
 
+		// Emitted for every workload, and unconditionally: an unsampled arm yields a Sample
+		// with no runs, which `undersampled` reports as INCONCLUSIVE. A visible refusal is
+		// right; silence is how a missing measurement gets forgotten.
+		results = append(results,
+			at(rustPoint, LowerIsBetter(AxisCPUPerOp, rustPoint.CPUMicrosPerOp, goPoint.CPUMicrosPerOp)),
+			at(rustPoint, LowerIsBetter(AxisMemory, rustPoint.WorkingSetBytes, goPoint.WorkingSetBytes)))
+
 		switch rust.Workload {
 		case WorkloadChurn:
 			results = append(results, at(rustPoint,
@@ -208,11 +272,13 @@ func Compare(direct, rust, golang Report) []Result {
 			results = append(results, at(rustPoint,
 				HigherIsBetter(AxisBulk, rustPoint.MBPerSec, goPoint.MBPerSec)))
 		case WorkloadDensity:
-			// Density is decided from resident memory read outside the process, which the
-			// driver cannot see. The connection count is reported so a proxy that refused
-			// connections is not credited with having held them cheaply.
+			// Resident bytes per idle connection, lower being better - which is what
+			// criteria.go always documented this axis as and what the shipped path did not
+			// do. It fed the establish rate into HigherIsBetter instead, and since both arms
+			// establish over the same window that ratio was structurally ~1.00: a guaranteed
+			// PASS carrying no information, which is worse than no row at all.
 			results = append(results, at(rustPoint,
-				HigherIsBetter(AxisDensity, rustPoint.Throughput, goPoint.Throughput)))
+				LowerIsBetter(AxisDensity, rustPoint.BytesPerConn, goPoint.BytesPerConn)))
 		case WorkloadLatency:
 			directPoint, ok := directPoints[rustPoint.Concurrency]
 			if !ok {

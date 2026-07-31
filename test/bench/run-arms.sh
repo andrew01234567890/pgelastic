@@ -97,10 +97,10 @@ start_pgbouncer() {
 }
 
 measure() {
-	local target="$1" dsn="$2" workload="$3" label="$4"
+	local target="$1" dsn="$2" workload="$3" label="$4" pooler="${5:-}"
 	echo "=== $label / $workload ==="
 	taskset -c "$LOADGEN_CPUS" bin/pgebench run \
-		--target "$target" --dsn "$dsn" \
+		--target "$target" --dsn "$dsn" ${pooler:+--pooler "$pooler"} \
 		--workload "$workload" --concurrency "$CONCURRENCY" \
 		--duration "$DURATION" --warmup "$WARMUP" --repetitions "$REPS" \
 		${SIMPLE:+--simple-protocol} \
@@ -109,7 +109,7 @@ measure() {
 }
 
 run_arm() {
-	local arm="$1" target dsn
+	local arm="$1" target dsn pooler=""
 	case "$arm" in
 	direct)
 		stop_poolers
@@ -117,22 +117,22 @@ run_arm() {
 		;;
 	rust)
 		start_proxy txn-fence-off.toml
-		target=rust dsn="$POOLER_DSN"
+		target=rust dsn="$POOLER_DSN" pooler=pgebench-proxy
 		;;
 	rust-fence-on)
 		start_proxy txn-fence-on.toml
-		target=rust dsn="$POOLER_DSN"
+		target=rust dsn="$POOLER_DSN" pooler=pgebench-proxy
 		;;
 	rust-session)
 		start_proxy session-fence-off.toml
-		target=rust dsn="$POOLER_DSN"
+		target=rust dsn="$POOLER_DSN" pooler=pgebench-proxy
 		;;
 	rust-reset-dirty)
 		# The real like-for-like row against pgbouncer. dirtyTracked reuses a clean link
 		# with no reset at all, so a SELECT workload costs one backend round trip - which
 		# is what pgbouncer does in transaction mode.
 		start_proxy txn-reset-dirty.toml
-		target=rust dsn="$POOLER_DSN"
+		target=rust dsn="$POOLER_DSN" pooler=pgebench-proxy
 		;;
 	rust-reset-none)
 		# The other like-for-like row against pgbouncer. Our resetPolicy = "discardAll"
@@ -141,18 +141,18 @@ run_arm() {
 		# transaction mode by default, so comparing the two without this arm would be
 		# comparing two round trips against one and calling the gap an implementation.
 		start_proxy txn-reset-none.toml
-		target=rust dsn="$POOLER_DSN"
+		target=rust dsn="$POOLER_DSN" pooler=pgebench-proxy
 		;;
 	rust-1worker)
 		# The like-for-like row against pgbouncer, which is single-threaded by design.
 		# Without it the reference comparison silently credits us with twice the runtime
 		# threads and reads as a language result.
 		start_proxy txn-fence-off.toml 1
-		target=rust dsn="$POOLER_DSN"
+		target=rust dsn="$POOLER_DSN" pooler=pgebench-proxy
 		;;
 	pgbouncer)
 		start_pgbouncer
-		target=pgbouncer dsn="$POOLER_DSN"
+		target=pgbouncer dsn="$POOLER_DSN" pooler=pgebench-pgbouncer
 		;;
 	*)
 		echo "unknown arm $arm" >&2
@@ -162,7 +162,7 @@ run_arm() {
 
 	local workload
 	for workload in $WORKLOADS; do
-		measure "$target" "$dsn" "$workload" "$arm"
+		measure "$target" "$dsn" "$workload" "$arm" "$pooler"
 	done
 }
 

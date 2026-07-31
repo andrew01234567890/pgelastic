@@ -78,6 +78,19 @@ type RunConfig struct {
 	// spike does neither. Measuring all three under the simple protocol removes the
 	// capability from the comparison rather than crediting whoever happens to have it.
 	SimpleProtocol bool
+	// IdleWorkingSet is the pooler's resident memory before the sweep opened anything, and is
+	// the floor every density cell subtracts.
+	//
+	// Taken once, not per cell. A per-cell baseline reads memory moments after the previous
+	// repetition closed thousands of connections, when the pages are freed but not yet
+	// reclaimed, so the floor lands ABOVE the steady state that follows it and the subtraction
+	// goes negative. Measured: -13490 bytes per connection for pgbouncer at 256 clients.
+	IdleWorkingSet int64
+
+	// Probe samples the pooler's cgroup for the length of the sweep, or is nil when nothing
+	// is being sampled - a direct arm has no pooler, and a rig with no readable cgroup has
+	// no numbers rather than approximate ones.
+	Probe *ResourceProbe
 }
 
 // EffectiveQuery is the statement this cell actually runs.
@@ -123,7 +136,30 @@ func Probe(ctx context.Context, dsn string) error {
 }
 
 // Run executes one cell and returns what it measured.
+//
+// The resource figures are attached afterwards from the sweep-long probe rather than gathered
+// by each workload, so no workload has to know sampling exists and none can forget to do it.
 func Run(ctx context.Context, cfg RunConfig) (Cell, error) {
+	// Only density divides memory by its operation count, because only there is an operation a
+	// connection. Passing the floor for the other workloads would publish a memory delta
+	// divided by half a million queries as though it were a per-connection cost.
+	idle := int64(0)
+	if cfg.Workload == WorkloadDensity {
+		idle = cfg.IdleWorkingSet
+	}
+	started := time.Now()
+	cell, err := dispatch(ctx, cfg)
+	if err != nil {
+		return cell, err
+	}
+	// Measured from the end of the warmup, for the same reason latency samples are: the first
+	// connection to a cold pooler pays for the pool filling, and averaging that into a
+	// steady-state figure reports a cold start as a regression.
+	cell.Resource = cfg.Probe.Segment(started.Add(cfg.Warmup), time.Now(), cell.Ops, idle)
+	return cell, nil
+}
+
+func dispatch(ctx context.Context, cfg RunConfig) (Cell, error) {
 	switch cfg.Workload {
 	case WorkloadChurn:
 		return runChurn(ctx, cfg)
