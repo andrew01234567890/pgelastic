@@ -265,6 +265,10 @@ const (
 	ControlMaxLeaseTTLMillis = 120_000
 )
 
+// defaultPreparedStatementsLimit must match the +kubebuilder:default on both CRD fields; this
+// is the value rendered when neither the pool nor its class sets one.
+const defaultPreparedStatementsLimit = 200
+
 func (c Config) renderRouting(out *strings.Builder, dynamic bool) {
 	out.WriteString("[routing]\n")
 	discriminators := tenantDiscriminators(c.Pool)
@@ -513,7 +517,7 @@ func preparedStatementsLimit(pooling *pgelasticv1alpha1.PoolingConfig) int32 {
 	if pooling != nil && pooling.PreparedStatementsLimit != nil {
 		return *pooling.PreparedStatementsLimit
 	}
-	return 1000
+	return defaultPreparedStatementsLimit
 }
 
 func serverLifetimeSeconds(pooling *pgelasticv1alpha1.PoolingConfig) int64 {

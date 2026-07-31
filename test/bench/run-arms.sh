@@ -33,6 +33,12 @@ RATE="${BENCH_RATE:-5000}"
 SIMPLE="${BENCH_SIMPLE:-}"
 SUFFIX="${BENCH_SUFFIX:-${SIMPLE:+-simple}}"
 ARMS="${ARMS:-direct rust rust-fence-on rust-session rust-1worker pgbouncer}"
+# Every arm of one invocation shares this, and every invocation gets its own directory beside
+# the canonical one. The canonical path is what the tables read; the per-run copy is what makes
+# drift between invocations answerable at all, since the canonical file is overwritten by the
+# next run and the comparison it supported cannot be checked afterwards.
+RUN_ID="${BENCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_DIR="$OUT/runs/$RUN_ID"
 
 LOADGEN_CPUS="${BENCH_LOADGEN_CPUS:-10-13,26-29}"
 POOLER_CPUS="${BENCH_PROXY_CPUS:-6-9,22-25}"
@@ -42,7 +48,7 @@ PGBOUNCER_IMG="${PGBOUNCER_IMG:-edoburu/pgbouncer:latest}"
 PG_DSN="postgres://bench:bench@localhost:15432/bench?sslmode=disable"
 POOLER_DSN="postgres://bench:bench@localhost:16432/bench?sslmode=disable"
 
-mkdir -p "$OUT"
+mkdir -p "$OUT" "$RUN_DIR"
 go build -trimpath -o bin/pgebench ./test/bench/cmd/pgebench
 
 stop_poolers() {
@@ -101,11 +107,15 @@ measure() {
 	echo "=== $label / $workload ==="
 	taskset -c "$LOADGEN_CPUS" bin/pgebench run \
 		--target "$target" --dsn "$dsn" ${pooler:+--pooler "$pooler"} \
+		--run-id "$RUN_ID" \
 		--workload "$workload" --concurrency "$CONCURRENCY" \
 		--duration "$DURATION" --warmup "$WARMUP" --repetitions "$REPS" \
 		${SIMPLE:+--simple-protocol} \
 		$([ "$workload" = latency ] && echo "--rate $RATE") \
 		--out "$OUT/$label$SUFFIX-$workload.json"
+	# Copied, not moved: the canonical path is what the tables read, and the per-run copy is
+	# what survives the next invocation overwriting it.
+	cp "$OUT/$label$SUFFIX-$workload.json" "$RUN_DIR/$label$SUFFIX-$workload.json"
 }
 
 run_arm() {

@@ -670,3 +670,120 @@ A negative is obvious. The same contamination shrinks a positive figure silently
 have handed the density axis to whichever arm had the dirtiest baseline. The floor is now taken
 once, before the first cell, and a cell sitting below its floor reports no per-connection cost
 at all rather than a number.
+
+## Round six: the run boundary, and the change it nearly mis-scored
+
+Round five's figures were all taken inside single invocations. This round makes the boundary
+between invocations something the harness knows about, because the first measurement taken
+across one produced a confident and completely wrong answer.
+
+### The wrong answer, in full
+
+The `attach` change below was measured against a baseline captured half an hour earlier. It read
+as a clear regression:
+
+| clients | baseline, 13:04 | after, 13:35 |
+|---|---|---|
+| 8 | 14,573 | 13,113 |
+| 64 | 16,476 | 13,815 |
+
+Nothing about the code changed between those two readings except thirty minutes. Re-measured
+interleaved — before, after, before, after, three rounds — the same change is **inconclusive**:
+
+| clients | round | before | after | delta |
+|---|---|---|---|---|
+| 8 | 1 | 12,600 | 14,296 | +13.5% |
+| 8 | 2 | 14,564 | 14,457 | −0.7% |
+| 8 | 3 | 14,457 | 14,602 | +1.0% |
+| 64 | 1 | 15,821 | 16,539 | +4.5% |
+| 64 | 2 | 16,547 | 16,436 | −0.7% |
+| 64 | 3 | 16,610 | 14,700 | −11.5% |
+
+The sign flips in both sweeps. A block design — three runs of one arm, then three of the other —
+would have put every run of one arm on one side of the drift and reported whichever ordering it
+happened to use. Alternating makes the drift fall on both arms equally, and what is left is that
+**the change is smaller than this rig can resolve.**
+
+`pgebench drift` on those same six invocations, which is the number this round exists to produce:
+
+```
+before   FAIL  3 invocations at 8 clients spread 13.6% (12600 to 14564)
+before   PASS  3 invocations at 64 clients spread 4.8% (15821 to 16610)
+after    PASS  3 invocations at 8 clients spread 2.1% (14296 to 14602)
+after    FAIL  3 invocations at 64 clients spread 11.2% (14700 to 16539)
+after    FAIL  3 invocations at 64 clients, p99, spread 16.1% (4575 to 5315)
+```
+
+Real rows fail. That was predicted before the threshold was applied and is the correct output,
+not a calibration error.
+
+### What the harness now does about it
+
+`Report` carries a `RunID` and `StartedAt`, shared by every arm of one `run-arms.sh` invocation.
+`Compare` then knows something it could not before:
+
+- Arms from different invocations still compare — the reference arm is often measured once and
+  kept — but **every row carries the warning**.
+- The **latency axes are withheld outright.** They subtract the direct arm from the pooled ones,
+  and across a run boundary that subtraction crosses drift larger than the added latency being
+  measured; the difference would be mostly the gap between two invocations, reported as a
+  property of the proxy.
+- A report predating run identity is **flagged rather than assumed** to belong with the others.
+  Silence there would assert exactly what cannot be established.
+
+The threshold is `MaxP99SpreadRatio`, **reused rather than chosen**. The drift was already
+measured, so any new number would be picked in view of the result it had to produce — the
+failure the pre-registration comment in `criteria.go` exists to prevent.
+
+Per-invocation copies go to `docs/bench/runs/<id>/` and are not committed: the answer is
+machine-specific, so one rig's copies would only grow the repository.
+
+## Round seven: the last two levers
+
+### The `PoolManager` lock, fused rather than counted
+
+`attach` took the manager lock twice — once for `sever_superseded`, once to claim — and
+`check_in` and `try_lease` take it once each. The sever is now done inside the lock the claim
+already holds.
+
+**The reason to do it is not the lock count.** `check_in` parks a link without consulting the
+epoch, so the gap between the two acquisitions is a window in which a link superseded while it
+was checked out gets parked just after the scan walked past it, and the claim then takes it.
+With `verify_at_checkout` set that is caught one round trip later and costs a wasted connection.
+**With it off there is no second check**, and the client is handed a link to a demoted primary —
+the whole failure the fence exists to prevent. One lock closes the window by construction rather
+than leaving it to a backstop that configuration can switch off.
+
+Its throughput effect is the inconclusive result above. It ships as a correctness change with
+one fewer acquisition, and **no performance claim**, because the rig could not resolve one.
+
+That leaves three acquisitions per transaction — `try_lease`, the fused sever-and-claim, and
+`check_in` — where the plan set a floor of two, by also fusing `try_lease` into the claim.
+**That second fusion was not done, and the reason is the result above.** The first lock removal
+produced no effect this rig could resolve, so there is no evidence that the second would either,
+and it is a more invasive change to the checkout path than the first. Reducing lock traffic was
+justified by a performance argument; the measurement withdrew the argument. Reopen it with a rig
+that can resolve a few percent, or with a profile showing the manager lock is contended — not on
+the reasoning that fewer acquisitions must be faster.
+
+### Zero-copy relay: measured against the traffic, and dropped
+
+The plan carried this as the remaining lever: the read side is already zero-copy, the copies are
+on write assembly, so keep the frames as `Bytes` and `writev` them.
+
+It does not pay, and the reason is the traffic rather than the implementation.
+`DEFAULT_INLINE_FRAME_BYTES` is 64 KiB, so `Relayed::Opaque` — the only path holding a large
+contiguous payload — is reached only by frames above that. A PostgreSQL result set is not one
+large frame; it is thousands of small ones. The bulk workload's own query,
+`SELECT repeat('x', 512) FROM generate_series(1, 20000)`, produces 20,000 `DataRow` frames of
+about 525 bytes, every one of them below the threshold.
+
+`RawFrame` holds its 5-byte header separately from its body, so relaying those without copying
+means two `IoSlice`s per frame: 40,000 slices, and `writev` takes at most `IOV_MAX`. That is
+roughly 600 syscalls where the coalesced write makes a handful. Trading a `memcpy` at memory
+bandwidth for hundreds of syscalls on a rig whose syscalls round four already identified as
+expensive is the wrong direction.
+
+Vectored writing would pay on a workload dominated by frames above 64 KiB — large `bytea`, wide
+text columns, `COPY`. It is not what `SELECT` traffic looks like, and the harness measures
+`SELECT` traffic. Recorded here rather than attempted, so the next person does not re-derive it.

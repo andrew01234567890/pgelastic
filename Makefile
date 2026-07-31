@@ -412,6 +412,10 @@ bench-table: build-bench ## Render the stored reports as a markdown table, one c
 # ARMS selects which to run, e.g. ARMS=pgbouncer make bench-arms.
 BENCH_ARMS ?= direct rust rust-fence-on rust-session rust-1worker pgbouncer
 
+BENCH_DRIFT_ARM ?= rust
+BENCH_DRIFT_WORKLOAD ?= throughput
+BENCH_DRIFT_METRIC ?= throughput
+
 # bench-table wants the arm list comma-separated; the scripts want it space-separated.
 BENCH_COMMA := ,
 BENCH_EMPTY :=
@@ -423,6 +427,12 @@ bench-arms: bench-stack-up docker-build-proxy ## Run the benchmark arms and writ
 		BENCH_WARMUP="$(BENCH_WARMUP)" BENCH_REPETITIONS="$(BENCH_REPETITIONS)" \
 		BENCH_CONCURRENCY="$(BENCH_CONCURRENCY)" BENCH_RATE="$(BENCH_RATE)" \
 		./test/bench/run-arms.sh
+
+.PHONY: bench-drift
+bench-drift: ## Ask whether repeating a measurement reproduces it. Needs 2+ runs of bench-arms.
+	@go build -trimpath -o bin/pgebench ./test/bench/cmd/pgebench
+	./bin/pgebench drift --dir "$(BENCH_DIR)/runs" --arm "$(BENCH_DRIFT_ARM)" \
+		--workload "$(BENCH_DRIFT_WORKLOAD)" --metric "$(BENCH_DRIFT_METRIC)"
 
 .PHONY: bench-proxy-down
 bench-proxy-down: ## Stop the benchmark's poolers.

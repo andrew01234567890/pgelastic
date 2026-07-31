@@ -529,9 +529,16 @@ async fn a_commit_whose_outcome_was_never_observed_is_reported_unknown_and_logge
 
     let client = connect(&proxy, "acme").await;
 
+    client.simple_query("BEGIN").await.expect("begin");
+
+    // Checked inside the transaction rather than before it. Outside one, transaction pooling
+    // is free to put each statement on a different backend link, so seeing the clause loaded
+    // says only that *some* link has it -- and the link that goes on to run the COMMIT may be
+    // one that has not processed the SIGHUP yet, whose commit then does not stall and the test
+    // fails having proved nothing. Inside BEGIN the session is pinned to one link, and it is
+    // the link whose commit must hang.
     await_quorum_clause(&client, "ghost").await;
 
-    client.simple_query("BEGIN").await.expect("begin");
     client
         .simple_query("INSERT INTO fence_commits VALUES (1)")
         .await

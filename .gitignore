@@ -39,3 +39,11 @@ verify-ledger.log
 # Locally built helper binaries
 /verify
 /manager
+
+# Per-invocation benchmark reports.
+#
+# The canonical docs/bench/*.json are the published numbers and are committed. These are the
+# copies that survive the next run overwriting them, and they exist to answer one question:
+# does repeating a measurement on THIS machine reproduce it. That answer does not transfer
+# between machines, so committing one rig's copies would only grow the repository.
+/docs/bench/runs/
