@@ -845,13 +845,32 @@ paying are the same thing. Every entry has to be asked whether it is ever *writt
 The per-connection task future went from **9,144 to 6,656 bytes**, and the whole footprint from
 **24,316 to 17,628** — 28% off, against pgbouncer at 8.7x before and 6.3x after.
 
-### What was deliberately not done
+### The retention half turned out not to be a second defect
 
-**The retention half of the defect is untouched.** The proxy's working set still climbs across
-repetitions where pgbouncer is flat. A `mimalloc` experiment measured the working set 22% smaller
-(34.9 MB against 44.9 MB at 1024 connections) and growth cut from +32.3% to +11.6%, so it is
-promising — but swapping the global allocator is a different kind of change from the four above,
-and the footprint result had to be established on its own first.
+The task these four changes came from named two problems and insisted they be established
+separately: the footprint, and memory that is never returned. A `mimalloc` experiment on the
+unfixed build looked like the answer to the second — working set 22% smaller (34.9 MB against
+44.9 MB at 1024 connections) and growth across repetitions cut from +32.3% to +11.6%.
+
+Measuring growth again after the footprint fix, interleaved, two rounds:
+
+| build | rep0 | rep4 | growth |
+|---|---|---|---|
+| before | 30.6 MB | 46.9 MB | +53.2% |
+| before | 40.7 MB | 49.2 MB | +21.0% |
+| after | 22.7 MB | 26.9 MB | +18.6% |
+| after | 32.1 MB | 29.5 MB | −8.2% |
+
+Median **+37.1% before, +5.2% after** — better than `mimalloc` achieved on the unfixed build, from
+changes that touch no allocator at all. The growth was the allocator holding freed per-connection
+blocks, so allocating less per connection is most of the cure; there was no independent retention
+bug to find.
+
+**So the allocator is not being swapped.** A residual +5.2% whose sign flips between rounds is
+below what this rig resolves, and replacing the global allocator to chase it would be a large,
+process-wide change justified by noise. Keeping the two halves separate is what made that
+answerable — had they been fixed together, `mimalloc` would have shipped and been credited with a
+result the buffer changes produced.
 
 ### Something else the search turned up
 
