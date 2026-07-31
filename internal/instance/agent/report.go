@@ -54,6 +54,8 @@ type Reporter struct {
 	Instance  string
 	// Member is this pod's name and the key of its entry in the instances list.
 	Member string
+	// Session identifies this agent process, and dies with it.
+	Session string
 }
 
 func (r Reporter) fieldOwner() client.FieldOwner {
@@ -86,6 +88,7 @@ func (r Reporter) Report(
 		"healthy":           healthy,
 		"walReceiverActive": observation.WALReceiverActive,
 		"walVolumeFull":     observation.WALVolumeFull,
+		"agentSession":      r.Session,
 	}
 	// The key is omitted rather than emptied when no rejoin is running. Under server-side
 	// apply a field the manager stops including is removed, which is exactly the clearing

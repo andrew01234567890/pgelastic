@@ -48,6 +48,10 @@ import (
 // cannot derive, so a real deployment configures it.
 const anySource = "all"
 
+// fieldName is the map key a status entry is identified by, spelled once so a listType=map
+// merge key cannot be lost to a typo.
+const fieldName = "name"
+
 // requeueInterval paces the provisioning ladder. Members are created one per reconcile and
 // each waits for the one before it, so the loop needs a heartbeat rather than only edges.
 const requeueInterval = 5 * time.Second
@@ -94,6 +98,9 @@ type PgInstanceReconciler struct {
 	// ControllerName is this operator's identity. An instance reaches a PgElasticClass
 	// through its pool, and one naming a different controller is left entirely alone.
 	ControllerName string
+	// Now is the clock the backup schedule is evaluated against. Nil is the real one; a
+	// test supplies its own so a cron slot can be reached without waiting for it.
+	Now func() time.Time
 
 	// observations reuses one round of member polls across the burst of reconciles that
 	// each member's own status write produces.
@@ -156,16 +163,33 @@ func (r *PgInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.publishStatus(ctx, instance, builder, groups, pods, decision, roll); err != nil {
+	backups := r.reconcileBackups(ctx, instance, decision)
+	if err := r.publishStatus(ctx, instance, builder, groups, pods, decision, roll, backups); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: reconcileRequeue(decision, roll)}, nil
+	return ctrl.Result{RequeueAfter: reconcileRequeue(decision, roll, backups)}, nil
+}
+
+// now is the clock, defaulting to the real one.
+func (r *PgInstanceReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 // reconcileRequeue paces the reconcile. A roll in progress is waiting on things that take
 // a second or two - a drain reaching zero, a promotion completing, a Pod coming back - so
 // it asks for a faster heartbeat than the provisioning ladder's.
-func reconcileRequeue(decision ha.Decision, roll rollState) time.Duration {
+func reconcileRequeue(decision ha.Decision, roll rollState, backups backupState) time.Duration {
+	if backups.requeue > 0 {
+		return min(backups.requeue, reconcileRequeueWithout(decision, roll))
+	}
+	return reconcileRequeueWithout(decision, roll)
+}
+
+// reconcileRequeueWithout is the pacing before the backup schedule is taken into account.
+func reconcileRequeueWithout(decision ha.Decision, roll rollState) time.Duration {
 	if roll.active {
 		return min(rollRequeue, failoverRequeue(decision))
 	}
@@ -574,6 +598,7 @@ func (r *PgInstanceReconciler) publishStatus(
 	pods []corev1.Pod,
 	decision ha.Decision,
 	roll rollState,
+	backups backupState,
 ) error {
 	capacity := builder.Capacity
 	status := map[string]any{
@@ -594,6 +619,28 @@ func (r *PgInstanceReconciler) publishStatus(
 	}
 	if published := rollStatus(roll); published != nil {
 		status["roll"] = published
+	}
+	// Both are omitted rather than emptied when absent. This is a server-side apply, so a
+	// field the operator stops including is removed - which is exactly how an election is
+	// withdrawn once the backup it named is no longer waiting to be taken.
+	if pending := backups.pending; pending != nil {
+		status["pendingBackup"] = map[string]any{
+			fieldName:     pending.Name,
+			"member":      pending.Member,
+			"requestedAt": pending.RequestedAt.UTC().Format(time.RFC3339),
+		}
+	}
+	if last := backups.last; last != nil {
+		summary := map[string]any{
+			"type":                 string(last.Type),
+			"sizeBytes":            last.SizeBytes,
+			"verified":             last.Verified,
+			"sourceMaxConnections": last.SourceMaxConnections,
+		}
+		if last.At != nil {
+			summary["at"] = last.At.UTC().Format(time.RFC3339)
+		}
+		status["lastBackup"] = summary
 	}
 	maps.Copy(status, failoverStatus(instance, decision))
 	// primaryEpoch is deliberately absent. It belongs to whichever member holds the role,

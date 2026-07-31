@@ -113,6 +113,11 @@ func (r Resolver) Of(ctx context.Context, object client.Object) (Verdict, error)
 		return r.ofPoolNamed(ctx, typed.Namespace, typed.Spec.PoolRef.Name)
 	case *pgelasticv1alpha1.PgTenantMigration:
 		return r.ofMigration(ctx, typed)
+	case *pgelasticv1alpha1.PgBackup:
+		// A backup outlives its instance on purpose - that is most of what a backup is for -
+		// so an instance that no longer exists resolves to Unresolved rather than Foreign,
+		// and the record is left alone rather than adopted by whichever operator asks next.
+		return r.ofInstanceNamed(ctx, typed.Namespace, typed.Spec.InstanceRef.Name)
 	default:
 		return Foreign, fmt.Errorf("ownership: %T carries no route to a PgElasticClass", object)
 	}
@@ -133,6 +138,21 @@ func (r Resolver) ofPool(ctx context.Context, pool *pgelasticv1alpha1.PgElasticP
 		return Mine, nil
 	}
 	return Foreign, nil
+}
+
+// ofInstanceNamed resolves through an instance to its pool.
+func (r Resolver) ofInstanceNamed(ctx context.Context, namespace, name string) (Verdict, error) {
+	if name == "" {
+		return Foreign, nil
+	}
+	instance := &pgelasticv1alpha1.PgInstance{}
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, instance); err != nil {
+		if apierrors.IsNotFound(err) {
+			return Unresolved, nil
+		}
+		return Foreign, err
+	}
+	return r.ofPoolNamed(ctx, instance.Namespace, instance.Spec.PoolRef.Name)
 }
 
 func (r Resolver) ofPoolNamed(ctx context.Context, namespace, name string) (Verdict, error) {

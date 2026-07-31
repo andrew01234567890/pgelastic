@@ -164,13 +164,13 @@ test-e2e-tenantdb: manifests generate install-e2e load-instance-images ## Create
 	go test -tags=e2e ./test/e2e/placement/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
 		-ginkgo.label-filter='postgres'
 
-# The backup e2e is the only place that answers "did the WAL actually arrive" by fetching
-# a segment back out of a real S3-compatible store, rather than by checking that the right
-# command was built. It stands the store up itself, with a certificate it signs itself,
-# because pgBackRest's S3 driver speaks TLS only and a plaintext store would be a
-# configuration that cannot exist in production.
+# The backup e2e is the only place that answers "did it actually arrive" by fetching a
+# segment back out of a real S3-compatible store and by taking a real base backup into one,
+# rather than by checking that the right command was built. It stands the store up itself,
+# with a certificate it signs itself, because pgBackRest's S3 driver speaks TLS only and a
+# plaintext store would be a configuration that cannot exist in production.
 .PHONY: test-e2e-backup
-test-e2e-backup: manifests generate install-e2e load-instance-images ## Archive WAL into a real object store and read it back.
+test-e2e-backup: manifests generate install-e2e load-instance-images ## Archive WAL and take a base backup against a real object store.
 	PGELASTIC_POSTGRES_IMG=$(PG_IMG) PGELASTIC_INSTANCE_IMG=$(INSTANCE_IMG) E2E_CONTEXT=$(E2E_CONTEXT) \
 	go test -tags=e2e ./test/e2e/backup/ -v -ginkgo.v -timeout $(E2E_TIMEOUT) \
 		$(if $(E2E_LABEL_FILTER),-ginkgo.label-filter='$(E2E_LABEL_FILTER)')

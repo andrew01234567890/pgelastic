@@ -1,0 +1,325 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: pgbackups.pgelastic.io
+spec:
+  group: pgelastic.io
+  names:
+    categories:
+    - pgelastic
+    kind: PgBackup
+    listKind: PgBackupList
+    plural: pgbackups
+    shortNames:
+    - pgb
+    singular: pgbackup
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.instanceRef.name
+      name: Instance
+      type: string
+    - jsonPath: .status.type
+      name: Type
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.member
+      name: Member
+      type: string
+    - jsonPath: .status.sizeBytes
+      name: Size
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          PgBackup is one physical backup of one instance, and the record of how to restore from it.
+
+          It carries no owner reference to its PgInstance, deliberately. Deleting an instance must
+          not delete the record of how to get it back, and the case a backup exists for is exactly
+          the case where the instance is gone.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of PgBackup
+            properties:
+              instanceRef:
+                description: instanceRef names the instance to back up, in this namespace.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              target:
+                default: PreferStandby
+                description: target selects which member takes it.
+                enum:
+                - Primary
+                - PreferStandby
+                type: string
+              type:
+                default: Full
+                description: |-
+                  type selects a full backup or one relative to the last.
+
+                  A differential is relative to the last full, and an incremental to the last backup of
+                  any type. Both are useless without the full they descend from, which is why retention
+                  is expressed as a recovery window rather than a count: expiring a full silently
+                  invalidates every backup that depended on it.
+                enum:
+                - Full
+                - Differential
+                - Incremental
+                type: string
+            required:
+            - instanceRef
+            type: object
+            x-kubernetes-validations:
+            - message: spec is immutable
+              rule: self == oldSelf
+          status:
+            description: status defines the observed state of PgBackup
+            properties:
+              agentSession:
+                description: |-
+                  agentSession identifies the instance manager process that claimed this backup.
+
+                  It changes on every agent start, including a container restart. A backup is taken by
+                  a goroutine inside a process that can die, and without an epoch token a restarted
+                  agent leaves its predecessor's backup marked Running forever, indistinguishable from
+                  one still in progress.
+                maxLength: 64
+                type: string
+              backupID:
+                description: backupID is what the repository calls it, and what a
+                  restore names.
+                maxLength: 128
+                type: string
+              beginLSN:
+                description: |-
+                  beginLSN, endLSN, beginWAL and endWAL bound the WAL a restore of this backup has to
+                  replay to reach consistency.
+                maxLength: 64
+                type: string
+              beginWAL:
+                maxLength: 64
+                type: string
+              conditions:
+                description: conditions carry the real state. Accepted, Progressing
+                  and Ready.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              endLSN:
+                maxLength: 64
+                type: string
+              endWAL:
+                maxLength: 64
+                type: string
+              error:
+                description: error is why it failed, when it did.
+                maxLength: 1024
+                type: string
+              member:
+                description: member is the Pod that took it.
+                maxLength: 253
+                type: string
+              observedGeneration:
+                description: observedGeneration is the spec generation these conditions
+                  describe.
+                format: int64
+                type: integer
+              phase:
+                description: phase is display only and carries no semantics of its
+                  own.
+                enum:
+                - Pending
+                - Running
+                - Completed
+                - Failed
+                type: string
+              repository:
+                description: repository is where it was written.
+                properties:
+                  credentialsSecretRef:
+                    description: credentialsSecretRef names a Secret holding the object-store
+                      credentials.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  endpointURL:
+                    description: endpointURL overrides the provider's default endpoint,
+                      for S3-compatible stores.
+                    maxLength: 2048
+                    type: string
+                  path:
+                    description: path is the destination URL, for example s3://bucket/prefix.
+                    maxLength: 2048
+                    minLength: 1
+                    type: string
+                  region:
+                    description: region for providers that require one.
+                    maxLength: 63
+                    type: string
+                required:
+                - credentialsSecretRef
+                - path
+                type: object
+              sizeBytes:
+                description: sizeBytes is the repository size of this backup after
+                  compression.
+                format: int64
+                minimum: 0
+                type: integer
+              sourceEnforcedParameters:
+                additionalProperties:
+                  format: int32
+                  type: integer
+                description: |-
+                  sourceEnforcedParameters are the five settings PostgreSQL refuses to begin recovery
+                  below.
+
+                  Recorded here because they are the source's, and the restore target's own
+                  configuration is not evidence about them: a restore into an instance whose
+                  max_connections is lower than the source's FATALs at start-up with a message that
+                  names the parameter and not the cause.
+                type: object
+              stanza:
+                maxLength: 128
+                type: string
+              startedAt:
+                description: |-
+                  startedAt and stoppedAt are the backup's own times, read back from the repository
+                  catalogue rather than measured by the operator.
+                format: date-time
+                type: string
+              stoppedAt:
+                format: date-time
+                type: string
+              systemIdentifier:
+                description: |-
+                  systemIdentifier and stanza address the repository this backup lives in. The stanza
+                  is derived from the system identifier rather than from the instance name, so a
+                  recreated instance cannot address a predecessor's archive.
+                maxLength: 32
+                type: string
+              timeline:
+                description: |-
+                  timeline is the timeline the backup was taken on. A restore that means to land before
+                  a promotion has to know which history it is asking for.
+                format: int32
+                minimum: 0
+                type: integer
+              type:
+                description: |-
+                  type is what was actually taken, which is not always what was asked for: pgBackRest
+                  promotes a differential or an incremental to a full when there is no full to descend
+                  from.
+                enum:
+                - Full
+                - Differential
+                - Incremental
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

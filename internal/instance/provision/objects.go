@@ -63,9 +63,11 @@ const defaultRetentionWindow = "30d"
 
 // verbGet is spelled once so an RBAC rule cannot lose a verb to a typo.
 const (
-	verbGet   = "get"
-	verbList  = "list"
-	verbWatch = "watch"
+	verbGet    = "get"
+	verbList   = "list"
+	verbWatch  = "watch"
+	verbUpdate = "update"
+	verbPatch  = "patch"
 )
 
 // Builder renders the objects one PgInstance is made of.
@@ -476,12 +478,26 @@ func (b Builder) Role() *rbacv1.Role {
 		{
 			APIGroups: []string{pgelasticv1alpha1.SchemeGroupVersion.Group},
 			Resources: []string{"pginstances/status"},
-			Verbs:     []string{verbGet, "update", "patch"},
+			Verbs:     []string{verbGet, verbUpdate, verbPatch},
+		},
+		{
+			// The agent reads the backup it was elected for and writes what happened to it.
+			// It claims one with an optimistic update rather than a patch, so two members
+			// that both believe they were elected race on the resource version and exactly
+			// one wins.
+			APIGroups: []string{pgelasticv1alpha1.SchemeGroupVersion.Group},
+			Resources: []string{"pgbackups"},
+			Verbs:     []string{verbGet, verbList, verbWatch},
+		},
+		{
+			APIGroups: []string{pgelasticv1alpha1.SchemeGroupVersion.Group},
+			Resources: []string{"pgbackups/status"},
+			Verbs:     []string{verbGet, verbUpdate, verbPatch},
 		},
 		{
 			APIGroups: []string{"coordination.k8s.io"},
 			Resources: []string{"leases"},
-			Verbs:     []string{verbGet, verbList, verbWatch, "create", "update", "patch"},
+			Verbs:     []string{verbGet, verbList, verbWatch, "create", verbUpdate, verbPatch},
 		},
 		{
 			APIGroups: []string{""},

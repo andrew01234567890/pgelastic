@@ -136,6 +136,68 @@ var _ = Describe("WAL archiving to an object store", Ordered, func() {
 		}).Should(Succeed())
 	})
 
+	// A base backup is the thing WAL archiving exists to make useful: without one there is
+	// nothing for the WAL to be replayed onto.
+	It("takes a full backup and records what a restore would need to use it", func() {
+		takeBackup("full-one", pgelasticv1alpha1.BackupTypeFull)
+
+		var taken *pgelasticv1alpha1.PgBackup
+		Eventually(func(g Gomega) {
+			taken = readBackup(g, "full-one")
+			g.Expect(taken.Status.Phase).To(Equal(pgelasticv1alpha1.BackupPhaseCompleted),
+				taken.Status.Error)
+		}).Should(Succeed())
+
+		// Every one of these is what a restore is planned from. A backup recorded without
+		// them is an object in a bucket that nothing knows how to use.
+		Expect(taken.Status.BackupID).NotTo(BeEmpty(), "no repository label was recorded")
+		Expect(taken.Status.BeginLSN).NotTo(BeEmpty())
+		Expect(taken.Status.EndLSN).NotTo(BeEmpty())
+		Expect(taken.Status.BeginWAL).NotTo(BeEmpty())
+		Expect(taken.Status.EndWAL).NotTo(BeEmpty())
+		Expect(taken.Status.SizeBytes).To(BeNumerically(">", 0))
+		Expect(taken.Status.Type).To(Equal(pgelasticv1alpha1.BackupTypeFull))
+		Expect(taken.Status.Member).NotTo(BeEmpty())
+
+		// The stanza and the system identifier are recorded on the backup rather than looked
+		// up from the instance, because a backup outlives its instance and that is the case
+		// it exists for.
+		Expect(taken.Status.Stanza).NotTo(BeEmpty())
+		Expect(taken.Status.SystemIdentifier).NotTo(BeEmpty())
+		Expect(taken.Status.Repository).NotTo(BeNil())
+
+		// A restore into an instance whose max_connections is below the source's FATALs at
+		// start-up with a message that names the parameter and not the cause.
+		Expect(taken.Status.SourceEnforcedParameters).To(HaveKey("max_connections"))
+	})
+
+	It("summarises the backup on the instance the gates read", func() {
+		Eventually(func(g Gomega) {
+			summary := readInstance(g).Status.LastBackup
+			g.Expect(summary).NotTo(BeNil(), "the instance never recorded its backup")
+			g.Expect(summary.At).NotTo(BeNil())
+			g.Expect(summary.SizeBytes).To(BeNumerically(">", 0))
+			// Completing is not verification, and reporting a backup as verified because it
+			// finished is an assurance worse than none.
+			g.Expect(summary.Verified).To(BeFalse())
+		}).Should(Succeed())
+	})
+
+	// A differential is only meaningful relative to the full it descends from, and the point
+	// of taking one here is that pgBackRest accepted it as a differential rather than
+	// promoting it to a full - which is what it does when there is no full to descend from.
+	It("takes a differential on top of the full", func() {
+		takeBackup("diff-one", pgelasticv1alpha1.BackupTypeDifferential)
+
+		Eventually(func(g Gomega) {
+			taken := readBackup(g, "diff-one")
+			g.Expect(taken.Status.Phase).To(Equal(pgelasticv1alpha1.BackupPhaseCompleted),
+				taken.Status.Error)
+			g.Expect(taken.Status.Type).To(Equal(pgelasticv1alpha1.BackupTypeDifferential))
+			g.Expect(taken.Status.SizeBytes).To(BeNumerically(">", 0))
+		}).Should(Succeed())
+	})
+
 	// A repository that stops accepting writes is the failure this whole subsystem exists to
 	// notice. The recovery half matters just as much: an archive that reports degraded
 	// forever after one transient failure is an alarm nobody will act on the second time.
@@ -156,6 +218,21 @@ var _ = Describe("WAL archiving to an object store", Ordered, func() {
 			g.Expect(condition.Message).NotTo(BeEmpty())
 		}).Should(Succeed())
 
+		// A base backup taken now could not be replayed to consistency: it needs every WAL
+		// segment from its own start position, and those are exactly the ones not arriving.
+		// Taking one anyway would put an object in the bucket that no restore can use, which
+		// is worse than taking none because it looks like progress.
+		By("asking for a backup while the repository is refusing writes")
+		takeBackup("while-degraded", pgelasticv1alpha1.BackupTypeFull)
+		Consistently(func(g Gomega) {
+			refused := readBackup(g, "while-degraded")
+			g.Expect(refused.Status.Phase).To(Equal(pgelasticv1alpha1.BackupPhasePending))
+			progressing := meta.FindStatusCondition(refused.Status.Conditions,
+				pgelasticv1alpha1.ConditionProgressing)
+			g.Expect(progressing).NotTo(BeNil())
+			g.Expect(progressing.Reason).To(Equal(pgelasticv1alpha1.ReasonArchiveDegraded))
+		}, "45s", "5s").Should(Succeed())
+
 		By("putting the working key back")
 		rotateSecretKey(objectStoreSecretKey)
 
@@ -164,6 +241,16 @@ var _ = Describe("WAL archiving to an object store", Ordered, func() {
 			g.Expect(meta.IsStatusConditionTrue(readInstance(g).Status.Conditions,
 				pgelasticv1alpha1.ConditionArchiving)).To(BeTrue(),
 				"archiving never recovered after the credential was fixed")
+		}).Should(Succeed())
+
+		// The refusal has to lift by itself. A backup parked forever behind a fault that has
+		// since cleared is the shape CloudNativePG shipped: a phase nothing ever transitions
+		// out of, which blocks every later backup because a waiting one holds the election.
+		By("waiting for the refused backup to be taken now that it can be")
+		Eventually(func(g Gomega) {
+			resumed := readBackup(g, "while-degraded")
+			g.Expect(resumed.Status.Phase).To(Equal(pgelasticv1alpha1.BackupPhaseCompleted),
+				resumed.Status.Error)
 		}).Should(Succeed())
 	})
 })
@@ -212,4 +299,24 @@ func inPrimary(args ...string) *exec.Cmd {
 	return kubectlCommand(append([]string{
 		"exec", "-n", archiveNamespace, primary, "-c", "postgres", "--",
 	}, args...)...)
+}
+
+// takeBackup asks for one backup and waits for the operator to accept it.
+func takeBackup(name string, kind pgelasticv1alpha1.BackupType) {
+	GinkgoHelper()
+	Expect(k8sClient.Create(suiteCtx, &pgelasticv1alpha1.PgBackup{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: archiveNamespace},
+		Spec: pgelasticv1alpha1.PgBackupSpec{
+			InstanceRef: corev1.LocalObjectReference{Name: archiveInstance},
+			Type:        kind,
+		},
+	})).To(Succeed())
+}
+
+func readBackup(g Gomega, name string) *pgelasticv1alpha1.PgBackup {
+	fetched := &pgelasticv1alpha1.PgBackup{}
+	g.Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
+		Namespace: archiveNamespace, Name: name,
+	}, fetched)).To(Succeed())
+	return fetched
 }

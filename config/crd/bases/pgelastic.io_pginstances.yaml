@@ -725,6 +725,17 @@ spec:
                   description: InstanceMemberStatus reports one member pod, as seen
                     by that pod's own agent.
                   properties:
+                    agentSession:
+                      description: |-
+                        agentSession identifies the instance manager process currently running on this
+                        member. It changes on every agent start, including a container restart in place.
+
+                        It is published so that work a member claimed can be told apart from work nobody is
+                        doing any more: a backup runs as a goroutine inside a process that can die, and
+                        without this a backup left Running by a dead agent is indistinguishable from one
+                        still in progress.
+                      maxLength: 64
+                      type: string
                     healthy:
                       description: |-
                         healthy reports whether the member's status endpoint answered and its postmaster is
@@ -869,6 +880,35 @@ spec:
                 format: int64
                 minimum: 0
                 type: integer
+              pendingBackup:
+                description: |-
+                  pendingBackup names the backup a member has been asked to take, and which member.
+
+                  The operator elects; the member's own agent acts. That split is the same one
+                  targetPrimary encodes, and for the same reason: the agent already reads this object
+                  on every observe tick, so an election costs no new watch and no new transport, and
+                  the operator never runs anything inside a Pod.
+                properties:
+                  member:
+                    description: member is the Pod elected to take it. Only that member
+                      acts on this.
+                    maxLength: 253
+                    type: string
+                  name:
+                    description: name is the PgBackup in this namespace.
+                    maxLength: 253
+                    type: string
+                  requestedAt:
+                    description: |-
+                      requestedAt is when the election was made, so a member that never claims one can be
+                      distinguished from one that has only just been asked.
+                    format: date-time
+                    type: string
+                required:
+                - member
+                - name
+                - requestedAt
+                type: object
               phase:
                 default: Pending
                 description: phase is a display-only pure function of the conditions.
