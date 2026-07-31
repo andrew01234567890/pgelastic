@@ -232,16 +232,35 @@ func writeTerminalStatus(
 	apply func(*pgelasticv1alpha1.PgBackupStatus),
 ) error {
 	key := types.NamespacedName{Namespace: options.Namespace, Name: name}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.OnError(retry.DefaultBackoff, worthAnotherAttempt, func() error {
 		fresh := &pgelasticv1alpha1.PgBackup{}
 		if err := options.Client.Get(ctx, key, fresh); err != nil {
-			// A backup deleted while it ran has nowhere to record what happened, and that is
-			// somebody's decision rather than a failure of the backup.
-			return client.IgnoreNotFound(err)
+			return err
 		}
 		apply(&fresh.Status)
 		return options.Client.Status().Update(ctx, fresh)
 	})
+	// A backup deleted while it ran has nowhere to record what happened, and that is
+	// somebody's decision about an object rather than a failure of the backup. Handled out
+	// here so it covers a delete between the read and the write as well as before both.
+	return client.IgnoreNotFound(err)
+}
+
+// worthAnotherAttempt is what a status write this important should not give up on.
+//
+// Conflict is the expected one and the reason the retry exists at all. The rest matter
+// because of when this runs: pgBackRest has already finished, the backup is good and in the
+// repository, and this is the only chance to say so. Giving up on one throttled or
+// briefly-unavailable API server leaves the backup Running for ever, holding the election so
+// no later backup is taken and no expiry runs - the very outcome the retry was added to
+// prevent, reached through a narrower door.
+func worthAnotherAttempt(err error) bool {
+	return apierrors.IsConflict(err) ||
+		apierrors.IsInternalError(err) ||
+		apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsTimeout(err) ||
+		apierrors.IsServerTimeout(err)
 }
 
 // readBackBackup finds this backup in the repository catalogue by the annotation it was

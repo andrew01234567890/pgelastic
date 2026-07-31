@@ -20,10 +20,9 @@ import (
 	"context"
 	"testing"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -73,14 +72,29 @@ func TestTheTerminalStatusSurvivesAConcurrentWrite(t *testing.T) {
 				ctx context.Context, c client.Client, subResource string,
 				object client.Object, options ...client.SubResourceUpdateOption,
 			) error {
-				// Somebody else wrote to the object between the read and this update, which
-				// is exactly what the PgBackup controller does while a backup runs.
-				if conflicts > 0 {
-					conflicts--
-					return apierrors.NewConflict(
-						schema.GroupResource{Group: pgelasticv1alpha1.SchemeGroupVersion.Group,
-							Resource: "pgbackups"},
-						object.GetName(), context.Canceled)
+				if conflicts == 0 {
+					return c.Status().Update(ctx, object, options...)
+				}
+				conflicts--
+
+				// The stored object is genuinely moved on, the way the PgBackup controller
+				// moves it while a backup runs, and the conflict is then the fake client's
+				// own. Fabricating one instead would leave resourceVersion untouched, so an
+				// implementation that never re-read would sail through its second attempt
+				// and the test would prove only that a retry happened - not that it read
+				// again, which is the entire fix.
+				moved := &pgelasticv1alpha1.PgBackup{}
+				if err := c.Get(ctx, client.ObjectKeyFromObject(object), moved); err != nil {
+					return err
+				}
+				meta.SetStatusCondition(&moved.Status.Conditions, metav1.Condition{
+					Type:    pgelasticv1alpha1.ConditionProgressing,
+					Status:  metav1.ConditionTrue,
+					Reason:  pgelasticv1alpha1.ReasonRunning,
+					Message: backupMember + " is taking this backup",
+				})
+				if err := c.Status().Update(ctx, moved); err != nil {
+					return err
 				}
 				return c.Status().Update(ctx, object, options...)
 			},
@@ -111,6 +125,12 @@ func TestTheTerminalStatusSurvivesAConcurrentWrite(t *testing.T) {
 	}
 	if got.Status.BackupID != "20260801-020000F" {
 		t.Errorf("backupID = %q, want what the repository reported", got.Status.BackupID)
+	}
+	// The other half of the contract: the terminal write is applied on top of what the
+	// controller wrote, not over it.
+	if meta.FindStatusCondition(got.Status.Conditions,
+		pgelasticv1alpha1.ConditionProgressing) == nil {
+		t.Error("the concurrent writer's condition was clobbered by the terminal write")
 	}
 }
 
