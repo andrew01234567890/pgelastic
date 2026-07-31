@@ -217,6 +217,14 @@ func archivingSpecs() {
 		// A repository that stops accepting writes is the failure this whole subsystem exists to
 		// notice. The recovery half matters just as much: an archive that reports degraded
 		// forever after one transient failure is an alarm nobody will act on the second time.
+		// The degraded spec deliberately breaks the credential. Everything after it in this
+		// suite needs a working one, and the whole suite is a single Ordered container now, so
+		// a failure between the two rotations would leave the key wrong and take the restore
+		// specs down with it for a reason that has nothing to do with them.
+		AfterAll(func() {
+			rotateSecretKey(objectStoreSecretKey)
+		})
+
 		It("goes degraded when the repository refuses it, and recovers when it stops", func() {
 			By("rotating the secret key to one the store will reject")
 			rotateSecretKey("wrong-secret-key")

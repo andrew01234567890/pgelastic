@@ -20,6 +20,7 @@ package backup
 
 import (
 	"regexp"
+	"slices"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -44,6 +45,12 @@ var scheduledBackupName = regexp.MustCompile(`^` + archiveInstance + `-\d{8}t\d{
 func scheduledBackupSpecs() {
 	Describe("a backup nobody asked for", Ordered, func() {
 		It("mints one when the schedule says so", func() {
+			// The instance has carried the default 0 2 * * * schedule since it was created,
+			// and the grace window is an hour, so a run that happens to straddle 02:00 UTC
+			// already has a slot-named backup sitting there. Without a baseline this spec
+			// passes on that one and proves nothing about the schedule it sets.
+			before := scheduledBackupNames()
+
 			By("asking for a backup every minute")
 			Eventually(func(g Gomega) {
 				instance := readInstance(g)
@@ -55,17 +62,13 @@ func scheduledBackupSpecs() {
 			// idempotency key: a controller reconciling twice inside one minute fills one slot.
 			By("waiting for the controller to mint a backup of its own accord")
 			Eventually(func(g Gomega) {
-				backups := &pgelasticv1alpha1.PgBackupList{}
-				g.Expect(k8sClient.List(suiteCtx, backups,
-					client.InNamespace(archiveNamespace))).To(Succeed())
-
-				var scheduled []string
-				for i := range backups.Items {
-					if scheduledBackupName.MatchString(backups.Items[i].Name) {
-						scheduled = append(scheduled, backups.Items[i].Name)
+				var minted []string
+				for _, name := range scheduledBackupNames() {
+					if !slices.Contains(before, name) {
+						minted = append(minted, name)
 					}
 				}
-				g.Expect(scheduled).NotTo(BeEmpty(),
+				g.Expect(minted).NotTo(BeEmpty(),
 					"the schedule minted nothing, so a nightly backup would never be taken")
 			}, "3m", "5s").Should(Succeed())
 		})
@@ -78,4 +81,20 @@ func scheduledBackupSpecs() {
 			}).Should(Succeed())
 		})
 	})
+}
+
+// scheduledBackupNames is every backup in the namespace whose name was derived from a
+// schedule slot rather than written by hand.
+func scheduledBackupNames() []string {
+	GinkgoHelper()
+	backups := &pgelasticv1alpha1.PgBackupList{}
+	Expect(k8sClient.List(suiteCtx, backups, client.InNamespace(archiveNamespace))).To(Succeed())
+
+	var names []string
+	for i := range backups.Items {
+		if scheduledBackupName.MatchString(backups.Items[i].Name) {
+			names = append(names, backups.Items[i].Name)
+		}
+	}
+	return names
 }
