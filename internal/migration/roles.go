@@ -263,6 +263,20 @@ END $pgelastic$;`,
 // The online path appends these to the dump file so they commit with the schema and the stamp.
 // Offline restores with pg_restore --jobs, which is not one transaction, so its equivalent runs
 // here as ordinary statements against the target.
+// RevokeReplicationReads takes back the reads GrantSourceReads made, on the far side.
+//
+// The far side is the point. pg_dump captures ACLs and pg_restore writes them into the
+// database it loads, so the grants made on the source to let the dump read ride the dump into
+// the copy. They do not die with the source, however throwaway it was. Leaving them behind
+// permanently gives a credential that lives in every member's environment read access to the
+// tenant's data.
+func RevokeReplicationReads(ctx context.Context, sql SQL, target Endpoint) error {
+	if err := sql.Exec(ctx, target, revokeReplicationGrantsSQL()); err != nil {
+		return fmt.Errorf("revoking the replication role's reads on the target: %w", err)
+	}
+	return nil
+}
+
 func SettleTargetGrants(ctx context.Context, sql SQL, plan Plan, owner string) error {
 	roles, err := EnumerateTenantRoles(ctx, sql, plan.Source)
 	if err != nil {
@@ -274,8 +288,8 @@ func SettleTargetGrants(ctx context.Context, sql SQL, plan Plan, owner string) e
 			return fmt.Errorf("applying the target database's ACL: %w", err)
 		}
 	}
-	if err := sql.Exec(ctx, plan.Target, revokeReplicationGrantsSQL()); err != nil {
-		return fmt.Errorf("revoking the replication role's reads on the target: %w", err)
+	if err := RevokeReplicationReads(ctx, sql, plan.Target); err != nil {
+		return err
 	}
 	return nil
 }

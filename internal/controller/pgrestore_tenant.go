@@ -201,12 +201,26 @@ func (r *PgRestoreReconciler) replaceTenant(
 	// is refused before it reads a row. The migration path issues the same grants before its
 	// own offline copy.
 	//
-	// Nothing revokes them afterwards, unlike a migration: these are granted on the throwaway
-	// recovery instance, which is deleted a few moments later.
+	// They do not die with the recovery instance, however throwaway it is. pg_dump captures
+	// ACLs and pg_restore writes them into what it loads, so these grants ride the dump into
+	// the live tenant - which would leave a credential that lives in every member's
+	// environment holding SELECT on a customer's data. The migration path revokes them on the
+	// far side for exactly this reason; so does the deferred revoke below.
 	if err := migration.GrantSourceReads(
 		ctx, r.SQL, recovered, provision.ReplicationRole); err != nil {
 		return fmt.Errorf("could not give the dump read access to the recovered tenant: %w", err)
 	}
+
+	// Registered before the unfence so that it runs after it: the tenant is fenced for the
+	// whole copy, and a fenced database refuses connections, so the revoke has nothing to
+	// connect to until the unfence has run. Deferred rather than sequential because a copy
+	// that failed half way can still have written the ACLs.
+	defer func() {
+		if err := migration.RevokeReplicationReads(ctx, r.SQL, live); err != nil {
+			logf.FromContext(ctx).Error(err, "the replication role was left holding reads on "+
+				"the restored tenant", "tenant", tenant.Name)
+		}
+	}()
 
 	if err := migration.FenceSource(ctx, r.SQL, live); err != nil {
 		return fmt.Errorf("could not hold the tenant still for the copy: %w", err)
