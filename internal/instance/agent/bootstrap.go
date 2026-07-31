@@ -365,7 +365,11 @@ func discardRecoveryTarget(dataDir string) error {
 		}
 		kept = append(kept, line)
 	}
-	return os.WriteFile(path, []byte(strings.Join(kept, "\n")), 0o600)
+	// Atomically, because a truncate-then-write killed half way leaves a postgresql.auto.conf
+	// ending mid-token, and Bootstrap adopts any data directory with a readable control file
+	// rather than re-cloning - so that member's postmaster would refuse to start for ever on
+	// a config syntax error.
+	return writeFileAtomically(path, strings.Join(kept, "\n"))
 }
 
 // PeerHost is a member's stable per-pod DNS name under the headless Service.

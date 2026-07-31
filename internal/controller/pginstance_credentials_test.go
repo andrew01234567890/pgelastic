@@ -20,6 +20,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -138,14 +139,33 @@ func TestARestoreWithNoSourceCredentialsFailsLoudly(t *testing.T) {
 
 // A backup records where it was written but not what to authenticate with: the agent is
 // configured with pgBackRest's own settings and never learns which Secret they came from.
-// A restore plans from the recorded repository in preference to the source's spec, so
-// without this the recovered instance was handed a repository it could not open at all -
-// its bootstrap container died on a missing accessKeyID until the restore timed out.
+// planRestore prefers that recorded repository over the source's spec, so without this the
+// recovered instance was handed a repository it could not open at all - its bootstrap
+// container died on a missing accessKeyID until the restore timed out.
+//
+// This drives planRestore itself. An earlier version of this test re-implemented the two
+// lines of the fix in the test body and asserted on its own copy, which passed with the fix
+// reverted.
 func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
-	recorded := &pgelasticv1alpha1.ObjectStore{
-		Path:        "/pgelastic",
-		EndpointURL: "objectstore.shop.svc",
-		Region:      "us-east-1",
+	scheme := credentialScheme(t)
+	stopped := metav1.NewTime(time.Date(2026, 8, 1, 2, 0, 0, 0, time.UTC))
+	backup := &pgelasticv1alpha1.PgBackup{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "friday"},
+		Spec: pgelasticv1alpha1.PgBackupSpec{
+			InstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
+		},
+		Status: pgelasticv1alpha1.PgBackupStatus{
+			Phase:     pgelasticv1alpha1.BackupPhaseCompleted,
+			StoppedAt: &stopped,
+			Stanza:    "pgelastic-7668815305197002786",
+			BackupID:  "20260801-020000F",
+			// What the agent records: where, and nothing about what to authenticate with.
+			Repository: &pgelasticv1alpha1.ObjectStore{
+				Path:        "/pgelastic",
+				EndpointURL: "objectstore.shop.svc",
+				Region:      "us-east-1",
+			},
+		},
 	}
 	source := &pgelasticv1alpha1.PgInstance{
 		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: sourceInstanceName},
@@ -160,20 +180,83 @@ func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
 			},
 		},
 	}
+	restore := &pgelasticv1alpha1.PgRestore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-it-back"},
+		Spec: pgelasticv1alpha1.PgRestoreSpec{
+			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
+			BackupRef:         &corev1.LocalObjectReference{Name: "friday"},
+		},
+	}
 
-	// What the repository ends up as is what planRestore hands the new instance; the fix is
-	// that the reference is taken off the source when the recorded copy has none.
-	carried := *recorded
-	if carried.CredentialsSecretRef.Name == "" && source.Spec.Backup != nil {
-		carried.CredentialsSecretRef = source.Spec.Backup.ObjectStore.CredentialsSecretRef
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(sourceCredentials(), backup, source, restore).Build()
+	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
+
+	plan, reason, err := reconciler.planRestore(context.Background(), restore)
+	if err != nil {
+		t.Fatalf("planning: %v", err)
 	}
-	if carried.CredentialsSecretRef.Name != "object-store-credentials" {
-		t.Fatalf("credentialsSecretRef = %q, want the source's; without it the recovered "+
-			"instance cannot authenticate to the repository it is told to read",
-			carried.CredentialsSecretRef.Name)
+	if reason != "" {
+		t.Fatalf("refused: %s", reason)
 	}
-	if recorded.CredentialsSecretRef.Name != "" {
+	if got := plan.Spec.Backup.ObjectStore.CredentialsSecretRef.Name; got != "object-store-credentials" {
+		t.Errorf("credentialsSecretRef = %q, want the source's; without it the recovered "+
+			"instance cannot authenticate to the repository it is told to read", got)
+	}
+	// The backup's own record is a shared pointer until it is copied. Mutating it would put a
+	// credentials reference on a status that never had one.
+	if backup.Status.Repository.CredentialsSecretRef.Name != "" {
 		t.Error("the backup's recorded repository was modified in place")
+	}
+}
+
+// Neither the backup nor the source says which Secret holds the object store's credentials,
+// so there is nothing the recovered instance could authenticate with. A named reason beats an
+// instance that provisions and then crash-loops on a missing accessKeyID.
+func TestARestoreWithNoObjectStoreCredentialsIsRefused(t *testing.T) {
+	scheme := credentialScheme(t)
+	stopped := metav1.NewTime(time.Date(2026, 8, 1, 2, 0, 0, 0, time.UTC))
+	backup := &pgelasticv1alpha1.PgBackup{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "friday"},
+		Spec: pgelasticv1alpha1.PgBackupSpec{
+			InstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
+		},
+		Status: pgelasticv1alpha1.PgBackupStatus{
+			Phase:      pgelasticv1alpha1.BackupPhaseCompleted,
+			StoppedAt:  &stopped,
+			Stanza:     "pgelastic-7668815305197002786",
+			Repository: &pgelasticv1alpha1.ObjectStore{Path: "/pgelastic"},
+		},
+	}
+	source := &pgelasticv1alpha1.PgInstance{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: sourceInstanceName},
+		Spec: pgelasticv1alpha1.PgInstanceSpec{
+			Backup: &pgelasticv1alpha1.InstanceBackup{
+				ObjectStore: pgelasticv1alpha1.ObjectStore{Path: "/pgelastic"},
+			},
+		},
+	}
+	restore := &pgelasticv1alpha1.PgRestore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-it-back"},
+		Spec: pgelasticv1alpha1.PgRestoreSpec{
+			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
+			BackupRef:         &corev1.LocalObjectReference{Name: "friday"},
+		},
+	}
+
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(sourceCredentials(), backup, source, restore).Build()
+	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
+
+	plan, reason, err := reconciler.planRestore(context.Background(), restore)
+	if err != nil {
+		t.Fatalf("planning: %v", err)
+	}
+	if reason == "" {
+		t.Fatalf("planned %v with no object store credentials at all", plan)
+	}
+	if !strings.Contains(reason, sourceInstanceName) {
+		t.Errorf("reason = %q, want it to name where the credentials were looked for", reason)
 	}
 }
 
