@@ -56,10 +56,17 @@ func ArchiveWAL(ctx context.Context, options Options, segment, name string) erro
 	// A restored instance carries its source's system identifier, because a physical
 	// restore copies the control file verbatim, so it addresses its source's stanza while
 	// running on a forked timeline. Archiving from here would interleave two histories into
-	// one archive and leave neither restorable. The operator additionally points
-	// archive_command somewhere that fails, so this is the second of two guards rather than
-	// the only one; it succeeds rather than failing for the same reason as the case below,
-	// which is that a throwaway instance must still be able to recycle its own WAL.
+	// one archive and leave neither restorable.
+	//
+	// This is the only guard. archive_command is rendered identically for every member,
+	// restored or not - it has to be, because pgBackRest refuses to take a base backup
+	// unless archive_command names it - so nothing upstream of here stops a recovery
+	// instance archiving. The operator's own refusal to schedule backups against a
+	// recovering instance is a separate protection for a separate hazard.
+	//
+	// It returns success rather than failing for the same reason as the case below: a
+	// throwaway instance must still be able to recycle its own WAL, and a failing
+	// archive_command fills pg_wal until the postmaster PANICs.
 	if options.Config.Recovering {
 		log.Info("this member was restored from a repository and does not archive",
 			"segment", name, "instance", options.Instance)
