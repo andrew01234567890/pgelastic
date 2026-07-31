@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
 )
 
@@ -48,6 +49,13 @@ const restoreRequeue = 15 * time.Second
 type PgRestoreReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// SQL and Shell are the two ports a tenant-scoped restore copies through. They are the
+	// migration engine's own ports, because lifting a database out of a recovered instance
+	// and loading it over a live one is the offline migration copy with different ends.
+	// Nil refuses a tenant-scoped restore and leaves instance-scoped ones working.
+	SQL   migration.SQL
+	Shell migration.Shell
 
 	// ControllerName is this operator's identity.
 	ControllerName string
@@ -66,12 +74,15 @@ func (r *PgRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return result, err
 	}
 	if !restore.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.finalize(ctx, restore)
 	}
 
 	status := restore.Status.DeepCopy()
 	status.ObservedGeneration = restore.Generation
 	status.TargetInstance = restoreTargetInstance(restore)
+	if restore.Spec.Scope == pgelasticv1alpha1.RestoreScopeTenant {
+		status.TargetInstance = recoveryInstanceName(restore)
+	}
 
 	requeue, err := r.converge(ctx, restore, status)
 	if err != nil {
@@ -98,6 +109,10 @@ func (r *PgRestoreReconciler) converge(
 	restore *pgelasticv1alpha1.PgRestore,
 	status *pgelasticv1alpha1.PgRestoreStatus,
 ) (time.Duration, error) {
+	if restore.Spec.Scope == pgelasticv1alpha1.RestoreScopeTenant {
+		return r.reconcileTenantRestore(ctx, restore, status)
+	}
+
 	target := &pgelasticv1alpha1.PgInstance{}
 	err := r.Get(ctx, types.NamespacedName{
 		Namespace: restore.Namespace, Name: status.TargetInstance,
@@ -379,6 +394,20 @@ func restorePhase(status *pgelasticv1alpha1.PgRestoreStatus) pgelasticv1alpha1.R
 	default:
 		return status.Phase
 	}
+}
+
+// finalize tears the throwaway recovery instance down.
+//
+// A tenant restore abandoned halfway leaves a full copy of every tenant on the source
+// instance running and readable, and nothing else would ever remove it.
+func (r *PgRestoreReconciler) finalize(
+	ctx context.Context,
+	restore *pgelasticv1alpha1.PgRestore,
+) error {
+	if restore.Spec.Scope != pgelasticv1alpha1.RestoreScopeTenant {
+		return nil
+	}
+	return r.deleteRecoveryInstance(ctx, restore)
 }
 
 func (r *PgRestoreReconciler) ownership() ownership.Resolver {

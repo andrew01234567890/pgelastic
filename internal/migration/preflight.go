@@ -282,12 +282,21 @@ const collationQuery = `SELECT pg_encoding_to_char(d.encoding)::text || '|' || d
   || '|' || coalesce(d.daticurules, '')::text
 FROM pg_database d WHERE d.datname = current_database()`
 
+// ReadCollation reads one database's text-handling identity.
+//
+// Two databases may only exchange data when these are byte-identical. Copying across a
+// difference produces indexes silently inconsistent with their heap ordering: no error,
+// wrong results, discovered by a customer.
+func ReadCollation(ctx context.Context, sql SQL, at Endpoint) (string, error) {
+	return scalar(ctx, sql, at, collationQuery)
+}
+
 func checkCollation(ctx context.Context, sql SQL, in PreflightInput) Check {
-	source, err := scalar(ctx, sql, in.Source, collationQuery)
+	source, err := ReadCollation(ctx, sql, in.Source)
 	if err != nil {
 		return failed(CheckCollationContract, "could not read the source's collation tuple: "+err.Error())
 	}
-	target, err := scalar(ctx, sql, in.Target.WithDatabase("postgres"), collationQuery)
+	target, err := ReadCollation(ctx, sql, in.Target.WithDatabase("postgres"))
 	if err != nil {
 		return failed(CheckCollationContract, "could not read the target's collation tuple: "+err.Error())
 	}
