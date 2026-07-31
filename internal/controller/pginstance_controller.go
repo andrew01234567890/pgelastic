@@ -289,6 +289,15 @@ func (r *PgInstanceReconciler) ensureCredentials(
 		return err
 	}
 
+	// A recovered instance's catalogue is its source's, copied verbatim: pgbackrest restores
+	// pg_authid along with everything else, so its roles keep the source's passwords. Minting
+	// fresh ones here would leave a Secret nothing in the cluster it describes has ever seen -
+	// every standby would fail SCRAM cloning from the primary, and anything dialling the
+	// recovered instance over the network would be refused.
+	if instance.Spec.Restore != nil {
+		return r.inheritCredentials(ctx, instance, name)
+	}
+
 	replication, err := randomPassword()
 	if err != nil {
 		return err
@@ -311,6 +320,35 @@ func (r *PgInstanceReconciler) ensureCredentials(
 		},
 	}
 	return r.ensure(ctx, instance, secret)
+}
+
+// inheritCredentials gives a recovered instance the role passwords its restored catalogue
+// already holds, by copying the source's Secret.
+//
+// It fails rather than falling back to fresh passwords when the source's Secret is gone. The
+// alternative is an instance that provisions cleanly and then cannot be reached by anything,
+// with a Secret that looks entirely correct - which is the sort of failure that gets
+// diagnosed at three in the morning during the restore it was needed for.
+func (r *PgInstanceReconciler) inheritCredentials(
+	ctx context.Context,
+	instance *pgelasticv1alpha1.PgInstance,
+	name string,
+) error {
+	source := instance.Spec.Restore.SourceInstanceName
+	from := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Namespace: instance.Namespace, Name: provision.CredentialsSecretName(source),
+	}, from); err != nil {
+		return fmt.Errorf(
+			"%s was restored from %s and its catalogue holds %s's role passwords, but %s's "+
+				"credentials Secret cannot be read: %w",
+			instance.Name, source, source, source, err)
+	}
+	return r.ensure(ctx, instance, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: instance.Namespace},
+		Type:       from.Type,
+		Data:       from.Data,
+	})
 }
 
 func randomPassword() (string, error) {
