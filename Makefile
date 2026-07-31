@@ -259,6 +259,25 @@ load-data-plane-images: load-instance-images docker-build-proxy ## Make every im
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+.PHONY: preflight
+preflight: ## Run everything CI runs, in CI's order. Do this before pushing.
+	@# The whole point is that it is one command. This repository is half Rust and half Go, the
+	@# two halves are checked by different tools, and running "the tests" in either language
+	@# leaves the other half unchecked -- which is how a clean local run has repeatedly been
+	@# followed by a red CI. Mirrors .github/workflows/rust.yml and test.yml step for step; if
+	@# CI grows a check, it belongs here too.
+	@#
+	@# Fails on the first problem rather than collecting them, because the second check's output
+	@# is rarely worth reading once the first has failed.
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets --all-features
+	cargo test --workspace --all-features
+	go build ./...
+	$(MAKE) test
+	$(MAKE) lint
+	@echo
+	@echo "preflight passed: fmt, clippy, cargo test, go build, go test, lint"
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run

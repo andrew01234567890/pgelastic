@@ -70,6 +70,17 @@ make lint-fix   # Auto-fix code style
 make test       # Run unit tests
 ```
 
+**Before pushing, always:**
+```
+make preflight  # Everything CI runs, in CI's order
+```
+
+`make test` checks the Go half and `cargo test` checks the Rust half; neither checks the other,
+and neither runs the linter. A change to one language that passes its own tests has repeatedly
+been followed by a red build on the other half or on `make lint`. `preflight` is the single
+command that covers all of it, and `internal/hygiene` fails if it ever stops matching what the
+workflows run.
+
 ## CLI Commands Cheat Sheet
 
 ### Create API (your own types)
