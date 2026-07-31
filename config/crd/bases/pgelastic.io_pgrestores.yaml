@@ -85,6 +85,7 @@ spec:
                 description: scope is what is being restored.
                 enum:
                 - Instance
+                - Tenant
                 type: string
               sourceInstanceRef:
                 description: |-
@@ -168,13 +169,34 @@ spec:
                     has(self.immediate)].filter(x, x).size() <= 1'
               targetInstanceName:
                 description: |-
-                  targetInstanceName is the instance to create. Defaults to the restore's own name.
+                  targetInstanceName is the instance to create, for an instance-scoped restore.
+                  Defaults to the restore's own name. It is ignored for a tenant-scoped one, which
+                  always recovers into a throwaway instance named after the restore.
 
                   It is always a new instance: restoring in place would destroy the only copy of the
                   thing being recovered, and a restore that went wrong would leave nothing to try again
                   from.
                 maxLength: 253
                 type: string
+              tenantRef:
+                description: |-
+                  tenantRef names the tenant to put back, for a tenant-scoped restore.
+
+                  The tenant is restored where it already lives. Its neighbours on that instance are
+                  untouched and served throughout, which is the whole point: the alternative is rolling
+                  every customer on the instance back to one customer's bad afternoon.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
             required:
             - sourceInstanceRef
             type: object
@@ -185,6 +207,9 @@ spec:
                 because nothing else can be searched for in the repository catalogue
               rule: has(self.backupRef) || !has(self.target) || has(self.target.time)
                 || has(self.target.lsn)
+            - message: a tenant-scoped restore has to name the tenant it is putting
+                back
+              rule: '!has(self.scope) || self.scope != ''Tenant'' || has(self.tenantRef)'
           status:
             description: status defines the observed state of PgRestore
             properties:
@@ -269,6 +294,8 @@ spec:
                 enum:
                 - Preflight
                 - Recovering
+                - Extracting
+                - Loading
                 - Completed
                 - Failed
                 type: string

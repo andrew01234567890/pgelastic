@@ -53,6 +53,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/controller"
 	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
 )
 
 // suiteControllerName is this suite's identity, deliberately not the default one a deployed
@@ -202,9 +203,19 @@ var _ = BeforeSuite(func() {
 		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
+	// A tenant restore copies through the same pods/exec transport a migration does, which
+	// is the only route to a database whose superuser has no password at all.
+	executor, err := migration.NewKubeExec(config)
+	Expect(err).NotTo(HaveOccurred())
+	restoreSQL := migration.PodSQL{
+		Runner:  executor,
+		Members: migration.PrimaryResolver{Client: manager.GetAPIReader()},
+	}
 	Expect((&controller.PgRestoreReconciler{
 		Client:         manager.GetClient(),
 		Scheme:         manager.GetScheme(),
+		SQL:            restoreSQL,
+		Shell:          restoreSQL,
 		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 

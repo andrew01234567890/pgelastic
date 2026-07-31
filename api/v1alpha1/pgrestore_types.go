@@ -23,7 +23,7 @@ import (
 )
 
 // RestoreScope is what is being put back.
-// +kubebuilder:validation:Enum=Instance
+// +kubebuilder:validation:Enum=Instance;Tenant
 type RestoreScope string
 
 const (
@@ -31,10 +31,19 @@ const (
 	// goes back to the same moment, which is what makes it disaster recovery rather than
 	// the per-customer restore a multi-tenant product is usually asked for.
 	RestoreScopeInstance RestoreScope = "Instance"
+	// RestoreScopeTenant restores one tenant and leaves its neighbours alone.
+	//
+	// There is no such thing as restoring one database out of a physical backup: WAL is
+	// instance-wide, so replaying it to a moment replays every tenant on the instance to
+	// that moment. What this does instead is recover the whole instance into one nobody can
+	// reach, lift the one database out of it, load it over the live one, and throw the
+	// recovery away. It costs a second instance for the duration and it is the restore a
+	// multi-tenant product is actually asked for.
+	RestoreScopeTenant RestoreScope = "Tenant"
 )
 
 // RestorePhase is the display-only projection of a restore's conditions.
-// +kubebuilder:validation:Enum=Preflight;Recovering;Completed;Failed
+// +kubebuilder:validation:Enum=Preflight;Recovering;Extracting;Loading;Completed;Failed
 type RestorePhase string
 
 const (
@@ -43,6 +52,10 @@ const (
 	// RestorePhaseRecovering is a target instance pulling the base backup down and
 	// replaying WAL onto it.
 	RestorePhaseRecovering RestorePhase = "Recovering"
+	// RestorePhaseExtracting is lifting one tenant's database out of the recovered instance.
+	RestorePhaseExtracting RestorePhase = "Extracting"
+	// RestorePhaseLoading is writing it over the live one, with the tenant held still.
+	RestorePhaseLoading RestorePhase = "Loading"
 	// RestorePhaseCompleted is a target instance serving on a forked timeline.
 	RestorePhaseCompleted RestorePhase = "Completed"
 	// RestorePhaseFailed is terminal. The target instance is left in place rather than
@@ -121,6 +134,7 @@ type RecoveryTarget struct {
 // The whole spec is immutable, and the target is required to name a backup unless it is
 // orderable against the catalogue.
 // +kubebuilder:validation:XValidation:rule="has(self.backupRef) || !has(self.target) || has(self.target.time) || has(self.target.lsn)",message="backupRef is required unless the target is a time or an LSN, because nothing else can be searched for in the repository catalogue"
+// +kubebuilder:validation:XValidation:rule="!has(self.scope) || self.scope != 'Tenant' || has(self.tenantRef)",message="a tenant-scoped restore has to name the tenant it is putting back"
 type PgRestoreSpec struct {
 	// scope is what is being restored.
 	// +kubebuilder:default=Instance
@@ -144,7 +158,17 @@ type PgRestoreSpec struct {
 	// +optional
 	Target *RecoveryTarget `json:"target,omitempty"`
 
-	// targetInstanceName is the instance to create. Defaults to the restore's own name.
+	// tenantRef names the tenant to put back, for a tenant-scoped restore.
+	//
+	// The tenant is restored where it already lives. Its neighbours on that instance are
+	// untouched and served throughout, which is the whole point: the alternative is rolling
+	// every customer on the instance back to one customer's bad afternoon.
+	// +optional
+	TenantRef *corev1.LocalObjectReference `json:"tenantRef,omitempty"`
+
+	// targetInstanceName is the instance to create, for an instance-scoped restore.
+	// Defaults to the restore's own name. It is ignored for a tenant-scoped one, which
+	// always recovers into a throwaway instance named after the restore.
 	//
 	// It is always a new instance: restoring in place would destroy the only copy of the
 	// thing being recovered, and a restore that went wrong would leave nothing to try again

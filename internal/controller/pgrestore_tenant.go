@@ -1,0 +1,273 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
+)
+
+// recoverySuffix names the throwaway instance a tenant restore recovers into.
+//
+// A tenant restore is a whole-instance point-in-time recovery with one database lifted out
+// of it, because there is no such thing as restoring one database out of a physical backup:
+// WAL is instance-wide, and replaying it to a moment replays every tenant on the instance to
+// that moment. The instance is throwaway because the other tenants on it are copies of live
+// customers' pasts and must never be reachable.
+const recoverySuffix = "-recovery"
+
+// recoveryInstanceName is the instance a tenant restore recovers into.
+func recoveryInstanceName(restore *pgelasticv1alpha1.PgRestore) string {
+	return restore.Name + recoverySuffix
+}
+
+// reconcileTenantRestore puts one tenant back without touching its neighbours.
+//
+// The shape is: recover the whole instance to the moment asked for, into an instance nobody
+// can reach; lift the one database out of it; load it over the live one; throw the recovery
+// instance away. Everything after the recovery is the offline migration path run in place -
+// the same pg_dump and pg_restore, the same fencing, the same scratch directory on the
+// volume whose headroom was already measured - because moving a tenant between two live
+// instances and replacing a tenant from a dead one are the same copy with different ends.
+func (r *PgRestoreReconciler) reconcileTenantRestore(
+	ctx context.Context,
+	restore *pgelasticv1alpha1.PgRestore,
+	status *pgelasticv1alpha1.PgRestoreStatus,
+) (time.Duration, error) {
+	log := logf.FromContext(ctx)
+
+	if r.SQL == nil || r.Shell == nil {
+		return 0, fmt.Errorf(
+			"this operator was started without the SQL and shell ports a tenant restore " +
+				"copies through")
+	}
+
+	tenant, reason, err := r.tenantUnderRestore(ctx, restore)
+	if err != nil || reason != "" {
+		status.Error = reason
+		return restoreRequeue, err
+	}
+
+	recovery := &pgelasticv1alpha1.PgInstance{}
+	err = r.Get(ctx, types.NamespacedName{
+		Namespace: restore.Namespace, Name: recoveryInstanceName(restore),
+	}, recovery)
+	switch {
+	case apierrors.IsNotFound(err):
+		return r.startTenantRecovery(ctx, restore, status)
+	case err != nil:
+		return 0, err
+	}
+
+	if !meta.IsStatusConditionTrue(recovery.Status.Conditions, pgelasticv1alpha1.ConditionReady) {
+		status.Phase = pgelasticv1alpha1.RestorePhaseRecovering
+		return restoreRequeue, nil
+	}
+
+	status.Phase = pgelasticv1alpha1.RestorePhaseExtracting
+	if err := r.replaceTenant(ctx, restore, status, tenant, recovery); err != nil {
+		status.Error = err.Error()
+		log.Error(err, "the tenant could not be replaced from the recovered instance")
+		return restoreRequeue, nil
+	}
+
+	// The recovery instance holds every other tenant of the source at the restored moment.
+	// Leaving it up is leaving a readable copy of other customers' data behind, so it is
+	// torn down on the way out rather than left for somebody to notice.
+	if err := r.Delete(ctx, recovery); err != nil && !apierrors.IsNotFound(err) {
+		return 0, err
+	}
+	status.Phase = pgelasticv1alpha1.RestorePhaseCompleted
+	status.Error = ""
+	return 0, nil
+}
+
+// startTenantRecovery mints the throwaway instance, planned exactly as an instance-scope
+// restore is, and named after the restore so a second reconcile finds it rather than
+// creating another.
+func (r *PgRestoreReconciler) startTenantRecovery(
+	ctx context.Context,
+	restore *pgelasticv1alpha1.PgRestore,
+	status *pgelasticv1alpha1.PgRestoreStatus,
+) (time.Duration, error) {
+	plan, reason, err := r.planRestore(ctx, restore)
+	if err != nil {
+		return 0, err
+	}
+	if reason != "" {
+		status.Error = reason
+		return restoreRequeue, nil
+	}
+	plan.Name = recoveryInstanceName(restore)
+	status.BackupID = plan.Spec.Restore.BackupID
+	status.Error = ""
+	status.Phase = pgelasticv1alpha1.RestorePhaseRecovering
+
+	if err := r.Create(ctx, plan); err != nil && !apierrors.IsAlreadyExists(err) {
+		status.Error = err.Error()
+	}
+	return restoreRequeue, nil
+}
+
+// replaceTenant lifts one database out of the recovered instance and loads it over the live
+// one.
+//
+// The tenant is fenced for the whole copy. A dump taken while writes continue is behind by
+// whatever was written during it, and unlike a migration there is no replication stream to
+// close that gap with - so the alternative to a pause is a restore that silently keeps some
+// of the data it was asked to discard.
+func (r *PgRestoreReconciler) replaceTenant(
+	ctx context.Context,
+	restore *pgelasticv1alpha1.PgRestore,
+	status *pgelasticv1alpha1.PgRestoreStatus,
+	tenant *pgelasticv1alpha1.PgTenant,
+	recovery *pgelasticv1alpha1.PgInstance,
+) error {
+	live := migration.Endpoint{
+		Namespace: restore.Namespace,
+		Instance:  tenant.Status.Binding.InstanceRef.Name,
+		Database:  tenant.Spec.DatabaseName,
+	}
+	recovered := migration.Endpoint{
+		Namespace: restore.Namespace,
+		Instance:  recovery.Name,
+		Database:  tenant.Spec.DatabaseName,
+	}
+
+	// Restoring under a different collation produces indexes silently inconsistent with
+	// their heap ordering: no error, wrong results, discovered by a customer. The recovery
+	// instance inherits its collation from the backup it was restored from, so a source
+	// whose contract has since changed is caught here rather than at the first index scan.
+	if err := r.checkCollationMatches(ctx, recovered, live); err != nil {
+		return err
+	}
+
+	plan := migration.Plan{
+		Source:      recovered,
+		Target:      live,
+		Concurrency: migration.DefaultDumpJobs,
+		DumpDir:     filepath.Join(migration.ScratchDir, restore.Namespace+"_"+restore.Name),
+	}
+
+	if err := migration.FenceSource(ctx, r.SQL, live); err != nil {
+		return fmt.Errorf("could not hold the tenant still for the copy: %w", err)
+	}
+	// Unfencing runs on every exit, successful or not. A tenant left refusing connections
+	// after a restore that failed halfway is an outage caused by the recovery rather than by
+	// whatever the recovery was for.
+	defer func() {
+		if err := migration.UnfenceSource(ctx, r.SQL, live); err != nil {
+			logf.FromContext(ctx).Error(err, "the tenant was left refusing connections",
+				"tenant", tenant.Name)
+		}
+	}()
+	// The dump is the size of the tenant and lands on the target's data volume. Leaving one
+	// behind is how the next restore fails its headroom check for reasons nobody can find.
+	defer func() {
+		if err := migration.DiscardDump(ctx, r.Shell, plan); err != nil {
+			logf.FromContext(ctx).Error(err, "the staged dump was left behind",
+				"dumpDir", plan.DumpDir)
+		}
+	}()
+
+	status.Phase = pgelasticv1alpha1.RestorePhaseLoading
+	return migration.CopyOffline(ctx, r.Shell, plan)
+}
+
+// checkCollationMatches refuses a copy between two databases whose text-handling identity
+// differs.
+func (r *PgRestoreReconciler) checkCollationMatches(
+	ctx context.Context,
+	source, target migration.Endpoint,
+) error {
+	from, err := migration.ReadCollation(ctx, r.SQL, source)
+	if err != nil {
+		return fmt.Errorf("could not read the recovered database's collation tuple: %w", err)
+	}
+	to, err := migration.ReadCollation(ctx, r.SQL, target)
+	if err != nil {
+		return fmt.Errorf("could not read the live database's collation tuple: %w", err)
+	}
+	if from != to {
+		return fmt.Errorf(
+			"the recovered database's collation tuple (%v) differs from the live one (%v); "+
+				"loading across that difference produces indexes inconsistent with their heap "+
+				"ordering, which is wrong results and no error", from, to)
+	}
+	return nil
+}
+
+// tenantUnderRestore resolves the tenant being put back, and says why it cannot be when it
+// cannot.
+func (r *PgRestoreReconciler) tenantUnderRestore(
+	ctx context.Context,
+	restore *pgelasticv1alpha1.PgRestore,
+) (*pgelasticv1alpha1.PgTenant, string, error) {
+	if restore.Spec.TenantRef == nil {
+		return nil, "a tenant-scoped restore has to name the tenant it is putting back", nil
+	}
+	tenant := &pgelasticv1alpha1.PgTenant{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: restore.Namespace, Name: restore.Spec.TenantRef.Name,
+	}, tenant)
+	switch {
+	case apierrors.IsNotFound(err):
+		return nil, fmt.Sprintf("no tenant named %s exists in this namespace",
+			restore.Spec.TenantRef.Name), nil
+	case err != nil:
+		return nil, "", err
+	case tenant.Status.Binding == nil || tenant.Status.Binding.InstanceRef.Name == "":
+		// A tenant with no database to load over is a tenant that was never provisioned.
+		// Creating one here would turn a restore into a provisioning path with none of the
+		// admission accounting that goes with it.
+		return nil, fmt.Sprintf("%s is not bound to an instance, so there is nothing to "+
+			"restore over", tenant.Name), nil
+	}
+	return tenant, "", nil
+}
+
+// deleteRecoveryInstance tears the throwaway instance down.
+//
+// It is also the deletion path: a tenant restore abandoned halfway leaves a full copy of
+// every tenant on the source instance running, and nothing else would ever remove it.
+func (r *PgRestoreReconciler) deleteRecoveryInstance(
+	ctx context.Context,
+	restore *pgelasticv1alpha1.PgRestore,
+) error {
+	recovery := &pgelasticv1alpha1.PgInstance{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: restore.Namespace, Name: recoveryInstanceName(restore),
+	}, recovery)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, recovery))
+}
