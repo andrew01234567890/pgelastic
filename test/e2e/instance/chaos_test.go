@@ -408,13 +408,71 @@ func keepDown(member string, window time.Duration) {
 
 // losePrimary takes the named primary away for longer than the failover delay and waits
 // until somebody else holds the role.
+//
+// keepDown stops deleting once targetPrimary names somebody else, so the failover has to be
+// decided inside that window. If it is not - the debounce not yet satisfied, quorum not yet
+// provable, a veto still standing - the Pod comes back, the member becomes healthy, and the
+// operator settles on PrimaryHealthy quite correctly. From that moment no other member will
+// ever be elected, so the wait below cannot succeed on any timeline. It used to run the full
+// ten minutes anyway and then report a timeout, which says what did not happen rather than
+// why. StopTrying ends it at the moment the outcome becomes unreachable, and both exits carry
+// the instance's own account of the decision.
 func losePrimary(primary string) {
 	GinkgoHelper()
 	keepDown(primary, 75*time.Second)
 	Eventually(func(g Gomega) {
-		g.Expect(chaosCR().Status.CurrentPrimary).NotTo(Equal(primary),
-			"the instance has to elect somebody else")
+		status := chaosCR().Status
+		// The operator has stopped considering the primary to be failing while that primary
+		// is still the member that was deleted: it came back, and from here nothing will
+		// elect anybody else.
+		if status.CurrentPrimary == primary && status.CurrentPrimaryFailingSince == nil &&
+			status.TargetPrimary == primary {
+			StopTrying("the member that was deleted is back and is no longer considered to be " +
+				"failing, so no other member will be elected: the failover was never decided " +
+				"inside the window it was held down for.\n" + chaosDiagnosis()).Now()
+		}
+		g.Expect(status.CurrentPrimary).NotTo(Equal(primary),
+			"the instance has to elect somebody else\n"+chaosDiagnosis())
 	}, "10m", "5s").Should(Succeed())
+}
+
+// chaosDiagnosis is what the chaos instance says about its own failover, for a failure
+// message that would otherwise only say which member was still primary.
+//
+// It names this instance specifically. The suite's general log dump is dominated by the
+// provisioning suite's instance, which is a different one entirely, and reading the wrong
+// instance's failover reasons is worse than reading none.
+func chaosDiagnosis() string {
+	status := chaosCR().Status
+	lines := []string{
+		fmt.Sprintf("instance %s/%s:", chaosNamespace, chaosInstance),
+		fmt.Sprintf("  currentPrimary=%q targetPrimary=%q primaryEpoch=%d",
+			status.CurrentPrimary, status.TargetPrimary, status.PrimaryEpoch),
+	}
+	if status.CurrentPrimaryFailingSince != nil {
+		lines = append(lines, fmt.Sprintf("  currentPrimaryFailingSince=%s (%s ago)",
+			status.CurrentPrimaryFailingSince.Format(time.RFC3339),
+			time.Since(status.CurrentPrimaryFailingSince.Time).Truncate(time.Second)))
+	} else {
+		lines = append(lines, "  currentPrimaryFailingSince=<nil> (the operator does not "+
+			"consider the primary to be failing)")
+	}
+	if evidence := status.QuorumEvidence; evidence != nil {
+		lines = append(lines, fmt.Sprintf("  quorumEvidence=%+v", *evidence))
+	} else {
+		lines = append(lines, "  quorumEvidence=<nil>")
+	}
+	for _, member := range status.Instances {
+		lines = append(lines, fmt.Sprintf("  member %s: role=%s lsn=%s replayLSN=%s",
+			member.Name, member.Role, member.LSN, member.ReplayLSN))
+	}
+	// Every condition, because which veto is standing is the whole question and each one is
+	// its own type.
+	for _, condition := range status.Conditions {
+		lines = append(lines, fmt.Sprintf("  condition %s=%s reason=%s: %s",
+			condition.Type, condition.Status, condition.Reason, condition.Message))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // memberTimeline is the timeline a member holds WAL for, which for a standby is the one its
