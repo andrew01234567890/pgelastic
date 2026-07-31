@@ -547,6 +547,11 @@ func (in *ElasticClassPoolingDefaults) DeepCopyInto(out *ElasticClassPoolingDefa
 		*out = new(int32)
 		**out = **in
 	}
+	if in.GlobalStatementsLimit != nil {
+		in, out := &in.GlobalStatementsLimit, &out.GlobalStatementsLimit
+		*out = new(int32)
+		**out = **in
+	}
 	if in.ServerIdleTimeout != nil {
 		in, out := &in.ServerIdleTimeout, &out.ServerIdleTimeout
 		*out = new(v1.Duration)
@@ -3117,6 +3122,11 @@ func (in *PoolingConfig) DeepCopyInto(out *PoolingConfig) {
 	*out = *in
 	if in.PreparedStatementsLimit != nil {
 		in, out := &in.PreparedStatementsLimit, &out.PreparedStatementsLimit
+		*out = new(int32)
+		**out = **in
+	}
+	if in.GlobalStatementsLimit != nil {
+		in, out := &in.GlobalStatementsLimit, &out.GlobalStatementsLimit
 		*out = new(int32)
 		**out = **in
 	}

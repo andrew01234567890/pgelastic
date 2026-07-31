@@ -57,7 +57,8 @@ pub use server::{
     ServerLink, ServerState, jittered_lifetime,
 };
 pub use stmt::{
-    CacheInvalidation, ClientStatements, GlobalStatementCache, PreparedStatement, ServerAction,
-    ServerStatements, StatementKey, StatementName, detect_cache_invalidation,
+    CacheInvalidation, ClientStatements, DEFAULT_GLOBAL_STATEMENTS, GlobalStatementCache,
+    PreparedStatement, ServerAction, ServerStatements, StatementKey, StatementName,
+    detect_cache_invalidation,
 };
 pub use wait::{Priority, WaitError, WaitQueue, Waiter};

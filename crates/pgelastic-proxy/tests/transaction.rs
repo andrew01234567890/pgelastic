@@ -881,6 +881,94 @@ async fn a_prepared_statement_survives_the_transaction_that_created_it() {
     );
 }
 
+const TINY_INTERN_TABLE: &str = "\
+[pool]
+mode = \"transaction\"
+backendConnections = 1
+resetPolicy = \"dirtyTracked\"
+maxGlobalStatements = 4
+";
+
+/// The intern table is bounded, and a client whose statement was evicted keeps working.
+///
+/// The table's key owns the query text, so without a bound the proxy retains every distinct
+/// statement any application has ever sent, for the life of the process. Neither benchmark
+/// could see it -- density issues no queries, throughput issues one -- so this drives the case
+/// they cannot: many distinct texts through one proxy, then a client binding a statement whose
+/// entry is long gone.
+///
+/// What eviction costs is a second `Parse` of the same text under a fresh name, which is why
+/// the assertion is on the client still getting right answers rather than on the backend
+/// holding exactly one statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_keeps_working_after_its_statement_leaves_the_intern_table() {
+    let stack = stack_with(TINY_INTERN_TABLE).await;
+    let client = stack.connect().await;
+
+    // Prepared first, so it is the least recent by the time the table fills.
+    let evicted = client.prepare("SELECT $1::int * 3").await.unwrap();
+    assert_eq!(
+        client
+            .query_one(&evicted, &[&7i32])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        21
+    );
+
+    // Forty distinct texts through a table that holds four.
+    for n in 0..40i32 {
+        let filler = client
+            .prepare(&format!("SELECT $1::int + {n}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .query_one(&filler, &[&1i32])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            1 + n
+        );
+    }
+
+    // The client never learned its statement was evicted, and is entitled to keep using it.
+    for value in 0..5i32 {
+        assert_eq!(
+            client
+                .query_one(&evicted, &[&value])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            value * 3,
+            "a statement the intern table evicted stopped answering correctly"
+        );
+    }
+
+    // The bound has to be observable, or a table that is thrashing looks exactly like one that
+    // is idle: both simply stop growing.
+    let rendered = stack.proxy.metrics.render();
+    let evicted = rendered
+        .lines()
+        .find_map(|line| line.strip_prefix("pgelastic_proxy_statements_evicted_total "))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .expect("the eviction counter is rendered");
+    assert!(
+        evicted > 0,
+        "forty distinct texts through a table of four must have evicted something, got {evicted}"
+    );
+
+    let interned = rendered
+        .lines()
+        .find_map(|line| line.strip_prefix("pgelastic_proxy_statements_interned "))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .expect("the size gauge is rendered");
+    assert!(
+        interned <= 4,
+        "the table held {interned} entries against a configured capacity of 4"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn named_prepared_statements_keep_working_across_handoffs() {
     let stack = stack_with(FOUR).await;

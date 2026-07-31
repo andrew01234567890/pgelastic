@@ -269,6 +269,10 @@ const (
 // is the value rendered when neither the pool nor its class sets one.
 const defaultPreparedStatementsLimit = 200
 
+// defaultGlobalStatementsLimit must match the +kubebuilder:default on both CRD fields, and the
+// Rust DEFAULT_GLOBAL_STATEMENTS it renders into.
+const defaultGlobalStatementsLimit = 2048
+
 func (c Config) renderRouting(out *strings.Builder, dynamic bool) {
 	out.WriteString("[routing]\n")
 	discriminators := tenantDiscriminators(c.Pool)
@@ -309,6 +313,10 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 	writeInt(out, "notifyAfterSeconds", int64(queryWaitNotifySeconds(c.Pool)))
 	writeInt(out, "queueDepthPerTenant", int64(queueDepthPerTenant(c.Pool)))
 	writeInt(out, "maxServerStatements", int64(preparedStatementsLimit(pooling)))
+	// A different quantity from preparedStatementsLimit, which bounds one backend link. This
+	// bounds the instance-wide intern table whose key owns the query text, so leaving it unset
+	// would make proxy memory a function of how much distinct SQL the applications contain.
+	writeInt(out, "maxGlobalStatements", int64(globalStatementsLimit(pooling)))
 	writeInt(out, "serverLifetimeSeconds", serverLifetimeSeconds(pooling))
 	out.WriteString("\n")
 
@@ -518,6 +526,13 @@ func preparedStatementsLimit(pooling *pgelasticv1alpha1.PoolingConfig) int32 {
 		return *pooling.PreparedStatementsLimit
 	}
 	return defaultPreparedStatementsLimit
+}
+
+func globalStatementsLimit(pooling *pgelasticv1alpha1.PoolingConfig) int32 {
+	if pooling != nil && pooling.GlobalStatementsLimit != nil {
+		return *pooling.GlobalStatementsLimit
+	}
+	return defaultGlobalStatementsLimit
 }
 
 func serverLifetimeSeconds(pooling *pgelasticv1alpha1.PoolingConfig) int64 {
