@@ -222,15 +222,23 @@ func (r *PgRestoreReconciler) replaceTenant(
 		}
 	}()
 
-	if err := migration.FenceSource(ctx, r.SQL, live); err != nil {
+	// The roles to hold out come from the recovered copy, which carries the same ones: the
+	// live database is about to be rewritten from it, and enumerating there means the answer
+	// does not depend on a live database that is halfway through being replaced.
+	tenantRoles, err := migration.EnumerateTenantRoles(ctx, r.SQL, recovered)
+	if err != nil {
+		return fmt.Errorf("could not read the roles the tenant's database depends on: %w", err)
+	}
+
+	if err := migration.HoldTenantOut(ctx, r.SQL, live, tenantRoles); err != nil {
 		return fmt.Errorf("could not hold the tenant still for the copy: %w", err)
 	}
-	// Unfencing runs on every exit, successful or not. A tenant left refusing connections
+	// Readmission runs on every exit, successful or not. A tenant left unable to connect
 	// after a restore that failed halfway is an outage caused by the recovery rather than by
 	// whatever the recovery was for.
 	defer func() {
-		if err := migration.UnfenceSource(ctx, r.SQL, live); err != nil {
-			logf.FromContext(ctx).Error(err, "the tenant was left refusing connections",
+		if err := migration.ReadmitTenant(ctx, r.SQL, live, tenantRoles); err != nil {
+			logf.FromContext(ctx).Error(err, "the tenant was left unable to connect",
 				"tenant", tenant.Name)
 		}
 	}()
