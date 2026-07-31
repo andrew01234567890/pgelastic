@@ -473,27 +473,39 @@ func poolMode(pooling *pgelasticv1alpha1.PoolingConfig) string {
 	return "transaction"
 }
 
+// The reset-policy names the proxy's TOML uses. Named because the default and the
+// DirtyTracked case must render the identical string: they were the same literal in two
+// places, and a divergence between them would silently change how much session state is
+// scrubbed between clients.
+const (
+	resetPolicyNone         = "none"
+	resetPolicyDirtyTracked = "dirtyTracked"
+	resetPolicySmartDiscard = "smartDiscard"
+	resetPolicyDiscardAll   = "discardAll"
+	resetPolicyVerified     = "verified"
+)
+
 func resetPolicy(pooling *pgelasticv1alpha1.PoolingConfig) string {
 	if pooling == nil || pooling.ResetMode == "" {
-		return "dirtyTracked"
+		return resetPolicyDirtyTracked
 	}
 	switch pooling.ResetMode {
 	case pgelasticv1alpha1.ResetNone:
-		return "none"
+		return resetPolicyNone
 	case pgelasticv1alpha1.ResetDirtyTracked:
-		return "dirtyTracked"
+		return resetPolicyDirtyTracked
 	case pgelasticv1alpha1.ResetSmartDiscard:
-		return "smartDiscard"
+		return resetPolicySmartDiscard
 	case pgelasticv1alpha1.ResetVerified:
-		return "verified"
+		return resetPolicyVerified
 	case pgelasticv1alpha1.ResetDiscardAll:
-		return "discardAll"
+		return resetPolicyDiscardAll
 	default:
 		// Explicit rather than folded into the default arm. DiscardAll used to be served by
 		// it, so changing the fallback without naming it would have rendered dirtyTracked for
 		// an operator who asked for discardAll - silently, on the setting that decides how
 		// much session state is scrubbed between clients.
-		return "dirtyTracked"
+		return resetPolicyDirtyTracked
 	}
 }
 

@@ -474,11 +474,11 @@ func TestTheWorkerCountIsDeclaredRatherThanDerivedFromTheHost(t *testing.T) {
 // scrubbed between clients.
 func TestEveryResetModeRendersTheOneItNames(t *testing.T) {
 	for mode, want := range map[pgelasticv1alpha1.ResetPolicy]string{
-		pgelasticv1alpha1.ResetNone:         "none",
-		pgelasticv1alpha1.ResetDirtyTracked: "dirtyTracked",
-		pgelasticv1alpha1.ResetSmartDiscard: "smartDiscard",
-		pgelasticv1alpha1.ResetDiscardAll:   "discardAll",
-		pgelasticv1alpha1.ResetVerified:     "verified",
+		pgelasticv1alpha1.ResetNone:         resetPolicyNone,
+		pgelasticv1alpha1.ResetDirtyTracked: resetPolicyDirtyTracked,
+		pgelasticv1alpha1.ResetSmartDiscard: resetPolicySmartDiscard,
+		pgelasticv1alpha1.ResetDiscardAll:   resetPolicyDiscardAll,
+		pgelasticv1alpha1.ResetVerified:     resetPolicyVerified,
 	} {
 		if got := resetPolicy(&pgelasticv1alpha1.PoolingConfig{ResetMode: mode}); got != want {
 			t.Errorf("resetMode %q rendered %q, want %q", mode, got, want)
@@ -486,7 +486,7 @@ func TestEveryResetModeRendersTheOneItNames(t *testing.T) {
 	}
 
 	// An unset mode takes the default, which the API server also supplies.
-	if got := resetPolicy(nil); got != "dirtyTracked" {
+	if got := resetPolicy(nil); got != resetPolicyDirtyTracked {
 		t.Errorf("an absent pooling block rendered %q, want dirtyTracked", got)
 	}
 }
