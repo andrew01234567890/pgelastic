@@ -209,8 +209,47 @@ func (b Builder) AgentConfig() AgentConfig {
 			WALSegmentSize: 16 << 20,
 			DataChecksums:  true,
 		},
-		Backup: repository(spec.Backup),
+		Backup:     repository(spec.Backup),
+		Restore:    restoreRequest(spec.Restore),
+		Recovering: spec.Restore != nil,
 	}
+}
+
+// restoreRequest carries the recovery instruction down to the agent.
+//
+// pgBackRest's spelling of the target type is lower case and differs from the API's field
+// names, and translating here rather than in the agent keeps the agent free of any opinion
+// about what an operator wrote.
+func restoreRequest(restore *pgelasticv1alpha1.InstanceRestore) *RestoreRequest {
+	if restore == nil {
+		return nil
+	}
+	request := &RestoreRequest{
+		Stanza:                 restore.Stanza,
+		BackupID:               restore.BackupID,
+		EnforcedParameterFloor: restore.EnforcedParameterFloor,
+	}
+	target := restore.Target
+	if target == nil {
+		return request
+	}
+	request.Timeline = target.Timeline
+	request.Exclusive = target.Exclusive != nil && *target.Exclusive
+	switch {
+	case target.Time != "":
+		request.TargetType, request.TargetValue = "time", target.Time
+	case target.LSN != "":
+		request.TargetType, request.TargetValue = "lsn", target.LSN
+	case target.Name != "":
+		request.TargetType, request.TargetValue = "name", target.Name
+	case target.XID != "":
+		request.TargetType, request.TargetValue = "xid", target.XID
+	case target.Immediate != nil && *target.Immediate:
+		// immediate takes no value: it stops as soon as the backup is consistent, which is
+		// a property of the backup rather than a moment somebody chose.
+		request.TargetType = "immediate"
+	}
+	return request
 }
 
 // repository carries the WAL and base-backup destination down to the agent, or nothing when

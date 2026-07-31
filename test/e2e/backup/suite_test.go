@@ -158,7 +158,7 @@ var (
 
 func TestBackupE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "WAL archiving and physical backup e2e")
+	RunSpecs(t, "WAL archiving, physical backup and point-in-time restore e2e")
 }
 
 var _ = BeforeSuite(func() {
@@ -197,6 +197,12 @@ var _ = BeforeSuite(func() {
 	}).SetupWithManager(manager)).To(Succeed())
 
 	Expect((&controller.PgBackupReconciler{
+		Client:         manager.GetClient(),
+		Scheme:         manager.GetScheme(),
+		ControllerName: suiteControllerName,
+	}).SetupWithManager(manager)).To(Succeed())
+
+	Expect((&controller.PgRestoreReconciler{
 		Client:         manager.GetClient(),
 		Scheme:         manager.GetScheme(),
 		ControllerName: suiteControllerName,

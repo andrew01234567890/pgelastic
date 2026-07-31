@@ -231,6 +231,16 @@ type PgInstanceSpec struct {
 	// +optional
 	Parameters map[string]GUCValue `json:"parameters,omitempty"`
 
+	// restore marks this instance as one created by recovering a repository rather than by
+	// initdb, and carries what recovery needs.
+	//
+	// It is immutable and only ever read at bootstrap: an instance that has finished
+	// recovering is an ordinary instance, and the record is kept so that where it came from
+	// is answerable afterwards rather than folklore.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="restore is immutable"
+	// +optional
+	Restore *InstanceRestore `json:"restore,omitempty"`
+
 	// backup configures physical backup and WAL archiving, both executed by shelling out
 	// to pgBackRest.
 	// +optional
@@ -394,6 +404,47 @@ type WALVolume struct {
 	// +kubebuilder:validation:MaxLength=253
 	// +optional
 	ClassName *string `json:"className,omitempty"`
+}
+
+// InstanceRestore is what an instance being recovered from a repository needs to know.
+//
+// The repository itself is not here: it is spec.backup.objectStore, because a recovering
+// instance reads the source's archive through exactly the configuration an archiving
+// instance writes it with. Read access and write refusal are the same credential, so the
+// refusal is behavioural - the instance manager declines to archive at all while this is
+// set - rather than a matter of withholding anything.
+type InstanceRestore struct {
+	// sourceInstanceName is where the repository came from, recorded for provenance.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	SourceInstanceName string `json:"sourceInstanceName,omitempty"`
+
+	// stanza is the repository stanza to restore from. It is named after the source's
+	// system identifier, which a restored instance inherits: a restore copies the control
+	// file verbatim, so this instance will address the same stanza while running on a
+	// forked timeline, and must never archive into it.
+	// +kubebuilder:validation:MaxLength=128
+	// +required
+	Stanza string `json:"stanza"`
+
+	// backupID is the base backup to start from. Empty lets the repository choose, which
+	// only works for a target that can be ordered against the catalogue.
+	// +kubebuilder:validation:MaxLength=128
+	// +optional
+	BackupID string `json:"backupID,omitempty"`
+
+	// target is where recovery stops. Omitted replays everything the archive holds.
+	// +optional
+	Target *RecoveryTarget `json:"target,omitempty"`
+
+	// enforcedParameterFloor are the source's values for the five settings PostgreSQL
+	// refuses to begin recovery below.
+	//
+	// Without them a restore into a smaller instance FATALs at start-up with a message that
+	// names the parameter and not the cause, after it has already pulled the whole base
+	// backup down.
+	// +optional
+	EnforcedParameterFloor map[string]int32 `json:"enforcedParameterFloor,omitempty"`
 }
 
 // InstanceBackup configures physical backup and WAL archiving.

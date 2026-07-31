@@ -461,6 +461,113 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              restore:
+                description: |-
+                  restore marks this instance as one created by recovering a repository rather than by
+                  initdb, and carries what recovery needs.
+
+                  It is immutable and only ever read at bootstrap: an instance that has finished
+                  recovering is an ordinary instance, and the record is kept so that where it came from
+                  is answerable afterwards rather than folklore.
+                properties:
+                  backupID:
+                    description: |-
+                      backupID is the base backup to start from. Empty lets the repository choose, which
+                      only works for a target that can be ordered against the catalogue.
+                    maxLength: 128
+                    type: string
+                  enforcedParameterFloor:
+                    additionalProperties:
+                      format: int32
+                      type: integer
+                    description: |-
+                      enforcedParameterFloor are the source's values for the five settings PostgreSQL
+                      refuses to begin recovery below.
+
+                      Without them a restore into a smaller instance FATALs at start-up with a message that
+                      names the parameter and not the cause, after it has already pulled the whole base
+                      backup down.
+                    type: object
+                  sourceInstanceName:
+                    description: sourceInstanceName is where the repository came from,
+                      recorded for provenance.
+                    maxLength: 253
+                    type: string
+                  stanza:
+                    description: |-
+                      stanza is the repository stanza to restore from. It is named after the source's
+                      system identifier, which a restored instance inherits: a restore copies the control
+                      file verbatim, so this instance will address the same stanza while running on a
+                      forked timeline, and must never archive into it.
+                    maxLength: 128
+                    type: string
+                  target:
+                    description: target is where recovery stops. Omitted replays everything
+                      the archive holds.
+                    properties:
+                      exclusive:
+                        description: |-
+                          exclusive stops just before the named target rather than just after it. It has no
+                          meaning for immediate.
+                        type: boolean
+                      immediate:
+                        description: |-
+                          immediate stops recovery as soon as the backup is consistent, without replaying any
+                          further. It is the fastest restore and it lands at whatever moment the backup ended.
+                        type: boolean
+                      lsn:
+                        description: lsn stops recovery at a write-ahead log position.
+                        maxLength: 64
+                        type: string
+                      name:
+                        description: |-
+                          name stops recovery at a restore point created with pg_create_restore_point.
+
+                          PostgreSQL enforces MAXFNAMELEN on both ends, so a longer name is refused here rather
+                          than silently truncated into one that matches nothing.
+                        maxLength: 63
+                        pattern: ^[^\x00-\x1f\x7f]*$
+                        type: string
+                      time:
+                        description: |-
+                          time stops recovery at the first transaction that committed after this moment.
+
+                          A timestamp with no zone is read as UTC. Recovery fails outright if no transaction
+                          committed after it, which is a surprising way to learn that the target is in the
+                          future.
+                        maxLength: 64
+                        type: string
+                      timeline:
+                        description: |-
+                          timeline selects which history to follow, "latest" or a positive integer.
+
+                          It is not mutually exclusive with the rest: a target time can fall on more than one
+                          timeline once an instance has been restored before, and picking the wrong one lands
+                          on a history that diverged before the moment asked for.
+                        maxLength: 16
+                        pattern: ^(latest|[1-9][0-9]*)$
+                        type: string
+                      xid:
+                        description: |-
+                          xid stops recovery at a transaction id.
+
+                          PostgreSQL casts this to TransactionId, which is 32 bits: a larger value would be
+                          silently truncated into a different transaction, so the pattern refuses one outright.
+                        maxLength: 10
+                        pattern: ^[0-9]+$
+                        type: string
+                    type: object
+                    x-kubernetes-validations:
+                    - message: at most one of time, lsn, name, xid or immediate may
+                        be set
+                      rule: '[has(self.time), has(self.lsn), has(self.name), has(self.xid),
+                        has(self.immediate)].filter(x, x).size() <= 1'
+                required:
+                - stanza
+                type: object
+                x-kubernetes-validations:
+                - message: restore is immutable
+                  rule: self == oldSelf
               storage:
                 description: storage configures the two mandatory PVC roles, PG_DATA
                   and PG_WAL.

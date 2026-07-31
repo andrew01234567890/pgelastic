@@ -130,6 +130,21 @@ func RestoreWAL(ctx context.Context, options Options, name, target string, rewin
 // pg_controldata once per archived segment; caching it turns that into once per Pod, and
 // once more whenever the credentials are rotated.
 func ensureRepository(ctx context.Context, options Options) (pgbackrest.Invocation, bool, error) {
+	return ensureRepositoryForStanza(ctx, options, "")
+}
+
+// ensureRepositoryForStanza is the same, for a caller that already knows the stanza.
+//
+// A restore is the caller that does. The stanza is named after the system identifier, and
+// at restore time the data directory is empty, so there is no control file to read one out
+// of - the stanza has to come from the backup being restored instead. Passing it in also
+// means a restore addresses the source's stanza rather than deriving one from a data
+// directory it is about to overwrite.
+func ensureRepositoryForStanza(
+	ctx context.Context,
+	options Options,
+	stanza string,
+) (pgbackrest.Invocation, bool, error) {
 	repository := options.Config.Backup
 	if repository == nil || !repository.Configured() {
 		return pgbackrest.Invocation{}, false, nil
@@ -141,13 +156,14 @@ func ensureRepository(ctx context.Context, options Options) (pgbackrest.Invocati
 	}
 	fingerprint := repositoryFingerprint(*repository, credentials)
 
-	if stanza, ok := cachedStanza(provision.BackupConfigFile, fingerprint); ok {
+	if cached, ok := cachedStanza(provision.BackupConfigFile, fingerprint); ok &&
+		(stanza == "" || cached == stanza) {
 		return pgbackrest.Invocation{
 			ConfigFile: provision.BackupConfigFile,
-			Stanza:     stanza,
+			Stanza:     cached,
 		}, true, nil
 	}
-	return renderRepository(ctx, options, *repository, credentials, fingerprint)
+	return renderRepository(ctx, options, *repository, credentials, fingerprint, stanza)
 }
 
 // configMarker is the first line of the generated file: the fingerprint of the inputs it
@@ -178,15 +194,18 @@ func renderRepository(
 	options Options,
 	repository pgbackrest.Repository,
 	credentials pgbackrest.Credentials,
-	fingerprint string,
+	fingerprint, stanza string,
 ) (pgbackrest.Invocation, bool, error) {
-	controlData, err := toolchain(options).ControlData(ctx, options.DataDir)
-	if err != nil {
-		return pgbackrest.Invocation{}, false, fmt.Errorf(
-			"the archive stanza is named after the system identifier and this member's "+
-				"control file could not be read: %w", err)
+	restoring := stanza != ""
+	if stanza == "" {
+		controlData, err := toolchain(options).ControlData(ctx, options.DataDir)
+		if err != nil {
+			return pgbackrest.Invocation{}, false, fmt.Errorf(
+				"the archive stanza is named after the system identifier and this member's "+
+					"control file could not be read: %w", err)
+		}
+		stanza = pgbackrest.StanzaName(controlData.SystemIdentifier)
 	}
-	stanza := pgbackrest.StanzaName(controlData.SystemIdentifier)
 
 	layout := pgbackrest.Layout{
 		DataDir:   options.DataDir,
@@ -219,8 +238,15 @@ func renderRepository(
 	// Creating the stanza is safe to repeat: pgBackRest accepts a stanza whose recorded
 	// system identifier matches this one and refuses a stanza that belongs to a different
 	// database, which is the guard against two instances sharing one archive.
-	if _, err := (pgbackrest.Runner{}).Run(ctx, invocation.StanzaCreate()); err != nil {
-		return pgbackrest.Invocation{}, false, err
+	//
+	// It is skipped entirely when a restore supplied the stanza. That stanza belongs to the
+	// source and already exists; running stanza-create against it from a member whose data
+	// directory is empty is at best a no-op and at worst a write into somebody else's
+	// repository from an instance that has no business writing to it at all.
+	if !restoring {
+		if _, err := (pgbackrest.Runner{}).Run(ctx, invocation.StanzaCreate()); err != nil {
+			return pgbackrest.Invocation{}, false, err
+		}
 	}
 	return invocation, true, nil
 }
