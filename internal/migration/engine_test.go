@@ -29,6 +29,9 @@ import (
 
 var frozen = time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
 
+// testDumpDir is where the offline path stages its directory-format dump, on the target.
+const testDumpDir = "/var/lib/postgresql/data/pgelastic-migration/shop_move"
+
 // runningSQL answers every question a healthy online migration asks.
 func runningSQL() *fakeSQL {
 	sql := passingSource()
@@ -144,7 +147,8 @@ func TestOfflineCopyingRunsAParallelDumpAndRestore(t *testing.T) {
 	shell := &fakeShell{}
 	run := testRun(copying, offline)
 	run.Plan.Concurrency = 6
-	run.Plan.DumpDir = "/var/lib/postgresql/data/pgelastic-migration/shop_move"
+	run.Plan.DumpDir = testDumpDir
+	run.Plan.SourceConnInfo = "host=pg-a-rw.default.svc port=5432 user=pgelastic_repl dbname=acme"
 	result := testEngine(runningSQL(), &fakeRouter{}, shell).Step(context.Background(), run)
 	if result.Observation.Fault != nil {
 		t.Fatal(result.Observation.Fault)
@@ -156,6 +160,28 @@ func TestOfflineCopyingRunsAParallelDumpAndRestore(t *testing.T) {
 		if !strings.Contains(commands, want) {
 			t.Fatalf("the offline copy never ran %q: %s", want, commands)
 		}
+	}
+}
+
+// A dump with no source connection string reads the target's own local database.
+//
+// Both commands run inside the target's container, so SourceConnInfo is the only thing that
+// makes the copy a copy of somewhere else. Empty renders an empty --dbname, which libpq
+// treats as "use the defaults" rather than as an error, and the whole thing then succeeds:
+// pg_dump dumps the target and pg_restore loads it back over the top. A tenant restore
+// shipped that way, reported Completed, and restored nothing.
+func TestAnOfflineCopyWithNoSourceIsRefused(t *testing.T) {
+	shell := &fakeShell{}
+	run := testRun(copying, offline)
+	run.Plan.DumpDir = testDumpDir
+	run.Plan.SourceConnInfo = ""
+
+	result := testEngine(runningSQL(), &fakeRouter{}, shell).Step(context.Background(), run)
+	if result.Observation.Fault == nil {
+		t.Fatal("the copy was allowed to run against no source at all")
+	}
+	if commands := shell.joined(); strings.Contains(commands, "pg_dump") {
+		t.Errorf("pg_dump ran anyway: %s", commands)
 	}
 }
 

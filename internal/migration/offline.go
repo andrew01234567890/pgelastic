@@ -40,6 +40,17 @@ const DefaultDumpJobs int32 = 4
 // behind by whatever was written during it and offline has no replication stream to close
 // that gap with.
 func CopyOffline(ctx context.Context, shell Shell, plan Plan) error {
+	// Both commands run in the target's container, so this string is the only thing that
+	// makes the dump a copy of somewhere else. Empty renders --dbname='', which libpq reads
+	// as "use the defaults" rather than as an error: pg_dump then dumps the target's own
+	// local database and pg_restore loads it back over the top, successfully. Refusing here
+	// is what turns that silent wrong answer into a caller's bug.
+	if strings.TrimSpace(plan.SourceConnInfo) == "" {
+		return fmt.Errorf("the offline copy of %s has no source connection string, so pg_dump "+
+			"would read the target's own local database rather than the source",
+			plan.Target.Database)
+	}
+
 	jobs := plan.Concurrency
 	if jobs < 1 {
 		jobs = DefaultDumpJobs

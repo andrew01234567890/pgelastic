@@ -29,6 +29,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 )
 
@@ -91,9 +92,15 @@ func (r *PgRestoreReconciler) reconcileTenantRestore(
 
 	status.Phase = pgelasticv1alpha1.RestorePhaseExtracting
 	if err := r.replaceTenant(ctx, restore, status, tenant, recovery); err != nil {
-		status.Error = err.Error()
+		// Terminal, rather than retried on the requeue. The copy loads with --clean, so a
+		// second attempt drops objects out of a live tenant database that somebody now needs
+		// to look at, and it would do that every fifteen seconds for ever. The recovery
+		// instance is deliberately left standing: it holds the only copy of what the tenant
+		// was supposed to end up containing.
 		log.Error(err, "the tenant could not be replaced from the recovered instance")
-		return restoreRequeue, nil
+		status.Phase = pgelasticv1alpha1.RestorePhaseFailed
+		status.Error = err.Error()
+		return 0, nil
 	}
 
 	// The recovery instance holds every other tenant of the source at the restored moment.
@@ -167,11 +174,38 @@ func (r *PgRestoreReconciler) replaceTenant(
 		return err
 	}
 
+	// SourceConnInfo is the only thing that points pg_dump at the recovered instance. Both
+	// commands run inside the live target's own Pod, so plan.Source addresses nothing on the
+	// offline path: without a connection string libpq falls back to its defaults and dumps
+	// the target's own local database over the top of itself.
+	//
+	// The credential is the recovery instance's, and it works because a restored instance is
+	// given its source's credentials rather than fresh ones - its catalogue is the source's,
+	// copied verbatim by pgbackrest, so nothing else would authenticate.
+	password, err := replicationPassword(ctx, r.Client, restore.Namespace, recovery.Name)
+	if err != nil {
+		return fmt.Errorf("could not read the recovered instance's replication credential: %w", err)
+	}
+
 	plan := migration.Plan{
-		Source:      recovered,
-		Target:      live,
-		Concurrency: migration.DefaultDumpJobs,
-		DumpDir:     filepath.Join(migration.ScratchDir, restore.Namespace+"_"+restore.Name),
+		Source:         recovered,
+		Target:         live,
+		SourceConnInfo: sourceConnInfo(recovery, tenant.Spec.DatabaseName, password),
+		Concurrency:    migration.DefaultDumpJobs,
+		DumpDir:        filepath.Join(migration.ScratchDir, restore.Namespace+"_"+restore.Name),
+	}
+
+	// The replication role can authenticate against the recovered instance and cannot read a
+	// thing on it. A tenant's database revokes PUBLIC and grants CONNECT back to its own roles
+	// and the ops role only, and the recovered copy inherits exactly those grants, so pg_dump
+	// is refused before it reads a row. The migration path issues the same grants before its
+	// own offline copy.
+	//
+	// Nothing revokes them afterwards, unlike a migration: these are granted on the throwaway
+	// recovery instance, which is deleted a few moments later.
+	if err := migration.GrantSourceReads(
+		ctx, r.SQL, recovered, provision.ReplicationRole); err != nil {
+		return fmt.Errorf("could not give the dump read access to the recovered tenant: %w", err)
 	}
 
 	if err := migration.FenceSource(ctx, r.SQL, live); err != nil {

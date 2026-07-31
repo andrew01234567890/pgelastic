@@ -17,12 +17,16 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
@@ -65,6 +69,29 @@ func sourceConnInfo(source *pgelasticv1alpha1.PgInstance, database, password str
 	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s password=%s dbname=%s",
 		provision.PrimaryServiceName(source.Name), source.Namespace, provision.PostgresPort,
 		provision.ReplicationRole, password, database)
+}
+
+// replicationPassword reads an instance's replication credential, which is what the
+// subscriber and pg_dump dial it as. The superuser cannot be used for either: it has no
+// password at all and is reachable only over a Unix socket.
+//
+// It is a free function rather than a method because both a migration and a tenant-scoped
+// restore dial an instance this way, and a restore's source is an instance the restore
+// itself created.
+func replicationPassword(
+	ctx context.Context, reader client.Reader, namespace, instance string,
+) (string, error) {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: namespace, Name: provision.CredentialsSecretName(instance)}
+	if err := reader.Get(ctx, key, secret); err != nil {
+		return "", fmt.Errorf("credentials Secret for %q: %w", instance, err)
+	}
+	password, ok := secret.Data[provision.SecretKeyReplicationPassword]
+	if !ok {
+		return "", fmt.Errorf("the credentials Secret for %q has no %s",
+			instance, provision.SecretKeyReplicationPassword)
+	}
+	return string(password), nil
 }
 
 // preflightInput assembles the gate's inputs. Storage headroom and the tenant's coldness

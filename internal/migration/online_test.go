@@ -38,7 +38,7 @@ const testReader = "shop_reader"
 
 func TestTheSchemaCopyCommitsTheWholeSchemaAndItsStampOrNeither(t *testing.T) {
 	plan := testPlan()
-	plan.DumpDir = "/var/lib/postgresql/data/pgelastic-migration/shop_move"
+	plan.DumpDir = testDumpDir
 	command := schemaCopyCommand(plan, "shop", []RoleSpec{{Name: testReader}})
 
 	if !strings.Contains(command, "--single-transaction") {
