@@ -37,6 +37,9 @@ const (
 	credentialNamespace = "shop"
 	sourceInstanceName  = "pg-a"
 	sourcePassword      = "the-password-the-catalogue-was-backed-up-with"
+	backupName          = "friday"
+	repositoryPath      = "/pgelastic"
+	objectStoreSecret   = "object-store-credentials"
 )
 
 func credentialScheme(t *testing.T) *runtime.Scheme {
@@ -150,7 +153,7 @@ func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
 	scheme := credentialScheme(t)
 	stopped := metav1.NewTime(time.Date(2026, 8, 1, 2, 0, 0, 0, time.UTC))
 	backup := &pgelasticv1alpha1.PgBackup{
-		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "friday"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: backupName},
 		Spec: pgelasticv1alpha1.PgBackupSpec{
 			InstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
 		},
@@ -161,7 +164,7 @@ func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
 			BackupID:  "20260801-020000F",
 			// What the agent records: where, and nothing about what to authenticate with.
 			Repository: &pgelasticv1alpha1.ObjectStore{
-				Path:        "/pgelastic",
+				Path:        repositoryPath,
 				EndpointURL: "objectstore.shop.svc",
 				Region:      "us-east-1",
 			},
@@ -172,9 +175,9 @@ func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
 		Spec: pgelasticv1alpha1.PgInstanceSpec{
 			Backup: &pgelasticv1alpha1.InstanceBackup{
 				ObjectStore: pgelasticv1alpha1.ObjectStore{
-					Path: "/pgelastic",
+					Path: repositoryPath,
 					CredentialsSecretRef: corev1.LocalObjectReference{
-						Name: "object-store-credentials",
+						Name: objectStoreSecret,
 					},
 				},
 			},
@@ -184,7 +187,7 @@ func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-it-back"},
 		Spec: pgelasticv1alpha1.PgRestoreSpec{
 			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
-			BackupRef:         &corev1.LocalObjectReference{Name: "friday"},
+			BackupRef:         &corev1.LocalObjectReference{Name: backupName},
 		},
 	}
 
@@ -199,7 +202,7 @@ func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("refused: %s", reason)
 	}
-	if got := plan.Spec.Backup.ObjectStore.CredentialsSecretRef.Name; got != "object-store-credentials" {
+	if got := plan.Spec.Backup.ObjectStore.CredentialsSecretRef.Name; got != objectStoreSecret {
 		t.Errorf("credentialsSecretRef = %q, want the source's; without it the recovered "+
 			"instance cannot authenticate to the repository it is told to read", got)
 	}
@@ -217,7 +220,7 @@ func TestARestoreWithNoObjectStoreCredentialsIsRefused(t *testing.T) {
 	scheme := credentialScheme(t)
 	stopped := metav1.NewTime(time.Date(2026, 8, 1, 2, 0, 0, 0, time.UTC))
 	backup := &pgelasticv1alpha1.PgBackup{
-		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "friday"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: backupName},
 		Spec: pgelasticv1alpha1.PgBackupSpec{
 			InstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
 		},
@@ -225,14 +228,14 @@ func TestARestoreWithNoObjectStoreCredentialsIsRefused(t *testing.T) {
 			Phase:      pgelasticv1alpha1.BackupPhaseCompleted,
 			StoppedAt:  &stopped,
 			Stanza:     "pgelastic-7668815305197002786",
-			Repository: &pgelasticv1alpha1.ObjectStore{Path: "/pgelastic"},
+			Repository: &pgelasticv1alpha1.ObjectStore{Path: repositoryPath},
 		},
 	}
 	source := &pgelasticv1alpha1.PgInstance{
 		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: sourceInstanceName},
 		Spec: pgelasticv1alpha1.PgInstanceSpec{
 			Backup: &pgelasticv1alpha1.InstanceBackup{
-				ObjectStore: pgelasticv1alpha1.ObjectStore{Path: "/pgelastic"},
+				ObjectStore: pgelasticv1alpha1.ObjectStore{Path: repositoryPath},
 			},
 		},
 	}
@@ -240,7 +243,7 @@ func TestARestoreWithNoObjectStoreCredentialsIsRefused(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-it-back"},
 		Spec: pgelasticv1alpha1.PgRestoreSpec{
 			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
-			BackupRef:         &corev1.LocalObjectReference{Name: "friday"},
+			BackupRef:         &corev1.LocalObjectReference{Name: backupName},
 		},
 	}
 
