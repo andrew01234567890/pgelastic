@@ -38,7 +38,9 @@ async fn main() -> Result<()> {
     // is already taken fails at start-up rather than passing a readiness probe
     // nobody can reach.
     let metrics_listener = match &config.metrics.address {
-        Some(address) => Some(tokio::net::TcpListener::bind(config::resolve(address)?).await?),
+        Some(address) => {
+            Some(tokio::net::TcpListener::bind(config::resolve(address).await?).await?)
+        }
         None => None,
     };
 

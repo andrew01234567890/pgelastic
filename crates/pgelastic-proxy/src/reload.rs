@@ -106,7 +106,7 @@ impl Reloader {
         for instance in self.fleet.instances() {
             claims += instance.pools.apply_tenants(&next.pool.tenants);
         }
-        self.fleet.publish_budget();
+        self.fleet.publish_budget_now();
         self.applied.clone_from(&next.config_version);
         self.metrics.config_applied(&next.config_version);
         Applied {

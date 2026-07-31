@@ -308,6 +308,143 @@ verify-check: build-verify ## Check an existing ledger against VERIFY_DSN withou
 test-verify: ## Run the durability oracle's own tests. Needs a container runtime for the integration specs.
 	go test ./cmd/verify/... ./internal/verify/...
 
+##@ Benchmark
+
+# The proxy benchmark. Its purpose is to decide, on evidence, whether the data plane should
+# be rewritten in Go, so every part of it is arranged to make a flattering number hard to
+# produce: the thresholds are committed constants (internal/bench/criteria.go), the machine
+# is recorded in every result file, and a cell whose repetitions do not agree is reported as
+# INCONCLUSIVE rather than resolved.
+#
+# The three components share one user-defined Docker bridge rather than published ports.
+# Under WSL2 there is no docker0 and every published port crosses a userspace relay, whose
+# cost is multiplied by the number of backend round trips - and the arms deliberately differ
+# in round-trip count, so it would not cancel out in a delta.
+BENCH_NETWORK ?= pgebench
+BENCH_PG_NAME ?= pgebench-pg
+BENCH_PG_IMG ?= postgres:18
+BENCH_PG_PORT ?= 15432
+BENCH_DIR ?= docs/bench
+
+# The core budget is expressed in physical cores and mapped onto SMT pairs. The proxy never
+# shares a pair with anything else; the load generator may share with PostgreSQL, and that
+# is recorded rather than hidden.
+BENCH_PG_CPUS ?= 0-5,16-21
+BENCH_PROXY_CPUS ?= 6-9,22-25
+BENCH_LOADGEN_CPUS ?= 10-13,26-29
+
+BENCH_WORKLOAD ?= throughput
+BENCH_CONCURRENCY ?= 1,8,64,256
+BENCH_DURATION ?= 120s
+BENCH_WARMUP ?= 30s
+BENCH_REPETITIONS ?= 5
+BENCH_RATE ?= 0
+BENCH_METRIC ?= throughput
+BENCH_DSN ?= postgres://bench:bench@localhost:$(BENCH_PG_PORT)/bench?sslmode=disable
+
+.PHONY: build-bench
+build-bench: ## Build the benchmark driver.
+	go build -trimpath -o bin/pgebench ./test/bench/cmd/pgebench
+
+.PHONY: bench-doctor
+bench-doctor: build-bench ## Report what this machine is and which axes it can decide.
+	bin/pgebench doctor
+
+# fsync and synchronous_commit are off because every workload here is select-only: leaving
+# them on would measure the disk rather than the proxy. shared_buffers is sized so the
+# working set is served from memory, for the same reason.
+.PHONY: bench-stack-up
+bench-stack-up: ## Start the pinned PostgreSQL the benchmark measures against.
+	-docker network create $(BENCH_NETWORK)
+	-docker rm -f $(BENCH_PG_NAME)
+	docker run -d --name $(BENCH_PG_NAME) --network $(BENCH_NETWORK) \
+		--cpuset-cpus $(BENCH_PG_CPUS) --memory 4g \
+		-e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
+		-p $(BENCH_PG_PORT):5432 $(BENCH_PG_IMG) \
+		-c shared_buffers=2GB -c max_connections=1000 \
+		-c fsync=off -c synchronous_commit=off -c log_min_messages=fatal
+	@until docker exec $(BENCH_PG_NAME) pg_isready -U bench >/dev/null 2>&1; do sleep 1; done
+	@echo "postgres ready on port $(BENCH_PG_PORT), pinned to $(BENCH_PG_CPUS)"
+
+.PHONY: bench-stack-down
+bench-stack-down: ## Stop the benchmark's PostgreSQL.
+	-docker rm -f $(BENCH_PG_NAME)
+
+# The no-proxy baseline is not optional. Almost all of a query's latency is PostgreSQL, so
+# without it the two proxy numbers are a ratio between two unknowns.
+.PHONY: bench-baseline
+bench-baseline: build-bench ## Measure PostgreSQL with no proxy in front of it.
+	@mkdir -p $(BENCH_DIR)
+	taskset -c $(BENCH_LOADGEN_CPUS) bin/pgebench run \
+		--target direct --dsn "$(BENCH_DSN)" \
+		--workload $(BENCH_WORKLOAD) --concurrency $(BENCH_CONCURRENCY) \
+		--duration $(BENCH_DURATION) --warmup $(BENCH_WARMUP) \
+		--repetitions $(BENCH_REPETITIONS) --rate $(BENCH_RATE) \
+		--out $(BENCH_DIR)/direct-$(BENCH_WORKLOAD).json
+
+.PHONY: bench-rust
+bench-rust: build-bench ## Measure the Rust proxy. BENCH_DSN must point at it.
+	@mkdir -p $(BENCH_DIR)
+	taskset -c $(BENCH_LOADGEN_CPUS) bin/pgebench run \
+		--target rust --dsn "$(BENCH_DSN)" \
+		--workload $(BENCH_WORKLOAD) --concurrency $(BENCH_CONCURRENCY) \
+		--duration $(BENCH_DURATION) --warmup $(BENCH_WARMUP) \
+		--repetitions $(BENCH_REPETITIONS) --rate $(BENCH_RATE) \
+		--out $(BENCH_DIR)/rust-$(BENCH_WORKLOAD).json
+
+.PHONY: bench-go
+bench-go: build-bench ## Measure the Go proxy. BENCH_DSN must point at it.
+	@mkdir -p $(BENCH_DIR)
+	taskset -c $(BENCH_LOADGEN_CPUS) bin/pgebench run \
+		--target go --dsn "$(BENCH_DSN)" \
+		--workload $(BENCH_WORKLOAD) --concurrency $(BENCH_CONCURRENCY) \
+		--duration $(BENCH_DURATION) --warmup $(BENCH_WARMUP) \
+		--repetitions $(BENCH_REPETITIONS) --rate $(BENCH_RATE) \
+		--out $(BENCH_DIR)/go-$(BENCH_WORKLOAD).json
+
+# Separate from the runs so a verdict can be recomputed from stored reports without
+# re-measuring, and so re-measuring cannot quietly move a threshold. Exits 1 on any FAIL.
+#
+# Only the arms that were actually measured are passed. Before the Go proxy exists this
+# produces the pgbouncer reference rows and no verdict, which is the correct output for a
+# question that cannot be answered yet rather than an error.
+.PHONY: bench-report
+bench-report: build-bench ## Apply the pre-registered criteria to whichever reports exist.
+	@bin/pgebench compare \
+		--direct $(BENCH_DIR)/direct-$(BENCH_WORKLOAD).json \
+		$(if $(wildcard $(BENCH_DIR)/rust-$(BENCH_WORKLOAD).json),--rust $(BENCH_DIR)/rust-$(BENCH_WORKLOAD).json) \
+		$(if $(wildcard $(BENCH_DIR)/go-$(BENCH_WORKLOAD).json),--go $(BENCH_DIR)/go-$(BENCH_WORKLOAD).json) \
+		$(if $(wildcard $(BENCH_DIR)/pgbouncer-$(BENCH_WORKLOAD).json),--pgbouncer $(BENCH_DIR)/pgbouncer-$(BENCH_WORKLOAD).json)
+
+.PHONY: bench-table
+bench-table: build-bench ## Render the stored reports as a markdown table, one column per arm.
+	@bin/pgebench table --dir $(BENCH_DIR) --workload $(BENCH_WORKLOAD) \
+		--metric $(BENCH_METRIC) --arms "$(subst $(BENCH_SPACE),$(BENCH_COMMA),$(strip $(BENCH_ARMS)))"
+
+# One arm at a time, because two arms sharing the cores would measure the contention rather
+# than either arm. Each arm waits for readiness - /readyz for the proxy, a real query for
+# pgbouncer, which has no health endpoint - rather than sleeping a guessed interval.
+#
+# ARMS selects which to run, e.g. ARMS=pgbouncer make bench-arms.
+BENCH_ARMS ?= direct rust rust-fence-on rust-session rust-1worker pgbouncer
+
+# bench-table wants the arm list comma-separated; the scripts want it space-separated.
+BENCH_COMMA := ,
+BENCH_EMPTY :=
+BENCH_SPACE := $(BENCH_EMPTY) $(BENCH_EMPTY)
+
+.PHONY: bench-arms
+bench-arms: bench-stack-up docker-build-proxy ## Run the benchmark arms and write one report per arm and workload.
+	ARMS="$(BENCH_ARMS)" ./test/bench/run-arms.sh
+
+.PHONY: bench-proxy-down
+bench-proxy-down: ## Stop the benchmark's poolers.
+	-docker rm -f pgebench-proxy pgebench-pgbouncer
+
+.PHONY: test-bench
+test-bench: ## Run the harness's own tests. Needs a container runtime for the driver specs.
+	go test ./internal/bench/...
+
 ##@ Build
 
 .PHONY: build

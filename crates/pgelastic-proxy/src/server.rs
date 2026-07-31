@@ -166,7 +166,7 @@ impl Running {
 
 /// Binds the listener and starts accepting.
 pub async fn spawn(proxy: Arc<Proxy>, shutdown: watch::Sender<bool>) -> Result<Running> {
-    let addr = crate::config::resolve(&proxy.config.listen.address)?;
+    let addr = crate::config::resolve(&proxy.config.listen.address).await?;
     let listener = TcpListener::bind(addr).await?;
     let address = listener.local_addr()?;
     let drain_timeout = proxy.config.drain.shutdown_timeout();
@@ -225,7 +225,7 @@ async fn spawn_fence_paths(
     let default = proxy.fleet.default_instance();
     let mut push_address = None;
     if let Some(address) = &proxy.config.fence.push_address {
-        let listener = TcpListener::bind(crate::config::resolve(address)?).await?;
+        let listener = TcpListener::bind(crate::config::resolve(address).await?).await?;
         let bound = listener.local_addr()?;
         info!(address = %bound, "epoch push endpoint listening");
         push_address = Some(bound);
@@ -296,7 +296,7 @@ async fn spawn_availability_paths(
                 ProxyError::config("control.address is set but control.tls is not")
             })?;
         let authority = crate::tls::ControlAuthority::new(tls)?;
-        let listener = TcpListener::bind(crate::config::resolve(address)?).await?;
+        let listener = TcpListener::bind(crate::config::resolve(address).await?).await?;
         let bound = listener.local_addr()?;
         info!(
             address = %bound,
@@ -541,7 +541,9 @@ async fn serve(
         &proxy.backend_for(&instance, &tenant)?,
         &session.startup,
         &tenant,
-    ) {
+    )
+    .await
+    {
         Ok(key) => key,
         Err(error) => {
             proxy.metrics.client_rejected(RejectReason::Handshake);
@@ -734,7 +736,7 @@ async fn relay(
     let token = CancelToken::mint(proxy.config.routing.cancel_routing_id)?;
     let route = CancelRoute::new();
     route.set(Some(crate::cancel::CancelTarget {
-        address: instance.backend.address.clone(),
+        address: std::sync::Arc::from(instance.backend.address.as_str()),
         key_data: link.key_data.clone(),
         instance: instance.id.clone(),
         // Session mode: the client owns its one backend for life and takes
@@ -804,7 +806,7 @@ async fn multiplexed(
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let gate = proxy.quiesce.gate(tenant);
-    let binding = crate::txn::Binding::open(proxy, &session.startup, tenant)?;
+    let binding = crate::txn::Binding::open(proxy, &session.startup, tenant).await?;
 
     // The greeting is the first link's `ParameterStatus` set, cached per pool
     // key: a client that arrives twentieth must not have to hold a backend just

@@ -1,0 +1,8 @@
+; Plaintext rather than a stored verifier, deliberately.
+;
+; With auth_type = scram-sha-256, a verifier in this file would let pgbouncer authenticate a
+; client and then leave it unable to authenticate to PostgreSQL, because the server leg needs
+; something it can prove a password with. Holding the password is also what our own proxy
+; does for the backend leg ([backend] password in txn-fence-off.toml), so this keeps the two
+; arms doing the same amount of cryptography rather than accidentally giving one a shortcut.
+"bench" "bench"

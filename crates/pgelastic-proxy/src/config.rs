@@ -1089,10 +1089,15 @@ fn default_max_frame_bytes() -> usize {
 
 /// Resolves a `host:port` string, preferring the first IPv4 answer so a
 /// container-mapped `localhost` port does not silently resolve to `::1`.
-pub fn resolve(address: &str) -> Result<SocketAddr> {
-    use std::net::ToSocketAddrs;
-    let mut resolved = address
-        .to_socket_addrs()
+///
+/// Async because the blocking resolver parks a whole runtime worker for the
+/// length of a DNS lookup, and the operator starts this process with two of
+/// them (`TOKIO_WORKER_THREADS`, `internal/proxy/objects.go`). One slow answer
+/// would take half the proxy's ability to make progress with it, on a path that
+/// runs once per backend connect.
+pub async fn resolve(address: &str) -> Result<SocketAddr> {
+    let mut resolved = tokio::net::lookup_host(address)
+        .await
         .map_err(|e| ProxyError::config(format!("resolving {address}: {e}")))?
         .collect::<Vec<_>>();
     resolved.sort_by_key(|a| u8::from(a.is_ipv6()));
@@ -1477,9 +1482,9 @@ mod tests {
         assert!(config.reload.report_to_pod);
     }
 
-    #[test]
-    fn resolve_prefers_ipv4() {
-        let addr = resolve("localhost:5432").unwrap();
+    #[tokio::test]
+    async fn resolve_prefers_ipv4() {
+        let addr = resolve("localhost:5432").await.unwrap();
         assert!(addr.is_ipv4() || addr.is_ipv6());
         assert_eq!(addr.port(), 5432);
     }

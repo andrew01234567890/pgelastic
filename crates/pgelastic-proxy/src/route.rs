@@ -18,9 +18,10 @@
 //! is queued behind a quiesce resumes against whichever instance the table names
 //! when it is released — which is the entire point of `setRoute`.
 
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::config::{BackendConfig, Config, DEFAULT_INSTANCE, PoolConfig};
 use crate::epoch::FenceRuntime;
@@ -76,7 +77,14 @@ pub struct Fleet {
     instances: HashMap<InstanceId, Arc<Instance>>,
     order: Vec<InstanceId>,
     default: InstanceId,
-    routes: Mutex<HashMap<String, InstanceId>>,
+    /// The tenant-to-instance table, read at every checkout and written only by a cutover or
+    /// a configuration reload.
+    ///
+    /// `ArcSwap` rather than a `Mutex` because the ratio between those two is enormous: a
+    /// mutex here put a contended acquisition on the hot path of every transaction, on both
+    /// runtime workers, to read a map that changes a few times a day. Readers now take a
+    /// pointer; writers build a new map and swap it.
+    routes: ArcSwap<HashMap<String, InstanceId>>,
     metrics: Arc<Metrics>,
 }
 
@@ -124,7 +132,7 @@ impl Fleet {
             let fence = FenceRuntime::from(&config.fence);
             let pools =
                 PoolManager::new(id.clone(), pool_config, fence.clone(), Arc::clone(metrics))?;
-            pools.publish_budget();
+            pools.publish_budget_now();
             let stall = StallMonitor::new(
                 id.clone(),
                 config.stall.confirmations,
@@ -160,7 +168,7 @@ impl Fleet {
             instances,
             order,
             default,
-            routes: Mutex::new(routes),
+            routes: ArcSwap::from_pointee(routes),
             metrics: Arc::clone(metrics),
         }))
     }
@@ -187,8 +195,7 @@ impl Fleet {
     pub fn route(&self, tenant: &str) -> Arc<Instance> {
         let id = self
             .routes
-            .lock()
-            .expect("the routing table is never poisoned")
+            .load()
             .get(tenant)
             .cloned()
             .unwrap_or_else(|| self.default.clone());
@@ -220,10 +227,7 @@ impl Fleet {
             return Vec::new();
         }
         let default_is_target = &self.default == instance;
-        let routes = self
-            .routes
-            .lock()
-            .expect("the routing table is never poisoned");
+        let routes = self.routes.load();
         let mut on = Vec::new();
         for tenant in known {
             let here = match routes.get(tenant) {
@@ -248,11 +252,11 @@ impl Fleet {
         if !self.instances.contains_key(instance) {
             return None;
         }
-        let previous = self
-            .routes
-            .lock()
-            .expect("the routing table is never poisoned")
-            .insert(tenant.to_owned(), instance.clone());
+        // Read-copy-update: a cutover happens on the order of once per migration, so paying
+        // for a whole new map here is what buys the lock-free read on every checkout.
+        let mut next = HashMap::clone(&self.routes.load());
+        let previous = next.insert(tenant.to_owned(), instance.clone());
+        self.routes.store(Arc::new(next));
         self.metrics.tenant_rerouted();
         Some(previous.unwrap_or_else(|| self.default.clone()))
     }
@@ -283,11 +287,8 @@ impl Fleet {
             }
         }
 
-        let mut current = self
-            .routes
-            .lock()
-            .expect("the routing table is never poisoned");
-        if *current == wanted {
+        let current = self.routes.load();
+        if **current == wanted {
             return 0;
         }
         let changed = wanted
@@ -298,8 +299,8 @@ impl Fleet {
                 .keys()
                 .filter(|tenant| !wanted.contains_key(*tenant))
                 .count();
-        *current = wanted;
         drop(current);
+        self.routes.store(Arc::new(wanted));
         for _ in 0..changed {
             self.metrics.tenant_rerouted();
         }
@@ -307,9 +308,9 @@ impl Fleet {
     }
 
     /// Refreshes every instance's budget gauge.
-    pub fn publish_budget(&self) {
+    pub fn publish_budget_now(&self) {
         for instance in self.instances() {
-            instance.pools.publish_budget();
+            instance.pools.publish_budget_now();
         }
     }
 }

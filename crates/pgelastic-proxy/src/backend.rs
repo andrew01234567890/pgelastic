@@ -29,7 +29,7 @@ pub async fn connect_socket(
     tls: Option<&BackendTls>,
     connect_timeout: Duration,
 ) -> Result<BackendStream> {
-    let addr = crate::config::resolve(address)?;
+    let addr = crate::config::resolve(address).await?;
     let socket = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| ProxyError::Timeout(connect_timeout))??;
