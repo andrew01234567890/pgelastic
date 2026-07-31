@@ -81,6 +81,40 @@ func (i Invocation) ArchiveGet(name, destination string, prefetch bool) Command 
 // Info reports the repository catalogue for this stanza as JSON.
 func (i Invocation) Info() Command { return i.command("--output=json", "info") }
 
+// BackupAnnotation ties a repository object back to the PgBackup that asked for it.
+const BackupAnnotation = "pgelastic-backup"
+
+// Backup takes one physical backup.
+//
+// The annotation ties the repository object back to the PgBackup that asked for it, so the
+// repository stays self-describing when the Kubernetes objects are gone - which is the case
+// a backup exists for.
+func (i Invocation) Backup(kind BackupType, name string) Command {
+	return i.command("backup",
+		"--type="+string(kind),
+		"--annotation="+BackupAnnotation+"="+name,
+	)
+}
+
+// Expire applies the retention policy configured for the stanza.
+//
+// It is a command of its own rather than a flag on backup because it has to be able to run
+// when no backup is being taken: a repository whose instance stopped backing up would
+// otherwise keep everything forever, and the storage bill is the first anybody hears of it.
+func (i Invocation) Expire() Command { return i.command("expire") }
+
+// BackupType is what pgBackRest calls the three kinds on the command line.
+type BackupType string
+
+const (
+	// BackupFull stands alone.
+	BackupFull BackupType = "full"
+	// BackupDifferential is relative to the last full.
+	BackupDifferential BackupType = "diff"
+	// BackupIncremental is relative to the last backup of any type.
+	BackupIncremental BackupType = "incr"
+)
+
 // Runner executes pgBackRest.
 type Runner struct {
 	// Binary is the executable, resolved from PATH when empty.

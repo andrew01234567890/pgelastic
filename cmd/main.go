@@ -309,6 +309,17 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgtenantmigration")
 		os.Exit(1)
 	}
+	// The backup controller reports on backups and never takes one: a backup runs inside the
+	// member's Pod, claimed by that member's own agent, which is what keeps this operator's
+	// ServiceAccount free of pods/exec.
+	if err := (&controller.PgBackupReconciler{
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		ControllerName: controllerName,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "pgbackup")
+		os.Exit(1)
+	}
 	if err := mgr.Add(&controller.MigrationSweeper{
 		Client:         mgr.GetClient(),
 		SQL:            migrationSQL,

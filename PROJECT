@@ -70,4 +70,13 @@ resources:
   kind: PgTenantMigration
   path: github.com/andrew01234567890/pgelastic/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: io
+  group: pgelastic
+  kind: PgBackup
+  path: github.com/andrew01234567890/pgelastic/api/v1alpha1
+  version: v1alpha1
 version: "3"

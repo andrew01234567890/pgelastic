@@ -101,6 +101,7 @@ rules:
 - apiGroups:
   - pgelastic.io
   resources:
+  - pgbackups
   - pgelasticclasses
   - pgelasticpools
   - pginstances
@@ -118,17 +119,7 @@ rules:
 - apiGroups:
   - pgelastic.io
   resources:
-  - pgelasticclasses/finalizers
-  - pgelasticpools/finalizers
-  - pginstances/finalizers
-  - pgtenantmigrations/finalizers
-  - pgtenants/finalizers
-  - pgworkloadclasses/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - pgelastic.io
-  resources:
+  - pgbackups/status
   - pgelasticclasses/status
   - pgelasticpools/status
   - pginstances/status
@@ -139,6 +130,17 @@ rules:
   verbs:
   - get
   - patch
+  - update
+- apiGroups:
+  - pgelastic.io
+  resources:
+  - pgelasticclasses/finalizers
+  - pgelasticpools/finalizers
+  - pginstances/finalizers
+  - pgtenantmigrations/finalizers
+  - pgtenants/finalizers
+  - pgworkloadclasses/finalizers
+  verbs:
   - update
 - apiGroups:
   - pgelastic.io

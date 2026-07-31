@@ -577,6 +577,15 @@ type PgInstanceStatus struct {
 	// +optional
 	CollationContract *CollationContract `json:"collationContract,omitempty"`
 
+	// pendingBackup names the backup a member has been asked to take, and which member.
+	//
+	// The operator elects; the member's own agent acts. That split is the same one
+	// targetPrimary encodes, and for the same reason: the agent already reads this object
+	// on every observe tick, so an election costs no new watch and no new transport, and
+	// the operator never runs anything inside a Pod.
+	// +optional
+	PendingBackup *PendingBackup `json:"pendingBackup,omitempty"`
+
 	// lastBackup summarises the most recent successful physical backup.
 	// +optional
 	LastBackup *BackupSummary `json:"lastBackup,omitempty"`
@@ -615,6 +624,17 @@ type InstanceMemberStatus struct {
 	// +kubebuilder:default=unknown
 	// +optional
 	Role InstanceRole `json:"role,omitempty"`
+
+	// agentSession identifies the instance manager process currently running on this
+	// member. It changes on every agent start, including a container restart in place.
+	//
+	// It is published so that work a member claimed can be told apart from work nobody is
+	// doing any more: a backup runs as a goroutine inside a process that can die, and
+	// without this a backup left Running by a dead agent is indistinguishable from one
+	// still in progress.
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	AgentSession string `json:"agentSession,omitempty"`
 
 	// lsn is the member's latest WAL position.
 	// +kubebuilder:validation:MaxLength=32
@@ -852,6 +872,28 @@ type RestoreRehearsalSummary struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	DurationSeconds int64 `json:"durationSeconds,omitempty"`
+}
+
+// PendingBackup is the operator's election of a member to take a named backup.
+//
+// It is a command carried in status, which is unusual and deliberate: targetPrimary is the
+// same shape, and for the same reason. The agent is the only thing that may act inside its
+// own Pod, and this object is the only channel it already reads.
+type PendingBackup struct {
+	// name is the PgBackup in this namespace.
+	// +kubebuilder:validation:MaxLength=253
+	// +required
+	Name string `json:"name"`
+
+	// member is the Pod elected to take it. Only that member acts on this.
+	// +kubebuilder:validation:MaxLength=253
+	// +required
+	Member string `json:"member"`
+
+	// requestedAt is when the election was made, so a member that never claims one can be
+	// distinguished from one that has only just been asked.
+	// +required
+	RequestedAt metav1.Time `json:"requestedAt"`
 }
 
 // ArchiveHealthStatus reports WAL archiving, assembled from three inputs because none is

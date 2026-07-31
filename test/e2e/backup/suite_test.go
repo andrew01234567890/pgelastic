@@ -16,13 +16,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package backup holds the end-to-end proof that WAL actually reaches an object store.
+// Package backup holds the end-to-end proof that WAL and base backups actually reach an
+// object store.
 //
 // It is gated behind the e2e build tag and runs against a real kind cluster with a real
 // S3-compatible store, because the claim it exists to check cannot be made anywhere else.
 // A unit test can assert that the right command line was built; only this can assert that
-// the bytes arrived, and that they can be read back out again - which is the only property
-// an archive has that anybody cares about.
+// the bytes arrived, that they can be read back out again, and that what the API says about
+// a backup matches what the repository holds - which is the only property a backup has that
+// anybody cares about.
 package backup
 
 import (
@@ -49,6 +51,7 @@ import (
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/controller"
+	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 )
 
@@ -155,7 +158,7 @@ var (
 
 func TestBackupE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "WAL archiving e2e")
+	RunSpecs(t, "WAL archiving and physical backup e2e")
 }
 
 var _ = BeforeSuite(func() {
@@ -175,6 +178,10 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).NotTo(HaveOccurred())
 
+	// The instance reconciler lists an instance's backups through a field index, so the
+	// index has to exist before it runs.
+	Expect(index.Setup(suiteCtx, manager.GetFieldIndexer())).To(Succeed())
+
 	Expect((&controller.PgInstanceReconciler{
 		Client:        manager.GetClient(),
 		Scheme:        manager.GetScheme(),
@@ -186,6 +193,12 @@ var _ = BeforeSuite(func() {
 		PeerSources:    []string{"all"},
 		ProxySources:   []string{"all"},
 		Prober:         kubectlProber{},
+		ControllerName: suiteControllerName,
+	}).SetupWithManager(manager)).To(Succeed())
+
+	Expect((&controller.PgBackupReconciler{
+		Client:         manager.GetClient(),
+		Scheme:         manager.GetScheme(),
 		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 

@@ -269,7 +269,7 @@ func certManagerObject(
 }
 
 func issuerRef(name string) map[string]any {
-	return map[string]any{"name": name, "kind": "Issuer", "group": certManagerGroup}
+	return map[string]any{fieldName: name, "kind": "Issuer", "group": certManagerGroup}
 }
 
 func (r *PgElasticPoolReconciler) applyProxyObject(

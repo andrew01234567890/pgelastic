@@ -39,6 +39,10 @@ const (
 	// PoolByDefaultWorkloadClass indexes PgElasticPool on the workload class its
 	// tenants inherit when they name none.
 	PoolByDefaultWorkloadClass = "spec.admission.defaultWorkloadClassName"
+	// BackupByInstance indexes PgBackup on the instance it was taken from. A backup
+	// deliberately outlives its instance, so this index can name an instance that no
+	// longer exists - which is the case a backup exists for.
+	BackupByInstance = "spec.instanceRef.name"
 )
 
 // Setup registers every pgelastic field index on a cache's indexer.
@@ -61,6 +65,17 @@ func Setup(ctx context.Context, indexer client.FieldIndexer) error {
 				return nil
 			}
 			return []string{*tenant.Spec.WorkloadClassName}
+		}); err != nil {
+		return err
+	}
+
+	if err := indexer.IndexField(ctx, &pgelasticv1alpha1.PgBackup{}, BackupByInstance,
+		func(object client.Object) []string {
+			backup, ok := object.(*pgelasticv1alpha1.PgBackup)
+			if !ok || backup.Spec.InstanceRef.Name == "" {
+				return nil
+			}
+			return []string{backup.Spec.InstanceRef.Name}
 		}); err != nil {
 		return err
 	}

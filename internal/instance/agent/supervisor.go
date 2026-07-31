@@ -170,6 +170,12 @@ type Supervisor struct {
 	// spent on, so a parameter that reports pending_restart forever costs one restart
 	// rather than an endless loop of them.
 	restartedFor map[string]bool
+	// session identifies this agent process, and dies with it. It is what lets the operator
+	// tell a backup still being taken from one whose taker no longer exists.
+	session string
+	// backingUp admits one backup at a time. A backup outlives by minutes to hours the
+	// observe tick that started it, so without this every tick would start another.
+	backingUp bool
 	// heldPosition is the last position this member was seen holding, and strandedSince is
 	// when it stopped moving while a primary that is not this member existed. Divergence is
 	// only ever evaluated once that has held for divergenceGrace, because a standby between
@@ -194,6 +200,7 @@ func NewSupervisor(options Options) *Supervisor {
 		},
 		state:        ProbeState{Role: RoleUnknown},
 		restartedFor: map[string]bool{},
+		session:      NewSession(),
 	}
 }
 
@@ -549,6 +556,7 @@ func (s *Supervisor) observe(ctx context.Context) {
 	s.requestRestartIfPending(ctx, observation, instance)
 	s.report(ctx, observation)
 	s.publishPrimaryState(ctx, instance, observation, contract)
+	s.reconcileBackup(ctx, instance, observation)
 	s.reconcileRole(ctx, observation, instance)
 }
 
@@ -655,6 +663,7 @@ func (s *Supervisor) reporter() Reporter {
 		Namespace: s.options.Namespace,
 		Instance:  s.options.Instance,
 		Member:    s.options.Member,
+		Session:   s.session,
 	}
 }
 
