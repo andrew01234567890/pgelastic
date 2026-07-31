@@ -17,6 +17,9 @@ limitations under the License.
 package proxy
 
 import (
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -489,6 +492,60 @@ func TestEveryResetModeRendersTheOneItNames(t *testing.T) {
 	if got := resetPolicy(nil); got != resetPolicyDirtyTracked {
 		t.Errorf("an absent pooling block rendered %q, want dirtyTracked", got)
 	}
+}
+
+// The rendered default and the CRD default have to agree, because whether the API server or
+// this code supplies the value depends on whether the pooling block exists at all. They
+// disagreeing means the same pool is configured two ways depending on how it was written.
+//
+// The number itself matters more than it used to. Until the statement cache could outlive a
+// transaction it was wiped on every release, so no plan was ever held and the limit was never
+// reached; it is reached now, per link, and 1000 across 100 backends is 100,000 plans resident
+// in PostgreSQL.
+func TestThePreparedStatementLimitMatchesTheCrdDefault(t *testing.T) {
+	if got := preparedStatementsLimit(nil); got != defaultPreparedStatementsLimit {
+		t.Errorf("an absent pooling block rendered %d, want %d", got, defaultPreparedStatementsLimit)
+	}
+	if got := preparedStatementsLimit(&pgelasticv1alpha1.PoolingConfig{}); got != defaultPreparedStatementsLimit {
+		t.Errorf("an empty pooling block rendered %d, want %d", got, defaultPreparedStatementsLimit)
+	}
+
+	crd := crdDefaultFor(t, "preparedStatementsLimit")
+	if crd != int64(defaultPreparedStatementsLimit) {
+		t.Errorf("the CRD defaults preparedStatementsLimit to %d and this code to %d; a pool "+
+			"written with a pooling block and one written without would be configured "+
+			"differently", crd, defaultPreparedStatementsLimit)
+	}
+
+	// An explicit value is still honoured, or the cap could not be raised for a workload that
+	// genuinely needs it.
+	asked := int32(4096)
+	if got := preparedStatementsLimit(&pgelasticv1alpha1.PoolingConfig{
+		PreparedStatementsLimit: &asked,
+	}); got != asked {
+		t.Errorf("an explicit %d rendered %d", asked, got)
+	}
+}
+
+// crdDefaultFor reads the generated CRD rather than a copy of the number, so the assertion
+// fails when the manifest and the code drift apart rather than when someone forgets to update
+// a second constant.
+func crdDefaultFor(t *testing.T, field string) int64 {
+	t.Helper()
+	raw, err := os.ReadFile("../../config/crd/bases/pgelastic.io_pgelasticpools.yaml")
+	if err != nil {
+		t.Fatalf("reading the generated CRD: %v", err)
+	}
+	pattern := regexp.MustCompile(`(?s)` + regexp.QuoteMeta(field) + `:.{0,400}?default:\s*(\d+)`)
+	match := pattern.FindSubmatch(raw)
+	if match == nil {
+		t.Fatalf("no default found for %s in the generated CRD", field)
+	}
+	value, err := strconv.ParseInt(string(match[1]), 10, 64)
+	if err != nil {
+		t.Fatalf("parsing the default for %s: %v", field, err)
+	}
+	return value
 }
 
 func TestTheFleetCanReadItsOwnConfigurationAndNoOtherSecret(t *testing.T) {

@@ -539,9 +539,15 @@ type ElasticClassPoolingDefaults struct {
 	PreparedStatements string `json:"preparedStatements,omitempty"`
 
 	// preparedStatementsLimit bounds the per-backend statement cache, evicted LRU.
+	//
+	// A statement here is a plan the backend holds for the life of the link. Until the cache
+	// could outlive a transaction none of these were ever allocated -- the cache was wiped on
+	// every release -- so 1000 was a number that had never been paid for. It is paid for now,
+	// per link: at 100 backends that is 100,000 plans resident in PostgreSQL. 200 matches
+	// pgbouncer's max_prepared_statements and is the largest figure with a precedent behind it.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100000
-	// +kubebuilder:default=1000
+	// +kubebuilder:default=200
 	// +optional
 	PreparedStatementsLimit *int32 `json:"preparedStatementsLimit,omitempty"`
 

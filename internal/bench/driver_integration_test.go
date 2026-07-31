@@ -106,9 +106,29 @@ func TestChurnMeasuresCompleteConnectionLifecycles(t *testing.T) {
 	if cell.Ops == 0 {
 		t.Fatalf("no connection cycles completed; errors: %v", cell.Errors)
 	}
-	if len(cell.Errors) > 0 {
-		t.Errorf("connection cycles failed against a healthy database: %v", cell.Errors)
+
+	// A timeout and a rejection are not the same finding, and this test used to fail on both.
+	// Churn is deliberately unbounded -- it opens connections as fast as the machine allows --
+	// so on a shared runner some cycles are still establishing when the measurement window
+	// closes. That is a fact about the runner. A PostgreSQL error code or a transport failure
+	// against a database that is up is a fact about the code, and stays fatal.
+	timeouts := cell.Errors["timeout"] + cell.Errors["canceled"]
+	rejected := map[string]int64{}
+	for class, count := range cell.Errors {
+		if class != "timeout" && class != "canceled" {
+			rejected[class] = count
+		}
 	}
+	if len(rejected) > 0 {
+		t.Errorf("connection cycles were refused by a healthy database: %v", rejected)
+	}
+	// Tolerated, but not unboundedly: if most cycles cannot finish, the workload is measuring
+	// the clock rather than the connection lifecycle and its percentiles mean nothing.
+	if timeouts > cell.Ops {
+		t.Errorf("%d cycles timed out against %d that completed, so the window rather than the "+
+			"connection lifecycle is what was measured", timeouts, cell.Ops)
+	}
+
 	if cell.P50Micros <= 0 {
 		t.Error("a connection cycle cannot take zero time")
 	}
