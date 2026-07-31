@@ -126,7 +126,9 @@ func targetsOnTheMergeGate(t *testing.T) map[string]bool {
 		Jobs     map[string]struct {
 			If    string `json:"if"`
 			Steps []struct {
-				Run string `json:"run"`
+				Name string `json:"name"`
+				If   string `json:"if"`
+				Run  string `json:"run"`
 			} `json:"steps"`
 		} `json:"jobs"`
 	}
@@ -148,6 +150,13 @@ func targetsOnTheMergeGate(t *testing.T) map[string]bool {
 			continue
 		}
 		for _, step := range job.Steps {
+			// A step condition counts as much as a job condition. `if: github.event_name ==
+			// 'push'` on the step that runs the suite leaves the job itself pull-request
+			// triggered and the suite gating nothing, and reading only the job would call
+			// that gated.
+			if !runsOnPullRequest(t, name+"/"+step.Name, step.If) {
+				continue
+			}
 			for _, match := range invoked.FindAllStringSubmatch(step.Run, -1) {
 				for _, target := range append([]string{match[1]}, chainedBy(t, match[1])...) {
 					reached[target] = true
@@ -193,6 +202,10 @@ func runsOnPullRequest(t *testing.T, job, condition string) bool {
 		return true
 	case "github.event_name == 'schedule' || inputs.chaos":
 		return false
+	// Step conditions about cancellation and failure say nothing about which event triggered
+	// the run, so a step carrying one still runs on a pull request.
+	case "${{ !cancelled() }}", "!cancelled()", "always()", "${{ always() }}":
+		return true
 	default:
 		t.Fatalf("job %q carries an `if:` this check cannot evaluate (%q). Teach it that "+
 			"condition rather than leaving it to guess", job, condition)
