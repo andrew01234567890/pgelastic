@@ -124,6 +124,7 @@ mod tests {
     use super::*;
     use crate::outstanding::{Relay, RequestKind};
     use crate::reset::Taint;
+    use crate::server::Origin;
     use crate::server::tests::logged_in;
     use crate::server::{ServerEvent, ServerLink};
 
@@ -137,6 +138,7 @@ mod tests {
         link.observe_frontend(
             &FrontendMessage::Query(Bytes::from_static(b"SELECT 1")),
             Relay::Forward,
+            Origin::Client,
         );
         ready(&mut link, TransactionStatus::Idle);
         link
@@ -159,6 +161,7 @@ mod tests {
         link.observe_frontend(
             &FrontendMessage::Query(Bytes::from_static(b"BEGIN")),
             Relay::Forward,
+            Origin::Client,
         );
         ready(&mut link, TransactionStatus::Transaction);
         assert_eq!(
@@ -173,6 +176,7 @@ mod tests {
         link.observe_frontend(
             &FrontendMessage::Query(Bytes::from_static(b"SELECT bad")),
             Relay::Forward,
+            Origin::Client,
         );
         ready(&mut link, TransactionStatus::Failed);
         assert_eq!(
@@ -184,7 +188,7 @@ mod tests {
     #[test]
     fn an_unanswered_request_holds_the_link() {
         let mut link = idle_after_a_query();
-        link.observe_frontend(&FrontendMessage::Sync, Relay::Forward);
+        link.observe_frontend(&FrontendMessage::Sync, Relay::Forward, Origin::Client);
         assert_eq!(
             link.can_check_in(),
             Err(CheckInBlock::OutstandingRequests(1))
@@ -197,6 +201,7 @@ mod tests {
         link.observe_frontend(
             &FrontendMessage::Query(Bytes::from_static(b"COPY t FROM STDIN")),
             Relay::Forward,
+            Origin::Client,
         );
         link.observe_backend(&BackendMessage::CopyInResponse(CopyResponse {
             format: Format::Text,
@@ -212,7 +217,7 @@ mod tests {
             Err(CheckInBlock::CopyOpen(CopyState::In))
         );
 
-        link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward);
+        link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward, Origin::Client);
         assert_eq!(link.can_check_in(), Ok(()));
     }
 
@@ -277,6 +282,7 @@ mod tests {
         link.observe_frontend(
             &FrontendMessage::Query(Bytes::from_static(b"DISCARD ALL")),
             Relay::Skip,
+            Origin::Client,
         );
         assert_eq!(
             link.can_check_in(),
@@ -322,7 +328,7 @@ mod tests {
                 }),
                 _ => FrontendMessage::Sync,
             };
-            link.observe_frontend(&message, Relay::Forward);
+            link.observe_frontend(&message, Relay::Forward, Origin::Client);
         }
 
         link.observe_backend(&BackendMessage::ParseComplete)

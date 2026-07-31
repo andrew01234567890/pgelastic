@@ -69,6 +69,11 @@ impl TaintSet {
         self.0 |= taint.bit();
     }
 
+    /// Folds another set in. Taints only ever accumulate until a scrub clears them.
+    pub fn union(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
     pub fn contains(self, taint: Taint) -> bool {
         self.0 & taint.bit() != 0
     }
@@ -156,6 +161,15 @@ impl ResetStep {
 impl fmt::Display for ResetStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.sql())
+    }
+}
+
+impl fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unscrubbable(reason) => write!(f, "unscrubbable state: {}", reason.as_str()),
+            Self::ResetDisabled => f.write_str("the reset policy forbids scrubbing this link"),
+        }
     }
 }
 

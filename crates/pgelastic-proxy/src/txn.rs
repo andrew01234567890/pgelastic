@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use pgelastic_pool::{
-    CacheInvalidation, CheckInBlock, ClientStatements, PinReason, PoolKey, PreparedStatement,
-    Relay, ResetDisposition, ResetPolicy, ResetStep, ServerAction, ServerEvent, StatementKey,
-    detect_cache_invalidation,
+    CacheInvalidation, CheckInBlock, ClientStatements, Origin, PinReason, PoolKey,
+    PreparedStatement, Relay, ResetDisposition, ResetPolicy, ResetStep, ServerAction, ServerEvent,
+    StatementKey, detect_cache_invalidation,
 };
 use pgelastic_wire::{
     BackendMessage, Close, FrontendMessage, Parse, RawFrame, Target, TransactionStatus,
@@ -434,7 +434,8 @@ impl Running<'_> {
                     self.manager().publish_budget();
                     return Err(superseded_error(opened_under, current));
                 }
-                self.manager().discard(checkout);
+                self.manager()
+                    .discard(checkout, crate::metrics::BackendCloseReason::FenceHeld);
                 self.session.metrics.backend_held();
                 self.manager().publish_budget();
                 Ok(())
@@ -578,21 +579,30 @@ impl Running<'_> {
             }
             FrontendMessage::Parse(parse) => {
                 self.on_sql(&parse.query);
+                // Before `on_parse`, so the `ensure` it performs records against a view that
+                // has already forgotten what this statement is about to destroy.
+                if let Some(invalidation) = detect_cache_invalidation(&parse.query) {
+                    self.invalidate(invalidation);
+                }
                 self.on_parse(parse);
             }
             FrontendMessage::Bind(mut bind) => {
                 if let Some(statement) = self.resolve(&bind.statement) {
                     self.ensure_parsed(&statement);
                     bind.statement = statement.name().as_bytes().clone();
+                } else {
+                    bind.statement = reserve_namespace(&bind.statement);
                 }
                 self.dispatch(&FrontendMessage::Bind(bind), Relay::Forward);
             }
             FrontendMessage::Describe(mut describe) => {
-                if describe.target == Target::Statement
-                    && let Some(statement) = self.resolve(&describe.name)
-                {
-                    self.ensure_parsed(&statement);
-                    describe.name = statement.name().as_bytes().clone();
+                if describe.target == Target::Statement {
+                    if let Some(statement) = self.resolve(&describe.name) {
+                        self.ensure_parsed(&statement);
+                        describe.name = statement.name().as_bytes().clone();
+                    } else {
+                        describe.name = reserve_namespace(&describe.name);
+                    }
                 }
                 self.dispatch(&FrontendMessage::Describe(describe), Relay::Forward);
             }
@@ -606,11 +616,20 @@ impl Running<'_> {
 
     /// Everything decided from statement text, in one place.
     ///
-    /// Pinning is the only thing SQL text is ever consulted for: it decides
-    /// whether a link may be handed on at all, never when it is handed on.
+    /// Two separable questions, and neither is about *when* a link is released — that is the
+    /// backend's `ReadyForQuery` byte and nothing else. Pinning decides whether a link may be
+    /// handed on at all. Tainting decides whether it must be scrubbed first, and exists
+    /// because the server announces only its `GUC_REPORT` parameters: without reading the SQL,
+    /// a `SET search_path` is invisible and would survive to whoever gets the link next.
     fn on_sql(&mut self, sql: &Bytes) {
-        if let Some(reason) = crate::tripwire::scan(sql) {
+        let scan = crate::tripwire::scan(sql);
+        if let Some(reason) = scan.pin {
             self.pin(reason);
+        }
+        if !scan.taint.is_clean()
+            && let Some(checkout) = self.checkout.as_mut()
+        {
+            checkout.conn.link.add_taints(scan.taint);
         }
     }
 
@@ -643,14 +662,14 @@ impl Running<'_> {
                 Relay::fake(BackendMessage::ParseComplete),
             ),
             ServerAction::Parse(name) => {
-                self.dispatch(
+                self.dispatch_pool(
                     &FrontendMessage::Parse(rename(parse, &name)),
                     Relay::Forward,
                 );
             }
             ServerAction::EvictThenParse { evict, name } => {
-                self.dispatch(&close_statement(&evict), Relay::Skip);
-                self.dispatch(
+                self.dispatch_pool(&close_statement(&evict), Relay::Skip);
+                self.dispatch_pool(
                     &FrontendMessage::Parse(rename(parse, &name)),
                     Relay::Forward,
                 );
@@ -690,11 +709,11 @@ impl Running<'_> {
         match action {
             ServerAction::Ready => {}
             ServerAction::Parse(name) => {
-                self.dispatch(&parse_for(statement, &name), Relay::Skip);
+                self.dispatch_pool(&parse_for(statement, &name), Relay::Skip);
             }
             ServerAction::EvictThenParse { evict, name } => {
-                self.dispatch(&close_statement(&evict), Relay::Skip);
-                self.dispatch(&parse_for(statement, &name), Relay::Skip);
+                self.dispatch_pool(&close_statement(&evict), Relay::Skip);
+                self.dispatch_pool(&parse_for(statement, &name), Relay::Skip);
             }
         }
     }
@@ -709,15 +728,30 @@ impl Running<'_> {
         }
     }
 
-    /// Records a frontend message against the link and queues its bytes.
+    /// Records a client's own message against the link and queues its bytes.
     ///
     /// A faked request is recorded but never sent: the pool answers it.
     fn dispatch(&mut self, message: &FrontendMessage, relay: Relay) {
+        self.dispatch_from(message, relay, Origin::Client);
+    }
+
+    /// Records a message the pool authored: a `Parse` under a name it minted, or the `Close`
+    /// that evicts one.
+    ///
+    /// Separate from [`dispatch`](Self::dispatch) so provenance is stated at the call site
+    /// rather than guessed from the message. It cannot be guessed: `on_parse` rewrites a
+    /// client's statement onto a `pgel_` name, so by the time a `Parse` reaches the wire the
+    /// pool's own and the client's are indistinguishable.
+    fn dispatch_pool(&mut self, message: &FrontendMessage, relay: Relay) {
+        self.dispatch_from(message, relay, Origin::Pool);
+    }
+
+    fn dispatch_from(&mut self, message: &FrontendMessage, relay: Relay, origin: Origin) {
         let Some(checkout) = self.checkout.as_mut() else {
             return;
         };
         let faked = matches!(relay, Relay::Fake(_));
-        checkout.conn.link.observe_frontend(message, relay);
+        checkout.conn.link.observe_frontend(message, relay, origin);
         if !faked {
             // Only what actually goes out: a request the pool answers from its
             // own cache executes nothing, so it can be neither a write nor an
@@ -759,6 +793,15 @@ impl Running<'_> {
                                 .client_vars
                                 .observe(&status.name, &status.value);
                         }
+                    }
+                    // `ensure` records a statement as parsed the moment it decides to send the
+                    // `Parse`, so an error means the pool's view may name a statement the
+                    // backend does not have. It cannot tell from here which error was whose,
+                    // and the link outlives the transaction now, so a wrong belief would be a
+                    // permanent `26000` for every client that later lands here rather than a
+                    // one-transaction annoyance. Dropping the view costs a re-`Parse`.
+                    if matches!(message, BackendMessage::ErrorResponse(_)) {
+                        checkout.conn.statements.clear();
                     }
                     if reaction.disposition.forwards() {
                         self.witness.observe_backend(&message);
@@ -820,7 +863,8 @@ impl Running<'_> {
         if let Some(checkout) = self.take_checkout() {
             self.session.route.set(None);
             if hold {
-                self.manager().discard(checkout);
+                self.manager()
+                    .discard(checkout, crate::metrics::BackendCloseReason::Lifecycle);
                 self.session.metrics.backend_held();
             } else {
                 self.manager().sever(checkout, FenceAction::DrainThenClose);
@@ -1055,7 +1099,8 @@ impl Running<'_> {
                 debug!(?flags, "a link is disqualified from reuse and is closed");
                 let checkout = self.take_checkout().expect("just observed");
                 self.session.route.set(None);
-                self.manager().discard(checkout);
+                self.manager()
+                    .discard(checkout, crate::metrics::BackendCloseReason::Disqualified);
                 self.manager().publish_budget();
                 Ok(())
             }
@@ -1119,10 +1164,21 @@ impl Running<'_> {
                 client_gone: false,
             },
         );
-        if plan.disposition() != ResetDisposition::Reuse {
+        if let ResetDisposition::Close(reason) = plan.disposition() {
             let checkout = self.take_checkout().expect("just observed");
+            // Logged rather than silently discarded, as its three siblings below already are.
+            // A pool closing every link it takes and one reusing them look identical from
+            // outside: the only tell was `checkouts_total{source="reused"}` going to nothing,
+            // and nothing named the cause.
+            debug!(
+                %reason,
+                policy = ?self.reset_policy,
+                taint = ?checkout.conn.link.taint(),
+                "the reset policy will not scrub this link, so it is closed rather than reused"
+            );
             self.session.route.set(None);
-            self.manager().discard(checkout);
+            self.manager()
+                .discard(checkout, crate::metrics::BackendCloseReason::ResetDisabled);
             self.manager().publish_budget();
             return Ok(());
         }
@@ -1143,7 +1199,8 @@ impl Running<'_> {
                 debug!(%error, %step, "the reset ladder failed; the link is closed");
                 if let Some(checkout) = self.take_checkout() {
                     self.session.route.set(None);
-                    self.manager().discard(checkout);
+                    self.manager()
+                        .discard(checkout, crate::metrics::BackendCloseReason::ResetFailed);
                     self.manager().publish_budget();
                 }
                 return Ok(());
@@ -1170,7 +1227,8 @@ impl Running<'_> {
                 debug!(%block, "a scrubbed link still cannot be checked in; closing it");
                 let checkout = self.take_checkout().expect("just observed");
                 self.session.route.set(None);
-                self.manager().discard(checkout);
+                self.manager()
+                    .discard(checkout, crate::metrics::BackendCloseReason::StillBlocked);
                 self.manager().publish_budget();
             }
         }
@@ -1202,7 +1260,8 @@ impl Running<'_> {
     fn abandon(&mut self) {
         if let Some(checkout) = self.take_checkout() {
             self.session.route.set(None);
-            self.manager().discard(checkout);
+            self.manager()
+                .discard(checkout, crate::metrics::BackendCloseReason::Abandoned);
             self.manager().publish_budget();
         }
     }
@@ -1356,6 +1415,25 @@ fn admission_error(denial: Denial) -> ProxyError {
     ProxyError::Admission {
         sqlstate: denial.sqlstate,
         message: denial.message,
+    }
+}
+
+/// Keeps a name this session never prepared out of the pool's own namespace.
+///
+/// Minted names are the `pgel_` prefix and a fixed-width hex id, so a client could name one it
+/// never prepared and reach a statement belonging to somebody else on the same pool key — the
+/// same tenant, role and database, but not the same session, and a `Describe` of it would
+/// return that session's parameter and row descriptions.
+///
+/// Only names of exactly the minted shape are moved, so a client that prepared a statement
+/// through SQL rather than the protocol still finds its own. The escaped name goes to the
+/// backend and is answered there with `26000`, which keeps the outstanding queue and the
+/// error-recovery-to-`Sync` semantics precisely as `PostgreSQL` defines them.
+fn reserve_namespace(name: &Bytes) -> Bytes {
+    if pgelastic_pool::StatementName::is_generated(name) {
+        pgelastic_pool::StatementName::escaped(name)
+    } else {
+        name.clone()
     }
 }
 

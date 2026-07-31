@@ -350,6 +350,136 @@ async fn scrubbable_session_state_never_survives_a_handoff() {
     assert_eq!(row.get::<_, i32>(5), 0, "a LISTEN registration leaked");
 }
 
+/// The same guarantee as its neighbour, with every parameter `PostgreSQL` reports removed.
+///
+/// That distinction is the whole point. `scrubbable_session_state_never_survives_a_handoff`
+/// also sets `TimeZone`, which is `GUC_REPORT` — so the link taints from the `ParameterStatus`
+/// alone and the policy escalates to a full scrub. Its `search_path` and `SET ROLE` assertions
+/// have therefore never been load-bearing: they would pass with no statement scanning at all.
+///
+/// Nothing here is announced by the server. Under the default policy the only thing that can
+/// notice this state is the scan of the statement text, so if that scan stops working this
+/// test fails and its neighbour does not.
+/// One backend that refuses to scrub anything.
+const ONE_RESET_NONE: &str = "\
+[pool]
+mode = \"transaction\"
+backendConnections = 1
+resetPolicy = \"none\"
+";
+
+/// `resetPolicy = "none"` does not skip the scrub, it closes any link that would have needed
+/// one — so a pool set to it churns a connection per transaction. That was invisible: the
+/// reason was dropped at the call site, and `backend_closed` is a gauge decrement with no
+/// label, so it looked exactly like a pool reusing its links.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_the_policy_refuses_to_scrub_is_closed_and_says_why() {
+    let stack = stack_with(ONE_RESET_NONE).await;
+    let client = stack.connect().await;
+
+    // Reported, so the link taints whatever the statement scan does.
+    client
+        .batch_execute("SET TimeZone TO 'Pacific/Auckland'")
+        .await
+        .unwrap();
+    // A second statement, so the release that follows the first has happened.
+    client.simple_query("SELECT 1").await.unwrap();
+
+    let rendered = stack.proxy.metrics.render();
+    let closed = rendered
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("pgelastic_proxy_backends_closed_total{reason=\"reset_disabled\"} ")
+        })
+        .and_then(|count| count.trim().parse::<u64>().ok())
+        .expect("the close-reason series is always exposed, even at zero");
+
+    // More than one, and the second is the interesting one: the replacement link is checked
+    // out, the variable cache re-issues the `SET` to match what the client was told, and that
+    // taints it too. Under this policy the pool churns a connection per transaction.
+    assert!(
+        closed >= 1,
+        "a link closed because the policy would not scrub it must say so: {rendered}"
+    );
+    assert!(
+        rendered.contains("pgelastic_proxy_backends_closed_total{reason=\"abandoned\"} 0"),
+        "every close reason is exposed at zero, so a dashboard does not have to wait for one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unreported_session_state_never_survives_a_handoff() {
+    let stack = stack_with(ONE).await;
+    let observer = stack.observer("pgelastic_probe").await;
+    observer
+        .batch_execute(
+            "CREATE ROLE lurker NOLOGIN; GRANT lurker TO pgelastic; CREATE SCHEMA hidden;",
+        )
+        .await
+        .unwrap();
+
+    let alice = stack.connect().await;
+    let poisoned = pid(&alice).await;
+    let default_path: String = alice
+        .query_one("SELECT current_setting('search_path')", &[])
+        .await
+        .unwrap()
+        .get(0);
+
+    // Deliberately no `SET search_path` and no `SET ROLE`. PostgreSQL 18 reports both, so
+    // either would taint the link through its `ParameterStatus` and scrub it whether or not
+    // anything read the statement text — which is the trap this test exists to avoid falling
+    // into. A custom variable and a SQL-level PREPARE are announced by nothing.
+    alice
+        .batch_execute(
+            "SELECT set_config('app.current_tenant', 'acme', false); \
+             PREPARE alice_hidden AS SELECT 1;",
+        )
+        .await
+        .unwrap();
+
+    let bob = stack.connect().await;
+    assert_eq!(
+        pid(&bob).await,
+        poisoned,
+        "the pool did not reuse the one backend it has, so this proves nothing"
+    );
+
+    let row = bob
+        .query_one(
+            "SELECT current_user::text, \
+                    current_setting('search_path'), \
+                    current_setting('app.current_tenant', true), \
+                    (SELECT count(*)::int FROM pg_catalog.pg_prepared_statements \
+                     WHERE name = 'alice_hidden')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        row.get::<_, String>(0),
+        "pgelastic",
+        "SET ROLE leaked: the server never reports `role`, so only the statement scan sees it"
+    );
+    assert_eq!(
+        row.get::<_, String>(1),
+        default_path,
+        "a search_path leaked: the server never reports it either"
+    );
+    assert!(
+        row.get::<_, Option<String>>(2)
+            .is_none_or(|value| value.is_empty()),
+        "a custom variable leaked — this is the row-level-security idiom, so the next client \
+         would read this one's tenant id"
+    );
+    assert_eq!(
+        row.get::<_, i32>(3),
+        0,
+        "a SQL-level PREPARE leaked: it is not a protocol Parse, so nothing else would notice it"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unscrubbable_state_pins_its_client_and_is_invisible_to_everybody_else() {
     let stack = stack_with(FOUR).await;
@@ -698,6 +828,58 @@ async fn a_pinned_connection_leaves_the_elastic_budget_and_is_reported_separatel
 }
 
 // ---- prepared statements across handoffs --------------------------------
+
+/// One backend, and a policy that only scrubs a link it has reason to think is dirty.
+const ONE_DIRTY_TRACKED: &str = "\
+[pool]
+mode = \"transaction\"
+backendConnections = 1
+resetPolicy = \"dirtyTracked\"
+";
+
+/// The statement cache exists so that one server-side statement serves every client that asks
+/// for the same text. It could not: the pool tainted the link with its own injected `Parse`,
+/// the taint made `dirtyTracked` scrub at every release, and the scrub deallocated exactly
+/// what had just been cached. `maxServerStatements` was dead configuration.
+///
+/// Counted on the backend rather than inferred from latency, because "it got faster" would not
+/// say which of the two mechanisms moved. `pg_prepared_statements` is session-local, so the
+/// count has to run *through* the proxy to land on the pooled link — and over the simple
+/// protocol, or the counting query would prepare a statement of its own and be included in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_statement_survives_the_transaction_that_created_it() {
+    let stack = stack_with(ONE_DIRTY_TRACKED).await;
+    let client = stack.connect().await;
+    let statement = client.prepare("SELECT $1::int * 2").await.unwrap();
+
+    // Twenty separate transactions. Each is its own checkout, so before the fix each one
+    // re-parsed the same text onto a link that had just been scrubbed of it.
+    for value in 0..20i32 {
+        let row = client.query_one(&statement, &[&value]).await.unwrap();
+        let doubled: i32 = row.get(0);
+        assert_eq!(doubled, value * 2);
+    }
+
+    let rows = client
+        .simple_query(
+            "SELECT count(*)::text FROM pg_catalog.pg_prepared_statements \
+             WHERE name LIKE 'pgel!_%' ESCAPE '!'",
+        )
+        .await
+        .expect("counting the pool's statements on the backend");
+    let parsed = rows
+        .iter()
+        .find_map(|row| match row {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .expect("a count row");
+    assert_eq!(
+        parsed, "1",
+        "twenty transactions over one backend must leave one prepared statement, not a \
+         re-parse of the same text at every checkout"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn named_prepared_statements_keep_working_across_handoffs() {

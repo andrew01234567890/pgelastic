@@ -973,22 +973,32 @@ impl From<PoolModeConfig> for pgelastic_capacity::PoolMode {
 
 /// How hard a link is scrubbed before it may serve a different client.
 ///
-/// The default is `discardAll` rather than `dirtyTracked`, and the reason is
-/// worth stating: taint is fed only by facts the *protocol* exposes — a
-/// `ParameterStatus` for a `GUC_REPORT`ed setting, a named `Parse`. `SET ROLE`
-/// reports nothing, `SELECT set_config(...)` reports nothing, and a
-/// `CommandComplete` tag is deliberately never sniffed because that heuristic
-/// misses all of them. So `dirtyTracked` is safe for exactly the state the
-/// protocol announces and no more, whereas cross-tenant session-state isolation
-/// has to hold unconditionally. `discardAll` costs one round trip per release
-/// and buys that.
+/// The default is `dirtyTracked`. It was `discardAll`, for a reason that was correct at the
+/// time: taint was fed only by what the *protocol* announces — a `ParameterStatus` for a
+/// `GUC_REPORT`ed setting, a named `Parse` — and `PostgreSQL` announces neither `SET
+/// search_path` nor `SET ROLE` nor `SELECT set_config(...)`. Tracking only what is announced
+/// would have left every one of those to the next client on the link.
+///
+/// What changed is that the statement text is now scanned for them as well
+/// ([`crate::tripwire`]), on the same pass that already looks for state no reset can remove.
+/// The scan is deliberately over-eager: a false positive costs one `DISCARD ALL`, which is
+/// precisely what this default used to cost unconditionally, so its worst case is the old
+/// behaviour.
+///
+/// The gain is that a link nobody dirtied is now handed on untouched — no round trip, and its
+/// prepared statements survive, which is what makes `maxServerStatements` mean anything in
+/// transaction pooling.
+///
+/// `discardAll` remains available and is still the right answer for a workload that runs SQL
+/// the scan cannot see into: a `DO` block, a function body, or anything that reaches
+/// `set_config` other than by naming it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ResetPolicyConfig {
     None,
+    #[default]
     DirtyTracked,
     SmartDiscard,
-    #[default]
     DiscardAll,
     Verified,
 }

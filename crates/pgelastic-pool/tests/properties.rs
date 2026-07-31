@@ -12,7 +12,7 @@ use pgelastic_pool::key::{
 };
 use pgelastic_pool::outstanding::{OutstandingQueue, Relay, RequestKind};
 use pgelastic_pool::reset::{ReleaseContext, ResetDisposition, ResetPolicy, Taint, TaintSet};
-use pgelastic_pool::server::{ServerEvent, ServerId, ServerLink};
+use pgelastic_pool::server::{Origin, ServerEvent, ServerId, ServerLink};
 use pgelastic_pool::wait::{Priority, WaitQueue, Waiter};
 use pgelastic_wire::{BackendMessage, Fields, FrontendMessage, RowDescription, TransactionStatus};
 use proptest::prelude::*;
@@ -38,6 +38,7 @@ fn idle_link() -> ServerLink {
     link.observe_frontend(
         &FrontendMessage::Query(Bytes::from_static(b"SELECT 1")),
         Relay::Forward,
+        Origin::Client,
     );
     link.observe_backend(&BackendMessage::ReadyForQuery(TransactionStatus::Idle))
         .unwrap();

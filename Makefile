@@ -335,8 +335,8 @@ BENCH_LOADGEN_CPUS ?= 10-13,26-29
 
 BENCH_WORKLOAD ?= throughput
 BENCH_CONCURRENCY ?= 1,8,64,256
-BENCH_DURATION ?= 120s
-BENCH_WARMUP ?= 30s
+BENCH_DURATION ?= 20s
+BENCH_WARMUP ?= 5s
 BENCH_REPETITIONS ?= 5
 BENCH_RATE ?= 0
 BENCH_METRIC ?= throughput
@@ -392,22 +392,6 @@ bench-rust: build-bench ## Measure the Rust proxy. BENCH_DSN must point at it.
 		--repetitions $(BENCH_REPETITIONS) --rate $(BENCH_RATE) \
 		--out $(BENCH_DIR)/rust-$(BENCH_WORKLOAD).json
 
-.PHONY: bench-go
-bench-go: build-bench ## Measure the Go proxy. BENCH_DSN must point at it.
-	@mkdir -p $(BENCH_DIR)
-	taskset -c $(BENCH_LOADGEN_CPUS) bin/pgebench run \
-		--target go --dsn "$(BENCH_DSN)" \
-		--workload $(BENCH_WORKLOAD) --concurrency $(BENCH_CONCURRENCY) \
-		--duration $(BENCH_DURATION) --warmup $(BENCH_WARMUP) \
-		--repetitions $(BENCH_REPETITIONS) --rate $(BENCH_RATE) \
-		--out $(BENCH_DIR)/go-$(BENCH_WORKLOAD).json
-
-# Separate from the runs so a verdict can be recomputed from stored reports without
-# re-measuring, and so re-measuring cannot quietly move a threshold. Exits 1 on any FAIL.
-#
-# Only the arms that were actually measured are passed. Before the Go proxy exists this
-# produces the pgbouncer reference rows and no verdict, which is the correct output for a
-# question that cannot be answered yet rather than an error.
 .PHONY: bench-report
 bench-report: build-bench ## Apply the pre-registered criteria to whichever reports exist.
 	@bin/pgebench compare \
@@ -435,7 +419,10 @@ BENCH_SPACE := $(BENCH_EMPTY) $(BENCH_EMPTY)
 
 .PHONY: bench-arms
 bench-arms: bench-stack-up docker-build-proxy ## Run the benchmark arms and write one report per arm and workload.
-	ARMS="$(BENCH_ARMS)" ./test/bench/run-arms.sh
+	ARMS="$(BENCH_ARMS)" BENCH_DIR="$(BENCH_DIR)" BENCH_DURATION="$(BENCH_DURATION)" \
+		BENCH_WARMUP="$(BENCH_WARMUP)" BENCH_REPETITIONS="$(BENCH_REPETITIONS)" \
+		BENCH_CONCURRENCY="$(BENCH_CONCURRENCY)" BENCH_RATE="$(BENCH_RATE)" \
+		./test/bench/run-arms.sh
 
 .PHONY: bench-proxy-down
 bench-proxy-down: ## Stop the benchmark's poolers.

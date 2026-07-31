@@ -80,6 +80,22 @@ type RunConfig struct {
 	SimpleProtocol bool
 }
 
+// EffectiveQuery is the statement this cell actually runs.
+//
+// Bulk synthesises its own unless told otherwise, and that is why `Query` has to be able to be
+// unset: the driver defaulted it to a literal and passed it unconditionally, so the bulk
+// workload drained `SELECT 1` and `--bulk-rows` did nothing at all. The report records what
+// comes back from here rather than the flag, or the artifact keeps the same lie.
+func (c RunConfig) EffectiveQuery() string {
+	if c.Query != "" {
+		return c.Query
+	}
+	if c.Workload == WorkloadBulk {
+		return fmt.Sprintf("SELECT repeat('x', 512) FROM generate_series(1, %d)", max(c.BulkRows, 1))
+	}
+	return "SELECT 1"
+}
+
 // connect opens one client connection honouring the configured protocol.
 func connect(ctx context.Context, cfg RunConfig) (*pgx.Conn, error) {
 	config, err := pgx.ParseConfig(cfg.DSN)
@@ -168,7 +184,7 @@ func oneConnectCycle(ctx context.Context, cfg RunConfig) error {
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 
 	var scratch int
-	return conn.QueryRow(ctx, cfg.Query).Scan(&scratch)
+	return conn.QueryRow(ctx, cfg.EffectiveQuery()).Scan(&scratch)
 }
 
 // runThroughput holds connections open and asks for as much work as the system will take.
@@ -195,7 +211,7 @@ func runThroughput(ctx context.Context, cfg RunConfig) (Cell, error) {
 			for deadline.Err() == nil {
 				started := time.Now()
 				var scratch int
-				err := conn.QueryRow(deadline, cfg.Query).Scan(&scratch)
+				err := conn.QueryRow(deadline, cfg.EffectiveQuery()).Scan(&scratch)
 				if aborted(deadline) {
 					return
 				}
@@ -262,7 +278,7 @@ func runLatency(ctx context.Context, cfg RunConfig) (Cell, error) {
 
 			for scheduled := range due {
 				var scratch int
-				err := conn.QueryRow(deadline, cfg.Query).Scan(&scratch)
+				err := conn.QueryRow(deadline, cfg.EffectiveQuery()).Scan(&scratch)
 				if aborted(deadline) {
 					return
 				}
@@ -324,11 +340,7 @@ func runBulk(ctx context.Context, cfg RunConfig) (Cell, error) {
 	deadline, cancel := context.WithTimeout(ctx, cfg.Warmup+cfg.Duration)
 	defer cancel()
 
-	query := cfg.Query
-	if query == "" {
-		query = fmt.Sprintf(
-			"SELECT repeat('x', 512) FROM generate_series(1, %d)", max(cfg.BulkRows, 1))
-	}
+	query := cfg.EffectiveQuery()
 
 	measuring := afterWarmup(cfg.Warmup)
 	var wait sync.WaitGroup
@@ -352,7 +364,10 @@ func runBulk(ctx context.Context, cfg RunConfig) (Cell, error) {
 				}
 				if err != nil {
 					recorder.Fail(err)
-					return
+					if !recoverable(err) {
+						return
+					}
+					continue
 				}
 				recorder.Observe(time.Since(started))
 				recorder.ObserveBytes(moved)

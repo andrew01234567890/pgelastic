@@ -81,6 +81,29 @@ impl StatementName {
     pub fn as_bytes(&self) -> &Bytes {
         &self.0
     }
+
+    /// Whether `name` has the exact shape this cache mints.
+    ///
+    /// Names are the prefix plus a fixed-width hex id, so they are trivially guessable. A
+    /// client that names one it never prepared would otherwise reach whatever statement
+    /// another client of the same pool key had put there.
+    pub fn is_generated(name: &[u8]) -> bool {
+        name.len() == Self::PREFIX.len() + 16
+            && name.starts_with(Self::PREFIX.as_bytes())
+            && name[Self::PREFIX.len()..].iter().all(u8::is_ascii_hexdigit)
+    }
+
+    /// Moves a client-chosen name out of the pool's namespace, keeping its length.
+    ///
+    /// Sent on to the backend rather than refused here, so the answer is `PostgreSQL`'s own
+    /// `26000` and the outstanding queue keeps the error-recovery-to-`Sync` semantics the
+    /// protocol defines. A minted name always has `_` at the prefix boundary, so replacing
+    /// that one byte cannot land on another minted name.
+    pub fn escaped(name: &Bytes) -> Bytes {
+        let mut escaped = name.to_vec();
+        escaped[Self::PREFIX.len() - 1] = b'x';
+        Bytes::from(escaped)
+    }
 }
 
 impl fmt::Display for StatementName {
@@ -373,6 +396,36 @@ pub fn detect_cache_invalidation(sql: &[u8]) -> Option<CacheInvalidation> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_minted_name_is_recognised_and_a_client_name_is_not() {
+        assert!(StatementName::is_generated(b"pgel_0000000000000000"));
+        assert!(StatementName::is_generated(b"pgel_00000000deadbeef"));
+        // A client is entitled to a name that merely starts the same way.
+        assert!(!StatementName::is_generated(b"pgel_orders"));
+        assert!(!StatementName::is_generated(b"pgel_000000000000000"));
+        assert!(!StatementName::is_generated(b"pgel_0000000000000000x"));
+        assert!(!StatementName::is_generated(b"pgel_00000000zzzzzzzz"));
+        assert!(!StatementName::is_generated(b""));
+    }
+
+    #[test]
+    fn escaping_a_name_keeps_its_length_and_leaves_the_minted_space() {
+        let name = Bytes::from_static(b"pgel_0000000000000003");
+        let escaped = StatementName::escaped(&name);
+
+        assert_eq!(
+            escaped.len(),
+            name.len(),
+            "the backend sees a name, not a truncation"
+        );
+        assert!(
+            !StatementName::is_generated(&escaped),
+            "an escaped name must not be able to land on another client's statement"
+        );
+        assert_ne!(escaped, name);
+    }
+
     use std::hash::Hasher;
 
     use super::*;

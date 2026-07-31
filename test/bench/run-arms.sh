@@ -23,10 +23,15 @@ WARMUP="${BENCH_WARMUP:-5s}"
 REPS="${BENCH_REPETITIONS:-5}"
 CONCURRENCY="${BENCH_CONCURRENCY:-1,8,64,256}"
 WORKLOADS="${BENCH_WORKLOADS:-throughput churn}"
+# Offered rate for the latency workload, which is refused without one. Held constant across
+# the concurrency sweep and set well below the measured ceiling: offering anything near
+# saturation makes every cell an overrun, and the percentiles then describe a queue rather
+# than the pooler - which is the closed-loop measurement this workload exists to escape.
+RATE="${BENCH_RATE:-5000}"
 # A suffix keeps a simple-protocol sweep from overwriting an extended-protocol one; the two
 # are not comparable and must not land in the same file.
-SUFFIX="${BENCH_SUFFIX:-}"
 SIMPLE="${BENCH_SIMPLE:-}"
+SUFFIX="${BENCH_SUFFIX:-${SIMPLE:+-simple}}"
 ARMS="${ARMS:-direct rust rust-fence-on rust-session rust-1worker pgbouncer}"
 
 LOADGEN_CPUS="${BENCH_LOADGEN_CPUS:-10-13,26-29}"
@@ -56,9 +61,16 @@ start_proxy() {
 		-v "$ROOT/test/bench/configs:/etc/pgelastic/proxy:ro" \
 		-p 16432:6432 -p 19127:9127 \
 		pgelastic/proxy:latest --config "/etc/pgelastic/proxy/$config" >/dev/null
-	until [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:19127/readyz)" = "200" ]; do
+	local attempt
+	for attempt in $(seq 1 60); do
+		if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:19127/readyz)" = "200" ]; then
+			return 0
+		fi
 		sleep 1
 	done
+	echo "the proxy never reported ready; logs follow" >&2
+	docker logs pgebench-proxy >&2 2>&1 || true
+	return 1
 }
 
 # start_pgbouncer has no readiness endpoint to wait on, so readiness is established the only
@@ -92,6 +104,7 @@ measure() {
 		--workload "$workload" --concurrency "$CONCURRENCY" \
 		--duration "$DURATION" --warmup "$WARMUP" --repetitions "$REPS" \
 		${SIMPLE:+--simple-protocol} \
+		$([ "$workload" = latency ] && echo "--rate $RATE") \
 		--out "$OUT/$label$SUFFIX-$workload.json"
 }
 

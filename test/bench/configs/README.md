@@ -8,28 +8,38 @@ Every file here is rendered against the same PostgreSQL (`pgebench-pg` on the `p
 Docker bridge) with the same credentials, the same pool size and the same frame limits. The
 only thing that varies between files is the one axis named in the filename.
 
+Every file pins `resetPolicy` explicitly rather than taking the default, and now has to: the
+shipped default moved from `discardAll` to `dirtyTracked`, and the numbers published in
+`docs/bench.md` were all taken under `discardAll`. Pinning keeps them reproducible. A sweep of
+the new default belongs in a fresh set of arms, not in a silent redefinition of the old ones.
+
 | File | Pool mode | `fence.verifyAtCheckout` | Role |
 |---|---|---|---|
 | `txn-fence-off.toml` | transaction | `false` | **Primary decision number.** Proxy overhead in isolation. |
 | `txn-fence-on.toml` | transaction | `true` | What production runs. Reported alongside, never instead. |
 | `session-fence-off.toml` | session | `false` | Session-mode overhead, where checkout is per connection. |
-| `txn-reset-none.toml` | transaction | `false` | `resetPolicy = "none"`. The like-for-like row against pgbouncer — see below. |
+| `txn-reset-dirty.toml` | transaction | `false` | `resetPolicy = "dirtyTracked"`. **The like-for-like row against pgbouncer.** |
+| `txn-reset-none.toml` | transaction | `false` | `resetPolicy = "none"`. A trap, kept as evidence — see below. |
 | `pgbouncer.ini` + `userlist.txt` | transaction | n/a | **External reference.** Never a gate — see below. |
 
 ## Why the reset policy gets its own file
 
 `ResetPolicy::DiscardAll` issues a `DISCARD ALL` on **every release**, and in transaction mode
-a release happens per transaction. The operator ships `resetPolicy = "discardAll"`, so the
-shipped proxy makes **two** backend round trips per client transaction: the client's query,
-and the scrub.
+a release happens per transaction — so a proxy configured that way makes **two** backend round
+trips per client transaction: the client's query, and the scrub.
 
 pgbouncer's `server_reset_query_always` defaults to `0`, which means it runs no reset query in
-transaction mode at all — **one** round trip per transaction.
+transaction mode at all — **one** round trip per transaction. Comparing the two directly would
+be comparing one round trip against two and calling the gap an implementation difference.
 
-Comparing those two directly would be comparing one round trip against two and reporting the
-gap as an implementation difference. `txn-reset-none.toml` is the row that matches pgbouncer
-term for term; `txn-fence-off.toml` remains the row that matches production. Both are
-reported, for exactly the reason both fence settings are.
+`txn-reset-dirty.toml` is the row that matches pgbouncer term for term, because `dirtyTracked`
+scrubs only a link something actually dirtied and a `SELECT` workload dirties nothing.
+
+**`txn-reset-none.toml` is not that row, though it was described as it here for a while.**
+`ResetPolicy::None` does not skip the scrub — it *closes* any link that would have needed one,
+so throughput collapses to the rate backends can be opened. It is kept as an arm because that
+collapse is worth being able to reproduce, and because it is now visible in
+`pgelastic_proxy_backends_closed_total{reason="reset_disabled"}` rather than silent.
 
 ## Why pgbouncer is here
 
