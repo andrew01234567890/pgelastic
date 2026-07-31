@@ -1,0 +1,19 @@
+# Scrapes the two things a memory question needs: what the container is using, and what the
+# proxy says it is doing. cAdvisor gives the same working-set figure the benchmark probe reads
+# from cgroup v2, so a graph here and a number in a report cannot disagree.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: cadvisor
+    static_configs:
+      - targets: ['pgebench-cadvisor:8080']
+
+  - job_name: proxy
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['pgebench-proxy:9127']
+    # The proxy is torn down and restarted between arms, so a scrape failure is expected and
+    # must not be read as the proxy having died.
+    honor_labels: true

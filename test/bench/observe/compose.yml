@@ -1,0 +1,57 @@
+# Memory over time for the benchmark stack.
+#
+# Deliberately not Tempo or Pyroscope: Tempo stores traces and Pyroscope's Rust SDK profiles
+# CPU only, so neither can attribute heap bytes. Heap attribution is done out of band with a
+# heap profiler; this stack answers the other half of the question -- how the working set moves
+# while a sweep runs, which is what makes the growth-and-plateau across repetitions visible as
+# a shape rather than as two numbers.
+name: pgebench-observe
+
+services:
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.52.1
+    container_name: pgebench-cadvisor
+    privileged: true
+    networks: [pgebench]
+    ports: ['18080:8080']
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices: ['/dev/kmsg']
+    # Pinned off the cores under measurement, for the same reason every other component is:
+    # a sampler that competes with the proxy is measuring itself.
+    cpuset: '14,15'
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    container_name: pgebench-prometheus
+    networks: [pgebench]
+    ports: ['19090:9090']
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=6h'
+    cpuset: '14,15'
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    container_name: pgebench-grafana
+    networks: [pgebench]
+    ports: ['13000:3000']
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: 'true'
+    volumes:
+      - ./grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./dashboard-memory.json:/var/lib/grafana/dashboards/memory.json:ro
+    cpuset: '14,15'
+
+networks:
+  pgebench:
+    external: true

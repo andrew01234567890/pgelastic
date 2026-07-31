@@ -24,7 +24,20 @@ pub const DEFAULT_INLINE_FRAME_BYTES: usize = 64 * 1024;
 /// Ceiling on a declared frame length, matching the server's own 1 GiB limit.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1 << 30;
 
-const READ_CHUNK: usize = 16 * 1024;
+/// The largest read the relay will ask for, once a connection has shown it can fill one.
+const MAX_READ_CHUNK: usize = 16 * 1024;
+
+/// What a connection starts with, and what an idle one keeps.
+///
+/// Resident memory is touched pages, not reserved bytes, which is the whole reason this
+/// constant matters. A 16 KiB buffer into which a client writes only a startup packet still
+/// costs a full page; measured, dropping the starting request below the page size took
+/// 2,790 bytes off every idle connection, because a small allocation shares a page with its
+/// neighbours where a 16 KiB one does not.
+///
+/// 2 KiB rather than something smaller because it is also pgbouncer's `pkt_buf`, and a value
+/// that cannot hold a typical query would make the growth path the common path.
+const MIN_READ_CHUNK: usize = 2 * 1024;
 
 /// One unit of relayable output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +56,14 @@ pub struct FrameRelay {
     inline_limit: usize,
     max_frame_len: usize,
     streaming: usize,
+    /// Grows towards [`MAX_READ_CHUNK`] as reads come back full, and never shrinks.
+    ///
+    /// One-way on purpose. A connection relaying a result set wants large reads and would pay
+    /// a syscall for every shrink-and-regrow cycle; a connection that sits idle never grows in
+    /// the first place, which is the case this exists to make cheap. The distinction the
+    /// benchmark cares about -- thousands of idle clients against a hundred busy backends --
+    /// falls out of the traffic rather than having to be configured.
+    read_chunk: usize,
 }
 
 impl Default for FrameRelay {
@@ -58,6 +79,7 @@ impl FrameRelay {
             inline_limit: inline_limit.max(1),
             max_frame_len,
             streaming: 0,
+            read_chunk: MIN_READ_CHUNK,
         }
     }
 
@@ -71,8 +93,15 @@ impl FrameRelay {
     /// Cancel-safe in the same sense as `MessageBuffer::read_target`: the
     /// partially-read frame lives here, not inside the read future.
     pub fn read_target(&mut self) -> &mut BytesMut {
-        if self.buf.capacity() - self.buf.len() < READ_CHUNK {
-            self.buf.reserve(READ_CHUNK);
+        // A buffer still holding a chunk's worth of unparsed bytes is one whose last read came
+        // back full, so the peer has more to say than the current size asks for. Doubling here
+        // rather than on a byte count keeps a connection that sends one large message from
+        // being treated the same as one that streams.
+        if self.buf.len() >= self.read_chunk && self.read_chunk < MAX_READ_CHUNK {
+            self.read_chunk = (self.read_chunk * 2).min(MAX_READ_CHUNK);
+        }
+        if self.buf.capacity() - self.buf.len() < self.read_chunk {
+            self.buf.reserve(self.read_chunk);
         }
         &mut self.buf
     }
@@ -133,6 +162,79 @@ impl FrameRelay {
 
 #[cfg(test)]
 mod tests {
+    /// A frame the relay will accept: one tag byte, a big-endian length that counts itself,
+    /// and a body. A run of zero bytes is not a frame -- it decodes to a negative body length
+    /// -- and a loop that drains until `NeedMore` never terminates on the error that produces.
+    fn frame(body: usize) -> Vec<u8> {
+        let mut out = vec![b'D'];
+        out.extend_from_slice(
+            &i32::try_from(body + 4)
+                .expect("a test frame fits in i32")
+                .to_be_bytes(),
+        );
+        out.extend(std::iter::repeat_n(b'x', body));
+        out
+    }
+
+    /// Drains what the relay can produce, stopping on either terminal answer.
+    fn drain(relay: &mut FrameRelay) {
+        while matches!(
+            relay.next_output(),
+            Ok(Relayed::Frame(_) | Relayed::Opaque(_))
+        ) {}
+    }
+
+    /// An idle connection never grows its read buffer, which is the entire point: resident
+    /// memory is touched pages, and thousands of connections that each touch a page they do
+    /// not need is what put the proxy well above pgbouncer per idle connection.
+    #[test]
+    fn a_connection_that_never_fills_a_read_keeps_the_small_buffer() {
+        let mut relay = FrameRelay::default();
+
+        for _ in 0..50 {
+            relay.read_target().extend_from_slice(&frame(64));
+            drain(&mut relay);
+        }
+
+        assert_eq!(
+            relay.read_chunk, MIN_READ_CHUNK,
+            "an idle connection grew its buffer without ever filling one"
+        );
+    }
+
+    /// A connection that does fill its reads has to reach the large chunk, or a result set
+    /// would be relayed a couple of kilobytes per syscall.
+    #[test]
+    fn a_connection_that_fills_its_reads_grows_to_the_large_chunk() {
+        let mut relay = FrameRelay::default();
+
+        for _ in 0..16 {
+            let chunk = relay.read_chunk;
+            relay.read_target().extend_from_slice(&frame(chunk));
+        }
+
+        assert_eq!(
+            relay.read_chunk, MAX_READ_CHUNK,
+            "a relay whose reads keep coming back full must reach the large chunk"
+        );
+    }
+
+    /// Growth is one-way. A shrink would cost a reallocation every time a busy connection went
+    /// briefly quiet, which is the common rhythm of a transaction-pooled link.
+    #[test]
+    fn the_read_chunk_does_not_shrink_once_grown() {
+        let mut relay = FrameRelay::default();
+
+        for _ in 0..16 {
+            let chunk = relay.read_chunk;
+            relay.read_target().extend_from_slice(&frame(chunk));
+        }
+        drain(&mut relay);
+        let _ = relay.read_target();
+
+        assert_eq!(relay.read_chunk, MAX_READ_CHUNK);
+    }
+
     use super::*;
 
     fn wire(tag: u8, body: &[u8]) -> Vec<u8> {

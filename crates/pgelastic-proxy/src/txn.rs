@@ -973,11 +973,19 @@ impl Running<'_> {
             tenant: &self.session.binding.tenant,
             client: self.session.binding.client,
         };
-        let checkout = instance
-            .pools
-            .acquire(&request, &connector, self.session.client)
-            .await
-            .map_err(admission_error)?;
+        // Boxed, and this is a memory fix rather than a style choice. A coroutine frame is
+        // sized by its largest suspend point, so the whole dial-connect-SCRAM-TLS chain behind
+        // `acquire` -- 4,848 bytes of it -- was reserved inside every client's task for the
+        // life of the connection, including the thousands that are sitting idle having never
+        // checked out a backend at all. Moving it behind a pointer pays one allocation when a
+        // checkout actually happens, instead of the space on every connection that never does.
+        let checkout = Box::pin(
+            instance
+                .pools
+                .acquire(&request, &connector, self.session.client),
+        )
+        .await
+        .map_err(admission_error)?;
         drop(instance_baton);
         drop(baton);
 

@@ -787,3 +787,100 @@ expensive is the wrong direction.
 Vectored writing would pay on a workload dominated by frames above 64 KiB — large `bytea`, wide
 text columns, `COPY`. It is not what `SELECT` traffic looks like, and the harness measures
 `SELECT` traffic. Recorded here rather than attempted, so the next person does not re-derive it.
+
+## Round eight: per-connection memory, and why the first three answers were wrong
+
+Round five found the proxy holding ~30 KB per idle connection against pgbouncer's ~2.8 KB. This
+round cuts that by 28%. Most of the work went into finding out what the memory actually was,
+because the obvious answer was wrong three times over.
+
+### Wrong answer one: the read buffer
+
+`relay.rs` reserved a 16 KiB `READ_CHUNK` per connection, and `read_target()` is evaluated on
+every iteration of the select loop, so the reservation happens before the client has sent a byte.
+Sixteen kilobytes times four thousand connections is the whole gap. Obvious, and nearly wrong:
+rebuilding with a 2 KiB chunk and re-measuring saved **2,790 bytes**, not 14,336.
+
+Resident memory is touched pages, not reserved bytes. An idle client writes a startup packet into
+that buffer and nothing else, so exactly one page of the sixteen is ever faulted in. The reserved
+remainder costs address space, which nothing measures and nobody pays for.
+
+That also explains why 2 KiB helps at all: an allocation smaller than a page shares one with its
+neighbours, where a 16 KiB one does not. pgbouncer's `pkt_buf` default is 2048 bytes.
+
+### Wrong answer two: the measurement
+
+The first attempt at that ablation used the density report's `bytesPerConnection` and produced
+`-352`, then `+1620`, then `-880` bytes across interleaved rounds — the sign flipped. The figure
+subtracts a floor captured once at sweep start, and that floor was observed ranging **4.0 to 10.7
+MB for the same build**, which is larger than the effect being measured.
+
+Reading `anon` from the cgroup before and after the connections are opened, inside one proxy
+process, removes the floor from the comparison entirely. The same quantity then repeats to within
+3%:
+
+```
+mem-before  [24716, 24248, 24316]  median 24316 B/conn
+mem-after   [17148, 17712, 17628]  median 17628 B/conn
+```
+
+The density axis is still the right thing to publish — it is what an operator experiences — but
+it is not sharp enough to attribute a change to a line of code. Two instruments, two jobs.
+
+### Wrong answer three: the inventory
+
+A static inventory of the allocations came to 39,013 bytes per connection. The measurement said
+24,316. The inventory was not wrong about the allocations; it was wrong that allocating and
+paying are the same thing. Every entry has to be asked whether it is ever *written to*.
+
+### What actually changed
+
+| | bytes | what it was |
+|---|---|---|
+| Handshake buffer released | ~8 KiB allocated | `MessageBuffer` held 8 KiB for the whole session. The backend link already released its own at `server.rs:688`; the client side simply never did, on either pooling path. |
+| Adaptive read chunk | 2,790 | Starts at 2 KiB and doubles to 16 KiB only once a read comes back full. An idle connection never grows; a connection relaying a result set reaches the large chunk within a few reads. Growth is one-way, so a busy link going briefly quiet does not pay a reallocation. |
+| `acquire` boxed | ~2,500 | A coroutine frame is sized by its largest suspend point, so the entire dial-connect-SCRAM-TLS chain — 4,848 bytes of it — sat inside every client's task, including the thousands that never check out a backend. |
+| `greeting` dropped | ~2,240 | Already written to the client, but still live across the `txn::run` await, so it occupied the frame for the life of the connection. |
+
+The per-connection task future went from **9,144 to 6,656 bytes**, and the whole footprint from
+**24,316 to 17,628** — 28% off, against pgbouncer at 8.7x before and 6.3x after.
+
+### The retention half turned out not to be a second defect
+
+The task these four changes came from named two problems and insisted they be established
+separately: the footprint, and memory that is never returned. A `mimalloc` experiment on the
+unfixed build looked like the answer to the second — working set 22% smaller (34.9 MB against
+44.9 MB at 1024 connections) and growth across repetitions cut from +32.3% to +11.6%.
+
+Measuring growth again after the footprint fix, interleaved, two rounds:
+
+| build | rep0 | rep4 | growth |
+|---|---|---|---|
+| before | 30.6 MB | 46.9 MB | +53.2% |
+| before | 40.7 MB | 49.2 MB | +21.0% |
+| after | 22.7 MB | 26.9 MB | +18.6% |
+| after | 32.1 MB | 29.5 MB | −8.2% |
+
+Median **+37.1% before, +5.2% after** — better than `mimalloc` achieved on the unfixed build, from
+changes that touch no allocator at all. The growth was the allocator holding freed per-connection
+blocks, so allocating less per connection is most of the cure; there was no independent retention
+bug to find.
+
+**So the allocator is not being swapped.** A residual +5.2% whose sign flips between rounds is
+below what this rig resolves, and replacing the global allocator to chase it would be a large,
+process-wide change justified by noise. Keeping the two halves separate is what made that
+answerable — had they been fixed together, `mimalloc` would have shipped and been credited with a
+result the buffer changes produced.
+
+### Something else the search turned up
+
+`GlobalStatementCache` (`stmt.rs:149`) has `insert` and `get` and **no removal path of any kind**.
+Its key holds the query bytes, so every distinct (query text, parameter types) pair the proxy has
+ever seen is retained for the life of the process. `maxServerStatements` does not bound it — that
+bounds the per-link view.
+
+It is invisible to both benchmarks, which is why it survived this long: density issues no queries
+and throughput issues exactly one. It needs a workload with many distinct query texts, which is
+the ordinary case for any client that inlines literals instead of binding parameters. Filed
+separately, because it is proportional to query variety where this round's defect is proportional
+to connections, and conflating them would produce a fix that cannot be measured.

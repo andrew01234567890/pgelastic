@@ -267,6 +267,36 @@ pub struct Metrics {
     ready: AtomicBool,
 }
 
+/// The proxy's own resident memory, read at scrape time.
+///
+/// Exported because per-connection memory is a capacity question an operator has to answer
+/// before it becomes an OOM, and until now the only way to see it was to read the container's
+/// cgroup from outside. It is the same quantity the benchmark harness samples -- `memory.current`
+/// less `inactive_file`, which is how `docker stats` defines a working set -- so a dashboard and
+/// a benchmark report cannot quietly disagree about what was measured.
+///
+/// Absent rather than zero when the files cannot be read: a proxy running outside a cgroup v2
+/// hierarchy has no answer, and publishing 0 would read as "uses no memory".
+fn resident_bytes() -> Option<i64> {
+    let current: i64 = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let inactive = std::fs::read_to_string("/sys/fs/cgroup/memory.stat")
+        .ok()
+        .and_then(|stat| {
+            stat.lines().find_map(|line| {
+                line.strip_prefix("inactive_file ")?
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+            })
+        })
+        .unwrap_or(0);
+    Some(current.saturating_sub(inactive))
+}
+
 impl Metrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -588,6 +618,14 @@ impl Metrics {
             "Backend connections currently established.",
             self.backends_active.load(Ordering::Relaxed),
         );
+        if let Some(resident) = resident_bytes() {
+            gauge(
+                &mut out,
+                "pgelastic_proxy_resident_bytes",
+                "Resident memory, as memory.current less inactive_file.",
+                resident,
+            );
+        }
         counter(
             &mut out,
             "pgelastic_proxy_auth_total",
@@ -1087,6 +1125,26 @@ mod tests {
         metrics.relayed_to_client(4096);
         let rendered = metrics.render();
         assert!(rendered.contains("pgelastic_proxy_client_connections 1"));
+
+        // Absent rather than zero off a cgroup v2 host: a proxy that cannot read its own
+        // memory has no answer, and 0 would be read as "uses none".
+        let resident = rendered
+            .lines()
+            .find(|line| line.starts_with("pgelastic_proxy_resident_bytes "));
+        match super::resident_bytes() {
+            Some(_) => assert!(
+                resident.is_some_and(|line| line
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .is_some_and(|v| v > 0)),
+                "a readable cgroup must render a positive resident figure, got {resident:?}"
+            ),
+            None => assert!(
+                resident.is_none(),
+                "no cgroup to read, so nothing may be rendered, got {resident:?}"
+            ),
+        }
         assert!(rendered.contains("side=\"client\",outcome=\"success\"} 1"));
         assert!(rendered.contains("side=\"backend\",outcome=\"failure\"} 1"));
         assert!(rendered.contains("outcome=\"matched\"} 1"));

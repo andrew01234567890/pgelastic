@@ -1,0 +1,53 @@
+{
+  "title": "pgebench: proxy memory",
+  "uid": "pgebench-memory",
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Resident memory, as the proxy reports it",
+      "description": "pgelastic_proxy_resident_bytes is memory.current less inactive_file, the same definition the benchmark probe and docker stats use, read by the proxy from its own cgroup. Preferred over cAdvisor here because cAdvisor cannot reach the Docker daemon under Docker Desktop and so cannot label a series with a container name.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [{ "expr": "pgelastic_proxy_resident_bytes", "legendFormat": "proxy resident" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Connections held",
+      "description": "Plotted beside memory so a step in one can be told from a step in the other.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "targets": [
+        { "expr": "pgelastic_proxy_client_connections", "legendFormat": "clients" },
+        { "expr": "pgelastic_proxy_backend_connections", "legendFormat": "backends" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes per client connection",
+      "description": "The density axis, live. Divided by connections actually established, so a proxy that refused half of them is not credited with cheap memory. Watch this across repetitions: a figure that steps up and does not come back down is memory the proxy is not returning.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        {
+          "expr": "pgelastic_proxy_resident_bytes / clamp_min(pgelastic_proxy_client_connections, 1)",
+          "legendFormat": "bytes/connection"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Whole-machine container memory (cAdvisor, by cgroup)",
+      "description": "Unlabelled by container name on this rig for the reason above, so it is here as a cross-check on the proxy's own figure rather than as the primary source.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        {
+          "expr": "topk(5, container_memory_working_set_bytes{id=~\"/docker/.+\"})",
+          "legendFormat": "{{id}}"
+        }
+      ]
+    }
+  ]
+}
