@@ -578,21 +578,30 @@ impl Running<'_> {
             }
             FrontendMessage::Parse(parse) => {
                 self.on_sql(&parse.query);
+                // Before `on_parse`, so the `ensure` it performs records against a view that
+                // has already forgotten what this statement is about to destroy.
+                if let Some(invalidation) = detect_cache_invalidation(&parse.query) {
+                    self.invalidate(invalidation);
+                }
                 self.on_parse(parse);
             }
             FrontendMessage::Bind(mut bind) => {
                 if let Some(statement) = self.resolve(&bind.statement) {
                     self.ensure_parsed(&statement);
                     bind.statement = statement.name().as_bytes().clone();
+                } else {
+                    bind.statement = reserve_namespace(&bind.statement);
                 }
                 self.dispatch(&FrontendMessage::Bind(bind), Relay::Forward);
             }
             FrontendMessage::Describe(mut describe) => {
-                if describe.target == Target::Statement
-                    && let Some(statement) = self.resolve(&describe.name)
-                {
-                    self.ensure_parsed(&statement);
-                    describe.name = statement.name().as_bytes().clone();
+                if describe.target == Target::Statement {
+                    if let Some(statement) = self.resolve(&describe.name) {
+                        self.ensure_parsed(&statement);
+                        describe.name = statement.name().as_bytes().clone();
+                    } else {
+                        describe.name = reserve_namespace(&describe.name);
+                    }
                 }
                 self.dispatch(&FrontendMessage::Describe(describe), Relay::Forward);
             }
@@ -774,6 +783,15 @@ impl Running<'_> {
                                 .client_vars
                                 .observe(&status.name, &status.value);
                         }
+                    }
+                    // `ensure` records a statement as parsed the moment it decides to send the
+                    // `Parse`, so an error means the pool's view may name a statement the
+                    // backend does not have. It cannot tell from here which error was whose,
+                    // and the link outlives the transaction now, so a wrong belief would be a
+                    // permanent `26000` for every client that later lands here rather than a
+                    // one-transaction annoyance. Dropping the view costs a re-`Parse`.
+                    if matches!(message, BackendMessage::ErrorResponse(_)) {
+                        checkout.conn.statements.clear();
                     }
                     if reaction.disposition.forwards() {
                         self.witness.observe_backend(&message);
@@ -1371,6 +1389,25 @@ fn admission_error(denial: Denial) -> ProxyError {
     ProxyError::Admission {
         sqlstate: denial.sqlstate,
         message: denial.message,
+    }
+}
+
+/// Keeps a name this session never prepared out of the pool's own namespace.
+///
+/// Minted names are the `pgel_` prefix and a fixed-width hex id, so a client could name one it
+/// never prepared and reach a statement belonging to somebody else on the same pool key — the
+/// same tenant, role and database, but not the same session, and a `Describe` of it would
+/// return that session's parameter and row descriptions.
+///
+/// Only names of exactly the minted shape are moved, so a client that prepared a statement
+/// through SQL rather than the protocol still finds its own. The escaped name goes to the
+/// backend and is answered there with `26000`, which keeps the outstanding queue and the
+/// error-recovery-to-`Sync` semantics precisely as `PostgreSQL` defines them.
+fn reserve_namespace(name: &Bytes) -> Bytes {
+    if pgelastic_pool::StatementName::is_generated(name) {
+        pgelastic_pool::StatementName::escaped(name)
+    } else {
+        name.clone()
     }
 }
 
