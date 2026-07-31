@@ -40,8 +40,15 @@ import (
 // CNPG's six-field variant is a documented usability wart in their own docs: every operator
 // who has written a CronJob writes five fields, and the sixth silently shifts everything by
 // one position rather than failing.
+//
+// Descriptors are deliberately not enabled, matching internal/autoscale. "@every 6h" is not
+// a cron expression at all: it is a delay measured from an arbitrary anchor rather than a
+// grid of fixed times, so it has no "most recent firing at or before now" for dueSlot to
+// find. Accepting it produced silence for delays longer than the grace window and a backup
+// every minute for delays shorter than it. Refusing it at the parse is a logged error naming
+// the schedule, which is the failure an operator can act on.
 var backupScheduleParser = cron.NewParser(
-	cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
 // backupState is what one pass over an instance's backups concluded.
 type backupState struct {

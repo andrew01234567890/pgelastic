@@ -127,6 +127,20 @@ func TestTheScheduleIsFiveFieldCron(t *testing.T) {
 	}
 }
 
+// "@every 6h" is a delay from an arbitrary anchor, not a grid of fixed times, so it has no
+// most-recent-firing for dueSlot to find. Accepted, it was silent for delays longer than the
+// grace window and minted a differently-named backup every minute for delays shorter than
+// it - a real full backup each time. Refused at the parse instead, which is a logged error
+// naming the schedule.
+func TestADelayIsNotASchedule(t *testing.T) {
+	for _, expression := range []string{"@every 6h", "@every 30m", "@hourly", "@daily"} {
+		if _, err := backupScheduleParser.Parse(expression); err == nil {
+			t.Errorf("%q parsed; the API documents a five-field cron expression and dueSlot "+
+				"can only answer for one", expression)
+		}
+	}
+}
+
 // An instance whose archiving has stopped must not take a base backup. It would need every
 // WAL segment from its own start position to reach consistency, and those are precisely the
 // ones not arriving - so the result is an object in a bucket that no restore can use.
