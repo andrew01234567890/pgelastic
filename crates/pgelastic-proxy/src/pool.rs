@@ -675,31 +675,63 @@ impl PoolManager {
     /// finish whatever it was doing first, and a demoted primary finishing one
     /// more commit is the entire failure this fence exists to prevent.
     ///
-    /// Returns how many were severed. Called at the head of every checkout, so
-    /// the ordering the design requires — *before any further checkout* — holds
-    /// by construction rather than by a timer being fast enough; the background
-    /// sweeper only makes it prompt for an idle pool.
+    /// Returns how many were severed. This is the entry point for the epoch
+    /// watcher and the background sweeper; the checkout path does the same
+    /// scan through [`take_superseded`](Self::take_superseded), inside the lock
+    /// it already holds to claim. Between them the ordering the design requires
+    /// — *before any further checkout* — holds by construction rather than by a
+    /// timer being fast enough, and the sweeper only makes it prompt for a pool
+    /// nobody is checking out of.
     pub fn sever_superseded(&self) -> usize {
         let current = self.fence.current();
-        let mut severed = Vec::new();
-        {
+        let severed = {
             let mut inner = self.lock();
-            let stale: Vec<pgelastic_capacity::ServerId> = inner
-                .parked
-                .iter()
-                .filter(|(_, parked)| parked.conn.epoch < current)
-                .map(|(server, _)| *server)
-                .collect();
-            for server in stale {
-                if let Some(conn) = inner.unpark(server) {
-                    let grants = inner.allocator.backend_died(server);
-                    inner.dispatch(grants);
-                    severed.push(conn);
-                }
+            Self::take_superseded(&mut inner, current)
+        };
+        let count = severed.len();
+        self.sever_all(severed, current);
+        count
+    }
+
+    /// Removes every parked link below `current` from a caller-held lock.
+    ///
+    /// Split out so the checkout path can do this inside the lock it already
+    /// takes to claim. Two acquisitions — one to sever, one to claim — is not
+    /// merely slower: `check_in` parks a link without consulting the epoch, so
+    /// the gap between them is a window in which a link superseded while it was
+    /// checked out is parked just after the scan walked past it, and the claim
+    /// then takes it.
+    ///
+    /// With `verify_at_checkout` set that is caught one round trip later by
+    /// [`verify_epoch`](Self::verify_epoch) and costs only a wasted connection.
+    /// **Without it there is no second check**, and the client is handed a link
+    /// to a demoted primary — which is the whole failure the fence exists to
+    /// prevent. Doing both under one lock closes the window by construction
+    /// rather than leaving it to a backstop that is switched off by
+    /// configuration.
+    fn take_superseded(inner: &mut Inner, current: Epoch) -> Vec<BackendConn> {
+        let stale: Vec<pgelastic_capacity::ServerId> = inner
+            .parked
+            .iter()
+            .filter(|(_, parked)| parked.conn.epoch < current)
+            .map(|(server, _)| *server)
+            .collect();
+
+        let mut severed = Vec::with_capacity(stale.len());
+        for server in stale {
+            if let Some(conn) = inner.unpark(server) {
+                let grants = inner.allocator.backend_died(server);
+                inner.dispatch(grants);
+                severed.push(conn);
             }
         }
+        severed
+    }
 
-        let count = severed.len();
+    /// Closes what [`take_superseded`](Self::take_superseded) removed, with the
+    /// lock released — the sockets are already unreachable to any later
+    /// checkout, so the ordering the fence needs is satisfied before this runs.
+    fn sever_all(&self, severed: Vec<BackendConn>, current: Epoch) {
         for conn in severed {
             debug!(
                 epoch = %conn.epoch,
@@ -711,7 +743,6 @@ impl PoolManager {
                 .backend_severed(crate::epoch::FenceAction::Close);
             conn.sever();
         }
-        count
     }
 
     /// Turns a capacity slot into a physical link under `request.key`.
@@ -721,15 +752,20 @@ impl PoolManager {
         connector: &Connector<'_>,
         lease: Lease,
     ) -> std::result::Result<Checkout, Denial> {
-        // Before anything is claimed: a link parked across a promotion is
-        // precisely the one that would carry this client to a demoted primary.
-        self.sever_superseded();
-
         let server = lease.server;
-        let (parked, stale) = {
+        let current = self.fence.current();
+        // Severed and claimed under one lock. A link parked across a promotion
+        // is precisely the one that would carry this client to a demoted
+        // primary, so the sever has to be ordered before the claim — and taking
+        // the lock twice to do it leaves a window between them in which exactly
+        // such a link can be parked.
+        let (superseded, parked, stale) = {
             let mut inner = self.lock();
-            inner.claim(server, request.key)
+            let superseded = Self::take_superseded(&mut inner, current);
+            let (parked, stale) = inner.claim(server, request.key);
+            (superseded, parked, stale)
         };
+        self.sever_all(superseded, current);
         if let Some(stale) = stale {
             self.metrics.backend_closed();
             tokio::spawn(stale.close());

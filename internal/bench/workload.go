@@ -78,6 +78,9 @@ type RunConfig struct {
 	// spike does neither. Measuring all three under the simple protocol removes the
 	// capability from the comparison rather than crediting whoever happens to have it.
 	SimpleProtocol bool
+	// RunID names the invocation this cell belongs to, shared by every arm of one sweep.
+	RunID string
+
 	// IdleWorkingSet is the pooler's resident memory before the sweep opened anything, and is
 	// the floor every density cell subtracts.
 	//

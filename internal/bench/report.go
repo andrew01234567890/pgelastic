@@ -69,7 +69,18 @@ type Point struct {
 
 // Report is one target measured across one workload. Written to disk verbatim.
 type Report struct {
-	Environment Environment  `json:"environment"`
+	Environment Environment `json:"environment"`
+	// RunID names the invocation that produced this report, and is shared by every arm of one
+	// run-arms.sh sweep.
+	//
+	// It exists because drift between invocations was measured at 8-13% against 0-2% within
+	// one, which is wider than several of the gaps this harness is asked to adjudicate. Two
+	// reports carrying different IDs were taken far enough apart that the machine, not the
+	// code, may account for the difference between them - and until this field existed
+	// nothing in the artifact recorded which was which.
+	RunID     string    `json:"runId,omitempty"`
+	StartedAt time.Time `json:"startedAt"`
+
 	Target      string       `json:"target"`
 	Workload    WorkloadName `json:"workload"`
 	Query       string       `json:"query,omitempty"`
@@ -129,6 +140,8 @@ func SweepWithProbe(ctx context.Context, env Environment, target string, cfg Run
 
 	report := Report{
 		Environment:    env,
+		RunID:          cfg.RunID,
+		StartedAt:      time.Now().UTC(),
 		Target:         target,
 		Workload:       cfg.Workload,
 		Query:          cfg.EffectiveQuery(),
@@ -239,6 +252,7 @@ func Compare(direct, rust, golang Report) []Result {
 		return []Result{*mismatch}
 	}
 
+	boundary := crossRun(direct, rust, golang)
 	var results []Result
 	rig := rust.Environment.Rig
 	goPoints := byConcurrency(golang)
@@ -285,14 +299,78 @@ func Compare(direct, rust, golang Report) []Result {
 				results = append(results, missingPoint(rust.Workload, rustPoint.Concurrency, "direct"))
 				continue
 			}
-			results = append(results,
-				at(rustPoint, AddedLatency(rig, AxisP99,
-					directPoint.P99Micros, rustPoint.P99Micros, goPoint.P99Micros)),
-				at(rustPoint, AddedLatency(rig, AxisP999,
-					directPoint.P999Micros, rustPoint.P999Micros, goPoint.P999Micros)))
+			// The latency axes subtract the direct arm from the pooled ones. Across a run
+			// boundary that subtraction crosses the drift, and drift is larger than the
+			// added latency being measured - so the difference would be mostly the gap
+			// between two invocations, reported as a property of the proxy.
+			p99 := at(rustPoint, AddedLatency(rig, AxisP99,
+				directPoint.P99Micros, rustPoint.P99Micros, goPoint.P99Micros))
+			p999 := at(rustPoint, AddedLatency(rig, AxisP999,
+				directPoint.P999Micros, rustPoint.P999Micros, goPoint.P999Micros))
+			if boundary != "" {
+				p99, p999 = withheld(p99), withheld(p999)
+			}
+			results = append(results, p99, p999)
+		}
+	}
+
+	if boundary != "" {
+		for i := range results {
+			results[i].Reason = appendReason(results[i].Reason, boundary)
 		}
 	}
 	return results
+}
+
+// crossRun reports that these arms came from different invocations, or "" if they did not.
+//
+// A note on every row rather than a refusal. Comparing arms across runs is a real thing to
+// want - the reference arm is often measured once and kept - and the drift is a qualification
+// on the number, not a reason to withhold it. The exception is the latency axes, which
+// subtract across the boundary and are withheld outright.
+func crossRun(reports ...Report) string {
+	ids := map[string]bool{}
+	anonymous := false
+	for _, report := range reports {
+		// An empty workload is the zero Report that Compare is given when an arm is absent,
+		// not an arm that was measured without an identity.
+		if report.Workload == "" {
+			continue
+		}
+		if report.RunID == "" {
+			anonymous = true
+			continue
+		}
+		ids[report.RunID] = true
+	}
+
+	if len(ids) > 1 {
+		return fmt.Sprintf("these arms come from %d separate invocations, between which this rig "+
+			"drifts by more than it varies within one", len(ids))
+	}
+	// Silence here would imply these were measured together, which is exactly what cannot be
+	// established: a report written before run identity existed carries no way to tell.
+	if anonymous && len(ids) > 0 {
+		return "one of these arms predates run identity, so whether it was measured alongside " +
+			"the others cannot be established"
+	}
+	return ""
+}
+
+// withheld turns a result into a refusal, keeping both the ratio and the reason the axis gave
+// so a reader can still see what it would have said and why.
+//
+// The cross-run note itself is not added here; every row gets it once, at the end.
+func withheld(result Result) Result {
+	result.Verdict = Inconclusive
+	return result
+}
+
+func appendReason(existing, addition string) string {
+	if existing == "" {
+		return addition
+	}
+	return existing + "; " + addition
 }
 
 // incomparable refuses two reports that are not measuring the same thing.

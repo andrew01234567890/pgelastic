@@ -26,6 +26,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -48,6 +49,8 @@ func main() {
 		os.Exit(compare(os.Args[2:]))
 	case "probe":
 		os.Exit(probe(os.Args[2:]))
+	case "drift":
+		os.Exit(drift(os.Args[2:]))
 	case "table":
 		os.Exit(table(os.Args[2:]))
 	default:
@@ -65,6 +68,7 @@ subcommands:
   run       measure one target across one workload and write a report
   compare   apply the pre-registered criteria to direct/rust/go reports
   probe     run one query against a DSN and exit non-zero if it fails
+  drift     ask whether repeating a measurement reproduces it
   table     render stored reports as a markdown table, one column per arm
 `)
 }
@@ -214,6 +218,9 @@ func run(args []string) int {
 			"taking prepared-statement handling out of the comparison")
 	pooler := flags.String("pooler", "",
 		"container whose CPU and memory to sample; empty for the direct arm, which has none")
+	runID := flags.String("run-id", "",
+		"names this invocation; every arm of one sweep shares it, so a later comparison can "+
+			"tell arms measured together from arms measured a day apart")
 	out := flags.String("out", "", "write the JSON report here (default stdout summary only)")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -241,6 +248,7 @@ func run(args []string) int {
 		Query:          *query,
 		BulkRows:       *bulkRows,
 		SimpleProtocol: *simple,
+		RunID:          *runID,
 	}, concurrencies, *repetitions, os.Stderr, *pooler)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -482,4 +490,86 @@ func dirtySuffix(dirty bool) string {
 		return " (dirty)"
 	}
 	return ""
+}
+
+// drift asks whether repeating a measurement reproduces it.
+//
+// The question every other verdict rests on and none of them ask. A 25% claim drawn from two
+// invocations is only worth what the gap between invocations is worth.
+func drift(args []string) int {
+	flags := flag.NewFlagSet("drift", flag.ExitOnError)
+	dir := flags.String("dir", "docs/bench/runs", "directory holding one subdirectory per run")
+	arm := flags.String("arm", "rust", "which arm to check")
+	workload := flags.String("workload", "throughput", "which workload to check")
+	metric := flags.String("metric", "throughput", "throughput, p50, p99 or p999")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+
+	runs, err := os.ReadDir(*dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "reading %s: %v\n", *dir, err)
+		return 1
+	}
+
+	var reports []bench.Report
+	for _, run := range runs {
+		if !run.IsDir() {
+			continue
+		}
+		path := fmt.Sprintf("%s/%s/%s-%s.json", *dir, run.Name(), *arm, *workload)
+		report, readErr := readReport(path)
+		if readErr != nil {
+			continue
+		}
+		reports = append(reports, report)
+	}
+	if len(reports) < 2 {
+		fmt.Fprintf(os.Stderr,
+			"found %d runs of %s/%s under %s; drift needs at least 2 separate invocations\n",
+			len(reports), *arm, *workload, *dir)
+		return 1
+	}
+
+	fmt.Printf("%s / %s / %s across %d invocations\n\n", *arm, *workload, *metric, len(reports))
+	worst := 0
+	for _, concurrency := range concurrenciesIn(reports) {
+		result := bench.Reproducible(axisFor(*metric), reports, concurrency,
+			func(point bench.Point) bench.Sample { return sampleFor(point, *metric) })
+		fmt.Printf("  %-9s %s\n", result.Verdict, result.Reason)
+		if result.Verdict == bench.Fail {
+			worst = 1
+		}
+	}
+	return worst
+}
+
+// axisFor names the axis a metric belongs to, so a row about p99 does not say "throughput".
+func axisFor(metric string) bench.Axis {
+	switch metric {
+	case "p99":
+		return bench.AxisP99
+	case "p999":
+		return bench.AxisP999
+	case "mb":
+		return bench.AxisBulk
+	default:
+		return bench.AxisThroughput
+	}
+}
+
+// concurrenciesIn is every client count any of the reports visited, in order.
+func concurrenciesIn(reports []bench.Report) []int {
+	seen := map[int]bool{}
+	var out []int
+	for _, report := range reports {
+		for _, point := range report.Points {
+			if !seen[point.Concurrency] {
+				seen[point.Concurrency] = true
+				out = append(out, point.Concurrency)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
 }
