@@ -135,6 +135,13 @@ jobs:
       - name: Run the proxy suite
         run: make test-e2e-proxy E2E_CONTEXT="kind-${KIND_CLUSTER}"
 
+      # The backup suite is the only place the claim "WAL reached the object store" is
+      # answered by fetching a segment back out of one. It stands up an S3-compatible store
+      # with a certificate it signs itself, so it needs egress for that image and a real
+      # three-node instance to archive from, which is why it is here rather than per-push.
+      - name: Run the backup suite
+        run: make test-e2e-backup E2E_CONTEXT="kind-${KIND_CLUSTER}"
+
       # The restart suite recreates every member Pod of a real instance and switches the
       # primary away under a client that never disconnects. It drives real restarts, so it
       # belongs with the chaos and migration specs rather than on the per-push job. The

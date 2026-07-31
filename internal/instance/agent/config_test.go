@@ -34,6 +34,13 @@ const (
 	quorumOfTwo   = `ANY 1 ("pg-a-2","pg-a-3")`
 )
 
+// A standby's view of the primary, spelled once so the tests that build one cannot drift
+// from each other.
+const (
+	testPrimaryConnInfo = "host=pg-a-1 dbname=postgres"
+	testPrimarySlot     = "pgelastic_pg_a_2"
+)
+
 func agentConfig() provision.AgentConfig {
 	return provision.AgentConfig{
 		Instance:  "pg-a",
@@ -133,8 +140,8 @@ func TestWriteConfigReplacesOverrideConfWholesale(t *testing.T) {
 	dir := t.TempDir()
 	standby := pgconf.ReplicationConfig{
 		Standby:         true,
-		PrimaryConnInfo: "host=pg-a-1 dbname=postgres",
-		PrimarySlotName: "pgelastic_pg_a_2",
+		PrimaryConnInfo: testPrimaryConnInfo,
+		PrimarySlotName: testPrimarySlot,
 	}
 	if _, err := WriteConfig(agentConfig(), standbyMember, standby, dir, nil); err != nil {
 		t.Fatal(err)
@@ -242,8 +249,8 @@ func TestWriteConfigNeverExposesAPartialFile(t *testing.T) {
 	dir := t.TempDir()
 	standby := pgconf.ReplicationConfig{
 		Standby:                 true,
-		PrimaryConnInfo:         "host=pg-a-1 dbname=postgres",
-		PrimarySlotName:         "pgelastic_pg_a_2",
+		PrimaryConnInfo:         testPrimaryConnInfo,
+		PrimarySlotName:         testPrimarySlot,
 		SynchronousStandbyNames: "ANY 1 (pg-a-2, pg-a-3)",
 	}
 	if _, err := WriteConfig(agentConfig(), standbyMember, standby, dir, nil); err != nil {

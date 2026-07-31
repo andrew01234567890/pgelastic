@@ -24,12 +24,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// testInstance is the instance name every test in this package builds objects for.
+const testInstance = "pg-a"
+
 func claim(name string, serial, role string) corev1.PersistentVolumeClaim {
 	return corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 			Labels: map[string]string{
-				LabelInstanceName: "pg-a",
+				LabelInstanceName: testInstance,
 				LabelNodeSerial:   serial,
 				LabelPVCRole:      role,
 			},
@@ -146,10 +149,10 @@ func TestSerialOf(t *testing.T) {
 }
 
 func TestNamesAreStableAcrossRecreation(t *testing.T) {
-	if DataPVCName("pg-a", 2) != MemberName("pg-a", 2) {
+	if DataPVCName(testInstance, 2) != MemberName(testInstance, 2) {
 		t.Error("the data claim shares the member's name so a recreated Pod finds its volume")
 	}
-	if WALPVCName("pg-a", 2) != "pg-a-2-wal" {
-		t.Errorf("WALPVCName = %q, want pg-a-2-wal", WALPVCName("pg-a", 2))
+	if WALPVCName(testInstance, 2) != "pg-a-2-wal" {
+		t.Errorf("WALPVCName = %q, want pg-a-2-wal", WALPVCName(testInstance, 2))
 	}
 }

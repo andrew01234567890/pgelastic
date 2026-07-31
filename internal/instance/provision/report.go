@@ -23,6 +23,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Status server paths. They live beside the AgentConfig for the same reason: the operator
@@ -97,6 +99,34 @@ type MemberReport struct {
 	// PrimaryEpoch is the fence token bound into this member's postmaster, read back with
 	// current_setting() so it cannot drift from the running server.
 	PrimaryEpoch int64 `json:"primaryEpoch"`
+	// Archive is this member's WAL archiving.
+	//
+	// It travels on the report the operator already polls rather than on a channel of its
+	// own, and in particular not by patching the API server from archive_command. Archiving
+	// is a per-segment event; writing to Kubernetes on every one of them would put an
+	// instance's WAL rate onto the API server, and the answer the operator needs is the
+	// current state rather than the log of transitions.
+	Archive *ArchiveReport `json:"archive,omitempty"`
+}
+
+// ArchiveReport is one member's view of its own WAL archiving.
+type ArchiveReport struct {
+	// State is working, failing or neverRun. The third is not a failure: it is what a
+	// primary looks like before anything has ever been archived, and the only state from
+	// which switching a segment to prove the archive works is the right move.
+	State string `json:"state"`
+	// LastArchivedWAL and LastArchivedAt are pg_stat_archiver's record of success.
+	LastArchivedWAL string       `json:"lastArchivedWAL,omitempty"`
+	LastArchivedAt  *metav1.Time `json:"lastArchivedAt,omitempty"`
+	// FailedCount is cumulative since the last stats reset.
+	FailedCount int64 `json:"failedCount"`
+	// LastFailureAt and LastFailureMessage are the failure and the reason for it.
+	// pg_stat_archiver supplies the first and never the second, so the second comes from
+	// what archive_command recorded before it exited.
+	LastFailureAt      *metav1.Time `json:"lastFailureAt,omitempty"`
+	LastFailureMessage string       `json:"lastFailureMessage,omitempty"`
+	// ReadyBacklog is how many segments are queued for archiving.
+	ReadyBacklog int32 `json:"readyBacklog"`
 }
 
 // memberReportTimeout bounds one status poll.

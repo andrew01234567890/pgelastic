@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -99,7 +100,35 @@ func MemberReportOf(member string, state ProbeState) provision.MemberReport {
 		VotingMembers:           observation.VotingMembers,
 		StreamingMembers:        observation.SyncStandbys,
 		PrimaryEpoch:            observation.PrimaryEpoch,
+		Archive:                 archiveReport(observation.Archive),
 	}
+}
+
+// archiveReport carries the archive observation onto the wire, and reports nothing at all
+// when this member has no repository.
+//
+// The distinction matters to the operator: an instance with no repository configured is not
+// an instance whose archiving is broken, and a status that could not tell the two apart
+// would either alarm on every instance that has not opted in or stay silent on every
+// instance that has.
+func archiveReport(observation ArchiveObservation) *provision.ArchiveReport {
+	if observation.State == "" {
+		return nil
+	}
+	report := &provision.ArchiveReport{
+		State:              string(observation.State),
+		LastArchivedWAL:    observation.LastArchivedWAL,
+		FailedCount:        observation.FailedCount,
+		LastFailureMessage: observation.LastFailureMessage,
+		ReadyBacklog:       observation.ReadyBacklog,
+	}
+	if observation.LastArchivedAt != nil {
+		report.LastArchivedAt = &metav1.Time{Time: *observation.LastArchivedAt}
+	}
+	if observation.LastFailureAt != nil {
+		report.LastFailureAt = &metav1.Time{Time: *observation.LastFailureAt}
+	}
+	return report
 }
 
 // Serve runs the status server until the context is cancelled.

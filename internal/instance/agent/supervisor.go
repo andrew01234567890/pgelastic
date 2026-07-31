@@ -474,6 +474,24 @@ func (s *Supervisor) checkpoint(ctx context.Context, timeout time.Duration) {
 	}
 }
 
+// archiveObservation completes what PostgreSQL could not answer, and reports nothing at all
+// for a member with no repository.
+//
+// The empty case is the load-bearing one. pg_stat_archiver records a successful archive
+// whether or not anything was written anywhere: with no repository configured
+// archive_command deliberately succeeds without pushing, so PostgreSQL would report a
+// healthy archive for an instance whose WAL is going nowhere. Reporting nothing is the only
+// answer that does not read as either a fault or a working archive.
+func (s *Supervisor) archiveObservation(observation ArchiveObservation) ArchiveObservation {
+	repository := s.options.Config.Backup
+	if repository == nil || !repository.Configured() {
+		return ArchiveObservation{}
+	}
+	observation.ReadyBacklog = ArchiveBacklog(s.options.WALDir)
+	observation.LastFailureMessage = LastArchiveFailure(provision.ArchiveStatusFile, observation.LastFailedWAL)
+	return observation
+}
+
 // observe re-reads the postmaster, converges the replication configuration, and
 // republishes this member's status.
 func (s *Supervisor) observe(ctx context.Context) {
@@ -509,6 +527,7 @@ func (s *Supervisor) observe(ctx context.Context) {
 		return
 	}
 	observation.WALVolumeFull = usageErr == nil && usage.Full()
+	observation.Archive = s.archiveObservation(observation.Archive)
 	s.update(func(state *ProbeState) {
 		state.Role = observation.Role
 		state.ReplayLag = observation.ReplayLag
@@ -621,6 +640,9 @@ func (s *Supervisor) publishPrimaryState(
 		Epoch:       s.publishedEpoch(),
 		Observation: observation,
 		Contract:    contract,
+	}
+	if observation.Archive.State != "" {
+		state.Archive = &observation.Archive
 	}
 	if err := s.reporter().PublishPrimaryState(ctx, state); err != nil {
 		logf.FromContext(ctx).Error(err, "could not publish the primary's view of the instance")
