@@ -32,6 +32,7 @@ import (
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/ha"
+	"github.com/andrew01234567890/pgelastic/internal/instance/pgbackrest"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 )
 
@@ -52,6 +53,13 @@ const postgresUID int64 = 999
 
 // componentName labels every object of an instance and names the postgres container.
 const componentName = "postgres"
+
+// bootstrapContainer is the init container that brings the data directory into existence.
+const bootstrapContainer = "bootstrap"
+
+// defaultRetentionWindow is the window the API server defaults both halves of the retention
+// policy to, repeated here for an object that never went through admission.
+const defaultRetentionWindow = "30d"
 
 // verbGet is spelled once so an RBAC rule cannot lose a verb to a typo.
 const (
@@ -162,7 +170,7 @@ func (b Builder) AgentConfig() AgentConfig {
 		LogDirectory:             LogDir,
 		LogFilename:              LogFileName,
 		ArchiveCommand:           fmt.Sprintf("%s wal-archive --segment %%p --name %%f", AgentBinary),
-		ArchiveTimeout:           "5min",
+		ArchiveTimeout:           ArchiveTimeout,
 		WALVolumeBytes:           spec.Storage.WALVolume.Size.Value(),
 		SynchronousCommit:        string(synchronousCommit(spec)),
 		AutovacuumWorkerSlots:    16,
@@ -199,7 +207,43 @@ func (b Builder) AgentConfig() AgentConfig {
 			WALSegmentSize: 16 << 20,
 			DataChecksums:  true,
 		},
+		Backup: repository(spec.Backup),
 	}
+}
+
+// repository carries the WAL and base-backup destination down to the agent, or nothing when
+// none is configured.
+func repository(backup *pgelasticv1alpha1.InstanceBackup) *pgbackrest.Repository {
+	if backup == nil {
+		return nil
+	}
+	// The API server defaults the retention block, but an object built in a test or applied
+	// by a client that skipped validation has not been through it.
+	full, wal := defaultRetentionWindow, defaultRetentionWindow
+	if retention := backup.Retention; retention != nil {
+		if retention.Full != "" {
+			full = retention.Full
+		}
+		if retention.WAL != "" {
+			wal = retention.WAL
+		}
+	}
+	return &pgbackrest.Repository{
+		Path:          backup.ObjectStore.Path,
+		EndpointURL:   backup.ObjectStore.EndpointURL,
+		Region:        backup.ObjectStore.Region,
+		RetentionFull: full,
+		RetentionWAL:  wal,
+	}
+}
+
+// backupCredentialsSecret names the Secret holding the object store's key pair, or nothing
+// when no repository is configured.
+func (b Builder) backupCredentialsSecret() string {
+	if b.Instance.Spec.Backup == nil {
+		return ""
+	}
+	return b.Instance.Spec.Backup.ObjectStore.CredentialsSecretRef.Name
 }
 
 // Pod builds one member, stamped with the roll signature it is being created for.
@@ -231,7 +275,7 @@ func (b Builder) Pod(serial int32, stamp RollStamp) *corev1.Pod {
 				VolumeMounts: []corev1.VolumeMount{{Name: "agent", MountPath: AgentMountPath}},
 			},
 			{
-				Name:            "bootstrap",
+				Name:            bootstrapContainer,
 				Image:           b.PostgresImage,
 				ImagePullPolicy: corev1.PullIfNotPresent,
 				Command:         []string{AgentBinary, "bootstrap"},
@@ -325,7 +369,7 @@ func (b Builder) env(serial int32) []corev1.EnvVar {
 }
 
 func (b Builder) mounts() []corev1.VolumeMount {
-	return []corev1.VolumeMount{
+	mounts := []corev1.VolumeMount{
 		{Name: "agent", MountPath: AgentMountPath},
 		{Name: "pgdata", MountPath: DataMountPath},
 		{Name: "pgwal", MountPath: WALMountPath},
@@ -333,7 +377,21 @@ func (b Builder) mounts() []corev1.VolumeMount {
 		{Name: "logs", MountPath: LogDir},
 		{Name: "config", MountPath: ConfigMountPath, ReadOnly: true},
 	}
+	// The credentials are mounted rather than handed over as environment variables, so that
+	// rotating them is a file the kubelet refreshes in place instead of a Pod restart that
+	// drops every tenant connection on the instance.
+	if b.backupCredentialsSecret() != "" {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      backupCredentialsVolume,
+			MountPath: BackupCredentialsMountPath,
+			ReadOnly:  true,
+		})
+	}
+	return mounts
 }
+
+// backupCredentialsVolume is the Pod volume carrying the object store Secret.
+const backupCredentialsVolume = "backup-credentials"
 
 func (b Builder) volumes(serial int32) []corev1.Volume {
 	claim := func(name, claimName string) corev1.Volume {
@@ -346,7 +404,7 @@ func (b Builder) volumes(serial int32) []corev1.Volume {
 			EmptyDir: &corev1.EmptyDirVolumeSource{},
 		}}
 	}
-	return []corev1.Volume{
+	volumes := []corev1.Volume{
 		claim("pgdata", DataPVCName(b.name(), serial)),
 		claim("pgwal", WALPVCName(b.name(), serial)),
 		empty("agent"),
@@ -358,6 +416,15 @@ func (b Builder) volumes(serial int32) []corev1.Volume {
 			},
 		}},
 	}
+	if secret := b.backupCredentialsSecret(); secret != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: backupCredentialsVolume,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: secret},
+			},
+		})
+	}
+	return volumes
 }
 
 // PeerService is headless and publishes not-ready addresses, because a member that is not

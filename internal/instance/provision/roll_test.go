@@ -30,7 +30,7 @@ import (
 func stampBuilder(epoch int64, dumps int32) Builder {
 	return Builder{
 		Instance: &pgelasticv1alpha1.PgInstance{
-			ObjectMeta: metav1.ObjectMeta{Name: "pg-a", Namespace: "saas"},
+			ObjectMeta: metav1.ObjectMeta{Name: testInstance, Namespace: "saas"},
 			Spec: pgelasticv1alpha1.PgInstanceSpec{
 				Class:   "dev-1",
 				Storage: storageOf("2Gi", "512Mi"),

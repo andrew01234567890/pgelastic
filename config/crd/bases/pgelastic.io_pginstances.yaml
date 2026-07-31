@@ -154,10 +154,13 @@ spec:
                       full:
                         default: 30d
                         description: full is how long full backups are kept.
+                        pattern: ^[1-9][0-9]*[dwm]$
                         type: string
                       wal:
                         default: 30d
-                        description: wal is how long archived WAL is kept.
+                        description: wal is how long archived WAL is kept. It may
+                          not be shorter than full.
+                        pattern: ^[1-9][0-9]*[dwm]$
                         type: string
                     type: object
                   schedule:

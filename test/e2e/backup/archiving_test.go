@@ -1,0 +1,215 @@
+//go:build e2e
+
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package backup
+
+import (
+	"os/exec"
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
+)
+
+const (
+	archiveNamespace  = "pgelastic-e2e-backup"
+	archiveInstance   = "pg-archive"
+	credentialsSecret = "object-store-credentials"
+)
+
+var _ = Describe("WAL archiving to an object store", Ordered, func() {
+	BeforeAll(func() {
+		probeNamespace.Store(archiveNamespace)
+
+		Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: archiveNamespace},
+		}))).To(Succeed())
+		claimNamespace(archiveNamespace)
+
+		caPEM := deployObjectStore(archiveNamespace)
+		Expect(k8sClient.Create(suiteCtx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      credentialsSecret,
+				Namespace: archiveNamespace,
+			},
+			Data: map[string][]byte{
+				provision.SecretKeyBackupAccessKeyID:     []byte(objectStoreAccessKey),
+				provision.SecretKeyBackupSecretAccessKey: []byte(objectStoreSecretKey),
+				// Without this pgBackRest refuses the store's certificate, which is the
+				// normal condition for an S3-compatible store running inside a cluster.
+				provision.SecretKeyBackupCABundle: caPEM,
+			},
+		})).To(Succeed())
+
+		instance := &pgelasticv1alpha1.PgInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: archiveInstance, Namespace: archiveNamespace},
+			Spec: pgelasticv1alpha1.PgInstanceSpec{
+				PoolRef: corev1.LocalObjectReference{Name: claimPoolName},
+				Class:   sizingClass,
+				Storage: pgelasticv1alpha1.InstanceStorage{
+					Size:      resource.MustParse("1Gi"),
+					WALVolume: pgelasticv1alpha1.WALVolume{Size: resource.MustParse("1Gi")},
+				},
+				Backup: &pgelasticv1alpha1.InstanceBackup{
+					ObjectStore: pgelasticv1alpha1.ObjectStore{
+						Path:                 "s3://" + objectStoreBucket + "/pgelastic",
+						EndpointURL:          objectStoreEndpoint(archiveNamespace),
+						CredentialsSecretRef: corev1.LocalObjectReference{Name: credentialsSecret},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(suiteCtx, instance)).To(Succeed())
+
+		By("waiting for the instance to serve")
+		Eventually(func(g Gomega) {
+			served := readInstance(g)
+			g.Expect(served.Status.CurrentPrimary).NotTo(BeEmpty())
+			g.Expect(meta.IsStatusConditionTrue(served.Status.Conditions,
+				pgelasticv1alpha1.ConditionReady)).To(BeTrue())
+		}).Should(Succeed())
+	})
+
+	// The claim this suite exists to make. Everything else here is about how it is reported.
+	It("pushes a segment into the repository and reads the same segment back out", func() {
+		By("switching a segment so there is something to archive")
+		switchWAL()
+
+		var archived string
+		Eventually(func(g Gomega) {
+			health := readInstance(g).Status.ArchiveHealth
+			g.Expect(health).NotTo(BeNil(), "the primary never published its archiving")
+			g.Expect(health.Healthy).To(BeTrue(), health.LastFailureMessage)
+			g.Expect(health.LastArchivedWAL).NotTo(BeEmpty())
+			archived = health.LastArchivedWAL
+		}).Should(Succeed())
+
+		// Reading it back is the only assertion that proves the bytes arrived. A push that
+		// reported success and wrote nothing looks identical from the sending side, and the
+		// difference is discovered at restore time, when there is nothing left to fall back
+		// on.
+		By("fetching " + archived + " back out of the repository")
+		const restored = "/tmp/e2e-restored-segment"
+		output, err := inPrimary(
+			provision.AgentBinary, "wal-restore", "--name", archived, "--target", restored,
+		).CombinedOutput()
+		Expect(err).NotTo(HaveOccurred(), string(output))
+
+		size, err := inPrimary("stat", "-c", "%s", restored).Output()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.TrimSpace(string(size))).To(Equal("16777216"),
+			"a restored segment that is not a whole WAL segment is a truncated object")
+	})
+
+	It("reports the archive on the instance's conditions", func() {
+		Eventually(func(g Gomega) {
+			condition := meta.FindStatusCondition(readInstance(g).Status.Conditions,
+				pgelasticv1alpha1.ConditionArchiving)
+			g.Expect(condition).NotTo(BeNil(),
+				"an instance with a repository must say whether WAL is reaching it")
+			g.Expect(condition.Status).To(Equal(metav1.ConditionTrue))
+			g.Expect(condition.Reason).To(Equal(pgelasticv1alpha1.ReasonArchiveHealthy))
+		}).Should(Succeed())
+	})
+
+	// A repository that stops accepting writes is the failure this whole subsystem exists to
+	// notice. The recovery half matters just as much: an archive that reports degraded
+	// forever after one transient failure is an alarm nobody will act on the second time.
+	It("goes degraded when the repository refuses it, and recovers when it stops", func() {
+		By("rotating the secret key to one the store will reject")
+		rotateSecretKey("wrong-secret-key")
+
+		Eventually(func(g Gomega) {
+			switchWAL()
+			condition := meta.FindStatusCondition(readInstance(g).Status.Conditions,
+				pgelasticv1alpha1.ConditionArchiving)
+			g.Expect(condition).NotTo(BeNil())
+			g.Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+			g.Expect(condition.Reason).To(Equal(pgelasticv1alpha1.ReasonArchiveDegraded))
+			// pg_stat_archiver records that a failure happened and never what it was, so a
+			// message here is evidence that archive_command's own account of the failure
+			// made it back to the API.
+			g.Expect(condition.Message).NotTo(BeEmpty())
+		}).Should(Succeed())
+
+		By("putting the working key back")
+		rotateSecretKey(objectStoreSecretKey)
+
+		Eventually(func(g Gomega) {
+			switchWAL()
+			g.Expect(meta.IsStatusConditionTrue(readInstance(g).Status.Conditions,
+				pgelasticv1alpha1.ConditionArchiving)).To(BeTrue(),
+				"archiving never recovered after the credential was fixed")
+		}).Should(Succeed())
+	})
+})
+
+// readInstance re-fetches on every poll rather than closing over one copy, so a spec
+// cannot wait for a change on an object it read before the change was possible.
+func readInstance(g Gomega) *pgelasticv1alpha1.PgInstance {
+	fetched := &pgelasticv1alpha1.PgInstance{}
+	g.Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
+		Namespace: archiveNamespace, Name: archiveInstance,
+	}, fetched)).To(Succeed())
+	return fetched
+}
+
+// switchWAL forces a segment boundary so archiving has something to do.
+//
+// Without it a quiet instance archives nothing at all: archive_timeout only switches a
+// segment when there has been WAL activity since the last switch, so a spec that merely
+// waited would wait forever and blame the archive.
+func switchWAL() {
+	GinkgoHelper()
+	output, err := inPrimary(
+		"psql", "-h", provision.SocketDir, "-U", "postgres", "-tAc",
+		"SELECT pg_switch_wal()",
+	).CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), string(output))
+}
+
+// rotateSecretKey rewrites the mounted credential in place. The kubelet refreshes the
+// projected file without restarting the Pod, which is the whole reason the credentials are
+// a volume rather than environment variables.
+func rotateSecretKey(value string) {
+	GinkgoHelper()
+	secret := &corev1.Secret{}
+	Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
+		Namespace: archiveNamespace, Name: credentialsSecret,
+	}, secret)).To(Succeed())
+	secret.Data[provision.SecretKeyBackupSecretAccessKey] = []byte(value)
+	Expect(k8sClient.Update(suiteCtx, secret)).To(Succeed())
+}
+
+func inPrimary(args ...string) *exec.Cmd {
+	GinkgoHelper()
+	primary := readInstance(Default).Status.CurrentPrimary
+	Expect(primary).NotTo(BeEmpty(), "the instance has no primary to run against")
+	return kubectlCommand(append([]string{
+		"exec", "-n", archiveNamespace, primary, "-c", "postgres", "--",
+	}, args...)...)
+}

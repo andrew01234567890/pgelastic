@@ -773,7 +773,60 @@ func conditionsFor(
 	conditions = append(conditions, condition(instance.Status.Conditions,
 		pgelasticv1alpha1.ConditionDegraded, degraded, instance.Generation,
 		degradedReason(degraded), quorumMessage(instance)))
+	if archiving := archivingCondition(instance); archiving != nil {
+		conditions = append(conditions, archiving)
+	}
 	return append(conditions, failoverConditions(instance, decision)...)
+}
+
+// archivingCondition projects what the primary published about WAL archiving.
+//
+// The operator reports it rather than measuring it: archiving happens on the primary, the
+// primary is the only member whose pg_stat_archiver describes anything, and it already
+// writes what it saw into status.archiveHealth on the same patch that carries the quorum
+// evidence. Polling for it separately would put a second, later reading beside the first.
+//
+// Nothing is reported for an instance with no repository. An absent condition and a False
+// one are different claims: the first says nobody asked for an archive, the second says one
+// was asked for and is not happening.
+func archivingCondition(instance *pgelasticv1alpha1.PgInstance) map[string]any {
+	if instance.Spec.Backup == nil {
+		return nil
+	}
+	health := instance.Status.ArchiveHealth
+	if health == nil {
+		return condition(instance.Status.Conditions, pgelasticv1alpha1.ConditionArchiving,
+			false, instance.Generation, pgelasticv1alpha1.ReasonArchiveDegraded,
+			"a repository is configured and no member has reported on archiving yet")
+	}
+	return condition(instance.Status.Conditions, pgelasticv1alpha1.ConditionArchiving,
+		health.Healthy, instance.Generation, archivingReason(health.Healthy),
+		archivingMessage(health))
+}
+
+func archivingReason(healthy bool) string {
+	if healthy {
+		return pgelasticv1alpha1.ReasonArchiveHealthy
+	}
+	return pgelasticv1alpha1.ReasonArchiveDegraded
+}
+
+// archivingMessage says which of the two ways archiving is failing, because they call for
+// different actions: a repository refusing writes is a credential or a bucket, and a queue
+// that is not draining behind a last success is an archive_command that has stopped
+// returning.
+func archivingMessage(health *pgelasticv1alpha1.ArchiveHealthStatus) string {
+	switch {
+	case health.Healthy:
+		return fmt.Sprintf("archived through %s", health.LastArchivedWAL)
+	case health.LastFailureMessage != "":
+		return health.LastFailureMessage
+	case health.ReadyBacklog > 0:
+		return fmt.Sprintf("%d segments are waiting to be archived and none has been archived recently",
+			health.ReadyBacklog)
+	default:
+		return "WAL archiving is not working"
+	}
 }
 
 func readyReason(phase pgelasticv1alpha1.InstancePhase) string {

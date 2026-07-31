@@ -17,8 +17,11 @@ limitations under the License.
 package provision
 
 import (
+	"time"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/andrew01234567890/pgelastic/internal/instance/pgbackrest"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 )
 
@@ -66,6 +69,57 @@ const (
 	// LogFIFOName is what the logging collector actually writes, and the FIFO the agent
 	// creates and drains to the container's stdout before any postmaster exists.
 	LogFIFOName = "postgresql.csv"
+)
+
+// Backup paths. The generated pgBackRest configuration carries the repository credentials,
+// so it lives in the agent's emptyDir at 0600 beside override.conf, which already carries
+// the replication password, rather than anywhere a second process could read it.
+const (
+	// BackupCredentialsMountPath is where the object store's Secret is mounted. It is a
+	// path of its own rather than a subdirectory of ConfigMountPath, because nesting one
+	// volume mount inside another is legal and unreadable.
+	BackupCredentialsMountPath = "/etc/pgelastic-backup"
+	// BackupConfigFile is the generated pgbackrest.conf.
+	BackupConfigFile = AgentMountPath + "/pgbackrest.conf"
+	// BackupSpoolPath backs asynchronous archiving. It sits beside pg_wal on the WAL volume,
+	// not inside it and not on the data volume: it holds WAL-sized files, and the volume
+	// already sized for WAL is the one whose worst case is understood.
+	BackupSpoolPath = WALMountPath + "/pgbackrest-spool"
+	// BackupLogPath is pgBackRest's own log directory. File logging is off, but pgBackRest
+	// still insists the path be writable.
+	BackupLogPath = AgentMountPath + "/pgbackrest-log"
+	// ArchiveTimeout is how long PostgreSQL waits before switching a segment so that a
+	// low-traffic instance still bounds how much committed work is not yet archived.
+	//
+	// Note what it does not do: it only switches when there has been WAL activity since the
+	// last switch, so an idle instance archives nothing for as long as it stays idle. That
+	// is why the age of the last successful archive is never on its own evidence of a fault.
+	ArchiveTimeout = "5min"
+	// ArchiveStallAfter is how long a non-empty archive queue may sit without anything
+	// being archived before archiving is called stalled rather than slow.
+	//
+	// Three archive_timeouts. Two would fire on a single slow upload; longer would let a
+	// hung archive_command - which fails no differently from an idle instance, because a
+	// command that never returns records neither a success nor a failure - go unnoticed for
+	// most of an hour.
+	ArchiveStallAfter = 15 * time.Minute
+	// ArchiveStatusFile is where archive_command records its own last outcome.
+	//
+	// It exists because archive_command runs as a separate short-lived process: it cannot
+	// hand an error to the agent in memory, and PostgreSQL discards its output. Without
+	// this the only evidence of why a segment failed would be an exit code, and
+	// pg_stat_archiver records that a failure happened without recording what it was.
+	ArchiveStatusFile = AgentMountPath + "/archive-status.json"
+)
+
+// Secret keys of the object store credentials.
+const (
+	// SecretKeyBackupAccessKeyID and SecretKeyBackupSecretAccessKey are the S3 key pair.
+	SecretKeyBackupAccessKeyID     = "accessKeyID"
+	SecretKeyBackupSecretAccessKey = "secretAccessKey"
+	// SecretKeyBackupCABundle is optional, and is the CA that signed an S3-compatible
+	// store's certificate when it is not one the image already trusts.
+	SecretKeyBackupCABundle = "ca.crt"
 )
 
 // Ports.
@@ -156,6 +210,18 @@ type AgentConfig struct {
 	// CollationContract is what initdb was pinned to, so a member can refuse to join a
 	// pool whose contract differs rather than discovering the difference at restore time.
 	CollationContract CollationContract `json:"collationContract"`
+	// Backup is the WAL and base-backup repository, absent until one is configured. When it
+	// is absent archive_command still runs and still succeeds, because archive_mode is
+	// PGC_POSTMASTER and turning it on later would cost a restart that drops every tenant
+	// connection on the instance.
+	Backup *pgbackrest.Repository `json:"backup,omitempty"`
+	// Recovering marks an instance restored from a repository rather than provisioned.
+	//
+	// Such a member carries its source's system identifier - a physical restore copies the
+	// control file verbatim - and therefore addresses its source's stanza, while running on
+	// a forked timeline. Archiving from it would interleave two histories into one archive
+	// and leave neither restorable, so it does not archive at all.
+	Recovering bool `json:"recovering,omitempty"`
 }
 
 // LeaseTimings are the promotion Lease's four durations, handed to the agent because the

@@ -18,6 +18,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -62,6 +63,7 @@ func WriteConfig(
 ) (string, error) {
 	instance := config.Postgres
 	instance.MemberName = member
+	replication.RestoreCommand = restoreCommand(config)
 
 	settings := pgconf.RenderCustomConf(instance)
 	if controlData != nil {
@@ -87,6 +89,24 @@ func WriteConfig(
 		}
 	}
 	return hash, nil
+}
+
+// restoreCommand is how PostgreSQL fetches a segment it no longer has in pg_wal.
+//
+// It is decided here rather than by each caller because there are four of them - initdb, a
+// standby's first join, a rejoin and a promotion - and a restore_command present on three
+// of the four is a member that silently cannot catch up from the archive. What it buys on a
+// standby is the difference between falling off the primary's wal_keep_size and having to
+// re-clone, and reading the missing segments out of the repository instead.
+//
+// It is set on a primary too, where it is inert: archive recovery is the only thing that
+// consults it, and a primary is not in archive recovery. A member that is demoted then has
+// it already, rather than acquiring it in the same reload that put it into recovery.
+func restoreCommand(config provision.AgentConfig) string {
+	if config.Backup == nil || !config.Backup.Configured() {
+		return ""
+	}
+	return fmt.Sprintf("%s wal-restore --name %%f --target %%p", provision.AgentBinary)
 }
 
 // writeFileAtomically replaces a configuration file in one step that either happens or

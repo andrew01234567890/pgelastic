@@ -113,6 +113,15 @@ type PrimaryState struct {
 	Observation MemberObservation
 	// Contract is the collation contract, recorded once and thereafter immutable.
 	Contract *Contract
+	// Archive is WAL archiving, absent when no repository is configured.
+	//
+	// It is published by the primary rather than by every member because archive_mode is on
+	// rather than always: only the primary archives, so a standby's pg_stat_archiver
+	// describes nothing. It travels in this patch rather than in the per-member apply for
+	// the same reason currentPrimary does - it is one fact about the instance, not one fact
+	// per member - and a demoted primary that stopped including it under server-side apply
+	// would delete it.
+	Archive *ArchiveObservation
 }
 
 // PublishPrimaryState merge-patches the fields only a primary may write.
@@ -153,12 +162,52 @@ func (r Reporter) PublishPrimaryState(ctx context.Context, state PrimaryState) e
 		}
 	}
 
+	if state.Archive != nil {
+		status["archiveHealth"] = archiveHealth(*state.Archive)
+	}
+
 	patch, err := json.Marshal(map[string]any{"status": status})
 	if err != nil {
 		return err
 	}
 	return r.Client.Status().Patch(ctx, r.object(),
 		client.RawPatch(types.MergePatchType, patch))
+}
+
+// archiveHealth renders the observation as the status the gates read.
+//
+// Timestamps are emitted as null rather than omitted when absent. This is a merge patch: a
+// key that is absent leaves whatever was there before, so a repository that recovered from
+// a failure would keep reporting the failure it recovered from forever.
+func archiveHealth(observation ArchiveObservation) map[string]any {
+	health := map[string]any{
+		"healthy":            observation.Healthy(time.Now()),
+		"failedCount":        observation.FailedCount,
+		"lastArchivedWAL":    observation.LastArchivedWAL,
+		"readyBacklog":       observation.ReadyBacklog,
+		"lastFailureMessage": truncate(observation.LastFailureMessage, maxFailureMessage),
+		"lastArchivedAt":     nil,
+		"lastFailureAt":      nil,
+	}
+	if observation.LastArchivedAt != nil {
+		health["lastArchivedAt"] = observation.LastArchivedAt.UTC().Format(time.RFC3339)
+	}
+	if observation.LastFailureAt != nil {
+		health["lastFailureAt"] = observation.LastFailureAt.UTC().Format(time.RFC3339)
+	}
+	return health
+}
+
+// maxFailureMessage matches the API's own limit on the field. A pgBackRest error carries the
+// whole failing command line, which for a repository with a long path is comfortably over
+// it, and a status update the API server rejects would take the rest of the patch with it.
+const maxFailureMessage = 1024
+
+func truncate(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit]
 }
 
 func instanceRole(role Role) pgelasticv1alpha1.InstanceRole {

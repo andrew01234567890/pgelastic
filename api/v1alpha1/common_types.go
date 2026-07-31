@@ -57,6 +57,12 @@ const (
 	// Required that is correct behaviour, but it has to be first-class and alertable rather
 	// than an inexplicable hang.
 	ConditionWriteStalled = "WriteStalled"
+	// ConditionArchiving reports whether WAL is reaching the repository. It is absent
+	// entirely on an instance with no repository configured, which is a different thing
+	// from an instance whose archiving has stopped: reporting False for both would alarm on
+	// every instance that never opted in, and reporting True for both would claim a
+	// recoverability window that does not exist.
+	ConditionArchiving = "Archiving"
 )
 
 // The four named failover vetoes, each its own condition type and its own metric label,
@@ -381,14 +387,21 @@ type ObjectStore struct {
 }
 
 // RetentionPolicy bounds how long backups and WAL are kept. WAL retention must always
-// cover the oldest restorable full backup plus every incremental depending on it.
+// cover the oldest restorable full backup plus every incremental depending on it: expiring
+// WAL first leaves a base backup that cannot be replayed to consistency, which is a
+// repository that looks healthy until somebody tries to restore from it.
+//
+// Both are a count and a unit - d, w, or m, where a month is thirty days. A recovery window
+// is a coarse operational promise rather than a calendar calculation.
 type RetentionPolicy struct {
 	// full is how long full backups are kept.
+	// +kubebuilder:validation:Pattern=`^[1-9][0-9]*[dwm]$`
 	// +kubebuilder:default="30d"
 	// +optional
 	Full string `json:"full,omitempty"`
 
-	// wal is how long archived WAL is kept.
+	// wal is how long archived WAL is kept. It may not be shorter than full.
+	// +kubebuilder:validation:Pattern=`^[1-9][0-9]*[dwm]$`
 	// +kubebuilder:default="30d"
 	// +optional
 	WAL string `json:"wal,omitempty"`

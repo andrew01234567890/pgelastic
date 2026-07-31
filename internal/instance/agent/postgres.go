@@ -86,6 +86,89 @@ type MemberObservation struct {
 	PendingRestart   bool
 	MaxConnections   int32
 	PrimaryEpoch     int64
+	// Archive is this member's view of its own WAL archiving.
+	Archive ArchiveObservation
+}
+
+// ArchiveState is the answer to "is WAL archiving working", and it has three values rather
+// than two.
+//
+// An archive nothing has ever been written to is not a failing archive. Collapsing that
+// case into failure would make every freshly bootstrapped primary report a fault it does
+// not have; collapsing it into success would report an archive as healthy before anything
+// had ever proved it was reachable. It is its own state because it is the only one from
+// which a primary can bootstrap the archive by switching a segment.
+type ArchiveState string
+
+const (
+	// ArchiveWorking means the last archive attempt succeeded more recently than the last
+	// failure.
+	ArchiveWorking ArchiveState = "working"
+	// ArchiveFailing means the reverse.
+	ArchiveFailing ArchiveState = "failing"
+	// ArchiveNeverRun means no segment has ever been archived or failed to archive.
+	ArchiveNeverRun ArchiveState = "neverRun"
+)
+
+// ArchiveObservation is pg_stat_archiver as this member reports it, plus the two things
+// pg_stat_archiver does not record: how many segments are queued, and why the last failure
+// happened.
+type ArchiveObservation struct {
+	State           ArchiveState
+	LastArchivedWAL string
+	LastArchivedAt  *time.Time
+	FailedCount     int64
+	LastFailedWAL   string
+	LastFailureAt   *time.Time
+	// LastFailureMessage comes from what archive_command recorded, because
+	// pg_stat_archiver records that a failure happened and never what it was.
+	LastFailureMessage string
+	// ReadyBacklog is how many segments are waiting to be archived, counted from the
+	// filesystem so that the answer survives a postmaster that has already stopped.
+	ReadyBacklog int32
+}
+
+// Healthy folds the three inputs into the summary the admission and migration gates read.
+//
+// State alone is not enough, because the worst failure does not set it. An archive_command
+// that hangs rather than fails records neither a success nor a failure, so
+// pg_stat_archiver goes on reporting the last success and an archive that has stopped
+// working is indistinguishable from one that is merely idle.
+//
+// What separates them is the queue. Segments waiting while nothing has been archived for a
+// long time is a stall; no segments waiting is an instance with nothing to archive, which
+// is not a fault. Staleness on its own is never evidence: archive_timeout only switches a
+// segment when there has been WAL activity since the last switch, so a quiet instance
+// archives nothing for as long as it stays quiet and is perfectly healthy while it does.
+func (o ArchiveObservation) Healthy(now time.Time) bool {
+	if o.State != ArchiveWorking {
+		return false
+	}
+	if o.ReadyBacklog == 0 {
+		return true
+	}
+	// A queue that has never archived anything at all has no last-success to age, and a
+	// queue is exactly what makes that a stall rather than an idle instance.
+	if o.LastArchivedAt == nil {
+		return false
+	}
+	return now.Sub(*o.LastArchivedAt) < provision.ArchiveStallAfter
+}
+
+// archiveState folds the two timestamps into the three-way answer.
+func archiveState(archived, failed *time.Time) ArchiveState {
+	switch {
+	case archived == nil && failed == nil:
+		return ArchiveNeverRun
+	case failed == nil:
+		return ArchiveWorking
+	case archived == nil:
+		return ArchiveFailing
+	case archived.After(*failed):
+		return ArchiveWorking
+	default:
+		return ArchiveFailing
+	}
 }
 
 // Observe reads the member's own state out of the running postmaster.
@@ -121,7 +204,12 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		       EXISTS (SELECT 1 FROM pg_settings WHERE pending_restart),
 		       current_setting('max_connections')::int,
 		       current_setting('synchronous_standby_names'),
-		       COALESCE(current_setting('pgelastic.primary_epoch', true), '0')::bigint`
+		       COALESCE(current_setting('pgelastic.primary_epoch', true), '0')::bigint,
+		       COALESCE((SELECT last_archived_wal FROM pg_stat_archiver), ''),
+		       (SELECT last_archived_time FROM pg_stat_archiver),
+		       COALESCE((SELECT failed_count FROM pg_stat_archiver), 0),
+		       COALESCE((SELECT last_failed_wal FROM pg_stat_archiver), ''),
+		       (SELECT last_failed_time FROM pg_stat_archiver)`
 	var lagSeconds float64
 	err := conn.QueryRow(ctx, stateQuery).Scan(
 		&observation.LSN,
@@ -136,11 +224,18 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		&observation.MaxConnections,
 		&observation.SyncStandbyNames,
 		&observation.PrimaryEpoch,
+		&observation.Archive.LastArchivedWAL,
+		&observation.Archive.LastArchivedAt,
+		&observation.Archive.FailedCount,
+		&observation.Archive.LastFailedWAL,
+		&observation.Archive.LastFailureAt,
 	)
 	if err != nil {
 		return observation, err
 	}
 	observation.ReplayLag = time.Duration(lagSeconds * float64(time.Second))
+	observation.Archive.State = archiveState(
+		observation.Archive.LastArchivedAt, observation.Archive.LastFailureAt)
 	observation.NumSync, observation.VotingMembers = ParseSyncStandbyNames(observation.SyncStandbyNames)
 
 	if observation.Role != RolePrimary {
