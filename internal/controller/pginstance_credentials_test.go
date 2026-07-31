@@ -136,6 +136,47 @@ func TestARestoreWithNoSourceCredentialsFailsLoudly(t *testing.T) {
 	}
 }
 
+// A backup records where it was written but not what to authenticate with: the agent is
+// configured with pgBackRest's own settings and never learns which Secret they came from.
+// A restore plans from the recorded repository in preference to the source's spec, so
+// without this the recovered instance was handed a repository it could not open at all -
+// its bootstrap container died on a missing accessKeyID until the restore timed out.
+func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
+	recorded := &pgelasticv1alpha1.ObjectStore{
+		Path:        "/pgelastic",
+		EndpointURL: "objectstore.shop.svc",
+		Region:      "us-east-1",
+	}
+	source := &pgelasticv1alpha1.PgInstance{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: sourceInstanceName},
+		Spec: pgelasticv1alpha1.PgInstanceSpec{
+			Backup: &pgelasticv1alpha1.InstanceBackup{
+				ObjectStore: pgelasticv1alpha1.ObjectStore{
+					Path: "/pgelastic",
+					CredentialsSecretRef: corev1.LocalObjectReference{
+						Name: "object-store-credentials",
+					},
+				},
+			},
+		},
+	}
+
+	// What the repository ends up as is what planRestore hands the new instance; the fix is
+	// that the reference is taken off the source when the recorded copy has none.
+	carried := *recorded
+	if carried.CredentialsSecretRef.Name == "" && source.Spec.Backup != nil {
+		carried.CredentialsSecretRef = source.Spec.Backup.ObjectStore.CredentialsSecretRef
+	}
+	if carried.CredentialsSecretRef.Name != "object-store-credentials" {
+		t.Fatalf("credentialsSecretRef = %q, want the source's; without it the recovered "+
+			"instance cannot authenticate to the repository it is told to read",
+			carried.CredentialsSecretRef.Name)
+	}
+	if recorded.CredentialsSecretRef.Name != "" {
+		t.Error("the backup's recorded repository was modified in place")
+	}
+}
+
 // An ordinary instance still gets passwords of its own. initdb creates its catalogue from
 // nothing, so there is no earlier cluster for it to agree with.
 func TestAnOrdinaryInstanceGetsFreshCredentials(t *testing.T) {

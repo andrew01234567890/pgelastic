@@ -311,6 +311,11 @@ func ExpireBackups(ctx context.Context, options Options) error {
 	return err
 }
 
+// repositoryOf records where this backup was written.
+//
+// It records where, not what to authenticate with: the agent is configured with pgBackRest's
+// own settings and has no idea which Kubernetes Secret they were projected from. A restore
+// takes the credentials reference off the source instance's spec instead.
 func repositoryOf(options Options) *pgelasticv1alpha1.ObjectStore {
 	repository := options.Config.Backup
 	if repository == nil {
