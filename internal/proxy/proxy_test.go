@@ -451,15 +451,20 @@ func TestTheWorkerCountIsDeclaredRatherThanDerivedFromTheHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var workers string
+	declared := map[string]string{}
 	for _, env := range deployment.Spec.Template.Spec.Containers[0].Env {
-		if env.Name == "TOKIO_WORKER_THREADS" {
-			workers = env.Value
+		declared[env.Name] = env.Value
+	}
+	for _, name := range []string{"TOKIO_WORKER_THREADS", "GOMAXPROCS"} {
+		if declared[name] != "4" {
+			t.Fatalf("%s is %q; a pod that spawns one worker per host core under a CPU limit "+
+				"spends its quota on CFS throttling", name, declared[name])
 		}
 	}
-	if workers != "4" {
-		t.Fatalf("the runtime worker count is %q; a pod that spawns one worker per host "+
-			"core under a CPU limit spends its quota on CFS throttling", workers)
+	if declared["TOKIO_WORKER_THREADS"] != declared["GOMAXPROCS"] {
+		t.Fatalf("the two runtimes were given different worker counts (%q and %q), so swapping "+
+			"the proxy image would silently change the concurrency the pool was sized against",
+			declared["TOKIO_WORKER_THREADS"], declared["GOMAXPROCS"])
 	}
 }
 

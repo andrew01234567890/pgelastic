@@ -1,0 +1,401 @@
+{
+  "environment": {
+    "rig": "wsl2-nonisolated",
+    "kernel": "Linux version 6.6.87.2-microsoft-standard-WSL2 (root@439a258ad544) (gcc (GCC) 11.2.0, GNU ld (GNU Binutils) 2.37) #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025",
+    "virtualization": "wsl2",
+    "cpuModel": "AMD Ryzen 9 5950X 16-Core Processor",
+    "physicalCores": 16,
+    "logicalCpus": 32,
+    "memTotalBytes": 16735412224,
+    "swapTotalBytes": 137438953472,
+    "swapUsedBytes": 2013741056,
+    "cpuFreqPresent": false,
+    "cgroupVersion": 2,
+    "toolchain": {
+      "go": "go version go1.26.4 linux/amd64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "docker": "29.5.3"
+    },
+    "gitSha": "41e7ca8dcc58334553feb32c31a1355c79495e72",
+    "gitDirty": true,
+    "warnings": [
+      "no cpufreq tree: the CPU governor and boost state are neither controllable nor observable",
+      "WSL2: reported core topology describes synthetic vCPUs, so SMT-aware pinning is not meaningful",
+      "swap already in use (2013741056 bytes) before the run started",
+      "working tree is dirty: this result cannot be tied to a commit"
+    ]
+  },
+  "target": "rust",
+  "workload": "throughput",
+  "query": "SELECT 1",
+  "durationMs": 20000,
+  "warmupMs": 5000,
+  "repetitions": 5,
+  "points": [
+    {
+      "concurrency": 1,
+      "repetitions": [
+        {
+          "ops": 53796,
+          "overruns": 0,
+          "elapsedMs": 25000.486,
+          "opsPerSecond": 2151.798125405976,
+          "p50Micros": 357,
+          "p90Micros": 433,
+          "p99Micros": 548,
+          "p999Micros": 770,
+          "maxMicros": 10735
+        },
+        {
+          "ops": 54119,
+          "overruns": 0,
+          "elapsedMs": 25000.074,
+          "opsPerSecond": 2164.753507038331,
+          "p50Micros": 355,
+          "p90Micros": 431,
+          "p99Micros": 545,
+          "p999Micros": 772,
+          "maxMicros": 12103
+        },
+        {
+          "ops": 54286,
+          "overruns": 0,
+          "elapsedMs": 25000.391,
+          "opsPerSecond": 2171.405990744523,
+          "p50Micros": 355,
+          "p90Micros": 427,
+          "p99Micros": 529,
+          "p999Micros": 718,
+          "maxMicros": 8759
+        },
+        {
+          "ops": 53725,
+          "overruns": 0,
+          "elapsedMs": 25000.302,
+          "opsPerSecond": 2148.973961570179,
+          "p50Micros": 358,
+          "p90Micros": 436,
+          "p99Micros": 550,
+          "p999Micros": 726,
+          "maxMicros": 9639
+        },
+        {
+          "ops": 53375,
+          "overruns": 0,
+          "elapsedMs": 25000.392,
+          "opsPerSecond": 2134.9664924694885,
+          "p50Micros": 360,
+          "p90Micros": 439,
+          "p99Micros": 557,
+          "p999Micros": 774,
+          "maxMicros": 8011
+        }
+      ],
+      "throughput": {
+        "median": 2151.798125405976,
+        "min": 2134.9664924694885,
+        "max": 2171.405990744523,
+        "runs": 5
+      },
+      "p50Micros": {
+        "median": 357,
+        "min": 355,
+        "max": 360,
+        "runs": 5
+      },
+      "p99Micros": {
+        "median": 548,
+        "min": 529,
+        "max": 557,
+        "runs": 5
+      },
+      "p999Micros": {
+        "median": 770,
+        "min": 718,
+        "max": 774,
+        "runs": 5
+      },
+      "mbPerSecond": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 5
+      },
+      "overruns": 0
+    },
+    {
+      "concurrency": 8,
+      "repetitions": [
+        {
+          "ops": 305758,
+          "overruns": 0,
+          "elapsedMs": 25000.544,
+          "opsPerSecond": 12230.053801138167,
+          "p50Micros": 512,
+          "p90Micros": 651,
+          "p99Micros": 822,
+          "p999Micros": 1039,
+          "maxMicros": 6211
+        },
+        {
+          "ops": 304957,
+          "overruns": 0,
+          "elapsedMs": 25000.612,
+          "opsPerSecond": 12197.981298273566,
+          "p50Micros": 512,
+          "p90Micros": 654,
+          "p99Micros": 825,
+          "p999Micros": 1043,
+          "maxMicros": 11831
+        },
+        {
+          "ops": 306902,
+          "overruns": 0,
+          "elapsedMs": 25000.297,
+          "opsPerSecond": 12275.934146189149,
+          "p50Micros": 509,
+          "p90Micros": 650,
+          "p99Micros": 823,
+          "p999Micros": 1033,
+          "maxMicros": 10183
+        },
+        {
+          "ops": 307502,
+          "overruns": 0,
+          "elapsedMs": 25000.693,
+          "opsPerSecond": 12299.738730465206,
+          "p50Micros": 508,
+          "p90Micros": 649,
+          "p99Micros": 825,
+          "p999Micros": 1046,
+          "maxMicros": 7467
+        },
+        {
+          "ops": 303539,
+          "overruns": 0,
+          "elapsedMs": 25000.253,
+          "opsPerSecond": 12141.436759074664,
+          "p50Micros": 514,
+          "p90Micros": 659,
+          "p99Micros": 835,
+          "p999Micros": 1056,
+          "maxMicros": 12463
+        }
+      ],
+      "throughput": {
+        "median": 12230.053801138167,
+        "min": 12141.436759074664,
+        "max": 12299.738730465206,
+        "runs": 5
+      },
+      "p50Micros": {
+        "median": 512,
+        "min": 508,
+        "max": 514,
+        "runs": 5
+      },
+      "p99Micros": {
+        "median": 825,
+        "min": 822,
+        "max": 835,
+        "runs": 5
+      },
+      "p999Micros": {
+        "median": 1043,
+        "min": 1033,
+        "max": 1056,
+        "runs": 5
+      },
+      "mbPerSecond": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 5
+      },
+      "overruns": 0
+    },
+    {
+      "concurrency": 64,
+      "repetitions": [
+        {
+          "ops": 338013,
+          "overruns": 0,
+          "elapsedMs": 25002.435,
+          "opsPerSecond": 13519.20277216017,
+          "p50Micros": 3775,
+          "p90Micros": 4727,
+          "p99Micros": 5683,
+          "p999Micros": 6963,
+          "maxMicros": 15039
+        },
+        {
+          "ops": 335017,
+          "overruns": 0,
+          "elapsedMs": 25001.197,
+          "opsPerSecond": 13400.037977380427,
+          "p50Micros": 3807,
+          "p90Micros": 4787,
+          "p99Micros": 5791,
+          "p999Micros": 7359,
+          "maxMicros": 13727
+        },
+        {
+          "ops": 338259,
+          "overruns": 0,
+          "elapsedMs": 25001.068,
+          "opsPerSecond": 13529.781532567,
+          "p50Micros": 3775,
+          "p90Micros": 4735,
+          "p99Micros": 5655,
+          "p999Micros": 6675,
+          "maxMicros": 11471
+        },
+        {
+          "ops": 337189,
+          "overruns": 0,
+          "elapsedMs": 25000.99,
+          "opsPerSecond": 13487.025762185647,
+          "p50Micros": 3783,
+          "p90Micros": 4755,
+          "p99Micros": 5695,
+          "p999Micros": 6831,
+          "maxMicros": 13447
+        },
+        {
+          "ops": 337930,
+          "overruns": 0,
+          "elapsedMs": 25001.498,
+          "opsPerSecond": 13516.38980975317,
+          "p50Micros": 3775,
+          "p90Micros": 4735,
+          "p99Micros": 5691,
+          "p999Micros": 6899,
+          "maxMicros": 13231
+        }
+      ],
+      "throughput": {
+        "median": 13516.38980975317,
+        "min": 13400.037977380427,
+        "max": 13529.781532567,
+        "runs": 5
+      },
+      "p50Micros": {
+        "median": 3775,
+        "min": 3775,
+        "max": 3807,
+        "runs": 5
+      },
+      "p99Micros": {
+        "median": 5691,
+        "min": 5655,
+        "max": 5791,
+        "runs": 5
+      },
+      "p999Micros": {
+        "median": 6899,
+        "min": 6675,
+        "max": 7359,
+        "runs": 5
+      },
+      "mbPerSecond": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 5
+      },
+      "overruns": 0
+    },
+    {
+      "concurrency": 256,
+      "repetitions": [
+        {
+          "ops": 304460,
+          "overruns": 0,
+          "elapsedMs": 25003.642,
+          "opsPerSecond": 12176.625691267503,
+          "p50Micros": 16687,
+          "p90Micros": 19039,
+          "p99Micros": 21887,
+          "p999Micros": 25327,
+          "maxMicros": 37631
+        },
+        {
+          "ops": 302610,
+          "overruns": 0,
+          "elapsedMs": 25003.536,
+          "opsPerSecond": 12102.68800071385,
+          "p50Micros": 16799,
+          "p90Micros": 19167,
+          "p99Micros": 22047,
+          "p999Micros": 25663,
+          "maxMicros": 31999
+        },
+        {
+          "ops": 304008,
+          "overruns": 0,
+          "elapsedMs": 25003.181,
+          "opsPerSecond": 12158.772577331629,
+          "p50Micros": 16687,
+          "p90Micros": 19151,
+          "p99Micros": 22463,
+          "p999Micros": 25583,
+          "maxMicros": 31983
+        },
+        {
+          "ops": 303368,
+          "overruns": 0,
+          "elapsedMs": 25003.64,
+          "opsPerSecond": 12132.952981964248,
+          "p50Micros": 16735,
+          "p90Micros": 19087,
+          "p99Micros": 22511,
+          "p999Micros": 28511,
+          "maxMicros": 33567
+        },
+        {
+          "ops": 303383,
+          "overruns": 0,
+          "elapsedMs": 25003.396,
+          "opsPerSecond": 12133.671447080518,
+          "p50Micros": 16703,
+          "p90Micros": 19231,
+          "p99Micros": 22495,
+          "p999Micros": 26287,
+          "maxMicros": 33695
+        }
+      ],
+      "throughput": {
+        "median": 12133.671447080518,
+        "min": 12102.68800071385,
+        "max": 12176.625691267503,
+        "runs": 5
+      },
+      "p50Micros": {
+        "median": 16703,
+        "min": 16687,
+        "max": 16799,
+        "runs": 5
+      },
+      "p99Micros": {
+        "median": 22463,
+        "min": 21887,
+        "max": 22511,
+        "runs": 5
+      },
+      "p999Micros": {
+        "median": 25663,
+        "min": 25327,
+        "max": 28511,
+        "runs": 5
+      },
+      "mbPerSecond": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 5
+      },
+      "overruns": 0
+    }
+  ]
+}

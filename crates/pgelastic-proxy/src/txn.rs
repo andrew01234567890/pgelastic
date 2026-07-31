@@ -78,14 +78,14 @@ pub struct Binding {
 
 impl Binding {
     /// Binds a session to whichever instance the routing table names now.
-    pub fn open(
+    pub async fn open(
         proxy: &Arc<Proxy>,
         startup: &pgelastic_wire::StartupMessage,
         tenant_name: &str,
     ) -> Result<Self> {
         let instance = proxy.fleet.route(tenant_name);
         let backend = Arc::new(proxy.backend_for(&instance, tenant_name)?);
-        let key = crate::pool::pool_key(&proxy.config, &backend, startup, tenant_name)?;
+        let key = crate::pool::pool_key(&proxy.config, &backend, startup, tenant_name).await?;
         let tenant = instance
             .pools
             .ensure_tenant(tenant_name)
@@ -855,7 +855,7 @@ impl Running<'_> {
     ///
     /// Only ever called with no backend held, which is what makes it safe: the
     /// instance changes at a transaction boundary and never underneath one.
-    fn follow_route(&mut self) -> Result<()> {
+    async fn follow_route(&mut self) -> Result<()> {
         debug_assert!(self.checkout.is_none(), "a bound session must not be moved");
         let routed = self.session.proxy.fleet.route_id(&self.session.tenant);
         if routed == self.session.binding.instance.id {
@@ -865,7 +865,8 @@ impl Running<'_> {
             self.session.proxy,
             self.session.startup,
             &self.session.tenant,
-        )?;
+        )
+        .await?;
         debug!(
             tenant = %self.session.tenant,
             from = %self.session.binding.instance.id,
@@ -907,7 +908,7 @@ impl Running<'_> {
         // backend, so each queue drains in the order it filled, and they are
         // always taken tenant-first so two gates never wait on each other.
         let baton = self.session.gate.admit().await;
-        self.follow_route()?;
+        self.follow_route().await?;
         self.instance_gate = instance_gate_of(&self.session);
         let instance_gate = Arc::clone(&self.instance_gate);
         let instance_baton = instance_gate.admit().await;

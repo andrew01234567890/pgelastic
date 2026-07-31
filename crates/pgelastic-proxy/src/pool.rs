@@ -116,7 +116,10 @@ pub struct BackendConn {
     pub vars: VariableCache,
     /// The backend's real cancel key. Never handed to a client.
     pub key_data: Option<BackendKeyData>,
-    pub address: String,
+    /// Where this link is dialled, kept behind an `Arc` because it is written once when the
+    /// link opens and copied at every checkout to route a cancel. As a `String` that copy was
+    /// a heap allocation per transaction.
+    pub address: Arc<str>,
     /// The primary epoch this link was opened — or last verified — under.
     ///
     /// The fence compares this against the highest epoch the proxy has ever
@@ -248,7 +251,26 @@ pub struct PoolManager {
     fence: FenceRuntime,
     metrics: Arc<Metrics>,
     next_link_id: AtomicU64,
+    /// When the budget gauges were last refreshed, in milliseconds since
+    /// `budget_epoch`. See [`publish_budget`](Self::publish_budget).
+    budget_published_ms: AtomicU64,
+    budget_epoch: std::time::Instant,
 }
+
+/// How stale a budget gauge is allowed to be on the checkout path.
+///
+/// Metrics are scraped on the order of seconds, so bounding staleness here costs an observer
+/// nothing it can see. What it buys is large: refreshing the gauges reads the ledger, which
+/// needs this manager's own lock, and the transaction state machine asks for a refresh at
+/// fifteen separate points. On the checkout path that turned observability into a contended
+/// acquisition per state transition, on a mutex both runtime workers share.
+///
+/// It applies to that path and to nothing else. Anything that moves the *ceiling* rather than
+/// the occupancy — a pin, an unpin, a configuration reload, a route change — publishes at once
+/// through [`PoolManager::publish_budget_now`]. A ceiling that dropped is the number an
+/// operator reads to find out why, and it has to be true the moment the thing that moved it
+/// happened rather than a few milliseconds afterwards.
+const BUDGET_PUBLISH_INTERVAL_MS: u64 = 5;
 
 impl PoolManager {
     pub fn new(
@@ -310,6 +332,8 @@ impl PoolManager {
             fence,
             metrics,
             next_link_id: AtomicU64::new(1),
+            budget_published_ms: AtomicU64::new(0),
+            budget_epoch: std::time::Instant::now(),
         }))
     }
 
@@ -500,19 +524,25 @@ impl PoolManager {
     /// is the ceiling that drops as a result. Without this split the drop has no
     /// attributable cause.
     pub fn record_pin(&self, reason: PinReason) {
-        let mut inner = self.lock();
-        if let Err(error) = inner.ledger.pin(reason) {
-            warn!(%error, %reason, "pinning a link the ledger does not know about");
+        {
+            let mut inner = self.lock();
+            if let Err(error) = inner.ledger.pin(reason) {
+                warn!(%error, %reason, "pinning a link the ledger does not know about");
+            }
         }
+        self.publish_budget_now();
     }
 
     /// Returns a pinned link to the elastic pool, once the client that dirtied
     /// it has gone and the scrub that removes the state has run.
     pub fn release_pin(&self, reason: PinReason) {
-        let mut inner = self.lock();
-        if let Err(error) = inner.ledger.unpin(reason) {
-            warn!(%error, %reason, "unpinning a link the ledger does not know about");
+        {
+            let mut inner = self.lock();
+            if let Err(error) = inner.ledger.unpin(reason) {
+                warn!(%error, %reason, "unpinning a link the ledger does not know about");
+            }
         }
+        self.publish_budget_now();
     }
 
     fn record_unpin(inner: &mut Inner, pin: Option<PinReason>) {
@@ -1059,7 +1089,7 @@ impl PoolManager {
             vars,
             backend_pid: session.key_data.as_ref().map(|data| data.process_id),
             key_data: session.key_data,
-            address: connector.backend.address.clone(),
+            address: Arc::from(connector.backend.address.as_str()),
             epoch: reported_epoch.unwrap_or_else(|| self.fence.current()),
             lsn: None,
         })
@@ -1173,6 +1203,35 @@ impl PoolManager {
 
     /// Refreshes the exported budget gauges from the ledger.
     pub fn publish_budget(&self) {
+        // Refuse to take the lock if the gauges were refreshed recently enough. The
+        // compare_exchange is what stops two workers both deciding it is their turn: the loser
+        // returns rather than queueing behind the winner, because a gauge does not need to be
+        // written twice in the same millisecond.
+        let elapsed = self.budget_epoch.elapsed();
+        let now = elapsed
+            .as_secs()
+            .saturating_mul(1000)
+            .saturating_add(u64::from(elapsed.subsec_millis()));
+        let last = self.budget_published_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < BUDGET_PUBLISH_INTERVAL_MS {
+            return;
+        }
+        if self
+            .budget_published_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.publish_budget_now();
+    }
+
+    /// Refreshes the budget gauges without waiting for the interval.
+    ///
+    /// For the paths where a stale gauge would be misread as a fact rather than as lag: a
+    /// configuration reload, or a route change that moves capacity between instances. Those
+    /// happen on the order of seconds, so the lock they take is not on anybody's hot path.
+    pub fn publish_budget_now(&self) {
         let snapshot = self.ledger_snapshot();
         self.metrics.budget(
             &self.instance,
@@ -1190,7 +1249,7 @@ impl PoolManager {
 /// equal?". `RESET ALL` restores GUCs to their *session-start* values, so the
 /// startup parameters are part of identity rather than of state and no reset
 /// ladder can undo them.
-pub fn pool_key(
+pub async fn pool_key(
     config: &crate::config::Config,
     backend: &crate::config::BackendConfig,
     startup: &StartupMessage,
@@ -1219,7 +1278,7 @@ pub fn pool_key(
     )
     .map_err(|e| ProxyError::client(e.to_string()))?;
 
-    let address = crate::config::resolve(&backend.address)?;
+    let address = crate::config::resolve(&backend.address).await?;
     let database = backend
         .database
         .clone()

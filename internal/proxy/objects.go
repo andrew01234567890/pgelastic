@@ -341,6 +341,11 @@ func (b Builder) ports() []corev1.ContainerPort {
 //
 // TOKIO_WORKER_THREADS rather than a count derived from the visible CPUs: a pod that spawns
 // one worker per host core under a CPU limit spends its quota on CFS throttling.
+//
+// GOMAXPROCS carries the same number for the same reason, and is set unconditionally rather
+// than per image. Both spellings being present means a proxy built on either runtime gets the
+// worker count the spec asked for, so swapping the image cannot silently change the
+// concurrency the pool was sized against.
 func (b Builder) env() []corev1.EnvVar {
 	workers := int32(2)
 	if declared := b.spec().Workers; declared != nil {
@@ -348,6 +353,7 @@ func (b Builder) env() []corev1.EnvVar {
 	}
 	return []corev1.EnvVar{
 		{Name: "TOKIO_WORKER_THREADS", Value: fmt.Sprintf("%d", workers)},
+		{Name: "GOMAXPROCS", Value: fmt.Sprintf("%d", workers)},
 		{
 			Name: "PGELASTIC_POD_NAME",
 			ValueFrom: &corev1.EnvVarSource{

@@ -39,7 +39,7 @@
 //! be migrated online has to be in transaction pooling.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -193,6 +193,15 @@ pub struct TenantGate {
     queue: Mutex<Queue>,
     lease: Mutex<Option<Lease>>,
     in_flight: AtomicU64,
+    /// Mirrors `open && waiting.is_empty() && !running`, so the overwhelmingly common case -
+    /// a transaction outside a cutover - can be admitted without taking `queue`.
+    ///
+    /// Safe to read stale in either direction. Stale-false costs one lock acquisition and the
+    /// authoritative check behind it. Stale-true admits a transaction that a quiesce closing
+    /// at that instant would have queued, which is the same race a caller already loses by
+    /// passing the locked check one instruction before the close: admission registers nothing,
+    /// and what a drain actually waits for is `in_flight`, which `hold` bumps after checkout.
+    fast: AtomicBool,
     admitted_while_queued: AtomicU64,
     /// When the gate closed, or `None` while it is admitting.
     ///
@@ -222,6 +231,7 @@ impl TenantGate {
             queue: Mutex::new(Queue::default()),
             lease: Mutex::new(None),
             in_flight: AtomicU64::new(0),
+            fast: AtomicBool::new(true),
             admitted_while_queued: AtomicU64::new(0),
             closed_at: Mutex::new(None),
         })
@@ -292,15 +302,20 @@ impl TenantGate {
     /// backend. On the open path — every transaction outside a cutover — this
     /// allocates nothing and returns immediately.
     pub async fn admit(self: &Arc<Self>) -> Baton {
+        if self.fast.load(Ordering::Acquire) {
+            return Baton { gate: None };
+        }
         let waiting = {
             let mut queue = self.queue.lock().expect("a tenant gate is never poisoned");
             if *self.open.borrow() && queue.waiting.is_empty() && !queue.running {
+                self.refresh_fast(&queue);
                 return Baton { gate: None };
             }
             let ticket = queue.next_ticket;
             queue.next_ticket += 1;
             let (tx, rx) = oneshot::channel();
             queue.waiting.insert(ticket, tx);
+            self.refresh_fast(&queue);
             Queued {
                 gate: Arc::clone(self),
                 ticket,
@@ -315,27 +330,39 @@ impl TenantGate {
         }
     }
 
+    /// Recomputes the lock-free admission hint. Must be called under `queue`, and from every
+    /// path that changes whether the gate is open, whether anybody is queued, or whether a
+    /// released waiter is still running.
+    fn refresh_fast(&self, queue: &Queue) {
+        let open = *self.open.borrow() && queue.waiting.is_empty() && !queue.running;
+        self.fast.store(open, Ordering::Release);
+    }
+
     /// Wakes the client at the head of the queue, if the gate is open.
     fn pass(&self) {
         let mut queue = self.queue.lock().expect("a tenant gate is never poisoned");
         queue.running = false;
         if !*self.open.borrow() {
+            self.refresh_fast(&queue);
             return;
         }
         while let Some(ticket) = queue.waiting.keys().next().copied() {
             let sender = queue.waiting.remove(&ticket).expect("just observed");
             if sender.send(()).is_ok() {
                 queue.running = true;
+                self.refresh_fast(&queue);
                 return;
             }
             // That client is gone. The next one is entitled to the slot rather
             // than to another wait.
         }
+        self.refresh_fast(&queue);
     }
 
     fn withdraw(&self, ticket: u64) {
         let mut queue = self.queue.lock().expect("a tenant gate is never poisoned");
         queue.waiting.remove(&ticket);
+        self.refresh_fast(&queue);
     }
 
     // ---- the control-plane operations -----------------------------------
@@ -382,7 +409,12 @@ impl TenantGate {
         };
         *lease = Some(taken.clone());
         drop(lease);
-        if self.open.send_replace(false) {
+        let closed = self.open.send_replace(false);
+        {
+            let queue = self.queue.lock().expect("a tenant gate is never poisoned");
+            self.refresh_fast(&queue);
+        }
+        if closed {
             *self
                 .closed_at
                 .lock()
@@ -462,6 +494,10 @@ impl TenantGate {
     fn open_gate(&self) -> u64 {
         let queued = self.queued();
         self.open.send_replace(true);
+        {
+            let queue = self.queue.lock().expect("a tenant gate is never poisoned");
+            self.refresh_fast(&queue);
+        }
         self.closed_at
             .lock()
             .expect("a tenant gate is never poisoned")
@@ -830,6 +866,31 @@ mod tests {
         gate.quiesce("migration", Duration::from_secs(5), MAX_TTL, source())
             .unwrap();
         assert!(!gate.lease().unwrap().reversible());
+    }
+
+    /// The lock-free admission hint has to track the gate, because a stale-true hint during a
+    /// cutover would admit transactions the quiesce is there to hold. Stale-false is merely
+    /// slow, so this asserts the direction that matters: closed means not fast.
+    #[test]
+    fn the_admission_hint_closes_with_the_gate_and_reopens_with_it() {
+        let gate = gate();
+        assert!(
+            gate.fast.load(Ordering::Acquire),
+            "a gate nobody has quiesced admits without taking its lock"
+        );
+
+        gate.quiesce("migration", Duration::from_secs(5), MAX_TTL, source())
+            .unwrap();
+        assert!(
+            !gate.fast.load(Ordering::Acquire),
+            "a quiesced gate must never admit on the fast path"
+        );
+
+        gate.resume("migration").unwrap();
+        assert!(
+            gate.fast.load(Ordering::Acquire),
+            "a resumed gate goes back to admitting without its lock"
+        );
     }
 
     #[test]

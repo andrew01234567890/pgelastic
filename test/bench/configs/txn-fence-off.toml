@@ -1,0 +1,55 @@
+# Transaction pooling, epoch fence off. The primary decision number.
+#
+# Fence off isolates what the proxy itself costs: with it on, both arms pay the same extra
+# backend round trip, which masks a difference rather than revealing one. See README.md.
+configVersion = "bench-txn-fence-off"
+
+[listen]
+address = "0.0.0.0:6432"
+maxClientConnections = 5000
+clientLoginSeconds = 10
+
+[backend]
+address = "pgebench-pg:5432"
+user = "bench"
+password = "bench"
+database = "bench"
+connectSeconds = 5
+
+[backend.tls]
+mode = "Disable"
+
+[auth]
+scramIterations = 4096
+kdfConcurrency = 4
+
+[[auth.users]]
+name = "bench"
+password = "bench"
+
+[pool]
+mode = "transaction"
+backendConnections = 100
+headroomPercent = 0
+maxClientConnections = 5000
+resetPolicy = "discardAll"
+queryWaitSeconds = 30
+notifyAfterSeconds = 5
+queueDepthPerTenant = 512
+maxServerStatements = 64
+serverLifetimeSeconds = 3600
+
+[limits]
+inlineFrameBytes = 65536
+
+[fence]
+verifyAtCheckout = false
+
+[stall]
+enabled = false
+
+[metrics]
+address = "0.0.0.0:9127"
+
+[drain]
+shutdownSeconds = 5

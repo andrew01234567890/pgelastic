@@ -76,7 +76,7 @@ impl From<&CancelRequest> for CancelToken {
 /// Everything needed to open a fresh cancel connection to the right backend.
 #[derive(Debug, Clone)]
 pub struct CancelTarget {
-    pub address: String,
+    pub address: std::sync::Arc<str>,
     pub key_data: Option<BackendKeyData>,
     /// Which instance the backend belongs to.
     ///
@@ -272,7 +272,7 @@ mod tests {
 
     fn target_for(process_id: i32) -> CancelTarget {
         CancelTarget {
-            address: "127.0.0.1:5432".to_owned(),
+            address: std::sync::Arc::from("127.0.0.1:5432"),
             key_data: Some(BackendKeyData {
                 process_id,
                 key: CancelKey::new(Bytes::from_static(b"real")).unwrap(),
