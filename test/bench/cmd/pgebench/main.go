@@ -206,11 +206,14 @@ func run(args []string) int {
 	warmup := flags.Duration("warmup", 30*time.Second, "discarded window before each repetition")
 	repetitions := flags.Int("repetitions", bench.MinRuns, "runs per concurrency point")
 	rate := flags.Float64("rate", 0, "offered operations per second (latency workload only)")
-	query := flags.String("query", "SELECT 1", "statement under test")
+	query := flags.String("query", "",
+		"statement under test; unset lets the workload choose, which is how bulk gets its own")
 	bulkRows := flags.Int("bulk-rows", 20000, "rows per result set for the bulk workload")
 	simple := flags.Bool("simple-protocol", false,
 		"send statements as Query rather than Parse/Bind/Execute/Sync, "+
 			"taking prepared-statement handling out of the comparison")
+	pooler := flags.String("pooler", "",
+		"container whose CPU and memory to sample; empty for the direct arm, which has none")
 	out := flags.String("out", "", "write the JSON report here (default stdout summary only)")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -229,7 +232,7 @@ func run(args []string) int {
 	ctx := context.Background()
 	env := bench.Capture(ctx)
 
-	report, err := bench.Sweep(ctx, env, *target, bench.RunConfig{
+	report, err := bench.SweepWithProbe(ctx, env, *target, bench.RunConfig{
 		Workload:       bench.WorkloadName(*workload),
 		DSN:            *dsn,
 		Duration:       *duration,
@@ -238,7 +241,7 @@ func run(args []string) int {
 		Query:          *query,
 		BulkRows:       *bulkRows,
 		SimpleProtocol: *simple,
-	}, concurrencies, *repetitions, os.Stderr)
+	}, concurrencies, *repetitions, os.Stderr, *pooler)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return 1
@@ -429,6 +432,12 @@ func report(env bench.Environment) {
 	for _, axis := range []bench.Axis{bench.AxisChurn, bench.AxisThroughput, bench.AxisBulk, bench.AxisDensity} {
 		fmt.Printf("  %-12s yes\n", axis)
 	}
+	sampling := "yes"
+	if why := bench.SamplingAvailable(); why != "" {
+		sampling = "no -- " + why
+	}
+	fmt.Printf("  %-12s %s\n", "cpu / memory", sampling)
+
 	expectation := "yes"
 	if !env.Rig.DecidesLatency() {
 		expectation = "only where the measured spread clears the " +

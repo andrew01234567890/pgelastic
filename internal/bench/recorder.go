@@ -129,6 +129,8 @@ type Cell struct {
 	P99Micros  float64          `json:"p99Micros"`
 	P999Micros float64          `json:"p999Micros"`
 	MaxMicros  float64          `json:"maxMicros"`
+	// Resource is what the pooler spent on this cell, and nil when nothing was sampled.
+	Resource *Resource `json:"resource,omitempty"`
 }
 
 // Snapshot freezes what has been recorded so far.

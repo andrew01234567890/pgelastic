@@ -1,0 +1,640 @@
+{
+  "environment": {
+    "rig": "wsl2-nonisolated",
+    "kernel": "Linux version 6.6.87.2-microsoft-standard-WSL2 (root@439a258ad544) (gcc (GCC) 11.2.0, GNU ld (GNU Binutils) 2.37) #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025",
+    "virtualization": "wsl2",
+    "cpuModel": "AMD Ryzen 9 5950X 16-Core Processor",
+    "physicalCores": 16,
+    "logicalCpus": 32,
+    "memTotalBytes": 16735412224,
+    "swapTotalBytes": 137438953472,
+    "swapUsedBytes": 3278012416,
+    "cpuFreqPresent": false,
+    "cgroupVersion": 2,
+    "toolchain": {
+      "go": "go version go1.26.4 linux/amd64",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "cargo": "cargo 1.96.0 (30a34c682 2026-05-25)",
+      "docker": "29.5.3"
+    },
+    "gitSha": "91b594ef843d7edda50eeaa9f83e81baa44da42c",
+    "gitDirty": true,
+    "warnings": [
+      "no cpufreq tree: the CPU governor and boost state are neither controllable nor observable",
+      "WSL2: reported core topology describes synthetic vCPUs, so SMT-aware pinning is not meaningful",
+      "swap already in use (3278012416 bytes) before the run started",
+      "working tree is dirty: this result cannot be tied to a commit"
+    ]
+  },
+  "target": "pgbouncer",
+  "workload": "density",
+  "query": "SELECT 1",
+  "durationMs": 10000,
+  "warmupMs": 3000,
+  "repetitions": 5,
+  "simpleProtocol": false,
+  "pooler": "pgebench-pgbouncer",
+  "poolerCpuSet": "6-9,22-25",
+  "points": [
+    {
+      "concurrency": 256,
+      "repetitions": [
+        {
+          "ops": 256,
+          "overruns": 0,
+          "elapsedMs": 13005.191,
+          "opsPerSecond": 19.684446847764352,
+          "p50Micros": 88383,
+          "p90Micros": 133247,
+          "p99Micros": 137599,
+          "p999Micros": 138367,
+          "maxMicros": 138367,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 41,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.001188,
+            "cpuCoresMean": 0.00011880415448623906,
+            "cpuCoresPeak": 0.00029641840168802427,
+            "cpuMicrosPerOp": 4.640625,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 2449408,
+            "workingSetBytesPeak": 2449408,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2592
+          }
+        },
+        {
+          "ops": 256,
+          "overruns": 0,
+          "elapsedMs": 13005.282,
+          "opsPerSecond": 19.68430886740699,
+          "p50Micros": 21951,
+          "p90Micros": 36639,
+          "p99Micros": 41087,
+          "p999Micros": 41535,
+          "maxMicros": 41535,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.001236,
+            "cpuCoresMean": 0.00012676866643413355,
+            "cpuCoresPeak": 0.00036704686298351657,
+            "cpuMicrosPerOp": 4.828125,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 2449408,
+            "workingSetBytesPeak": 2449408,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2592
+          }
+        },
+        {
+          "ops": 256,
+          "overruns": 0,
+          "elapsedMs": 13005.756,
+          "opsPerSecond": 19.683591296906904,
+          "p50Micros": 19215,
+          "p90Micros": 32895,
+          "p99Micros": 34335,
+          "p999Micros": 34591,
+          "maxMicros": 34591,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.001266,
+            "cpuCoresMean": 0.00012985965850477774,
+            "cpuCoresPeak": 0.00030762101460146316,
+            "cpuMicrosPerOp": 4.9453125,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 2449408,
+            "workingSetBytesPeak": 2449408,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2592
+          }
+        },
+        {
+          "ops": 256,
+          "overruns": 0,
+          "elapsedMs": 13004.947,
+          "opsPerSecond": 19.684815777102905,
+          "p50Micros": 21183,
+          "p90Micros": 36383,
+          "p99Micros": 39839,
+          "p999Micros": 40159,
+          "maxMicros": 40159,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.00132,
+            "cpuCoresMean": 0.0001353751226866278,
+            "cpuCoresPeak": 0.0004313985010699581,
+            "cpuMicrosPerOp": 5.15625,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 2449408,
+            "workingSetBytesPeak": 2449408,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2592
+          }
+        },
+        {
+          "ops": 256,
+          "overruns": 0,
+          "elapsedMs": 13005.671,
+          "opsPerSecond": 19.683720259014837,
+          "p50Micros": 22015,
+          "p90Micros": 36671,
+          "p99Micros": 39743,
+          "p999Micros": 39903,
+          "maxMicros": 39903,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.001224,
+            "cpuCoresMean": 0.0001255380971689629,
+            "cpuCoresPeak": 0.000375424807147871,
+            "cpuMicrosPerOp": 4.78125,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 2445312,
+            "workingSetBytesPeak": 2445312,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2576
+          }
+        }
+      ],
+      "throughput": {
+        "median": 19.68430886740699,
+        "min": 19.683591296906904,
+        "max": 19.684815777102905,
+        "runs": 5
+      },
+      "p50Micros": {
+        "median": 21951,
+        "min": 19215,
+        "max": 88383,
+        "runs": 5
+      },
+      "p99Micros": {
+        "median": 39839,
+        "min": 34335,
+        "max": 137599,
+        "runs": 5
+      },
+      "p999Micros": {
+        "median": 40159,
+        "min": 34591,
+        "max": 138367,
+        "runs": 5
+      },
+      "mbPerSecond": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 5
+      },
+      "cpuMicrosPerOp": {
+        "median": 4.828125,
+        "min": 4.640625,
+        "max": 5.15625,
+        "runs": 5
+      },
+      "cpuCoresPeak": {
+        "median": 0.00036704686298351657,
+        "min": 0.00029641840168802427,
+        "max": 0.0004313985010699581,
+        "runs": 5
+      },
+      "workingSetBytes": {
+        "median": 2449408,
+        "min": 2445312,
+        "max": 2449408,
+        "runs": 5
+      },
+      "bytesPerConnection": {
+        "median": 2592,
+        "min": 2576,
+        "max": 2592,
+        "runs": 5
+      },
+      "overruns": 0
+    },
+    {
+      "concurrency": 1024,
+      "repetitions": [
+        {
+          "ops": 1024,
+          "overruns": 0,
+          "elapsedMs": 13021.888,
+          "opsPerSecond": 78.63682571148972,
+          "p50Micros": 154623,
+          "p90Micros": 191103,
+          "p99Micros": 199167,
+          "p999Micros": 202367,
+          "maxMicros": 202367,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.00133,
+            "cpuCoresMean": 0.00013642156438673246,
+            "cpuCoresPeak": 0.0003313376520574853,
+            "cpuMicrosPerOp": 1.298828125,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 4653056,
+            "workingSetBytesPeak": 4653056,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2800
+          }
+        },
+        {
+          "ops": 1024,
+          "overruns": 0,
+          "elapsedMs": 13021.464,
+          "opsPerSecond": 78.63938900183656,
+          "p50Micros": 83071,
+          "p90Micros": 143103,
+          "p99Micros": 153471,
+          "p999Micros": 154367,
+          "maxMicros": 154879,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.001297,
+            "cpuCoresMean": 0.0001330281324037925,
+            "cpuCoresPeak": 0.00040880628536617747,
+            "cpuMicrosPerOp": 1.2666015625,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 4648960,
+            "workingSetBytesPeak": 4648960,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2796
+          }
+        },
+        {
+          "ops": 1024,
+          "overruns": 0,
+          "elapsedMs": 13031.046,
+          "opsPerSecond": 78.58156074445333,
+          "p50Micros": 88383,
+          "p90Micros": 164479,
+          "p99Micros": 174719,
+          "p999Micros": 175743,
+          "maxMicros": 175871,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.001136,
+            "cpuCoresMean": 0.00011650959730767269,
+            "cpuCoresPeak": 0.0002992206809333917,
+            "cpuMicrosPerOp": 1.109375,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 4648960,
+            "workingSetBytesPeak": 4648960,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2796
+          }
+        },
+        {
+          "ops": 1024,
+          "overruns": 0,
+          "elapsedMs": 13023.919,
+          "opsPerSecond": 78.62456511357526,
+          "p50Micros": 78847,
+          "p90Micros": 132991,
+          "p99Micros": 148095,
+          "p999Micros": 149759,
+          "maxMicros": 149887,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.00126,
+            "cpuCoresMean": 0.00012923271368606132,
+            "cpuCoresPeak": 0.0003403526461837639,
+            "cpuMicrosPerOp": 1.23046875,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 4653056,
+            "workingSetBytesPeak": 4653056,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2800
+          }
+        },
+        {
+          "ops": 1024,
+          "overruns": 0,
+          "elapsedMs": 13022.897,
+          "opsPerSecond": 78.6307355393396,
+          "p50Micros": 78591,
+          "p90Micros": 137471,
+          "p99Micros": 147071,
+          "p999Micros": 147583,
+          "maxMicros": 149119,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.001343,
+            "cpuCoresMean": 0.00013774011364931855,
+            "cpuCoresPeak": 0.0003516902874652466,
+            "cpuMicrosPerOp": 1.3115234375,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 4659200,
+            "workingSetBytesPeak": 4751360,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2806
+          }
+        }
+      ],
+      "throughput": {
+        "median": 78.6307355393396,
+        "min": 78.58156074445333,
+        "max": 78.63938900183656,
+        "runs": 5
+      },
+      "p50Micros": {
+        "median": 83071,
+        "min": 78591,
+        "max": 154623,
+        "runs": 5
+      },
+      "p99Micros": {
+        "median": 153471,
+        "min": 147071,
+        "max": 199167,
+        "runs": 5
+      },
+      "p999Micros": {
+        "median": 154367,
+        "min": 147583,
+        "max": 202367,
+        "runs": 5
+      },
+      "mbPerSecond": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 5
+      },
+      "cpuMicrosPerOp": {
+        "median": 1.2666015625,
+        "min": 1.109375,
+        "max": 1.3115234375,
+        "runs": 5
+      },
+      "cpuCoresPeak": {
+        "median": 0.0003403526461837639,
+        "min": 0.0002992206809333917,
+        "max": 0.00040880628536617747,
+        "runs": 5
+      },
+      "workingSetBytes": {
+        "median": 4653056,
+        "min": 4648960,
+        "max": 4659200,
+        "runs": 5
+      },
+      "bytesPerConnection": {
+        "median": 2800,
+        "min": 2796,
+        "max": 2806,
+        "runs": 5
+      },
+      "overruns": 0
+    },
+    {
+      "concurrency": 4096,
+      "repetitions": [
+        {
+          "ops": 4096,
+          "overruns": 0,
+          "elapsedMs": 13111.082,
+          "opsPerSecond": 312.40746082577243,
+          "p50Micros": 310527,
+          "p90Micros": 538623,
+          "p99Micros": 629247,
+          "p999Micros": 637439,
+          "maxMicros": 655359,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 41,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.107415,
+            "cpuCoresMean": 0.010741911781520423,
+            "cpuCoresPeak": 0.42635824365753905,
+            "cpuMicrosPerOp": 26.224365234375,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 13389923.902439024,
+            "workingSetBytesPeak": 15196160,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2833.0243902439024
+          }
+        },
+        {
+          "ops": 4096,
+          "overruns": 0,
+          "elapsedMs": 13098.902,
+          "opsPerSecond": 312.69795878772413,
+          "p50Micros": 315903,
+          "p90Micros": 566271,
+          "p99Micros": 628223,
+          "p999Micros": 633855,
+          "maxMicros": 633855,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.001319,
+            "cpuCoresMean": 0.00013528426986082515,
+            "cpuCoresPeak": 0.0003477789447471398,
+            "cpuMicrosPerOp": 0.322021484375,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 13377536,
+            "workingSetBytesPeak": 13377536,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2830
+          }
+        },
+        {
+          "ops": 4096,
+          "overruns": 0,
+          "elapsedMs": 13095.461,
+          "opsPerSecond": 312.7801264463266,
+          "p50Micros": 315135,
+          "p90Micros": 2449407,
+          "p99Micros": 3282943,
+          "p999Micros": 3354623,
+          "maxMicros": 3362815,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.026508,
+            "cpuCoresMean": 0.002718552342153941,
+            "cpuCoresPeak": 0.09392292611629068,
+            "cpuMicrosPerOp": 6.4716796875,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 13400473.6,
+            "workingSetBytesPeak": 13570048,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2835.6
+          }
+        },
+        {
+          "ops": 4096,
+          "overruns": 0,
+          "elapsedMs": 13107.802,
+          "opsPerSecond": 312.4856477653582,
+          "p50Micros": 2404351,
+          "p90Micros": 6090751,
+          "p99Micros": 6987775,
+          "p999Micros": 7077887,
+          "maxMicros": 7086079,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 41,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.417323,
+            "cpuCoresMean": 0.04173080836981255,
+            "cpuCoresPeak": 0.1861316631072352,
+            "cpuMicrosPerOp": 101.885498046875,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 13053852.097560976,
+            "workingSetBytesPeak": 19320832,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2750.9756097560976
+          }
+        },
+        {
+          "ops": 4096,
+          "overruns": 0,
+          "elapsedMs": 13102.265,
+          "opsPerSecond": 312.61769811147286,
+          "p50Micros": 2439167,
+          "p90Micros": 6066175,
+          "p99Micros": 6955007,
+          "p999Micros": 7049215,
+          "maxMicros": 7057407,
+          "resource": {
+            "source": "cgroup2",
+            "cgroupPath": "/sys/fs/cgroup/docker/1c48d9e111da80a21f8a4dde1cf5c1b7a372b382b6fbeb04a720e30baa8faab3",
+            "samples": 40,
+            "sampleIntervalMs": 250,
+            "cpuCoreSeconds": 0.357584,
+            "cpuCoresMean": 0.03667700874842776,
+            "cpuCoresPeak": 0.0953041841873407,
+            "cpuMicrosPerOp": 87.30078125,
+            "throttled": false,
+            "coresAvailable": 8,
+            "saturated": false,
+            "workingSetBytesMean": 12951449.6,
+            "workingSetBytesPeak": 13676544,
+            "idleWorkingSetBytes": 1785856,
+            "bytesPerConnection": 2725.975
+          }
+        }
+      ],
+      "throughput": {
+        "median": 312.61769811147286,
+        "min": 312.40746082577243,
+        "max": 312.7801264463266,
+        "runs": 5
+      },
+      "p50Micros": {
+        "median": 315903,
+        "min": 310527,
+        "max": 2439167,
+        "runs": 5
+      },
+      "p99Micros": {
+        "median": 3282943,
+        "min": 628223,
+        "max": 6987775,
+        "runs": 5
+      },
+      "p999Micros": {
+        "median": 3354623,
+        "min": 633855,
+        "max": 7077887,
+        "runs": 5
+      },
+      "mbPerSecond": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "runs": 5
+      },
+      "cpuMicrosPerOp": {
+        "median": 26.224365234375,
+        "min": 0.322021484375,
+        "max": 101.885498046875,
+        "runs": 5
+      },
+      "cpuCoresPeak": {
+        "median": 0.0953041841873407,
+        "min": 0.0003477789447471398,
+        "max": 0.42635824365753905,
+        "runs": 5
+      },
+      "workingSetBytes": {
+        "median": 13377536,
+        "min": 12951449.6,
+        "max": 13400473.6,
+        "runs": 5
+      },
+      "bytesPerConnection": {
+        "median": 2830,
+        "min": 2725.975,
+        "max": 2835.6,
+        "runs": 5
+      },
+      "overruns": 0
+    }
+  ]
+}

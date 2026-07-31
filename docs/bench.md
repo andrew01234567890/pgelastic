@@ -1,4 +1,4 @@
-# Benchmarking the proxy: Rust today, Go maybe, pgbouncer as the yardstick
+# Benchmarking the proxy: Rust today, pgbouncer as the yardstick
 
 The data plane is Rust and the operator is Go. Collapsing to one language is worth real money
 — one toolchain, one CI, one dependency-audit story, a config schema with a shared type
@@ -575,3 +575,98 @@ the lock traffic that separated them, the two converge on what the rig charges f
 Going faster than pgbouncer here would mean making fewer syscalls than it does, not writing
 tighter code between them. That is the zero-copy relay lever, and it pays on large result sets
 rather than on `SELECT 1`.
+
+## Round five: measuring what an operation costs, instead of estimating it
+
+Every CPU and memory figure above this line was derived by hand from `docker stats` read at
+some remembered moment. Round five replaces the instrument, and the replacement immediately
+contradicted two things this document asserted.
+
+### The instrument
+
+`internal/bench/probe.go` reads cgroup v2 pseudo-files directly, at 4 Hz, for the length of a
+sweep; each cell attributes its own window afterwards through `Segment(from, to)`. Nobody has
+to remember to sample at the right moment, which is how the earlier CPU claim came to be taken
+during the single-client phase and reported as though it described the sweep.
+
+`cpu.stat`'s `usage_usec` is a cumulative counter, so consumption over a window is a
+subtraction with no sampling error at all. That is the reason for reading the files rather
+than shelling out: `docker stats` reports CPU as a percentage, from which an exact core-seconds
+total cannot be recovered, and it costs a fork per sample on the machine being measured.
+
+Under Docker Desktop the usual `docker inspect .State.Pid` → `/proc/<pid>/cgroup` route does
+not work — the engine runs in its own PID namespace, so `cgroup.procs` reads 0. The path is
+resolved from the container ID string instead.
+
+**Calibrated against `docker stats` before being trusted: 3.0% disagreement**, with `docker
+stats` reading high because it samples the ramp outside the measured window. Had they disagreed
+materially the probe would have been the thing at fault, not the reference.
+
+### The ceiling was `TOKIO_WORKER_THREADS=2`, not the architecture
+
+Round four concluded that parity with pgbouncer was "roughly the expected ceiling here",
+because both poolers make the same four syscalls per query and the rig charges heavily for
+each. The first thing the probe reported was that the proxy was using 2.18 of its 8 pinned
+cores. Raising the worker count, identical load, 64 clients:
+
+| workers | ops/s | CPU µs/op | cores peak | p99 |
+|---|---|---|---|---|
+| pgbouncer (1 thread) | 15,175 | **52.9** | 1.11 | 4,831 µs |
+| 2 | 15,505 | 103.7 | 2.21 | 4,583 µs |
+| 4 | 23,516 | 134.8 | 4.38 | 4,759 µs |
+| 8 | 31,530 | 145.1 | 6.58 | 4,259 µs |
+
+Throughput scales roughly linearly with worker threads to **2.08x pgbouncer**. The syscall
+argument in round four was not wrong about syscalls being expensive; it was wrong to conclude
+that a ceiling had been reached, when what had been reached was the thread count the benchmark
+happened to configure.
+
+So the honest statement of round four's result is narrower than the one it made: **the proxy
+reached throughput parity with pgbouncer using two threads against pgbouncer's one, by
+spending 1.96x the CPU per operation.** pgbouncer remains close to twice as efficient per
+operation, and cannot scale past one thread; the proxy is less efficient and can. Which of
+those matters depends on whether cores are the scarce resource.
+
+The hand-derived estimates in round four — 120 µs against 66 µs — were close. They were also
+unfalsifiable, which is the actual problem the probe fixes.
+
+Note that efficiency *degrades* as threads are added: 103.7 → 134.8 → 145.1 µs/op. Parallelism
+is being bought, not gained.
+
+### Memory: 11x pgbouncer per idle connection, and it is not returned
+
+The density axis previously divided a working-set figure by a client count and always passed.
+It now measures resident bytes per idle connection against a floor taken before the sweep
+opened anything. Five repetitions at each point, connections established and held:
+
+| clients | pgbouncer | rust, first repetition → fifth |
+|---|---|---|
+| 256 | 2.4 MB (flat) | 9.9 → 14.1 MB |
+| 1024 | 4.6 MB (flat) | 34.5 → 46.8 MB |
+| 4096 | 13.4 MB (flat) | 122.4 → 175.6 MB |
+
+Against the sweep floor that is ~2.8 KB per connection for pgbouncer and **~30 KB for the
+proxy**. Two distinct problems, and they must not be fixed together:
+
+1. **Footprint.** `relay.rs:27` reserves a 16 KiB `READ_CHUNK` and `wire_io.rs:30` an 8 KiB
+   pre-startup buffer, both eagerly, both retained while the connection sits idle with no
+   backend attached. pgbouncer's `pkt_buf` is 2 KiB.
+2. **Memory that is never returned.** pgbouncer is flat to three significant figures across
+   every repetition. The proxy climbs monotonically and plateaus about 40% above its first
+   repetition. The growth tracks client count, so it is per-connection rather than a fixed
+   leak — most likely glibc arena retention rather than a true leak, but RSS is what a
+   container limit measures.
+
+Tracked as one task, to be established in that order.
+
+### A harness bug the measurement found
+
+The first density run reported **−13,490 bytes per connection**. The floor was being read at
+the start of each cell — moments after the previous repetition closed 256 connections, when
+the pages are freed but not yet reclaimed — so it landed *above* the steady state that
+followed and the subtraction went negative.
+
+A negative is obvious. The same contamination shrinks a positive figure silently, which would
+have handed the density axis to whichever arm had the dirtiest baseline. The floor is now taken
+once, before the first cell, and a cell sitting below its floor reports no per-connection cost
+at all rather than a number.

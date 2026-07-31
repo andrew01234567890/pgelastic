@@ -67,6 +67,18 @@ const (
 	AxisDensity    Axis = "density"
 	AxisP99        Axis = "p99"
 	AxisP999       Axis = "p99.9"
+	// AxisCPUPerOp and AxisMemory are NOT pre-registered, and the distinction matters enough
+	// to write down. Every other threshold in this file was fixed before anyone could see
+	// which way it would cut; these two were added after numbers for them already existed,
+	// and a comment claiming otherwise would be the exact move this file exists to prevent.
+	//
+	// They take the same MaxRatio as every other lower-is-better axis, chosen for unrelated
+	// reasons long before this result. Two things make that defensible rather than
+	// convenient: the "1.33x" quoted for CPU in docs/bench.md is not a constant anywhere - it
+	// is 1/MinRatio re-expressed by hand - and adopting the tighter 1.25 flips none of the
+	// published verdicts.
+	AxisCPUPerOp Axis = "cpu-per-op"
+	AxisMemory   Axis = "memory"
 )
 
 // Verdict is what a row of the results table says.
