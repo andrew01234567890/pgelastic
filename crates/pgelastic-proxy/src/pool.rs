@@ -257,13 +257,19 @@ pub struct PoolManager {
     budget_epoch: std::time::Instant,
 }
 
-/// How stale a budget gauge is allowed to be.
+/// How stale a budget gauge is allowed to be on the checkout path.
 ///
 /// Metrics are scraped on the order of seconds, so bounding staleness here costs an observer
 /// nothing it can see. What it buys is large: refreshing the gauges reads the ledger, which
 /// needs this manager's own lock, and the transaction state machine asks for a refresh at
 /// fifteen separate points. On the checkout path that turned observability into a contended
 /// acquisition per state transition, on a mutex both runtime workers share.
+///
+/// It applies to that path and to nothing else. Anything that moves the *ceiling* rather than
+/// the occupancy — a pin, an unpin, a configuration reload, a route change — publishes at once
+/// through [`PoolManager::publish_budget_now`]. A ceiling that dropped is the number an
+/// operator reads to find out why, and it has to be true the moment the thing that moved it
+/// happened rather than a few milliseconds afterwards.
 const BUDGET_PUBLISH_INTERVAL_MS: u64 = 5;
 
 impl PoolManager {
@@ -518,19 +524,25 @@ impl PoolManager {
     /// is the ceiling that drops as a result. Without this split the drop has no
     /// attributable cause.
     pub fn record_pin(&self, reason: PinReason) {
-        let mut inner = self.lock();
-        if let Err(error) = inner.ledger.pin(reason) {
-            warn!(%error, %reason, "pinning a link the ledger does not know about");
+        {
+            let mut inner = self.lock();
+            if let Err(error) = inner.ledger.pin(reason) {
+                warn!(%error, %reason, "pinning a link the ledger does not know about");
+            }
         }
+        self.publish_budget_now();
     }
 
     /// Returns a pinned link to the elastic pool, once the client that dirtied
     /// it has gone and the scrub that removes the state has run.
     pub fn release_pin(&self, reason: PinReason) {
-        let mut inner = self.lock();
-        if let Err(error) = inner.ledger.unpin(reason) {
-            warn!(%error, %reason, "unpinning a link the ledger does not know about");
+        {
+            let mut inner = self.lock();
+            if let Err(error) = inner.ledger.unpin(reason) {
+                warn!(%error, %reason, "unpinning a link the ledger does not know about");
+            }
         }
+        self.publish_budget_now();
     }
 
     fn record_unpin(inner: &mut Inner, pin: Option<PinReason>) {
