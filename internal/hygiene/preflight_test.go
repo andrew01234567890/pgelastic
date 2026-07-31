@@ -39,21 +39,26 @@ var mustRunLocally = []string{
 
 func preflightRecipe(t *testing.T) string {
 	t.Helper()
+	return makefileRecipe(t, "preflight")
+}
+
+// makefileRecipe returns one target's recipe: the tab-indented block after the target line,
+// ending at the first line that is neither indented nor blank.
+func makefileRecipe(t *testing.T, target string) string {
+	t.Helper()
 	raw, err := os.ReadFile("../../Makefile")
 	if err != nil {
 		t.Fatalf("reading the Makefile: %v", err)
 	}
 
-	// A make recipe is the tab-indented block after the target line, ending at the first line
-	// that is neither indented nor blank.
-	start := strings.Index(string(raw), "\npreflight:")
+	start := strings.Index(string(raw), "\n"+target+":")
 	if start < 0 {
-		t.Fatal("the Makefile has no preflight target; it is what this test exists to protect")
+		t.Fatalf("the Makefile has no %s target", target)
 	}
 	rest := string(raw)[start+1:]
 	var recipe []string
 	for line := range strings.SplitSeq(rest, "\n") {
-		if strings.HasPrefix(line, "preflight:") {
+		if strings.HasPrefix(line, target+":") {
 			continue
 		}
 		if line != "" && !strings.HasPrefix(line, "\t") {
