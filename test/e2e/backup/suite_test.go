@@ -68,8 +68,11 @@ const (
 	claimPoolName  = "e2e-backup-pool"
 )
 
-// sizingClass is the smallest that fits a kind node.
-const sizingClass = "small"
+// sizingClass is the development tier: three postmasters fit on one kind node, which is what
+// this suite gets. It has to name a class that exists - an unknown one leaves the instance
+// Pending with InvalidSpec and no Pods at all, and every spec here then waits out its timeout
+// against an instance that was never going to start.
+const sizingClass = "dev-1"
 
 func claimNamespace(namespace string) {
 	GinkgoHelper()
@@ -233,6 +236,22 @@ var _ = BeforeSuite(func() {
 
 	SetDefaultEventuallyTimeout(10 * time.Minute)
 	SetDefaultEventuallyPollingInterval(3 * time.Second)
+})
+
+// One container, in one order, because this suite is one narrative: archive WAL, back the
+// instance up, recover it to a moment, then recover a single tenant out of that.
+//
+// Ginkgo randomizes top-level containers against each other, so three sibling Describes did
+// not run in the order they are written - and the two restore containers, which need the
+// instance and the base backups the archiving container leaves behind, failed instantly with
+// `pginstances "pg-archive" not found` on any seed that put them first. Ordered is what makes
+// the dependency between them a fact rather than a hope, and the specs are grouped here
+// rather than merged into one file so that each still reads as its own subject.
+var _ = Describe("backup, restore and point-in-time recovery", Ordered, func() {
+	archivingSpecs()
+	instanceRestoreSpecs()
+	tenantRestoreSpecs()
+	scheduledBackupSpecs()
 })
 
 var _ = AfterSuite(func() {
