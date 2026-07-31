@@ -752,9 +752,20 @@ async fn relay(
     greeting.push(BackendMessage::BackendKeyData(token.key_data()?));
     greeting.push(BackendMessage::ReadyForQuery(TransactionStatus::Idle));
     crate::wire_io::write_backend(&mut session.stream, &greeting).await?;
+    // Dropped rather than left to the end of the scope. It has already been written to the
+    // client, and a local that is merely unused still occupies the coroutine frame at every
+    // await inside its scope -- so leaving it here costs its capacity on every connection for
+    // as long as that connection lives, and widens the task allocation for everyone.
+    drop(greeting);
 
     let pending_from_client = session.buf.as_slice().to_vec();
     let pending_from_backend = link.buf.as_slice().to_vec();
+    // The handshake buffer has done its job, and it is 8 KiB that would otherwise stay resident
+    // for as long as the client is connected -- `session` outlives it because it owns the
+    // stream. Released the same way the backend link's is above, which is where this pattern
+    // came from; the client side simply never did it.
+    session.buf = pgelastic_wire::MessageBuffer::new();
+    link.buf = pgelastic_wire::MessageBuffer::new();
 
     let ending = session::run(
         &mut session.stream,
@@ -850,8 +861,19 @@ async fn multiplexed(
     greeting.push(BackendMessage::BackendKeyData(token.key_data()?));
     greeting.push(BackendMessage::ReadyForQuery(TransactionStatus::Idle));
     crate::wire_io::write_backend(&mut session.stream, &greeting).await?;
+    // Dropped rather than left to the end of the scope. It has already been written to the
+    // client, and a local that is merely unused still occupies the coroutine frame at every
+    // await inside its scope -- so leaving it here costs its capacity on every connection for
+    // as long as that connection lives, and widens the task allocation for everyone.
+    drop(greeting);
 
     let pending = session.buf.as_slice().to_vec();
+    // The handshake buffer has done its job, and it is 8 KiB that would otherwise stay resident
+    // for as long as the client is connected -- `session` outlives it because it owns the
+    // stream. Released the same way the backend link's is above, which is where this pattern
+    // came from; the client side simply never did it.
+    session.buf = pgelastic_wire::MessageBuffer::new();
+
     let ending = crate::txn::run(
         crate::txn::Session {
             client: &mut session.stream,
