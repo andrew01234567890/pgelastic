@@ -115,6 +115,62 @@ const (
 	BackupIncremental BackupType = "incr"
 )
 
+// RestoreOptions is where recovery starts and where it stops.
+type RestoreOptions struct {
+	// BackupID names the base backup. Empty lets pgBackRest choose the newest one that
+	// ended before the target, which only has an answer for a target it can order.
+	BackupID string
+	// TargetType is pgBackRest's spelling: time, lsn, name, xid, immediate, or empty to
+	// replay everything the archive holds.
+	TargetType string
+	// TargetValue is the target itself, unused for immediate.
+	TargetValue string
+	// Exclusive stops just before the target rather than just after it.
+	Exclusive bool
+	// Timeline is "latest" or a timeline number.
+	Timeline string
+	// RestoreCommand is what the recovered instance will fetch further segments with. It is
+	// pinned rather than left to pgBackRest to generate, because the generated one does not
+	// carry the configuration file this deployment needs and would fail on the first
+	// segment - at the point where the base backup has already been downloaded.
+	RestoreCommand string
+}
+
+// Restore writes a base backup into the data directory and leaves PostgreSQL configured to
+// replay WAL onto it.
+//
+// --delta compares what is already in the data directory against the backup and fetches
+// only the difference. On an empty directory that costs one listing; on a directory being
+// restored over, it is the difference between minutes and hours.
+func (i Invocation) Restore(options RestoreOptions) Command {
+	command := i.command("restore", "--delta")
+	if options.BackupID != "" {
+		command.Args = append(command.Args, "--set="+options.BackupID)
+	}
+	if options.TargetType != "" {
+		command.Args = append(command.Args, "--type="+options.TargetType)
+	}
+	if options.TargetValue != "" {
+		command.Args = append(command.Args, "--target="+options.TargetValue)
+	}
+	if options.Exclusive {
+		command.Args = append(command.Args, "--target-exclusive")
+	}
+	if options.Timeline != "" {
+		command.Args = append(command.Args, "--target-timeline="+options.Timeline)
+	}
+	// Promote rather than pause. A recovery that reaches its target and then waits is an
+	// instance that never becomes ready, which reads from outside as a restore that hung.
+	if options.TargetType != "" {
+		command.Args = append(command.Args, "--target-action=promote")
+	}
+	if options.RestoreCommand != "" {
+		command.Args = append(command.Args,
+			"--recovery-option=restore_command="+options.RestoreCommand)
+	}
+	return command
+}
+
 // Runner executes pgBackRest.
 type Runner struct {
 	// Binary is the executable, resolved from PATH when empty.

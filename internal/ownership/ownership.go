@@ -113,6 +113,8 @@ func (r Resolver) Of(ctx context.Context, object client.Object) (Verdict, error)
 		return r.ofPoolNamed(ctx, typed.Namespace, typed.Spec.PoolRef.Name)
 	case *pgelasticv1alpha1.PgTenantMigration:
 		return r.ofMigration(ctx, typed)
+	case *pgelasticv1alpha1.PgRestore:
+		return r.ofInstanceNamed(ctx, typed.Namespace, typed.Spec.SourceInstanceRef.Name)
 	case *pgelasticv1alpha1.PgBackup:
 		// A backup outlives its instance on purpose - that is most of what a backup is for -
 		// so an instance that no longer exists resolves to Unresolved rather than Foreign,

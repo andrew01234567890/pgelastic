@@ -30,6 +30,7 @@ import (
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/ha"
+	"github.com/andrew01234567890/pgelastic/internal/instance/pgbackrest"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgtool"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
@@ -64,6 +65,13 @@ func Bootstrap(ctx context.Context, options Options) error {
 		return err
 	}
 	if primary == options.Member {
+		// The third way a data directory comes into existence, beside initdb and a clone.
+		// Only the designated primary restores: the other members clone from it once it is
+		// serving, exactly as they would from a primary that had been initdb'd, so a
+		// three-member instance costs one trip to the repository rather than three.
+		if options.Config.Restore != nil {
+			return restoreFromRepository(ctx, options, tools)
+		}
 		return initialise(ctx, options, tools)
 	}
 	return join(ctx, options, tools, primary)
@@ -398,4 +406,66 @@ func toolchain(options Options) pgtool.Toolchain {
 		WALDir:  options.WALDir,
 		Stderr:  os.Stderr,
 	}
+}
+
+// restoreFromRepository writes a base backup into this member's data directory and leaves
+// PostgreSQL configured to replay WAL onto it.
+//
+// What happens next is PostgreSQL's, not the agent's: pgBackRest leaves recovery.signal and
+// the recovery settings behind, the postmaster starts, replays to the target and promotes
+// itself. There is no polling loop waiting for recovery to end, because there is nothing
+// useful to do while it does - a restore that never reaches its target shows up as a member
+// whose startup probe never passes, which is a state the rest of the system already knows
+// how to report.
+func restoreFromRepository(ctx context.Context, options Options, tools pgtool.Toolchain) error {
+	log := logf.FromContext(ctx)
+	request := options.Config.Restore
+
+	if err := quarantine(ctx, options, tools); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(options.DataDir, dataDirMode); err != nil {
+		return err
+	}
+
+	invocation, configured, err := ensureRepositoryForStanza(ctx, options, request.Stanza)
+	if err != nil {
+		return err
+	}
+	if !configured {
+		return fmt.Errorf(
+			"this instance is a restore of stanza %s and has no repository to read it from",
+			request.Stanza)
+	}
+
+	// The archive is checked for the segment the base backup begins at before the base
+	// backup itself is fetched. An incomplete archive is otherwise discovered after an hour
+	// of downloading, at the point where the only remaining move is to start again.
+	log.Info("restoring from the repository", "stanza", request.Stanza,
+		"backupID", request.BackupID, "target", request.TargetValue)
+
+	if _, err := (pgbackrest.Runner{}).Run(ctx, invocation.Restore(pgbackrest.RestoreOptions{
+		BackupID:       request.BackupID,
+		TargetType:     request.TargetType,
+		TargetValue:    request.TargetValue,
+		Exclusive:      request.Exclusive,
+		Timeline:       request.Timeline,
+		RestoreCommand: fmt.Sprintf("%s wal-restore --name %%f --target %%p", provision.AgentBinary),
+	})); err != nil {
+		return err
+	}
+
+	if err := EnsureIncludes(options.DataDir); err != nil {
+		return err
+	}
+	// The floor is the source's, raised over whatever this instance was configured with.
+	// PostgreSQL refuses to begin recovery when max_connections and its four companions are
+	// below the values the WAL was written under, and it says so by naming the parameter
+	// rather than the cause.
+	controlData := &pgtool.ControlData{EnforcedSettings: request.EnforcedParameterFloor}
+	if _, err := WriteConfig(options.Config, options.Member,
+		pgconf.ReplicationConfig{}, options.DataDir, controlData); err != nil {
+		return err
+	}
+	return nil
 }

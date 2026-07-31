@@ -320,6 +320,14 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgbackup")
 		os.Exit(1)
 	}
+	if err := (&controller.PgRestoreReconciler{
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		ControllerName: controllerName,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "pgrestore")
+		os.Exit(1)
+	}
 	if err := mgr.Add(&controller.MigrationSweeper{
 		Client:         mgr.GetClient(),
 		SQL:            migrationSQL,

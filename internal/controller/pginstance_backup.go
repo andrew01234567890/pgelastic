@@ -72,6 +72,14 @@ func (r *PgInstanceReconciler) reconcileBackups(
 	if instance.Spec.Backup == nil {
 		return backupState{}
 	}
+	// An instance recovering from a repository has that repository configured so it can
+	// read from it, and must not be scheduled to write to it. It carries its source's
+	// system identifier - a physical restore copies the control file verbatim - so it
+	// addresses the source's stanza while running on a forked timeline, and a backup taken
+	// from here would land in somebody else's archive.
+	if instance.Spec.Restore != nil {
+		return backupState{}
+	}
 
 	backups, err := r.backupsOf(ctx, instance)
 	if err != nil {

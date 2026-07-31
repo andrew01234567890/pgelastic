@@ -105,6 +105,7 @@ rules:
   - pgelasticclasses
   - pgelasticpools
   - pginstances
+  - pgrestores
   - pgtenantmigrations
   - pgtenants
   - pgworkloadclasses
@@ -123,6 +124,7 @@ rules:
   - pgelasticclasses/status
   - pgelasticpools/status
   - pginstances/status
+  - pgrestores/status
   - pgtenantmigrations/status
   - pgtenants/status
   - pgtenantusers/status

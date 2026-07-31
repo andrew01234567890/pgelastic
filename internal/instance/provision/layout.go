@@ -215,6 +215,8 @@ type AgentConfig struct {
 	// PGC_POSTMASTER and turning it on later would cost a restart that drops every tenant
 	// connection on the instance.
 	Backup *pgbackrest.Repository `json:"backup,omitempty"`
+	// Restore is what recovery needs, absent on an instance created by initdb.
+	Restore *RestoreRequest `json:"restore,omitempty"`
 	// Recovering marks an instance restored from a repository rather than provisioned.
 	//
 	// Such a member carries its source's system identifier - a physical restore copies the
@@ -222,6 +224,23 @@ type AgentConfig struct {
 	// a forked timeline. Archiving from it would interleave two histories into one archive
 	// and leave neither restorable, so it does not archive at all.
 	Recovering bool `json:"recovering,omitempty"`
+}
+
+// RestoreRequest is the operator's recovery instruction, carried to the agent in the same
+// document as everything else it was told.
+type RestoreRequest struct {
+	// Stanza is the source's repository stanza.
+	Stanza string `json:"stanza"`
+	// BackupID names the base backup, empty to let the repository choose.
+	BackupID string `json:"backupID,omitempty"`
+	// TargetType, TargetValue, Exclusive and Timeline are where recovery stops.
+	TargetType  string `json:"targetType,omitempty"`
+	TargetValue string `json:"targetValue,omitempty"`
+	Exclusive   bool   `json:"exclusive,omitempty"`
+	Timeline    string `json:"timeline,omitempty"`
+	// EnforcedParameterFloor are the source's values for the five settings PostgreSQL
+	// refuses to begin recovery below.
+	EnforcedParameterFloor map[string]int32 `json:"enforcedParameterFloor,omitempty"`
 }
 
 // LeaseTimings are the promotion Lease's four durations, handed to the agent because the

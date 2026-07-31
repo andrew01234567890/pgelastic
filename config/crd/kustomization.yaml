@@ -10,6 +10,7 @@ resources:
 - bases/pgelastic.io_pgtenantusers.yaml
 - bases/pgelastic.io_pgtenantmigrations.yaml
 - bases/pgelastic.io_pgbackups.yaml
+- bases/pgelastic.io_pgrestores.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
