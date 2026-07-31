@@ -53,8 +53,8 @@ pub use reset::{
     TaintSet, plan,
 };
 pub use server::{
-    CopyState, IllegalServerTransition, LinkError, ReleaseFlags, ServerEvent, ServerId, ServerLink,
-    ServerState, jittered_lifetime,
+    CopyState, IllegalServerTransition, LinkError, Origin, ReleaseFlags, ServerEvent, ServerId,
+    ServerLink, ServerState, jittered_lifetime,
 };
 pub use stmt::{
     CacheInvalidation, ClientStatements, GlobalStatementCache, PreparedStatement, ServerAction,

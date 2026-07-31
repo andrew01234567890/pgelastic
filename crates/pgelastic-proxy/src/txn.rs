@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use pgelastic_pool::{
-    CacheInvalidation, CheckInBlock, ClientStatements, PinReason, PoolKey, PreparedStatement,
-    Relay, ResetDisposition, ResetPolicy, ResetStep, ServerAction, ServerEvent, StatementKey,
-    detect_cache_invalidation,
+    CacheInvalidation, CheckInBlock, ClientStatements, Origin, PinReason, PoolKey,
+    PreparedStatement, Relay, ResetDisposition, ResetPolicy, ResetStep, ServerAction, ServerEvent,
+    StatementKey, detect_cache_invalidation,
 };
 use pgelastic_wire::{
     BackendMessage, Close, FrontendMessage, Parse, RawFrame, Target, TransactionStatus,
@@ -643,14 +643,14 @@ impl Running<'_> {
                 Relay::fake(BackendMessage::ParseComplete),
             ),
             ServerAction::Parse(name) => {
-                self.dispatch(
+                self.dispatch_pool(
                     &FrontendMessage::Parse(rename(parse, &name)),
                     Relay::Forward,
                 );
             }
             ServerAction::EvictThenParse { evict, name } => {
-                self.dispatch(&close_statement(&evict), Relay::Skip);
-                self.dispatch(
+                self.dispatch_pool(&close_statement(&evict), Relay::Skip);
+                self.dispatch_pool(
                     &FrontendMessage::Parse(rename(parse, &name)),
                     Relay::Forward,
                 );
@@ -690,11 +690,11 @@ impl Running<'_> {
         match action {
             ServerAction::Ready => {}
             ServerAction::Parse(name) => {
-                self.dispatch(&parse_for(statement, &name), Relay::Skip);
+                self.dispatch_pool(&parse_for(statement, &name), Relay::Skip);
             }
             ServerAction::EvictThenParse { evict, name } => {
-                self.dispatch(&close_statement(&evict), Relay::Skip);
-                self.dispatch(&parse_for(statement, &name), Relay::Skip);
+                self.dispatch_pool(&close_statement(&evict), Relay::Skip);
+                self.dispatch_pool(&parse_for(statement, &name), Relay::Skip);
             }
         }
     }
@@ -709,15 +709,30 @@ impl Running<'_> {
         }
     }
 
-    /// Records a frontend message against the link and queues its bytes.
+    /// Records a client's own message against the link and queues its bytes.
     ///
     /// A faked request is recorded but never sent: the pool answers it.
     fn dispatch(&mut self, message: &FrontendMessage, relay: Relay) {
+        self.dispatch_from(message, relay, Origin::Client);
+    }
+
+    /// Records a message the pool authored: a `Parse` under a name it minted, or the `Close`
+    /// that evicts one.
+    ///
+    /// Separate from [`dispatch`](Self::dispatch) so provenance is stated at the call site
+    /// rather than guessed from the message. It cannot be guessed: `on_parse` rewrites a
+    /// client's statement onto a `pgel_` name, so by the time a `Parse` reaches the wire the
+    /// pool's own and the client's are indistinguishable.
+    fn dispatch_pool(&mut self, message: &FrontendMessage, relay: Relay) {
+        self.dispatch_from(message, relay, Origin::Pool);
+    }
+
+    fn dispatch_from(&mut self, message: &FrontendMessage, relay: Relay, origin: Origin) {
         let Some(checkout) = self.checkout.as_mut() else {
             return;
         };
         let faked = matches!(relay, Relay::Fake(_));
-        checkout.conn.link.observe_frontend(message, relay);
+        checkout.conn.link.observe_frontend(message, relay, origin);
         if !faked {
             // Only what actually goes out: a request the pool answers from its
             // own cache executes nothing, so it can be neither a write nor an

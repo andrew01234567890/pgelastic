@@ -15,7 +15,7 @@ use pgelastic_pool::pin::{BudgetLedger, PinReason};
 use pgelastic_pool::reset::{
     ReleaseContext, ResetDisposition, ResetPolicy, ResetStep, Taint, plan,
 };
-use pgelastic_pool::server::{CopyState, ServerEvent, ServerId, ServerLink, ServerState};
+use pgelastic_pool::server::{CopyState, Origin, ServerEvent, ServerId, ServerLink, ServerState};
 use pgelastic_pool::stmt::{
     CacheInvalidation, ClientStatements, GlobalStatementCache, ServerAction, ServerStatements,
     StatementKey, detect_cache_invalidation,
@@ -85,6 +85,7 @@ fn run_reset(link: &mut ServerLink, steps: &[ResetStep]) {
         link.observe_frontend(
             &FrontendMessage::Query(Bytes::copy_from_slice(step.sql().as_bytes())),
             Relay::Skip,
+            Origin::Client,
         );
         link.observe_backend(&BackendMessage::CommandComplete(Bytes::from_static(b"OK")))
             .unwrap();
@@ -101,6 +102,7 @@ fn a_backend_ready_for_query_mid_copy_does_not_release_the_link() {
     link.observe_frontend(
         &FrontendMessage::Query(Bytes::from_static(b"COPY orders FROM STDIN")),
         Relay::Forward,
+        Origin::Client,
     );
     link.observe_backend(&copy_in()).unwrap();
     link.observe_backend(&BackendMessage::ReadyForQuery(TransactionStatus::Idle))
@@ -120,13 +122,14 @@ fn a_backend_ready_for_query_mid_copy_does_not_release_the_link() {
     link.observe_frontend(
         &FrontendMessage::CopyData(Bytes::from_static(b"1\n")),
         Relay::Forward,
+        Origin::Client,
     );
     assert_eq!(
         link.can_check_in(),
         Err(CheckInBlock::CopyOpen(CopyState::In))
     );
 
-    link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward);
+    link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward, Origin::Client);
     assert_eq!(link.can_check_in(), Ok(()));
 }
 
@@ -136,14 +139,19 @@ fn an_extended_protocol_copy_is_held_by_the_outstanding_queue_as_well() {
     link.observe_frontend(
         &FrontendMessage::Query(Bytes::from_static(b"SELECT 1")),
         Relay::Forward,
+        Origin::Client,
     );
     link.observe_backend(&BackendMessage::ReadyForQuery(TransactionStatus::Idle))
         .unwrap();
 
-    link.observe_frontend(&parse("", "COPY orders FROM STDIN"), Relay::Forward);
-    link.observe_frontend(&bind(""), Relay::Forward);
-    link.observe_frontend(&execute(), Relay::Forward);
-    link.observe_frontend(&FrontendMessage::Sync, Relay::Forward);
+    link.observe_frontend(
+        &parse("", "COPY orders FROM STDIN"),
+        Relay::Forward,
+        Origin::Client,
+    );
+    link.observe_frontend(&bind(""), Relay::Forward, Origin::Client);
+    link.observe_frontend(&execute(), Relay::Forward, Origin::Client);
+    link.observe_frontend(&FrontendMessage::Sync, Relay::Forward, Origin::Client);
 
     link.observe_backend(&BackendMessage::ParseComplete)
         .unwrap();
@@ -156,7 +164,7 @@ fn an_extended_protocol_copy_is_held_by_the_outstanding_queue_as_well() {
         "the Execute has not been answered, so the batch is not over"
     );
 
-    link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward);
+    link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward, Origin::Client);
     link.observe_backend(&BackendMessage::CommandComplete(Bytes::from_static(
         b"COPY 1",
     )))
@@ -172,6 +180,7 @@ fn a_failed_copy_releases_the_link_once_the_backend_reports_the_error() {
     link.observe_frontend(
         &FrontendMessage::Query(Bytes::from_static(b"COPY orders FROM STDIN")),
         Relay::Forward,
+        Origin::Client,
     );
     link.observe_backend(&copy_in()).unwrap();
     link.observe_backend(&BackendMessage::ErrorResponse(
@@ -191,6 +200,7 @@ fn a_tainted_link_reaches_idle_only_through_the_reset_ladder() {
     link.observe_frontend(
         &FrontendMessage::Query(Bytes::from_static(b"SET search_path = audit")),
         Relay::Forward,
+        Origin::Client,
     );
     link.observe_backend(&BackendMessage::ParameterStatus(
         pgelastic_wire::ParameterStatus {
@@ -234,6 +244,7 @@ fn an_open_transaction_is_rolled_back_before_the_scrub() {
     link.observe_frontend(
         &FrontendMessage::Query(Bytes::from_static(b"BEGIN")),
         Relay::Forward,
+        Origin::Client,
     );
     link.observe_backend(&BackendMessage::ReadyForQuery(
         TransactionStatus::Transaction,
@@ -263,6 +274,7 @@ fn a_pinned_link_leaves_the_elastic_budget_and_is_counted_separately() {
     link.observe_frontend(
         &FrontendMessage::Query(Bytes::from_static(b"LISTEN orders")),
         Relay::Forward,
+        Origin::Client,
     );
     link.observe_backend(&BackendMessage::ReadyForQuery(TransactionStatus::Idle))
         .unwrap();
@@ -439,6 +451,7 @@ fn a_link_whose_credentials_were_rotated_is_never_reused() {
     link.observe_frontend(
         &FrontendMessage::Query(Bytes::from_static(b"SELECT 1")),
         Relay::Forward,
+        Origin::Client,
     );
     link.observe_backend(&BackendMessage::ReadyForQuery(TransactionStatus::Idle))
         .unwrap();

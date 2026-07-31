@@ -699,6 +699,58 @@ async fn a_pinned_connection_leaves_the_elastic_budget_and_is_reported_separatel
 
 // ---- prepared statements across handoffs --------------------------------
 
+/// One backend, and a policy that only scrubs a link it has reason to think is dirty.
+const ONE_DIRTY_TRACKED: &str = "\
+[pool]
+mode = \"transaction\"
+backendConnections = 1
+resetPolicy = \"dirtyTracked\"
+";
+
+/// The statement cache exists so that one server-side statement serves every client that asks
+/// for the same text. It could not: the pool tainted the link with its own injected `Parse`,
+/// the taint made `dirtyTracked` scrub at every release, and the scrub deallocated exactly
+/// what had just been cached. `maxServerStatements` was dead configuration.
+///
+/// Counted on the backend rather than inferred from latency, because "it got faster" would not
+/// say which of the two mechanisms moved. `pg_prepared_statements` is session-local, so the
+/// count has to run *through* the proxy to land on the pooled link — and over the simple
+/// protocol, or the counting query would prepare a statement of its own and be included in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_statement_survives_the_transaction_that_created_it() {
+    let stack = stack_with(ONE_DIRTY_TRACKED).await;
+    let client = stack.connect().await;
+    let statement = client.prepare("SELECT $1::int * 2").await.unwrap();
+
+    // Twenty separate transactions. Each is its own checkout, so before the fix each one
+    // re-parsed the same text onto a link that had just been scrubbed of it.
+    for value in 0..20i32 {
+        let row = client.query_one(&statement, &[&value]).await.unwrap();
+        let doubled: i32 = row.get(0);
+        assert_eq!(doubled, value * 2);
+    }
+
+    let rows = client
+        .simple_query(
+            "SELECT count(*)::text FROM pg_catalog.pg_prepared_statements \
+             WHERE name LIKE 'pgel!_%' ESCAPE '!'",
+        )
+        .await
+        .expect("counting the pool's statements on the backend");
+    let parsed = rows
+        .iter()
+        .find_map(|row| match row {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .expect("a count row");
+    assert_eq!(
+        parsed, "1",
+        "twenty transactions over one backend must leave one prepared statement, not a \
+         re-parse of the same text at every checkout"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn named_prepared_statements_keep_working_across_handoffs() {
     let stack = stack_with(FOUR).await;

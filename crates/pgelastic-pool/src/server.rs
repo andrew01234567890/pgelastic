@@ -22,6 +22,26 @@ use crate::outstanding::{
 use crate::pin::PinReason;
 use crate::reset::{Taint, TaintSet};
 
+/// Who wrote a frontend message on its way to the backend.
+///
+/// The pool does not only forward what a client sent. It injects `Parse` and `Close` of its
+/// own, and it rewrites a client's named `Parse` onto a content-addressed name it minted
+/// ([`crate::stmt`]). Neither dirties the link, and the distinction cannot be recovered from
+/// the message: by the time it reaches the wire, a client's statement and one the pool
+/// synthesised look identical, both carrying a `pgel_` name.
+///
+/// Only the caller knows, so only the caller can say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The client authored this. A named `Parse` from a client is state the pool is not
+    /// tracking, and taints the link.
+    Client,
+    /// The pool authored this. The statement it creates is identified by its full text and
+    /// parameter types, is recorded in [`crate::ServerStatements`], and is therefore
+    /// shareable with any client that asks for the same thing — so it is not dirt.
+    Pool,
+}
+
 /// Identifies a backend link for the lifetime of the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServerId(u64);
@@ -322,12 +342,31 @@ impl ServerLink {
     }
 
     /// Records a frontend message on its way to the backend.
-    pub fn observe_frontend(&mut self, message: &FrontendMessage, relay: Relay) {
+    ///
+    /// See [`Origin`] for why the caller has to say who wrote the message.
+    pub fn observe_frontend(&mut self, message: &FrontendMessage, relay: Relay, origin: Origin) {
+        let disposition = relay.disposition();
         match message {
             FrontendMessage::CopyDone | FrontendMessage::CopyFail(_) => {
                 self.copy = CopyState::None;
             }
-            FrontendMessage::Parse(parse) if !parse.name.is_empty() => {
+            // Two conditions, and they are independent.
+            //
+            // `Origin::Pool` is the real rule: a statement the pool minted is content-addressed
+            // and tracked in `ServerStatements`, so it is shareable with any client asking for
+            // the same text and parameter types. That is not dirt on the link, it is pool-owned
+            // state — and tainting it made the cache in `stmt.rs` unable to outlive a single
+            // transaction, because the scrub it provoked deallocated exactly what it had cached.
+            //
+            // The `Fake` clause states the weaker invariant that a message never written to the
+            // socket cannot dirty the socket. The caller already relies on it for the witness
+            // and the encoder; saying it here too means a future caller that forgets one does
+            // not silently start tainting.
+            FrontendMessage::Parse(parse)
+                if !parse.name.is_empty()
+                    && origin == Origin::Client
+                    && disposition != Disposition::Fake =>
+            {
                 self.taint.insert(Taint::PreparedStatement);
             }
             _ => {}
@@ -577,8 +616,16 @@ pub(crate) mod tests {
         assert!(link.taint().contains(Taint::SessionParameter));
     }
 
+    fn parse_named(name: &'static [u8]) -> FrontendMessage {
+        FrontendMessage::Parse(Parse {
+            name: Bytes::from_static(name),
+            query: Bytes::from_static(b"SELECT 1"),
+            param_types: Vec::new(),
+        })
+    }
+
     #[test]
-    fn a_named_parse_taints_the_link_but_the_unnamed_one_does_not() {
+    fn an_unnamed_parse_does_not_taint_the_link() {
         let mut link = logged_in();
         link.observe_frontend(
             &FrontendMessage::Parse(Parse {
@@ -587,18 +634,48 @@ pub(crate) mod tests {
                 param_types: Vec::new(),
             }),
             Relay::Forward,
+            Origin::Client,
         );
         assert!(link.taint().is_clean());
+    }
 
-        link.observe_frontend(
-            &FrontendMessage::Parse(Parse {
-                name: Bytes::from_static(b"s1"),
-                query: Bytes::from_static(b"SELECT 1"),
-                param_types: Vec::new(),
-            }),
-            Relay::Forward,
+    #[test]
+    fn a_client_authored_named_parse_still_taints_the_link() {
+        let mut link = logged_in();
+        link.observe_frontend(&parse_named(b"s1"), Relay::Forward, Origin::Client);
+        assert!(
+            link.taint().contains(Taint::PreparedStatement),
+            "a statement the pool is not tracking is unaccounted state on the link"
         );
-        assert!(link.taint().contains(Taint::PreparedStatement));
+    }
+
+    /// The statement cache exists to let one server-side statement serve every client that
+    /// asks for the same text. Tainting the link when the pool parses one made the scrub at
+    /// release deallocate exactly what had just been cached, so the cache could never outlive
+    /// a transaction.
+    #[test]
+    fn a_parse_the_pool_minted_does_not_taint_the_link() {
+        let mut link = logged_in();
+        link.observe_frontend(
+            &parse_named(b"pgel_0000000000000001"),
+            Relay::Forward,
+            Origin::Pool,
+        );
+        assert!(link.taint().is_clean());
+    }
+
+    /// A message that is answered from the pool's cache never reaches the socket, so it cannot
+    /// have dirtied it. This is the client's own name, which is why `Origin` alone would not
+    /// exempt it.
+    #[test]
+    fn a_parse_the_pool_answers_itself_does_not_taint_the_link() {
+        let mut link = logged_in();
+        link.observe_frontend(
+            &parse_named(b"s1"),
+            Relay::fake(BackendMessage::ParseComplete),
+            Origin::Client,
+        );
+        assert!(link.taint().is_clean());
     }
 
     #[test]
@@ -608,7 +685,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(link.copy(), CopyState::In);
 
-        link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward);
+        link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward, Origin::Client);
         assert_eq!(link.copy(), CopyState::None);
     }
 
