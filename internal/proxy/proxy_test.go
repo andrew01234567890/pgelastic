@@ -548,6 +548,39 @@ func crdDefaultFor(t *testing.T, field string) int64 {
 	return value
 }
 
+// The intern table's bound has to reach the proxy, and the CRD default has to agree with the
+// rendered one for the same reason preparedStatementsLimit does: whether the API server or this
+// code supplies the value depends on whether a pooling block was written at all.
+//
+// It is a different quantity from preparedStatementsLimit and must not silently inherit its
+// number -- one bounds a single backend link, the other the instance-wide table whose key owns
+// the query text.
+func TestTheGlobalStatementLimitMatchesTheCrdDefault(t *testing.T) {
+	if got := globalStatementsLimit(nil); got != defaultGlobalStatementsLimit {
+		t.Errorf("an absent pooling block rendered %d, want %d", got, defaultGlobalStatementsLimit)
+	}
+	if got := globalStatementsLimit(&pgelasticv1alpha1.PoolingConfig{}); got != defaultGlobalStatementsLimit {
+		t.Errorf("an empty pooling block rendered %d, want %d", got, defaultGlobalStatementsLimit)
+	}
+
+	if crd := crdDefaultFor(t, "globalStatementsLimit"); crd != int64(defaultGlobalStatementsLimit) {
+		t.Errorf("the CRD defaults globalStatementsLimit to %d and this code to %d", crd,
+			defaultGlobalStatementsLimit)
+	}
+
+	if defaultGlobalStatementsLimit == defaultPreparedStatementsLimit {
+		t.Error("the two limits bound different things and sharing a number is how they get " +
+			"confused for one another")
+	}
+
+	asked := int32(64)
+	if got := globalStatementsLimit(&pgelasticv1alpha1.PoolingConfig{
+		GlobalStatementsLimit: &asked,
+	}); got != asked {
+		t.Errorf("an explicit %d rendered %d", asked, got)
+	}
+}
+
 func TestTheFleetCanReadItsOwnConfigurationAndNoOtherSecret(t *testing.T) {
 	role := Builder{Pool: testPool(), Image: testImage}.Role()
 	var secretRule *int

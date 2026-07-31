@@ -823,6 +823,17 @@ pub struct PoolConfig {
     /// evicts. `PostgreSQL` has no server-side limit, so this is the proxy's.
     #[serde(default = "default_max_server_statements")]
     pub max_server_statements: usize,
+    /// Distinct statement texts the instance-wide intern table keeps before its
+    /// LRU evicts.
+    ///
+    /// A different quantity from `max_server_statements`, which counts what one
+    /// backend has parsed. This counts what the proxy has *named*, shared across
+    /// every client on the instance so that two clients sending the same text
+    /// get one id and the link parses once. Its key owns the query text, so
+    /// leaving it unbounded makes memory a function of how much distinct SQL the
+    /// applications behind the proxy contain.
+    #[serde(default = "default_max_global_statements")]
+    pub max_global_statements: usize,
     /// How long a backend link may live before it is recycled, spread over a
     /// jittered window so a pool does not recycle every link at once.
     #[serde(default = "default_server_lifetime_seconds")]
@@ -848,6 +859,7 @@ impl Default for PoolConfig {
             notify_after_seconds: default_notify_after_seconds(),
             queue_depth_per_tenant: default_queue_depth_per_tenant(),
             max_server_statements: default_max_server_statements(),
+            max_global_statements: default_max_global_statements(),
             server_lifetime_seconds: default_server_lifetime_seconds(),
             server_login_retry_seconds: default_server_login_retry_seconds(),
             tenants: Vec::new(),
@@ -1053,6 +1065,9 @@ fn default_queue_depth_per_tenant() -> u32 {
 }
 fn default_max_server_statements() -> usize {
     64
+}
+fn default_max_global_statements() -> usize {
+    pgelastic_pool::DEFAULT_GLOBAL_STATEMENTS
 }
 fn default_server_lifetime_seconds() -> u64 {
     3600

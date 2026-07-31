@@ -221,6 +221,10 @@ pub struct Metrics {
     closes: [AtomicU64; BackendCloseReason::ALL.len()],
     /// The elastic/pinned split, refreshed from the pool manager's ledger.
     budget: [AtomicI64; 3],
+    /// Distinct statement texts the instance has interned, and how many the bound has
+    /// discarded. Refreshed alongside the budget gauges.
+    statements_interned: AtomicI64,
+    statements_evicted: AtomicU64,
     primary_epoch: AtomicI64,
     /// `source x outcome`, flattened row-major over the three of each.
     epoch_observations: [AtomicU64; 9],
@@ -422,6 +426,21 @@ impl Metrics {
             .position(|known| *known == reason)
             .unwrap_or(0);
         self.pins[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publishes the size of the instance-wide statement intern table.
+    ///
+    /// Worth an operator's attention because the bound trades memory for backend work: once the
+    /// table is full, two clients sending the same text can be given different ids and the
+    /// backend parses it twice. A full table is fine; a full table whose eviction count keeps
+    /// climbing means the capacity is below the application's working set of distinct
+    /// statements.
+    pub fn statement_cache(&self, entries: usize, evicted: u64) {
+        self.statements_interned.store(
+            i64::try_from(entries).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
+        self.statements_evicted.store(evicted, Ordering::Relaxed);
     }
 
     /// Publishes the pool manager's elastic/pinned split.
@@ -854,6 +873,18 @@ impl Metrics {
     /// The pooling half of the exposition.
     fn render_pooling(&self, out: &mut String) {
         let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        gauge(
+            out,
+            "pgelastic_proxy_statements_interned",
+            "Distinct statement texts held by the instance-wide intern table.",
+            self.statements_interned.load(Ordering::Relaxed),
+        );
+        counter(
+            out,
+            "pgelastic_proxy_statements_evicted_total",
+            "Statements dropped from the intern table because it was at capacity.",
+            &[("", load(&self.statements_evicted))],
+        );
         counter(
             out,
             "pgelastic_proxy_checkouts_total",

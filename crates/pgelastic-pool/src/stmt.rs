@@ -15,6 +15,14 @@
 //! running *a different client's query* under this client's parameters. Hash
 //! values may therefore be used to find a bucket and never to decide equality,
 //! which is what [`HashMap`] with a full-key comparator gives.
+//!
+//! That sharing is **bounded, and therefore best-effort**. The intern table holds a capacity's
+//! worth of statements and evicts by least recent use, because its key owns the query text and
+//! an unbounded table would retain every distinct statement the proxy has ever seen. Once an
+//! entry is evicted, the next client to prepare the same text is given a *new* id and a new
+//! name — so "same text implies same id" holds only while the entry is resident, and nothing
+//! may depend on it for correctness. What it costs when it does not hold is a second `Parse`
+//! on the backend, which each link's own LRU eventually closes.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
@@ -141,14 +149,44 @@ impl PreparedStatement {
     }
 }
 
+/// The default number of distinct statements one instance's intern table keeps.
+///
+/// This table is not the per-link cache and its capacity is not the same quantity: a link holds
+/// what one backend has parsed, this holds what the proxy has *named*, shared by every client on
+/// the instance. Its whole value is that two clients sending the same text get the same id, so
+/// the link parses once — which means the capacity has to cover an application's working set of
+/// distinct statements rather than one connection's.
+///
+/// 2048 because an application with more than two thousand genuinely distinct statement texts is
+/// one whose SQL is being generated with literals inlined, and for that shape sharing was never
+/// going to work anyway; past that point the table would be retaining text to no purpose. Well
+/// above `max_server_statements` on purpose — a table smaller than a link's own cache would
+/// evict entries the link is still holding, and re-mint them on the next Bind.
+pub const DEFAULT_GLOBAL_STATEMENTS: usize = 2048;
+
 /// The process-wide content-addressed statement cache.
+///
+/// Bounded, and the bound is load-bearing rather than defensive. [`StatementKey`] owns the query
+/// text, so an unbounded table retains every distinct statement the proxy has ever seen for the
+/// lifetime of the process — which is unbounded in the query variety of the applications behind
+/// it, not in anything an operator configured.
+///
+/// Eviction is safe because an entry's removal does not disturb the [`Arc`] a client or a link
+/// still holds: the statement keeps its id, its minted name and its text, and only the *sharing*
+/// is lost. A later intern of the same text mints a fresh id, so the backend ends up holding
+/// that text twice until each link's own LRU closes the older one. Wasteful, and correct.
 ///
 /// Generic over the hasher only so that the collision behaviour can be tested
 /// directly; production use takes the default.
 #[derive(Debug)]
 pub struct GlobalStatementCache<S = RandomState> {
     entries: HashMap<StatementKey, Arc<PreparedStatement>, S>,
+    /// Least recent first, in the same shape [`ServerStatements`] uses. A second eviction policy
+    /// in this file with different mechanics would be a maintenance trap.
+    recency: VecDeque<StatementKey>,
+    capacity: usize,
     next_id: u64,
+    evicted: u64,
 }
 
 impl Default for GlobalStatementCache {
@@ -159,9 +197,16 @@ impl Default for GlobalStatementCache {
 
 impl GlobalStatementCache {
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_GLOBAL_STATEMENTS)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            recency: VecDeque::new(),
+            capacity: capacity.max(1),
             next_id: 0,
+            evicted: 0,
         }
     }
 }
@@ -170,7 +215,10 @@ impl<S: BuildHasher> GlobalStatementCache<S> {
     pub fn with_hasher(hasher: S) -> Self {
         Self {
             entries: HashMap::with_hasher(hasher),
+            recency: VecDeque::new(),
+            capacity: DEFAULT_GLOBAL_STATEMENTS,
             next_id: 0,
+            evicted: 0,
         }
     }
 
@@ -182,11 +230,28 @@ impl<S: BuildHasher> GlobalStatementCache<S> {
         self.entries.is_empty()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// How many entries the bound has discarded, so an operator can tell a table that is merely
+    /// full from one that is thrashing.
+    pub fn evicted(&self) -> u64 {
+        self.evicted
+    }
+
     /// Returns the shared statement for `key`, creating it if new.
     pub fn intern(&mut self, key: StatementKey) -> Arc<PreparedStatement> {
         if let Some(existing) = self.entries.get(&key) {
-            return Arc::clone(existing);
+            let shared = Arc::clone(existing);
+            self.touch(&key);
+            return shared;
         }
+
+        if self.entries.len() >= self.capacity {
+            self.evict_oldest();
+        }
+
         let id = self.next_id;
         self.next_id += 1;
         let statement = Arc::new(PreparedStatement {
@@ -194,12 +259,27 @@ impl<S: BuildHasher> GlobalStatementCache<S> {
             name: StatementName::generated(id),
             key: key.clone(),
         });
-        self.entries.insert(key, Arc::clone(&statement));
+        self.entries.insert(key.clone(), Arc::clone(&statement));
+        self.recency.push_back(key);
         statement
     }
 
     pub fn get(&self, key: &StatementKey) -> Option<&Arc<PreparedStatement>> {
         self.entries.get(key)
+    }
+
+    fn touch(&mut self, key: &StatementKey) {
+        if let Some(position) = self.recency.iter().position(|candidate| candidate == key) {
+            self.recency.remove(position);
+        }
+        self.recency.push_back(key.clone());
+    }
+
+    fn evict_oldest(&mut self) {
+        if let Some(victim) = self.recency.pop_front() {
+            self.entries.remove(&victim);
+            self.evicted += 1;
+        }
     }
 }
 
@@ -396,6 +476,99 @@ pub fn detect_cache_invalidation(sql: &[u8]) -> Option<CacheInvalidation> {
 
 #[cfg(test)]
 mod tests {
+
+    fn key_for(query: &str) -> StatementKey {
+        StatementKey::new(Bytes::copy_from_slice(query.as_bytes()), Vec::new())
+    }
+
+    /// The intern table is bounded by configuration, not by how much SQL an application
+    /// happens to contain.
+    ///
+    /// Its key holds the query text, so an unbounded table retains every distinct statement the
+    /// proxy has ever seen for the life of the process. That is ordinary for any client that
+    /// inlines literals instead of binding parameters, and it is invisible to both benchmarks:
+    /// the density workload issues no queries and the throughput workload issues one.
+    #[test]
+    fn the_intern_table_stops_growing_at_its_capacity() {
+        let mut cache = GlobalStatementCache::with_capacity(16);
+
+        for n in 0..1_000 {
+            cache.intern(key_for(&format!("SELECT {n}")));
+        }
+
+        assert_eq!(
+            cache.len(),
+            16,
+            "a thousand distinct query texts must not become a thousand retained entries"
+        );
+    }
+
+    /// Eviction is by least recent use, so a statement an application keeps asking for is not
+    /// thrown away to make room for one it asked for once.
+    #[test]
+    fn the_statement_still_in_use_survives_the_ones_that_are_not() {
+        let mut cache = GlobalStatementCache::with_capacity(4);
+        let hot = cache.intern(key_for("SELECT hot"));
+
+        for n in 0..100 {
+            cache.intern(key_for(&format!("SELECT cold {n}")));
+            // Asked for again on every round, so it is never the least recent.
+            assert_eq!(
+                cache.intern(key_for("SELECT hot")).id(),
+                hot.id(),
+                "the statement in continuous use was evicted at round {n}"
+            );
+        }
+    }
+
+    /// An evicted entry does not invalidate the `Arc` a live client still holds.
+    ///
+    /// This is what makes eviction safe at all. The client keeps its statement and the link
+    /// keeps whatever it parsed under that id; a later intern of the same text simply mints a
+    /// fresh id, so the backend ends up holding the text twice. Wasteful, and correct -- which
+    /// is the trade the bound buys.
+    #[test]
+    fn evicting_an_entry_leaves_the_statement_a_client_still_holds_intact() {
+        let mut cache = GlobalStatementCache::with_capacity(2);
+        let held = cache.intern(key_for("SELECT held"));
+        let (id, name) = (held.id(), held.name().clone());
+
+        for n in 0..50 {
+            cache.intern(key_for(&format!("SELECT other {n}")));
+        }
+
+        assert_eq!(
+            held.id(),
+            id,
+            "a live statement changed identity underneath its holder"
+        );
+        assert_eq!(held.name(), &name, "a live statement's minted name changed");
+        assert_eq!(
+            held.key(),
+            &key_for("SELECT held"),
+            "a live statement's text changed"
+        );
+
+        // Re-interning the evicted text mints a new identity rather than resurrecting the old
+        // one, which is exactly why the old Arc has to keep working.
+        let again = cache.intern(key_for("SELECT held"));
+        assert_ne!(
+            again.id(),
+            id,
+            "an evicted entry was expected to be re-minted, not recovered"
+        );
+    }
+
+    /// A capacity of zero is a configuration mistake, not an instruction to cache nothing and
+    /// re-mint on every single Parse.
+    #[test]
+    fn a_capacity_of_zero_is_treated_as_one() {
+        let mut cache = GlobalStatementCache::with_capacity(0);
+        let first = cache.intern(key_for("SELECT 1"));
+
+        assert_eq!(cache.intern(key_for("SELECT 1")).id(), first.id());
+        assert_eq!(cache.len(), 1);
+    }
 
     #[test]
     fn a_minted_name_is_recognised_and_a_client_name_is_not() {

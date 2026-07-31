@@ -551,6 +551,24 @@ type ElasticClassPoolingDefaults struct {
 	// +optional
 	PreparedStatementsLimit *int32 `json:"preparedStatementsLimit,omitempty"`
 
+	// globalStatementsLimit caps the distinct statement texts one proxy instance interns before
+	// its LRU evicts.
+	//
+	// A different quantity from preparedStatementsLimit, which bounds what a single backend link
+	// has parsed. This bounds what the proxy has named, shared across every client on the
+	// instance so two clients sending the same text get one identifier and the link parses once.
+	// The entry owns the query text, so an unbounded table makes proxy memory a function of how
+	// much distinct SQL the applications behind it contain rather than of anything configured.
+	//
+	// Raising it costs memory proportional to the average statement length; lowering it past an
+	// application's working set of distinct statements costs backend parses, which
+	// pgelastic_proxy_statements_evicted_total makes visible.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1000000
+	// +kubebuilder:default=2048
+	// +optional
+	GlobalStatementsLimit *int32 `json:"globalStatementsLimit,omitempty"`
+
 	// serverIdleTimeout closes idle backends. It is suppressed at or below a tenant's
 	// guaranteed floor, since reaping a reserved connection only forces it to be
 	// re-established.

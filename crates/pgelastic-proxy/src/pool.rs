@@ -324,7 +324,7 @@ impl PoolManager {
                 parked: HashMap::new(),
                 waits: HashMap::new(),
                 ledger,
-                statements: GlobalStatementCache::new(),
+                statements: GlobalStatementCache::with_capacity(config.max_global_statements),
                 tenants,
                 login_retry,
             }),
@@ -513,6 +513,8 @@ impl PoolManager {
             elastic: inner.ledger.elastic(),
             elastic_limit: inner.ledger.elastic_limit(),
             pinned: PinReason::ALL.map(|reason| (reason, inner.ledger.pinned_for(reason))),
+            statements: inner.statements.len(),
+            statements_evicted: inner.statements.evicted(),
         }
     }
 
@@ -1276,6 +1278,8 @@ impl PoolManager {
             snapshot.elastic,
             snapshot.elastic_limit,
         );
+        self.metrics
+            .statement_cache(snapshot.statements, snapshot.statements_evicted);
     }
 }
 
@@ -1452,6 +1456,13 @@ pub struct LedgerSnapshot {
     pub elastic: u32,
     pub elastic_limit: u32,
     pub pinned: [(PinReason, u32); PinReason::ALL.len()],
+    /// Distinct statement texts interned, and how many the bound has discarded.
+    ///
+    /// Published together because either alone misleads: a full table is the normal steady
+    /// state, and only the eviction count rising with it says the capacity is too small for
+    /// the query variety actually arriving.
+    pub statements: usize,
+    pub statements_evicted: u64,
 }
 
 impl Inner {
