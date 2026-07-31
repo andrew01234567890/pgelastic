@@ -162,21 +162,23 @@ func (r *PgInstanceReconciler) mintScheduledBackup(
 	}
 
 	now := r.now()
-	// The slot is the most recent firing at or before now, so a controller that was down
-	// over the scheduled minute still takes the backup when it comes back rather than
-	// skipping the day. It looks back one interval and no further: catching up on a week of
-	// missed backups all at once would be a worse outage than the one that caused it.
-	next := schedule.Next(now)
-	previous := schedule.Next(now.Add(-2 * next.Sub(now)))
-	if previous.After(now) || now.Sub(previous) > backupScheduleGrace {
-		return next.Sub(now)
+	// A schedule that parses and never fires again - "0 0 30 2 *" is one - answers a zero
+	// time here, and subtracting from it would hand back a hugely negative requeue.
+	var untilNext time.Duration
+	if next := schedule.Next(now); !next.IsZero() {
+		untilNext = next.Sub(now)
 	}
 
-	name := scheduledBackupName(instance.Name, previous)
+	slot, due := dueSlot(schedule, now)
+	if !due {
+		return untilNext
+	}
+
+	name := scheduledBackupName(instance.Name, slot)
 	if slices.ContainsFunc(existing, func(backup pgelasticv1alpha1.PgBackup) bool {
 		return backup.Name == name
 	}) {
-		return next.Sub(now)
+		return untilNext
 	}
 
 	backup := &pgelasticv1alpha1.PgBackup{
@@ -190,7 +192,35 @@ func (r *PgInstanceReconciler) mintScheduledBackup(
 	if err := r.Create(ctx, backup); err != nil && !apierrors.IsAlreadyExists(err) {
 		log.Error(err, "could not create the scheduled backup", "backup", name)
 	}
-	return next.Sub(now)
+	return untilNext
+}
+
+// dueSlot returns the most recent firing in (now-grace, now], if there is one.
+//
+// A controller that was down over the scheduled minute should still take the backup when it
+// comes back; one that was down for a day should not take yesterday's the moment it starts
+// and then today's an hour later. The grace window is therefore the whole of the lookback,
+// and the walk forward is what picks the newest slot inside it when a schedule fires more
+// often than the window is wide.
+//
+// It is written as a walk rather than as arithmetic on the interval because a cron schedule
+// has no single interval: "0 2 * * *" and "*/5 9-17 * * 1-5" both answer Next, and only one
+// of them can be reflected around it.
+//
+// The zero checks are not defensive tidiness: "0 0 30 2 *" parses and never fires, and Next
+// answers a zero time for it. Without them the walk would never advance and would spin.
+func dueSlot(schedule cron.Schedule, now time.Time) (time.Time, bool) {
+	slot := schedule.Next(now.Add(-backupScheduleGrace))
+	if slot.IsZero() || slot.After(now) {
+		return time.Time{}, false
+	}
+	for {
+		following := schedule.Next(slot)
+		if following.IsZero() || following.After(now) {
+			return slot, true
+		}
+		slot = following
+	}
 }
 
 // backupScheduleGrace bounds how late a scheduled backup may still be taken.

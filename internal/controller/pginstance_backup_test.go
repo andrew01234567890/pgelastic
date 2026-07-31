@@ -301,3 +301,83 @@ func TestNoSummaryWithoutACompletedBackup(t *testing.T) {
 		t.Fatalf("summary = %+v, want nothing", summary)
 	}
 }
+
+// Every minute of a day, counted, because the interesting answer is a total rather than a
+// verdict at one instant.
+//
+// The slot used to be derived by reflecting the next firing backwards, which lands on the
+// right slot only once a third of the period has passed - by which time the grace window has
+// already rejected it for being stale. For the documented default the two windows never
+// intersect, so a nightly backup was minted on none of the day's 1440 minutes. A spot check
+// at 02:00 would have reported that as a pass; only the count catches it.
+func TestEachScheduleIsDueForExactlyItsGraceWindow(t *testing.T) {
+	midnight := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	for _, testCase := range []struct {
+		expression string
+		want       int
+	}{
+		{"0 2 * * *", 60},
+		{"0 */6 * * *", 240},
+		// Firing more often than the window is wide does not mint more: one slot is due at
+		// any minute, and it is the newest.
+		{"0 * * * *", 1440},
+		{"*/5 * * * *", 1440},
+	} {
+		schedule, err := backupScheduleParser.Parse(testCase.expression)
+		if err != nil {
+			t.Fatalf("%s does not parse: %v", testCase.expression, err)
+		}
+		due := 0
+		for minute := range 1440 {
+			if _, ok := dueSlot(schedule, midnight.Add(time.Duration(minute)*time.Minute)); ok {
+				due++
+			}
+		}
+		if due != testCase.want {
+			t.Errorf("%s is due on %d of 1440 minutes, want %d",
+				testCase.expression, due, testCase.want)
+		}
+	}
+}
+
+// The newest firing inside the window, not the oldest. A schedule that fires more often than
+// the grace window is wide has several to choose from, and naming the backup after a slot
+// that has already been filled and passed would mint one nobody asked for.
+func TestTheDueSlotIsTheNewestFiringInsideTheWindow(t *testing.T) {
+	schedule, err := backupScheduleParser.Parse("*/5 * * * *")
+	if err != nil {
+		t.Fatalf("parsing: %v", err)
+	}
+	slot, due := dueSlot(schedule, time.Date(2026, 7, 31, 2, 32, 0, 0, time.UTC))
+	if !due {
+		t.Fatal("nothing was due, and a schedule firing every five minutes always has a slot")
+	}
+	if want := time.Date(2026, 7, 31, 2, 30, 0, 0, time.UTC); !slot.Equal(want) {
+		t.Errorf("slot = %s, want the newest firing at or before now (%s)", slot, want)
+	}
+}
+
+// A controller that was down for a day should not mint yesterday's backup the moment it
+// comes back, and then today's an hour later.
+func TestASlotOlderThanTheGraceWindowIsNotDue(t *testing.T) {
+	schedule, err := backupScheduleParser.Parse("0 2 * * *")
+	if err != nil {
+		t.Fatalf("parsing: %v", err)
+	}
+	if _, due := dueSlot(schedule, time.Date(2026, 7, 31, 3, 1, 0, 0, time.UTC)); due {
+		t.Error("the 02:00 slot was still due at 03:01, an hour and a minute late")
+	}
+}
+
+// "0 0 30 2 *" parses and never fires, because February has no thirtieth. robfig answers a
+// zero time for it, which the walk has to recognise as an end rather than as a slot to
+// advance from.
+func TestAScheduleThatNeverFiresIsNeverDue(t *testing.T) {
+	schedule, err := backupScheduleParser.Parse("0 0 30 2 *")
+	if err != nil {
+		t.Fatalf("parsing: %v", err)
+	}
+	if _, due := dueSlot(schedule, time.Date(2026, 7, 31, 2, 0, 0, 0, time.UTC)); due {
+		t.Error("a schedule that can never fire reported a due slot")
+	}
+}
