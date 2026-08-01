@@ -17,11 +17,15 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/ha"
@@ -187,6 +191,52 @@ func TestACompletedRestoreStaysCompleted(t *testing.T) {
 	}
 	if got := restorePhase(status); got != pgelasticv1alpha1.RestorePhaseCompleted {
 		t.Fatalf("phase = %q, want it to stay Completed", got)
+	}
+}
+
+// Naming a backup skipped the check the unnamed path does. A backup of somebody else carries
+// somebody else's stanza and repository, so the recovered instance would be a copy of an
+// instance this restore never named - while the credentials handed to it are the named
+// source's, which that catalogue has never seen. It is also the second route into handing an
+// arbitrary instance's live passwords to whoever asked.
+func TestABackupOfAnotherInstanceIsRefused(t *testing.T) {
+	scheme := credentialScheme(t)
+	stopped := metav1.NewTime(time.Date(2026, 8, 1, 2, 0, 0, 0, time.UTC))
+	somebodyElses := &pgelasticv1alpha1.PgBackup{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: backupName},
+		Spec: pgelasticv1alpha1.PgBackupSpec{
+			InstanceRef: corev1.LocalObjectReference{Name: "somebody-else"},
+		},
+		Status: pgelasticv1alpha1.PgBackupStatus{
+			Phase:     pgelasticv1alpha1.BackupPhaseCompleted,
+			StoppedAt: &stopped,
+			Stanza:    "pgelastic-somebody-else",
+		},
+	}
+	source := &pgelasticv1alpha1.PgInstance{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: sourceInstanceName},
+	}
+	restore := &pgelasticv1alpha1.PgRestore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-it-back"},
+		Spec: pgelasticv1alpha1.PgRestoreSpec{
+			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
+			BackupRef:         &corev1.LocalObjectReference{Name: backupName},
+		},
+	}
+
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(somebodyElses, source, restore).Build()
+	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
+
+	plan, reason, err := reconciler.planRestore(context.Background(), restore)
+	if err != nil {
+		t.Fatalf("planning: %v", err)
+	}
+	if reason == "" {
+		t.Fatalf("planned %v from a backup of a different instance", plan)
+	}
+	if !strings.Contains(reason, "somebody-else") {
+		t.Errorf("reason = %q, want it to name whose backup it actually is", reason)
 	}
 }
 

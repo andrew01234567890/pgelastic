@@ -148,6 +148,11 @@ func (r *PgRestoreReconciler) startTenantRecovery(
 
 	if err := r.Create(ctx, plan); err != nil && !apierrors.IsAlreadyExists(err) {
 		status.Error = err.Error()
+		return restoreRequeue, nil
+	}
+	if err := r.handOverCredentials(
+		ctx, restore.Spec.SourceInstanceRef.Name, plan); err != nil {
+		status.Error = err.Error()
 	}
 	return restoreRequeue, nil
 }
@@ -168,7 +173,7 @@ func (r *PgRestoreReconciler) replaceTenant(
 	status *pgelasticv1alpha1.PgRestoreStatus,
 	tenant *pgelasticv1alpha1.PgTenant,
 	recovery *pgelasticv1alpha1.PgInstance,
-) (bool, error) {
+) (touched bool, copyErr error) {
 	live := migration.Endpoint{
 		Namespace: restore.Namespace,
 		Instance:  tenant.Status.Binding.InstanceRef.Name,
@@ -229,10 +234,18 @@ func (r *PgRestoreReconciler) replaceTenant(
 	// whole copy, and a fenced database refuses connections, so the revoke has nothing to
 	// connect to until the unfence has run. Deferred rather than sequential because a copy
 	// that failed half way can still have written the ACLs.
+	// Failing the restore rather than logging. These reads are on the live tenant's own
+	// tables, and a restore that reported Completed with them still in place would never be
+	// looked at again - isTerminalRestore sees to that - so the grant would outlive everyone
+	// who could have noticed it. The migration path fails for the same reason.
 	defer func() {
 		if err := migration.RevokeReplicationReads(ctx, r.SQL, live); err != nil {
 			logf.FromContext(ctx).Error(err, "the replication role was left holding reads on "+
 				"the restored tenant", "tenant", tenant.Name)
+			if copyErr == nil {
+				copyErr = fmt.Errorf("the copy finished and the replication role's reads on "+
+					"%s could not be taken back: %w", tenant.Spec.DatabaseName, err)
+			}
 		}
 	}()
 
@@ -266,7 +279,8 @@ func (r *PgRestoreReconciler) replaceTenant(
 	}()
 
 	status.Phase = pgelasticv1alpha1.RestorePhaseLoading
-	return true, migration.CopyOffline(ctx, r.Shell, plan)
+	touched, copyErr = true, migration.CopyOffline(ctx, r.Shell, plan)
+	return touched, copyErr
 }
 
 // checkCollationMatches refuses a copy between two databases whose text-handling identity

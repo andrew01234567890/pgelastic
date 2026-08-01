@@ -31,6 +31,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
@@ -150,6 +151,10 @@ func (r *PgRestoreReconciler) converge(
 	status.Error = ""
 	status.BackupID = plan.Spec.Restore.BackupID
 	if err := r.Create(ctx, plan); err != nil && !apierrors.IsAlreadyExists(err) {
+		status.Error = err.Error()
+		return restoreRequeue, nil
+	}
+	if err := r.handOverCredentials(ctx, restore.Spec.SourceInstanceRef.Name, plan); err != nil {
 		status.Error = err.Error()
 		return restoreRequeue, nil
 	}
@@ -281,6 +286,53 @@ func (r *PgRestoreReconciler) planRestore(
 	return instance, "", nil
 }
 
+// handOverCredentials gives the instance this restore just created the source's role
+// passwords, which are the ones its restored catalogue holds.
+//
+// It lives here rather than in the instance controller because of who is allowed to ask.
+// spec.restore is a plain field on a namespaced object, so an instance controller that
+// copied the Secret it names would hand anybody who can create a PgInstance the replication,
+// ops and rewind passwords of any instance they cared to name - all three live against the
+// instance they came from, and reachable over the network from anywhere pg_hba admits. This
+// path is reached only after resolveBackup has found a completed backup belonging to that
+// same source.
+//
+// The Secret is owned by the instance, so it is collected with it - which matters most for
+// the throwaway instance a tenant restore recovers into.
+func (r *PgRestoreReconciler) handOverCredentials(
+	ctx context.Context,
+	source string,
+	instance *pgelasticv1alpha1.PgInstance,
+) error {
+	target := provision.CredentialsSecretName(instance.Name)
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: instance.Namespace, Name: target}, existing)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	from := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: instance.Namespace, Name: provision.CredentialsSecretName(source),
+	}, from); err != nil {
+		return fmt.Errorf("reading %s's credentials, which %s's restored catalogue holds: %w",
+			source, instance.Name, err)
+	}
+
+	handed := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: target, Namespace: instance.Namespace},
+		Type:       from.Type,
+		Data:       from.Data,
+	}
+	if err := controllerutil.SetControllerReference(instance, handed, r.Scheme); err != nil {
+		return err
+	}
+	return client.IgnoreAlreadyExists(r.Create(ctx, handed))
+}
+
 // resolveBackup finds the base backup this restore starts from.
 //
 // A named backup is used as named. An unnamed one is chosen from the instance's completed
@@ -305,6 +357,14 @@ func (r *PgRestoreReconciler) resolveBackup(
 		case backup.Status.Phase != pgelasticv1alpha1.BackupPhaseCompleted:
 			return nil, fmt.Sprintf("%s is %s rather than Completed, so there is nothing to "+
 				"restore from", named.Name, backup.Status.Phase), nil
+		case backup.Spec.InstanceRef.Name != restore.Spec.SourceInstanceRef.Name:
+			// The unnamed branch filters by instance; naming one skipped the check entirely.
+			// A backup of somebody else carries somebody else's stanza and repository, so the
+			// recovered instance would be a copy of an instance this restore never named -
+			// and the credentials handed to it are the named source's, which its restored
+			// catalogue has never seen.
+			return nil, fmt.Sprintf("%s is a backup of %s, not of %s", named.Name,
+				backup.Spec.InstanceRef.Name, restore.Spec.SourceInstanceRef.Name), nil
 		}
 		return backup, "", nil
 	}
