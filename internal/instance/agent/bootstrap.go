@@ -325,9 +325,51 @@ func cloneWithSlot(
 	err := clone(true)
 	if err != nil && strings.Contains(err.Error(), "already exists") {
 		logf.FromContext(ctx).Info("the primary already holds this member's slot", "slot", slot)
-		return clone(false)
+		err = clone(false)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return discardRecoveryTarget(options.DataDir)
+}
+
+// discardRecoveryTarget drops the one-shot recovery settings out of a freshly cloned data
+// directory.
+//
+// pgBackRest writes recovery_target_time and friends into postgresql.auto.conf when it
+// restores, and PostgreSQL does not remove them on promotion - so they are still there when
+// a standby clones, and pg_basebackup copies that file verbatim. The standby then enters
+// recovery with a target that is older than the base backup it just took, and PostgreSQL
+// refuses to start: "requested recovery stop point is before consistent recovery point".
+//
+// What that costs is not one member. synchronous_standby_names names the standbys, so with
+// none of them able to start, every commit on the restored primary blocks for ever while the
+// instance reports itself Ready. A restored instance served no writes at all.
+//
+// A recovery target is a property of the restore that produced the primary, never of a
+// member cloning from it, so it is discarded here rather than translated.
+func discardRecoveryTarget(dataDir string) error {
+	path := filepath.Join(dataDir, "postgresql.auto.conf")
+	body, err := os.ReadFile(path) // #nosec G304 -- inside the member's own data directory
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	kept := make([]string, 0, 16)
+	for line := range strings.SplitSeq(string(body), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "recovery_target") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	// Atomically, because a truncate-then-write killed half way leaves a postgresql.auto.conf
+	// ending mid-token, and Bootstrap adopts any data directory with a readable control file
+	// rather than re-cloning - so that member's postmaster would refuse to start for ever on
+	// a config syntax error.
+	return writeFileAtomically(path, strings.Join(kept, "\n"))
 }
 
 // PeerHost is a member's stable per-pod DNS name under the headless Service.

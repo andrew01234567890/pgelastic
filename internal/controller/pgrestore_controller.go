@@ -203,6 +203,22 @@ func (r *PgRestoreReconciler) planRestore(
 				"recorded on a backup; recreate %s first", restore.Spec.SourceInstanceRef.Name)
 	}
 
+	// The backup records where it was written but not what to authenticate with: the agent
+	// is configured with pgBackRest's own settings and never learns which Secret they were
+	// projected from. Without this the recovered instance was given a repository it could
+	// not open, and its bootstrap container died on a missing accessKeyID until the restore
+	// timed out.
+	if repository.CredentialsSecretRef.Name == "" && source.Spec.Backup != nil {
+		withCredentials := *repository
+		withCredentials.CredentialsSecretRef = source.Spec.Backup.ObjectStore.CredentialsSecretRef
+		repository = &withCredentials
+	}
+	if repository.CredentialsSecretRef.Name == "" {
+		return nil, fmt.Sprintf("neither the backup nor %s says which Secret holds the "+
+			"object store's credentials, so the recovered instance could not read the "+
+			"repository", source.Name), nil
+	}
+
 	instance := &pgelasticv1alpha1.PgInstance{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      restoreTargetInstance(restore),
@@ -223,7 +239,7 @@ func (r *PgRestoreReconciler) planRestore(
 			Backup: &pgelasticv1alpha1.InstanceBackup{
 				ObjectStore:   *repository,
 				Retention:     retentionOf(source),
-				BackupStandby: source.Spec.Backup.BackupStandby,
+				BackupStandby: backupStandbyOf(source),
 			},
 			Restore: &pgelasticv1alpha1.InstanceRestore{
 				SourceInstanceName:     restore.Spec.SourceInstanceRef.Name,
@@ -323,6 +339,16 @@ func restoreTargetTime(restore *pgelasticv1alpha1.PgRestore) *time.Time {
 		return nil
 	}
 	return &parsed
+}
+
+// backupStandbyOf guards the same nil retentionOf does. A source whose spec.backup was
+// removed after its backups were taken still has a repository recorded on those backups, so
+// this is reachable the moment anything records the credentials reference there too.
+func backupStandbyOf(source *pgelasticv1alpha1.PgInstance) *bool {
+	if source.Spec.Backup == nil {
+		return nil
+	}
+	return source.Spec.Backup.BackupStandby
 }
 
 func retentionOf(source *pgelasticv1alpha1.PgInstance) *pgelasticv1alpha1.RetentionPolicy {
