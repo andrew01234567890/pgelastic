@@ -114,7 +114,7 @@ func archivingSpecs() {
 			Expect(segment).To(HaveLen(24), "not a WAL segment name: "+segment)
 
 			By("closing " + segment + " so there is something to archive")
-			switchWAL()
+			switchWAL(Default)
 
 			Eventually(func(g Gomega) {
 				health := readInstance(g).Status.ArchiveHealth
@@ -129,13 +129,13 @@ func archivingSpecs() {
 			By("fetching " + segment + " back out of the repository")
 			const restored = "/tmp/e2e-restored-segment"
 			Eventually(func(g Gomega) {
-				output, err := inPrimary(
+				output, err := inPrimary(g,
 					provision.AgentBinary, "wal-restore", "--name", segment, "--target", restored,
 				).CombinedOutput()
 				g.Expect(err).NotTo(HaveOccurred(), string(output))
 			}).Should(Succeed())
 
-			size, err := inPrimary("stat", "-c", "%s", restored).Output()
+			size, err := inPrimary(Default, "stat", "-c", "%s", restored).Output()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(strings.TrimSpace(string(size))).To(Equal("16777216"),
 				"a restored segment that is not a whole WAL segment is a truncated object")
@@ -230,7 +230,7 @@ func archivingSpecs() {
 			rotateSecretKey("wrong-secret-key")
 
 			Eventually(func(g Gomega) {
-				switchWAL()
+				switchWAL(g)
 				condition := meta.FindStatusCondition(readInstance(g).Status.Conditions,
 					pgelasticv1alpha1.ConditionArchiving)
 				g.Expect(condition).NotTo(BeNil())
@@ -271,7 +271,7 @@ func archivingSpecs() {
 			rotateSecretKey(objectStoreSecretKey)
 
 			Eventually(func(g Gomega) {
-				switchWAL()
+				switchWAL(g)
 				g.Expect(meta.IsStatusConditionTrue(readInstance(g).Status.Conditions,
 					pgelasticv1alpha1.ConditionArchiving)).To(BeTrue(),
 					"archiving never recovered after the credential was fixed")
@@ -305,13 +305,13 @@ func readInstance(g Gomega) *pgelasticv1alpha1.PgInstance {
 // Without it a quiet instance archives nothing at all: archive_timeout only switches a
 // segment when there has been WAL activity since the last switch, so a spec that merely
 // waited would wait forever and blame the archive.
-func switchWAL() {
+func switchWAL(g Gomega) {
 	GinkgoHelper()
-	output, err := inPrimary(
+	output, err := inPrimary(g,
 		"psql", "-h", provision.SocketDir, "-U", "postgres", "-tAc",
 		"SELECT pg_switch_wal()",
 	).CombinedOutput()
-	Expect(err).NotTo(HaveOccurred(), string(output))
+	g.Expect(err).NotTo(HaveOccurred(), string(output))
 }
 
 // rotateSecretKey rewrites the mounted credential in place. The kubelet refreshes the
@@ -327,10 +327,10 @@ func rotateSecretKey(value string) {
 	Expect(k8sClient.Update(suiteCtx, secret)).To(Succeed())
 }
 
-func inPrimary(args ...string) *exec.Cmd {
+func inPrimary(g Gomega, args ...string) *exec.Cmd {
 	GinkgoHelper()
-	primary := readInstance(Default).Status.CurrentPrimary
-	Expect(primary).NotTo(BeEmpty(), "the instance has no primary to run against")
+	primary := readInstance(g).Status.CurrentPrimary
+	g.Expect(primary).NotTo(BeEmpty(), "the instance has no primary to run against")
 	return kubectlCommand(append([]string{
 		"exec", "-n", archiveNamespace, primary, "-c", "postgres", "--",
 	}, args...)...)

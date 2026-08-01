@@ -71,7 +71,7 @@ func instanceRestoreSpecs() {
 			// Recovery replays WAL out of the archive, so the segment holding the target has to
 			// be in it before the restore starts. Without the switch the last segment sits in
 			// pg_wal until archive_timeout, and the restore stops short of the moment asked for.
-			switchWAL()
+			switchWAL(Default)
 			Eventually(func(g Gomega) {
 				g.Expect(readInstance(g).Status.ArchiveHealth.Healthy).To(BeTrue())
 			}).Should(Succeed())
@@ -110,7 +110,7 @@ func instanceRestoreSpecs() {
 			// One: recovery forked a new timeline rather than resuming the source's. A restore
 			// that landed back on timeline 1 replayed everything and stopped nowhere.
 			By("checking that recovery forked a timeline")
-			timeline := strings.TrimSpace(inRestored(
+			timeline := strings.TrimSpace(inRestored(Default,
 				"psql", "-h", provision.SocketDir, "-U", "postgres", "-tAc",
 				"SELECT timeline_id FROM pg_control_checkpoint()"))
 			forked, err := strconv.Atoi(timeline)
@@ -122,7 +122,7 @@ func instanceRestoreSpecs() {
 			// one stranded in recovery with nobody following it.
 			By("checking that the restored primary is followed")
 			Eventually(func(g Gomega) {
-				streaming := strings.TrimSpace(inRestored(
+				streaming := strings.TrimSpace(inRestored(g,
 					"psql", "-h", provision.SocketDir, "-U", "postgres", "-tAc",
 					"SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'"))
 				g.Expect(streaming).NotTo(Equal("0"), "no standby follows the restored primary")
@@ -131,7 +131,7 @@ func instanceRestoreSpecs() {
 			// Three: the row written after the target is absent. This is the only one of the
 			// three that proves recovery stopped where it was told rather than simply finishing.
 			By("checking that the row written after the target is not there")
-			rows := strings.TrimSpace(inRestored(
+			rows := strings.TrimSpace(inRestored(Default,
 				"psql", "-h", provision.SocketDir, "-U", "postgres", "-tAc",
 				fmt.Sprintf("SELECT count(*) FROM %s", restoreProbeTable)))
 			Expect(rows).To(Equal(strconv.Itoa(restoreRowsBeforeMark)),
@@ -146,18 +146,18 @@ func instanceRestoreSpecs() {
 		// This is asserted against the repository rather than against the guard, because the
 		// guard is what is being tested.
 		It("archives nothing into the source's repository", func() {
-			before := archivedSegments()
+			before := archivedSegments(Default)
 
 			By("generating WAL on the restored instance")
 			for id := 100; id < 105; id++ {
 				runSQLIn(restoredInstance, fmt.Sprintf(
 					"INSERT INTO %s VALUES (%d)", restoreProbeTable, id))
 			}
-			inRestored("psql", "-h", provision.SocketDir, "-U", "postgres", "-tAc",
+			inRestored(Default, "psql", "-h", provision.SocketDir, "-U", "postgres", "-tAc",
 				"SELECT pg_switch_wal()")
 
 			Consistently(func(g Gomega) {
-				g.Expect(archivedSegments()).To(Equal(before),
+				g.Expect(archivedSegments(g)).To(Equal(before),
 					"the restored instance pushed a segment into its source's archive")
 			}, "60s", "10s").Should(Succeed())
 		})
@@ -180,14 +180,14 @@ func instanceRestoreSpecs() {
 // archivedSegments counts what the source's stanza holds, read through pgBackRest itself
 // rather than by listing the bucket, so the count is of objects the archive considers its
 // own rather than of files that happen to be under a prefix.
-func archivedSegments() string {
+func archivedSegments(g Gomega) string {
 	GinkgoHelper()
-	output, err := inPrimary("bash", "-c", fmt.Sprintf(
+	output, err := inPrimary(g, "bash", "-c", fmt.Sprintf(
 		"%s --config=%s --stanza=$(awk '/^\\[pgelastic-/{gsub(/[][]/,\"\"); print; exit}' %s) "+
 			"--output=json info",
 		"pgbackrest", provision.BackupConfigFile, provision.BackupConfigFile,
 	)).Output()
-	Expect(err).NotTo(HaveOccurred())
+	g.Expect(err).NotTo(HaveOccurred())
 	return string(output)
 }
 
@@ -198,7 +198,7 @@ func runSQL(statement string) string {
 
 func runSQLIn(instance, statement string) string {
 	GinkgoHelper()
-	primary := primaryOf(instance)
+	primary := primaryOf(Default, instance)
 	output, err := kubectlCommand(
 		"exec", "-n", archiveNamespace, primary, "-c", "postgres", "--",
 		"psql", "-h", provision.SocketDir, "-U", "postgres", "-tAc", statement,
@@ -207,23 +207,23 @@ func runSQLIn(instance, statement string) string {
 	return string(output)
 }
 
-func inRestored(args ...string) string {
+func inRestored(g Gomega, args ...string) string {
 	GinkgoHelper()
-	primary := primaryOf(restoredInstance)
+	primary := primaryOf(g, restoredInstance)
 	output, err := kubectlCommand(append([]string{
 		"exec", "-n", archiveNamespace, primary, "-c", "postgres", "--",
 	}, args...)...).CombinedOutput()
-	Expect(err).NotTo(HaveOccurred(), string(output))
+	g.Expect(err).NotTo(HaveOccurred(), string(output))
 	return string(output)
 }
 
-func primaryOf(name string) string {
+func primaryOf(g Gomega, name string) string {
 	GinkgoHelper()
 	instance := &pgelasticv1alpha1.PgInstance{}
-	Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
+	g.Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
 		Namespace: archiveNamespace, Name: name,
 	}, instance)).To(Succeed())
-	Expect(instance.Status.CurrentPrimary).NotTo(BeEmpty(),
+	g.Expect(instance.Status.CurrentPrimary).NotTo(BeEmpty(),
 		fmt.Sprintf("%s has no primary to run against", name))
 	return instance.Status.CurrentPrimary
 }

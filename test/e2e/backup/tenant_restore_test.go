@@ -73,7 +73,7 @@ func tenantRestoreSpecs() {
 					"INSERT INTO %s VALUES (3) ON CONFLICT DO NOTHING", tenantProbeTable))
 			}
 
-			switchWAL()
+			switchWAL(Default)
 			Eventually(func(g Gomega) {
 				g.Expect(readInstance(g).Status.ArchiveHealth.Healthy).To(BeTrue())
 			}).Should(Succeed())
@@ -149,7 +149,7 @@ func tenantRestoreSpecs() {
 // time it is acted on.
 func createDatabase(name string) {
 	GinkgoHelper()
-	primary := primaryOf(archiveInstance)
+	primary := primaryOf(Default, archiveInstance)
 	_, _ = kubectlCommand(
 		"exec", "-n", archiveNamespace, primary, "-c", "postgres", "--",
 		"psql", "-h", provision.SocketDir, "-U", "postgres", "-tAc",
@@ -196,7 +196,7 @@ func countRows(database string) int {
 
 func runSQLOn(database, statement string) string {
 	GinkgoHelper()
-	primary := primaryOf(archiveInstance)
+	primary := primaryOf(Default, archiveInstance)
 	output, err := kubectlCommand(
 		"exec", "-n", archiveNamespace, primary, "-c", "postgres", "--",
 		"psql", "-h", provision.SocketDir, "-U", "postgres", "-d", database,
