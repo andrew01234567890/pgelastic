@@ -34,12 +34,16 @@ import (
 )
 
 const (
-	credentialNamespace   = "shop"
-	sourceInstanceName    = "pg-a"
-	sourcePassword        = "the-password-the-catalogue-was-backed-up-with"
-	backupName            = "friday"
-	repositoryPath        = "/pgelastic"
-	objectStoreSecret     = "object-store-credentials"
+	credentialNamespace = "shop"
+	sourceInstanceName  = "pg-a"
+	sourcePassword      = "the-password-the-catalogue-was-backed-up-with"
+	backupName          = "friday"
+	repositoryPath      = "/pgelastic"
+	objectStoreSecret   = "object-store-credentials"
+	// restoreTestStanza is the stanza a restore addresses; it is the source's system
+	// identifier, so every fixture that plans a restore names the same one.
+	restoreTestStanza     = "pgelastic-7668815305197002786"
+	restoreTestBackupID   = "20260801-020000F"
 	recoveredInstanceName = "pg-a-recovered"
 	restoreObjectName     = "put-it-back"
 )
@@ -191,8 +195,8 @@ func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
 		Status: pgelasticv1alpha1.PgBackupStatus{
 			Phase:     pgelasticv1alpha1.BackupPhaseCompleted,
 			StoppedAt: &stopped,
-			Stanza:    "pgelastic-7668815305197002786",
-			BackupID:  "20260801-020000F",
+			Stanza:    restoreTestStanza,
+			BackupID:  restoreTestBackupID,
 			// What the agent records: where, and nothing about what to authenticate with.
 			Repository: &pgelasticv1alpha1.ObjectStore{
 				Path:        repositoryPath,
