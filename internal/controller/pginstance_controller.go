@@ -128,7 +128,7 @@ func (r *PgInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if result, stop, err := unclaimed(ctx, r.ownership(), instance); stop {
+	if result, stop, err := unclaimed(ctx, r.ownership(), r.Client, finalizeAnyway, instance); stop {
 		return result, err
 	}
 	if !instance.DeletionTimestamp.IsZero() {

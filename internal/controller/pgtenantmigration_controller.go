@@ -124,7 +124,7 @@ func (r *PgTenantMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if err := r.reader().Get(ctx, req.NamespacedName, object); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if result, stop, err := unclaimed(ctx, r.ownership(), object); stop {
+	if result, stop, err := unclaimed(ctx, r.ownership(), r.Client, finalizeAnyway, object); stop {
 		return result, err
 	}
 	if !object.DeletionTimestamp.IsZero() {

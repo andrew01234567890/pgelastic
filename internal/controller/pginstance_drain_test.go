@@ -29,6 +29,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	"github.com/andrew01234567890/pgelastic/internal/index"
 )
 
@@ -147,5 +149,44 @@ func TestAnEmptyInstanceIsReleased(t *testing.T) {
 	if controllerutil.ContainsFinalizer(instance,
 		pgelasticv1alpha1.PgInstanceDrainTenantsFinalizer) {
 		t.Error("an instance with no tenants on it was held open anyway")
+	}
+}
+
+// The drain guard is a refusal, not a cleanup, so it has to survive an ownership verdict that
+// releases the finalizers which are cleanups. A pool carries no finalizer of its own and its
+// webhook does not refuse deletion, so `kubectl delete pgelasticpool` succeeds at once and
+// every instance under it stops resolving back to a class from that moment.
+func TestAnOrphanedInstanceStillRefusesToDrop(t *testing.T) {
+	scheme := credentialScheme(t)
+	instance := deletingInstance()
+	instance.Spec.PoolRef = corev1.LocalObjectReference{Name: "a-pool-that-is-gone"}
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(instance, boundTenant("acme", drainInstanceName)).
+		WithIndex(&pgelasticv1alpha1.PgTenant{}, index.TenantByInstance,
+			func(object client.Object) []string {
+				tenant, ok := object.(*pgelasticv1alpha1.PgTenant)
+				if !ok || tenant.Status.Binding == nil || tenant.Status.Binding.InstanceRef == nil {
+					return nil
+				}
+				return []string{tenant.Status.Binding.InstanceRef.Name}
+			}).
+		WithStatusSubresource(&pgelasticv1alpha1.PgInstance{}).Build()
+	reconciler := &PgInstanceReconciler{Client: kube, Scheme: scheme}
+
+	if _, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: client.ObjectKeyFromObject(instance),
+	}); err != nil {
+		t.Fatalf("reconciling: %v", err)
+	}
+
+	held := &pgelasticv1alpha1.PgInstance{}
+	if err := kube.Get(context.Background(),
+		client.ObjectKeyFromObject(instance), held); err != nil {
+		t.Fatalf("reading the instance back: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(held,
+		pgelasticv1alpha1.PgInstanceDrainTenantsFinalizer) {
+		t.Fatal("an instance whose pool has gone was released while a tenant was still on it, " +
+			"so that tenant's volumes are about to be garbage-collected")
 	}
 }

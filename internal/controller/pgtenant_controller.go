@@ -118,7 +118,7 @@ func (r *PgTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	// Ahead of the deletion branch, because releasing a finalizer is a write and a tenant
 	// this operator never claimed never carried one of ours to release.
-	if result, stop, err := unclaimed(ctx, r.ownership(), tenant); stop {
+	if result, stop, err := unclaimed(ctx, r.ownership(), r.Client, releaseOnly, tenant); stop {
 		return result, err
 	}
 	if !tenant.DeletionTimestamp.IsZero() {

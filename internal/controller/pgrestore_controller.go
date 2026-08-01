@@ -84,7 +84,7 @@ func (r *PgRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err := r.Get(ctx, req.NamespacedName, restore); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if result, stop, err := unclaimed(ctx, r.ownership(), restore); stop {
+	if result, stop, err := unclaimed(ctx, r.ownership(), r.Client, releaseOnly, restore); stop {
 		return result, err
 	}
 	if !restore.DeletionTimestamp.IsZero() {

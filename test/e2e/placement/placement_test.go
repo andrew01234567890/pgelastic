@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -33,6 +34,7 @@ import (
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/autoscale"
+	"github.com/andrew01234567890/pgelastic/internal/controller"
 	"github.com/andrew01234567890/pgelastic/internal/metering"
 )
 
@@ -348,6 +350,39 @@ var _ = Describe("placing a tenant population across a pool", Ordered, func() {
 		Expect(k8sClient.List(suiteCtx, migrations, client.InNamespace(namespace))).To(Succeed())
 		Expect(migrations.Items).To(BeEmpty(),
 			"Recommend mode moved a tenant, which is the one thing it must never do")
+	})
+
+	// Last, because it takes the pool away from every spec above it.
+	//
+	// A tenant inherits its claim on this operator from its pool, so a tenant that outlives
+	// its pool cannot be resolved back to a class at all. Deleting a namespace deletes both
+	// at once, which makes that ordering routine rather than exotic - and a tenant nobody
+	// can prove ownership of is a tenant whose finalizer nobody will release.
+	It("still lets a tenant be deleted once its pool has gone", func() {
+		doomed := tenants[len(tenants)-1]
+		Eventually(func(g Gomega) {
+			live := &pgelasticv1alpha1.PgTenant{}
+			g.Expect(k8sClient.Get(suiteCtx,
+				client.ObjectKeyFromObject(doomed), live)).To(Succeed())
+			g.Expect(live.Finalizers).To(ContainElement(controller.TenantDatabaseFinalizer))
+		}, "2m", "2s").Should(Succeed(), "the tenant never took the finalizer under test")
+
+		pool := &pgelasticv1alpha1.PgElasticPool{
+			ObjectMeta: metav1.ObjectMeta{Name: poolName, Namespace: namespace},
+		}
+		Expect(k8sClient.Delete(suiteCtx, pool)).To(Succeed())
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(suiteCtx,
+				client.ObjectKeyFromObject(pool), &pgelasticv1alpha1.PgElasticPool{}))
+		}, "2m", "2s").Should(BeTrue(), "the pool itself never finished deleting")
+
+		Expect(client.IgnoreNotFound(k8sClient.Delete(suiteCtx, doomed))).To(Succeed())
+
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(suiteCtx,
+				client.ObjectKeyFromObject(doomed), &pgelasticv1alpha1.PgTenant{}))
+		}, "2m", "2s").Should(BeTrue(),
+			"the tenant still holds its finalizer, so its namespace can never finish terminating")
 	})
 })
 

@@ -63,7 +63,7 @@ func (r *PgBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := r.Get(ctx, req.NamespacedName, backup); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if result, stop, err := unclaimed(ctx, r.ownership(), backup); stop {
+	if result, stop, err := unclaimed(ctx, r.ownership(), r.Client, finalizeAnyway, backup); stop {
 		return result, err
 	}
 	if !backup.DeletionTimestamp.IsZero() {

@@ -21,8 +21,10 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -191,6 +193,73 @@ var _ = Describe("ownership of the object graph", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.RequeueAfter).To(Equal(ownership.RetryUnresolved))
 			Expect(refetch(pool).ResourceVersion).To(Equal(before))
+		})
+	})
+
+	Context("a reference that stops resolving while the object is being deleted", func() {
+		It("still releases the finalizer, rather than stranding the object forever", func() {
+			pool := makePool(namespace, "ownership-vanishing-pool", ownedClass, 100)
+			Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+			tenant := makeTenant(namespace, "ownership-stranded",
+				pool.Name, "ownership_stranded")
+			tenant.Finalizers = []string{TenantDatabaseFinalizer}
+			Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
+			awaitCached(pool, tenant)
+
+			// Deleting a namespace deletes the pool and the tenant at once, so this is the
+			// ordering the API server produces on its own, not a contrived one.
+			Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
+			awaitCachedGone(pool)
+			Expect(k8sClient.Delete(ctx, tenant)).To(Succeed())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tenant),
+				&pgelasticv1alpha1.PgTenant{})).To(Succeed())
+
+			reconcileNow(&PgTenantReconciler{
+				Client: cachedClient, Scheme: cachedClient.Scheme(),
+			}, tenant)
+
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx,
+				client.ObjectKeyFromObject(tenant),
+				&pgelasticv1alpha1.PgTenant{}))).To(BeTrue())
+		})
+
+		// reclaimPolicy Delete is the case worth pinning, because it is the one that acts on
+		// the world. This tenant is bound and asks for its database to be dropped, and the
+		// reconciler is given no PostgreSQL transport - so if the release went through the
+		// normal finalize path it would fail with "no PostgreSQL transport is configured",
+		// keep the finalizer, and strand the object exactly as before.
+		It("releases without reclaiming, rather than dropping what it cannot prove is its own", func() {
+			pool := makePool(namespace, "ownership-doomed-pool", ownedClass, 100)
+			Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+			// A host that really exists: reclaim returns early on an instance that is already
+			// gone, which would take the spec past the branch it is here to pin.
+			host := makeInstance("ownership-host")
+			host.Namespace = namespace
+			host.Spec.PoolRef = corev1.LocalObjectReference{Name: pool.Name}
+			Expect(k8sClient.Create(ctx, host)).To(Succeed())
+			DeferCleanup(func() { deleteAndAwait(host) })
+
+			tenant := makeTenant(namespace, "ownership-reclaimer", pool.Name, "ownership_reclaimer")
+			tenant.Finalizers = []string{TenantDatabaseFinalizer}
+			tenant.Spec.ReclaimPolicy = ptr.To(pgelasticv1alpha1.ReclaimDelete)
+			Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
+			tenant.Status.Binding = &pgelasticv1alpha1.PgTenantBinding{
+				InstanceRef: &corev1.LocalObjectReference{Name: host.Name},
+			}
+			Expect(k8sClient.Status().Update(ctx, tenant)).To(Succeed())
+			awaitCached(pool, host, tenant)
+
+			Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
+			awaitCachedGone(pool)
+			Expect(k8sClient.Delete(ctx, tenant)).To(Succeed())
+
+			reconcileNow(&PgTenantReconciler{
+				Client: cachedClient, Scheme: cachedClient.Scheme(),
+			}, tenant)
+
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx,
+				client.ObjectKeyFromObject(tenant),
+				&pgelasticv1alpha1.PgTenant{}))).To(BeTrue())
 		})
 	})
 
