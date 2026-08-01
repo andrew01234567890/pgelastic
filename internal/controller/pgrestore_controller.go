@@ -113,13 +113,28 @@ func (r *PgRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	status.Conditions = restoreConditions(restore, status)
 	status.Phase = restorePhase(status)
-	if !equality.Semantic.DeepEqual(&restore.Status, status) {
-		restore.Status = *status
-		if err := r.Status().Update(ctx, restore); err != nil {
-			return ctrl.Result{}, err
-		}
+	if err := r.publish(ctx, restore, status); err != nil {
+		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil
+}
+
+// publish writes the status out.
+//
+// Every other controller here does this once, at the end of the pass. A tenant restore also
+// calls it in the middle of one: the record that a copy was cleared to overwrite the live
+// tenant has to be on the API server before the copy runs, and the pass that writes it is the
+// pass that runs it, so it cannot wait for the end.
+func (r *PgRestoreReconciler) publish(
+	ctx context.Context,
+	restore *pgelasticv1alpha1.PgRestore,
+	status *pgelasticv1alpha1.PgRestoreStatus,
+) error {
+	if equality.Semantic.DeepEqual(&restore.Status, status) {
+		return nil
+	}
+	restore.Status = *status
+	return r.Status().Update(ctx, restore)
 }
 
 // converge creates the target instance if it is not there and reports on it if it is.
@@ -139,6 +154,25 @@ func (r *PgRestoreReconciler) converge(
 	// here again on the very status write that recorded its success, and rebuilt the
 	// recovery instance and loaded the dump back over the live tenant every time.
 	if isTerminalRestore(status.Phase) {
+		return 0, nil
+	}
+
+	// A copy was cleared to start and the restore never reached an ending, so the pass that
+	// was running it did not survive: a rolled pod, a lost lease, a conflict on the terminal
+	// write. The clearance is written and flushed by the same pass that then runs the copy,
+	// so seeing it here at the top of a later pass means that copy did not finish. What it
+	// managed to do to the live tenant before it went is not knowable from here - pg_restore
+	// --clean drops as it goes - so this refuses rather than starting over. The recovery
+	// instance is left up because it holds the intended contents, and the operator can finish
+	// by hand or take another restore from it.
+	if restore.Spec.Scope == pgelasticv1alpha1.RestoreScopeTenant && status.CopyStartedAt != nil {
+		status.Phase = pgelasticv1alpha1.RestorePhaseFailed
+		status.Error = fmt.Sprintf(
+			"a copy into this tenant began at %s and did not report an ending, so it is not "+
+				"known how much of the database it had already replaced. Refusing to run it "+
+				"again, because it loads with --clean and would drop whatever has been "+
+				"written since. PgInstance %q still holds the recovered copy",
+			status.CopyStartedAt.UTC().Format(time.RFC3339), recoveryInstanceName(restore))
 		return 0, nil
 	}
 

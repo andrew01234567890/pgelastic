@@ -209,6 +209,18 @@ type PgRestoreStatus struct {
 	// +kubebuilder:validation:MaxLength=1024
 	// +optional
 	Error string `json:"error,omitempty"`
+
+	// copyStartedAt is when a tenant-scope restore was cleared to overwrite the live tenant.
+	//
+	// It is written, and has to reach the API server, before anything touches that database,
+	// and it is never cleared. A tenant copy loads with --clean: it drops and reloads every
+	// object, so running it twice destroys whatever was written in between. The operator
+	// cannot see whether a copy it started ever finished - a lost lease, a rolled pod or a
+	// conflict on the terminal write all leave the same evidence - so this records that one
+	// was allowed to begin. Finding it set on a restore that is not finished means a previous
+	// attempt died partway, and the restore fails rather than trying again.
+	// +optional
+	CopyStartedAt *metav1.Time `json:"copyStartedAt,omitempty"`
 }
 
 // +kubebuilder:object:root=true
