@@ -49,7 +49,7 @@ func scheduledBackupSpecs() {
 			// and the grace window is an hour, so a run that happens to straddle 02:00 UTC
 			// already has a slot-named backup sitting there. Without a baseline this spec
 			// passes on that one and proves nothing about the schedule it sets.
-			before := scheduledBackupNames()
+			before := scheduledBackupNames(Default)
 
 			By("asking for a backup every minute")
 			Eventually(func(g Gomega) {
@@ -63,7 +63,7 @@ func scheduledBackupSpecs() {
 			By("waiting for the controller to mint a backup of its own accord")
 			Eventually(func(g Gomega) {
 				var minted []string
-				for _, name := range scheduledBackupNames() {
+				for _, name := range scheduledBackupNames(g) {
 					if !slices.Contains(before, name) {
 						minted = append(minted, name)
 					}
@@ -85,10 +85,10 @@ func scheduledBackupSpecs() {
 
 // scheduledBackupNames is every backup in the namespace whose name was derived from a
 // schedule slot rather than written by hand.
-func scheduledBackupNames() []string {
+func scheduledBackupNames(g Gomega) []string {
 	GinkgoHelper()
 	backups := &pgelasticv1alpha1.PgBackupList{}
-	Expect(k8sClient.List(suiteCtx, backups, client.InNamespace(archiveNamespace))).To(Succeed())
+	g.Expect(k8sClient.List(suiteCtx, backups, client.InNamespace(archiveNamespace))).To(Succeed())
 
 	var names []string
 	for i := range backups.Items {
