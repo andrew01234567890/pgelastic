@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -168,9 +169,11 @@ func finishBackup(
 
 	if cause != nil {
 		log.Error(cause, "the backup failed")
-		backup.Status.Phase = pgelasticv1alpha1.BackupPhaseFailed
-		backup.Status.Error = truncate(cause.Error(), maxFailureMessage)
-		return options.Client.Status().Update(ctx, backup)
+		return writeTerminalStatus(ctx, options, backup.Name,
+			func(status *pgelasticv1alpha1.PgBackupStatus) {
+				status.Phase = pgelasticv1alpha1.BackupPhaseFailed
+				status.Error = truncate(cause.Error(), maxFailureMessage)
+			})
 	}
 
 	taken, err := readBackBackup(ctx, options, backup.Name)
@@ -178,36 +181,86 @@ func finishBackup(
 		// The backup itself succeeded and the catalogue could not be read. Reporting
 		// success without the LSN range would publish a backup nothing could plan a restore
 		// from, which is worse than reporting the failure to read it.
-		backup.Status.Phase = pgelasticv1alpha1.BackupPhaseFailed
-		backup.Status.Error = truncate(err.Error(), maxFailureMessage)
-		return options.Client.Status().Update(ctx, backup)
+		return writeTerminalStatus(ctx, options, backup.Name,
+			func(status *pgelasticv1alpha1.PgBackupStatus) {
+				status.Phase = pgelasticv1alpha1.BackupPhaseFailed
+				status.Error = truncate(err.Error(), maxFailureMessage)
+			})
 	}
-
-	backup.Status.Phase = pgelasticv1alpha1.BackupPhaseCompleted
-	backup.Status.Error = ""
-	backup.Status.BackupID = taken.Label
-	backup.Status.Type = instanceBackupType(taken.Type)
-	backup.Status.StartedAt = &metav1.Time{Time: taken.Started}
-	backup.Status.StoppedAt = &metav1.Time{Time: taken.Stopped}
-	backup.Status.BeginLSN = taken.BeginLSN
-	backup.Status.EndLSN = taken.EndLSN
-	backup.Status.BeginWAL = taken.BeginWAL
-	backup.Status.EndWAL = taken.EndWAL
-	backup.Status.SizeBytes = taken.SizeBytes
-	backup.Status.SystemIdentifier = taken.SystemIdentifier
-	backup.Status.Repository = repositoryOf(options)
 
 	// The five settings PostgreSQL refuses to begin recovery below are the source's, and a
 	// restore target's own configuration is not evidence about them. Recorded here so a
 	// restore can raise its floor before it starts rather than FATAL after it has pulled
 	// the whole base backup down.
-	if controlData, err := toolchain(options).ControlData(ctx, options.DataDir); err == nil {
-		backup.Status.SourceEnforcedParameters = controlData.EnforcedSettings
-		backup.Status.Timeline = controlData.TimelineID
-	}
+	controlData, controlErr := toolchain(options).ControlData(ctx, options.DataDir)
 
 	log.Info("the backup completed", "backupID", taken.Label, "sizeBytes", taken.SizeBytes)
-	return options.Client.Status().Update(ctx, backup)
+	return writeTerminalStatus(ctx, options, backup.Name,
+		func(status *pgelasticv1alpha1.PgBackupStatus) {
+			status.Phase = pgelasticv1alpha1.BackupPhaseCompleted
+			status.Error = ""
+			status.BackupID = taken.Label
+			status.Type = instanceBackupType(taken.Type)
+			status.StartedAt = &metav1.Time{Time: taken.Started}
+			status.StoppedAt = &metav1.Time{Time: taken.Stopped}
+			status.BeginLSN = taken.BeginLSN
+			status.EndLSN = taken.EndLSN
+			status.BeginWAL = taken.BeginWAL
+			status.EndWAL = taken.EndWAL
+			status.SizeBytes = taken.SizeBytes
+			status.SystemIdentifier = taken.SystemIdentifier
+			status.Repository = repositoryOf(options)
+			if controlErr == nil {
+				status.SourceEnforcedParameters = controlData.EnforcedSettings
+				status.Timeline = controlData.TimelineID
+			}
+		})
+}
+
+// writeTerminalStatus records how a backup ended, against whatever the object looks like now.
+//
+// It cannot write through the copy the claim was made on. Claiming sets the phase to Running,
+// the PgBackup controller sees that and rewrites the object's conditions to say so, and by
+// then the agent's copy is stale - while the backup it describes still has minutes to hours
+// to run. Writing through it lost every terminal status to a conflict, so a backup that had
+// completed stayed Running for ever, and because a running backup holds the election, no
+// later backup was taken either.
+func writeTerminalStatus(
+	ctx context.Context,
+	options Options,
+	name string,
+	apply func(*pgelasticv1alpha1.PgBackupStatus),
+) error {
+	key := types.NamespacedName{Namespace: options.Namespace, Name: name}
+	err := retry.OnError(retry.DefaultBackoff, worthAnotherAttempt, func() error {
+		fresh := &pgelasticv1alpha1.PgBackup{}
+		if err := options.Client.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		apply(&fresh.Status)
+		return options.Client.Status().Update(ctx, fresh)
+	})
+	// A backup deleted while it ran has nowhere to record what happened, and that is
+	// somebody's decision about an object rather than a failure of the backup. Handled out
+	// here so it covers a delete between the read and the write as well as before both.
+	return client.IgnoreNotFound(err)
+}
+
+// worthAnotherAttempt is what a status write this important should not give up on.
+//
+// Conflict is the expected one and the reason the retry exists at all. The rest matter
+// because of when this runs: pgBackRest has already finished, the backup is good and in the
+// repository, and this is the only chance to say so. Giving up on one throttled or
+// briefly-unavailable API server leaves the backup Running for ever, holding the election so
+// no later backup is taken and no expiry runs - the very outcome the retry was added to
+// prevent, reached through a narrower door.
+func worthAnotherAttempt(err error) bool {
+	return apierrors.IsConflict(err) ||
+		apierrors.IsInternalError(err) ||
+		apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsTimeout(err) ||
+		apierrors.IsServerTimeout(err)
 }
 
 // readBackBackup finds this backup in the repository catalogue by the annotation it was
