@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/andrew01234567890/pgelastic/internal/migration"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/ha"
@@ -324,5 +329,151 @@ func TestARecoveringInstanceIsNeverScheduledForBackups(t *testing.T) {
 	state := reconciler.reconcileBackups(t.Context(), instance, ha.Decision{ServingPrimary: "pg-a-1"})
 	if state.pending != nil {
 		t.Fatalf("elected %+v, want a recovering instance left alone", state.pending)
+	}
+}
+
+// failingPorts model a transient fault on the first thing replaceTenant does, which is a read
+// against the throwaway recovery instance and touches the live tenant not at all.
+type failingPorts struct{}
+
+func (failingPorts) Query(
+	_ context.Context, _ migration.Endpoint, _ string,
+) ([]migration.Row, error) {
+	return nil, errors.New("the recovery instance closed the connection")
+}
+
+func (failingPorts) Exec(_ context.Context, _ migration.Endpoint, _ string) error {
+	return errors.New("the recovery instance closed the connection")
+}
+
+func (failingPorts) Run(
+	_ context.Context, _ migration.Endpoint, _ []string,
+) ([]byte, error) {
+	return nil, errors.New("the recovery instance closed the connection")
+}
+
+// readyTenantRestore is a tenant-scope restore whose recovery instance is up and Ready, which
+// is the state from which the next pass would begin overwriting the live tenant.
+func readyTenantRestore() (*pgelasticv1alpha1.PgRestore, []client.Object) {
+	restore := &pgelasticv1alpha1.PgRestore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: restoreObjectName},
+		Spec: pgelasticv1alpha1.PgRestoreSpec{
+			Scope:             pgelasticv1alpha1.RestoreScopeTenant,
+			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
+			TenantRef:         &corev1.LocalObjectReference{Name: migrationTenant},
+		},
+	}
+	recovery := &pgelasticv1alpha1.PgInstance{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: credentialNamespace, Name: recoveryInstanceName(restore),
+		},
+		Status: pgelasticv1alpha1.PgInstanceStatus{
+			Conditions: []metav1.Condition{{
+				Type: pgelasticv1alpha1.ConditionReady, Status: metav1.ConditionTrue,
+				Reason: pgelasticv1alpha1.ReasonReady, LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+	live := &pgelasticv1alpha1.PgInstance{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "pg-live"},
+	}
+	tenant := &pgelasticv1alpha1.PgTenant{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: migrationTenant},
+		Spec:       pgelasticv1alpha1.PgTenantSpec{DatabaseName: "acme_prod"},
+		Status: pgelasticv1alpha1.PgTenantStatus{
+			Binding: &pgelasticv1alpha1.PgTenantBinding{
+				InstanceRef: &corev1.LocalObjectReference{Name: live.Name},
+			},
+		},
+	}
+	return restore, []client.Object{restore, recovery, live, tenant}
+}
+
+// Everything a tenant copy does before it fences the tenant is a read of the recovered
+// instance or of the catalogue: two collation tuples, a replication credential, a grant on the
+// throwaway instance, the role list. They fail for reasons that pass - a recovery instance that
+// has only just gone Ready is the commonest - and none of them alters the live database. Making
+// them terminal would strand a restore that had done nothing wrong, and its spec is immutable,
+// so the only way back would be to run the whole point-in-time recovery again.
+func TestAFailureBeforeTheTenantIsFencedIsRetried(t *testing.T) {
+	scheme := credentialScheme(t)
+	restore, objects := readyTenantRestore()
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).
+		WithStatusSubresource(&pgelasticv1alpha1.PgRestore{}).Build()
+	reconciler := &PgRestoreReconciler{
+		Client: kube, Scheme: scheme, SQL: failingPorts{}, Shell: failingPorts{},
+	}
+
+	status := restore.Status.DeepCopy()
+	requeue, err := reconciler.reconcileTenantRestore(context.Background(), restore, status)
+
+	if err != nil {
+		t.Fatalf("reconciling: %v", err)
+	}
+	if status.CopyStartedAt != nil {
+		t.Fatal("a clearance was recorded by a pass that never reached the fence")
+	}
+	if status.Phase == pgelasticv1alpha1.RestorePhaseFailed {
+		t.Error("a read against the recovery instance failed the whole restore, which cannot " +
+			"be retried because the spec is immutable")
+	}
+	if requeue == 0 {
+		t.Error("the restore was not asked to come back, so the transient is never retried")
+	}
+}
+
+// refusingPorts fail the test on any use, so a pass that must not reach the tenant can be
+// asserted by the attempt itself being the failure.
+type refusingPorts struct{ t *testing.T }
+
+func (p refusingPorts) Query(
+	_ context.Context, _ migration.Endpoint, _ string,
+) ([]migration.Row, error) {
+	p.t.Fatal("the tenant was queried on a pass that must not touch it")
+	return nil, nil
+}
+
+func (p refusingPorts) Exec(_ context.Context, _ migration.Endpoint, _ string) error {
+	p.t.Fatal("the tenant was written to on a pass that must not touch it")
+	return nil
+}
+
+func (p refusingPorts) Run(
+	_ context.Context, _ migration.Endpoint, argv []string,
+) ([]byte, error) {
+	p.t.Fatalf("pg_dump/pg_restore ran on a pass that must not touch the tenant: %v", argv)
+	return nil, nil
+}
+
+// And the other half: finding that clearance on a restore that never reached an ending means
+// the pass running the copy died partway through it. What it managed to drop before it went
+// is not knowable, so the only safe answer is to refuse.
+func TestAnInterruptedCopyIsNotRetried(t *testing.T) {
+	scheme := credentialScheme(t)
+	restore, objects := readyTenantRestore()
+	started := metav1.NewTime(time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC))
+	restore.Status.CopyStartedAt = &started
+	restore.Status.Phase = pgelasticv1alpha1.RestorePhaseExtracting
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).
+		WithStatusSubresource(&pgelasticv1alpha1.PgRestore{}).Build()
+	ports := refusingPorts{t: t}
+	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme, SQL: ports, Shell: ports}
+
+	status := restore.Status.DeepCopy()
+	requeue, err := reconciler.converge(context.Background(), restore, status)
+
+	if err != nil {
+		t.Fatalf("converging: %v", err)
+	}
+	if requeue != 0 {
+		t.Error("the restore asked to come back, so it will keep re-entering the copy")
+	}
+	if status.Phase != pgelasticv1alpha1.RestorePhaseFailed {
+		t.Fatalf("phase = %q, want Failed: an interrupted copy is not something to retry",
+			status.Phase)
+	}
+	if !strings.Contains(status.Error, recoveryInstanceName(restore)) {
+		t.Errorf("the error does not name the instance still holding the recovered copy: %q",
+			status.Error)
 	}
 }
