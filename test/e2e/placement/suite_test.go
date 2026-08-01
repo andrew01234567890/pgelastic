@@ -47,8 +47,13 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -260,10 +265,108 @@ func psql(member, database, query string) (string, error) {
 }
 
 var _ = AfterSuite(func() {
+	// Before the manager stops: every PgTenant and PgInstance here carries a finalizer that
+	// only its own reconciler removes.
+	releaseNamespaces()
+
 	if cancelSuite != nil {
 		cancelSuite()
 	}
 })
+
+// releaseNamespaces makes sure every namespace this suite created really finishes
+// terminating, so a cluster reused for a second run starts from nothing rather than failing
+// every spec with "namespace is being terminated" - a symptom a long way from its cause. CI
+// never sees it, because each job builds a fresh kind cluster; developing against one does.
+//
+// Deleting the namespace is the whole mechanism. The API server deletes its contents, and the
+// one ordering that matters - an instance holds its drain finalizer until no tenant is bound
+// to it - resolves itself, because the tenants are being deleted too.
+func releaseNamespaces() {
+	if k8sClient == nil {
+		return
+	}
+	for _, name := range suiteNamespaces {
+		_ = client.IgnoreNotFound(k8sClient.Delete(suiteCtx, &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+		}))
+	}
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		remaining := stillTerminating()
+		if len(remaining) == 0 {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			for _, name := range remaining {
+				forceRelease(name)
+			}
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func stillTerminating() []string {
+	var remaining []string
+	for _, name := range suiteNamespaces {
+		if !apierrors.IsNotFound(k8sClient.Get(suiteCtx,
+			client.ObjectKey{Name: name}, &corev1.Namespace{})) {
+			remaining = append(remaining, name)
+		}
+	}
+	return remaining
+}
+
+// forceRelease strips the finalizers off whatever is keeping one namespace from terminating.
+// Only defensible because this suite created that namespace itself, and scoped to it for the
+// same reason: this suite shares its cluster with anything else running there.
+//
+// Nothing here fails the run. A teardown that goes red says nothing about the code under test
+// while hiding the result that does, so it reports what it forced and leaves the verdict to
+// the specs.
+func forceRelease(namespace string) {
+	lists := []client.ObjectList{
+		&pgelasticv1alpha1.PgTenantList{},
+		&pgelasticv1alpha1.PgInstanceList{},
+	}
+	for _, list := range lists {
+		if err := k8sClient.List(suiteCtx, list, client.InNamespace(namespace)); err != nil {
+			continue
+		}
+		held, err := apimeta.ExtractList(list)
+		if err != nil {
+			continue
+		}
+		for _, item := range held {
+			object, ok := item.(client.Object)
+			if !ok || len(object.GetFinalizers()) == 0 {
+				continue
+			}
+			releaseOne(object)
+		}
+	}
+}
+
+func releaseOne(object client.Object) {
+	key := client.ObjectKeyFromObject(object)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := k8sClient.Get(suiteCtx, key, object); err != nil {
+			return err
+		}
+		object.SetFinalizers(nil)
+		return k8sClient.Update(suiteCtx, object)
+	})
+	switch {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		GinkgoWriter.Printf("could not release %s, so its namespace stays Terminating: %v\n",
+			key, err)
+	default:
+		GinkgoWriter.Printf("released %s by force: no reconciler removed its finalizer\n", key)
+	}
+}
 
 func envOr(name, fallback string) string {
 	if value := os.Getenv(name); value != "" {
@@ -272,6 +375,14 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
+// uniqueNamespace records what it mints, so teardown can find every namespace this suite
+// created without each spec having to hand its own back.
 func uniqueNamespace(prefix string) string {
-	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano()%100000)
+	name := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano()%100000)
+	suiteNamespaces = append(suiteNamespaces, name)
+	return name
 }
+
+// suiteNamespaces is appended to from spec setup and read in AfterSuite, both of which Ginkgo
+// runs on the one goroutine.
+var suiteNamespaces []string

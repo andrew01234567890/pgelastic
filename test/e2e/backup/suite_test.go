@@ -39,9 +39,13 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -254,11 +258,118 @@ var _ = Describe("backup, restore and point-in-time recovery", Ordered, func() {
 	scheduledBackupSpecs()
 })
 
+var _ = ReportAfterEach(func(report SpecReport) {
+	if report.Failed() {
+		suiteFailed.Store(true)
+	}
+})
+
 var _ = AfterSuite(func() {
+	// Before the manager stops: every PgRestore, PgTenant and PgInstance here carries a
+	// finalizer that only its own reconciler removes.
+	releaseNamespace()
+
 	if cancelSuite != nil {
 		cancelSuite()
 	}
 })
+
+var suiteFailed atomic.Bool
+
+// releaseNamespace deletes the namespace this suite works in and makes sure it really
+// finishes terminating.
+//
+// Unlike every other suite here, this one works in a fixed namespace, and it creates the
+// object store, its Secret and the credentials Secret with a bare Create. So a second run
+// against the same cluster used to fail either on AlreadyExists or - once objects held
+// finalizers nothing released - on "namespace is being terminated", a long way downstream of
+// the cause. CI never sees either, because each job builds a fresh kind cluster.
+//
+// Deleting the namespace is the whole mechanism. The API server deletes its contents, and the
+// one ordering that matters - an instance holds its drain finalizer until no tenant is bound
+// to it - resolves itself, because the tenants are being deleted too.
+//
+// A failed run keeps its namespace: what it left behind is the evidence, and this is the only
+// place that knows the run failed.
+func releaseNamespace() {
+	if k8sClient == nil {
+		return
+	}
+	if suiteFailed.Load() {
+		GinkgoWriter.Printf("keeping namespace %s: the run failed and its objects are why\n",
+			archiveNamespace)
+		return
+	}
+	if err := client.IgnoreNotFound(k8sClient.Delete(suiteCtx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: archiveNamespace},
+	})); err != nil {
+		GinkgoWriter.Printf("could not delete namespace %s: %v\n", archiveNamespace, err)
+		return
+	}
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		if apierrors.IsNotFound(k8sClient.Get(suiteCtx,
+			client.ObjectKey{Name: archiveNamespace}, &corev1.Namespace{})) {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			forceRelease(archiveNamespace)
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// forceRelease strips the finalizers off whatever is keeping the namespace from terminating.
+// Only defensible because this suite created that namespace itself, and scoped to it for the
+// same reason: the cluster is shared with whatever else is running on it.
+//
+// Nothing here fails the run. A teardown that goes red says nothing about the code under test
+// while hiding the result that does, so it reports what it forced and leaves the verdict to
+// the specs.
+func forceRelease(namespace string) {
+	lists := []client.ObjectList{
+		&pgelasticv1alpha1.PgRestoreList{},
+		&pgelasticv1alpha1.PgTenantList{},
+		&pgelasticv1alpha1.PgInstanceList{},
+	}
+	for _, list := range lists {
+		if err := k8sClient.List(suiteCtx, list, client.InNamespace(namespace)); err != nil {
+			continue
+		}
+		held, err := apimeta.ExtractList(list)
+		if err != nil {
+			continue
+		}
+		for _, item := range held {
+			object, ok := item.(client.Object)
+			if !ok || len(object.GetFinalizers()) == 0 {
+				continue
+			}
+			releaseOne(object)
+		}
+	}
+}
+
+func releaseOne(object client.Object) {
+	key := client.ObjectKeyFromObject(object)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := k8sClient.Get(suiteCtx, key, object); err != nil {
+			return err
+		}
+		object.SetFinalizers(nil)
+		return k8sClient.Update(suiteCtx, object)
+	})
+	switch {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		GinkgoWriter.Printf("could not release %s, so its namespace stays Terminating: %v\n",
+			key, err)
+	default:
+		GinkgoWriter.Printf("released %s by force: no reconciler removed its finalizer\n", key)
+	}
+}
 
 // atomicString is written by a spec's setup and read by the prober goroutines the manager
 // runs.
