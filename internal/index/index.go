@@ -43,6 +43,13 @@ const (
 	// deliberately outlives its instance, so this index can name an instance that no
 	// longer exists - which is the case a backup exists for.
 	BackupByInstance = "spec.instanceRef.name"
+	// TenantByInstance indexes PgTenant on the instance it is actually bound to.
+	//
+	// It is a status field rather than a spec one because a tenant never names its
+	// instance: placement chooses it and records the choice. Deleting an instance while
+	// this index still returns tenants is deleting their data, so the index is what the
+	// drain guard reads.
+	TenantByInstance = "status.binding.instanceRef.name"
 )
 
 // Setup registers every pgelastic field index on a cache's indexer.
@@ -65,6 +72,18 @@ func Setup(ctx context.Context, indexer client.FieldIndexer) error {
 				return nil
 			}
 			return []string{*tenant.Spec.WorkloadClassName}
+		}); err != nil {
+		return err
+	}
+
+	if err := indexer.IndexField(ctx, &pgelasticv1alpha1.PgTenant{}, TenantByInstance,
+		func(object client.Object) []string {
+			tenant, ok := object.(*pgelasticv1alpha1.PgTenant)
+			if !ok || tenant.Status.Binding == nil || tenant.Status.Binding.InstanceRef == nil ||
+				tenant.Status.Binding.InstanceRef.Name == "" {
+				return nil
+			}
+			return []string{tenant.Status.Binding.InstanceRef.Name}
 		}); err != nil {
 		return err
 	}
