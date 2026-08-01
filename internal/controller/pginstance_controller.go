@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -38,6 +40,7 @@ import (
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/ha"
+	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
@@ -129,7 +132,14 @@ func (r *PgInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return result, err
 	}
 	if !instance.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, nil
+		return r.finalize(ctx, instance)
+	}
+	// Held before the first PVC exists. A guard added after the volumes are there leaves a
+	// window in which deleting the instance destroys the only copy of every tenant on it.
+	if controllerutil.AddFinalizer(instance, pgelasticv1alpha1.PgInstanceDrainTenantsFinalizer) {
+		if err := r.Update(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	class, err := pgconf.LookupSizingClass(instance.Spec.Class)
@@ -226,6 +236,7 @@ const migrationSlotHeadroom int32 = 4
 const (
 	fieldObservedGeneration = "observedGeneration"
 	fieldPhase              = "phase"
+	fieldConditions         = "conditions"
 )
 
 func replicasOf(instance *pgelasticv1alpha1.PgInstance) int32 {
@@ -271,6 +282,52 @@ func (r *PgInstanceReconciler) ensureSupportingObjects(
 	}
 	return nil
 }
+
+// finalize refuses to let an instance go while tenants are still bound to it.
+//
+// Every PVC of an instance carries an owner reference to it, so deleting the object is
+// deleting the data of every tenant living on it - not eventually, and with no confirmation
+// beyond the one kubectl already asked for. `kubectl delete pginstance` is a plausible thing
+// to type at a cluster somebody believes is idle, and the tenants that make it not idle are
+// invisible from the instance itself.
+//
+// So the finalizer holds, and says which tenants are holding it. Releasing them is a
+// migration or an explicit release, both of which are things a person does deliberately.
+func (r *PgInstanceReconciler) finalize(
+	ctx context.Context,
+	instance *pgelasticv1alpha1.PgInstance,
+) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(instance,
+		pgelasticv1alpha1.PgInstanceDrainTenantsFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	bound := &pgelasticv1alpha1.PgTenantList{}
+	if err := r.List(ctx, bound,
+		client.InNamespace(instance.Namespace),
+		client.MatchingFields{index.TenantByInstance: instance.Name},
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(bound.Items) > 0 {
+		names := make([]string, 0, len(bound.Items))
+		for i := range bound.Items {
+			names = append(names, bound.Items[i].Name)
+		}
+		slices.Sort(names)
+		logf.FromContext(ctx).Info("refusing to delete an instance that still has tenants on it",
+			"instance", instance.Name, "tenants", strings.Join(names, ","))
+		return ctrl.Result{RequeueAfter: drainRecheck}, r.publishDraining(ctx, instance, names)
+	}
+
+	controllerutil.RemoveFinalizer(instance,
+		pgelasticv1alpha1.PgInstanceDrainTenantsFinalizer)
+	return ctrl.Result{}, r.Update(ctx, instance)
+}
+
+// drainRecheck paces the wait for somebody to move the tenants off. Nothing about it is made
+// faster by asking more often, and a deletion that is blocked is blocked until a person acts.
+const drainRecheck = 30 * time.Second
 
 // ensureCredentials creates the two role passwords once and never rotates them here.
 // The postgres superuser is deliberately absent: it is never given a password at all, and
@@ -634,7 +691,7 @@ func (r *PgInstanceReconciler) publishStatus(
 			"allocated": instance.Spec.Storage.Size.String(),
 		},
 		"instances": syncSetEntries(instance),
-		"conditions": append(conditionsFor(instance, groups, pods, decision, builder.Replicas()),
+		fieldConditions: append(conditionsFor(instance, groups, pods, decision, builder.Replicas()),
 			rollCondition(instance, roll)),
 	}
 	if published := rollStatus(roll); published != nil {
@@ -992,9 +1049,35 @@ func (r *PgInstanceReconciler) publishInvalid(
 	object.Object["status"] = map[string]any{
 		fieldObservedGeneration: instance.Generation,
 		fieldPhase:              string(pgelasticv1alpha1.InstancePhasePending),
-		"conditions": []any{
+		fieldConditions: []any{
 			condition(instance.Status.Conditions, pgelasticv1alpha1.ConditionReady, false,
 				instance.Generation, pgelasticv1alpha1.ReasonInvalidSpec, cause.Error()),
+		},
+	}
+	return r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(object),
+		client.FieldOwner("pgelastic-operator"), client.ForceOwnership)
+}
+
+// publishDraining says which tenants are keeping a deleted instance alive.
+//
+// The names are the whole point. "Deletion is blocked" tells somebody nothing they can act
+// on; the list of tenants still living on the instance is exactly the work that has to
+// happen before it can go.
+func (r *PgInstanceReconciler) publishDraining(
+	ctx context.Context,
+	instance *pgelasticv1alpha1.PgInstance,
+	tenants []string,
+) error {
+	object := statusApplyObject(instance)
+	object.Object["status"] = map[string]any{
+		fieldObservedGeneration: instance.Generation,
+		fieldPhase:              string(pgelasticv1alpha1.InstancePhaseTerminating),
+		fieldConditions: []any{
+			condition(instance.Status.Conditions, pgelasticv1alpha1.ConditionReady, false,
+				instance.Generation, pgelasticv1alpha1.ReasonTenantsStillBound,
+				fmt.Sprintf("deletion is held: %d tenant(s) are still on this instance and "+
+					"their data lives on its volumes - %s. Migrate or release them first.",
+					len(tenants), strings.Join(tenants, ", "))),
 		},
 	}
 	return r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(object),
