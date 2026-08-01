@@ -152,8 +152,8 @@ func TestTheTargetInstanceNameDefaultsToTheRestoresOwn(t *testing.T) {
 	if got := restoreTargetInstance(restore); got != "recover-friday" {
 		t.Errorf("target = %q, want the restore's own name", got)
 	}
-	restore.Spec.TargetInstanceName = "pg-a-recovered"
-	if got := restoreTargetInstance(restore); got != "pg-a-recovered" {
+	restore.Spec.TargetInstanceName = recoveredInstanceName
+	if got := restoreTargetInstance(restore); got != recoveredInstanceName {
 		t.Errorf("target = %q, want the name that was asked for", got)
 	}
 }
@@ -217,7 +217,7 @@ func TestABackupOfAnotherInstanceIsRefused(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: sourceInstanceName},
 	}
 	restore := &pgelasticv1alpha1.PgRestore{
-		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-it-back"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: restoreObjectName},
 		Spec: pgelasticv1alpha1.PgRestoreSpec{
 			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
 			BackupRef:         &corev1.LocalObjectReference{Name: backupName},

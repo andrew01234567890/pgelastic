@@ -34,12 +34,14 @@ import (
 )
 
 const (
-	credentialNamespace = "shop"
-	sourceInstanceName  = "pg-a"
-	sourcePassword      = "the-password-the-catalogue-was-backed-up-with"
-	backupName          = "friday"
-	repositoryPath      = "/pgelastic"
-	objectStoreSecret   = "object-store-credentials"
+	credentialNamespace   = "shop"
+	sourceInstanceName    = "pg-a"
+	sourcePassword        = "the-password-the-catalogue-was-backed-up-with"
+	backupName            = "friday"
+	repositoryPath        = "/pgelastic"
+	objectStoreSecret     = "object-store-credentials"
+	recoveredInstanceName = "pg-a-recovered"
+	restoreObjectName     = "put-it-back"
 )
 
 func credentialScheme(t *testing.T) *runtime.Scheme {
@@ -85,7 +87,7 @@ func recoveredInstance(name string) *pgelasticv1alpha1.PgInstance {
 // network can reach it - while the Secret itself looks perfectly well-formed.
 func TestARestoredInstanceIsHandedItsSourcesCredentials(t *testing.T) {
 	scheme := credentialScheme(t)
-	restored := recoveredInstance("pg-a-recovered")
+	restored := recoveredInstance(recoveredInstanceName)
 	kube := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(sourceCredentials(), restored).Build()
 	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
@@ -98,7 +100,7 @@ func TestARestoredInstanceIsHandedItsSourcesCredentials(t *testing.T) {
 	got := &corev1.Secret{}
 	if err := kube.Get(context.Background(), types.NamespacedName{
 		Namespace: credentialNamespace,
-		Name:      provision.CredentialsSecretName("pg-a-recovered"),
+		Name:      provision.CredentialsSecretName(recoveredInstanceName),
 	}, got); err != nil {
 		t.Fatalf("reading the restored instance's credentials: %v", err)
 	}
@@ -115,7 +117,7 @@ func TestARestoredInstanceIsHandedItsSourcesCredentials(t *testing.T) {
 	}
 	// Owned by the instance, so it is collected with it. The throwaway instance a tenant
 	// restore recovers into would otherwise leave the source's live passwords behind.
-	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].Name != "pg-a-recovered" {
+	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].Name != recoveredInstanceName {
 		t.Errorf("ownerReferences = %+v, want the recovered instance", got.OwnerReferences)
 	}
 }
@@ -156,7 +158,7 @@ func TestAHandAuthoredRestoringInstanceIsGivenNoCredentials(t *testing.T) {
 // discovered during the restore it was needed for.
 func TestAHandOverWithNoSourceCredentialsFailsLoudly(t *testing.T) {
 	scheme := credentialScheme(t)
-	restored := recoveredInstance("pg-a-recovered")
+	restored := recoveredInstance(recoveredInstanceName)
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(restored).Build()
 	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
 
@@ -213,7 +215,7 @@ func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
 		},
 	}
 	restore := &pgelasticv1alpha1.PgRestore{
-		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-it-back"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: restoreObjectName},
 		Spec: pgelasticv1alpha1.PgRestoreSpec{
 			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
 			BackupRef:         &corev1.LocalObjectReference{Name: backupName},
@@ -269,7 +271,7 @@ func TestARestoreWithNoObjectStoreCredentialsIsRefused(t *testing.T) {
 		},
 	}
 	restore := &pgelasticv1alpha1.PgRestore{
-		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-it-back"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: restoreObjectName},
 		Spec: pgelasticv1alpha1.PgRestoreSpec{
 			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
 			BackupRef:         &corev1.LocalObjectReference{Name: backupName},
