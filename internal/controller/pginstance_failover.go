@@ -24,6 +24,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -110,9 +111,44 @@ func (r *PgInstanceReconciler) reconcileFailover(
 
 	decision := ha.Decide(observation)
 	recordFailoverDecision(instance, decision)
+	logFailoverDecision(ctx, instance, decision)
+	return decision
+}
+
+// logFailoverDecision says what the operator decided, on the passes where it decided
+// something different.
+//
+// This runs on every reconcile of every instance, and the suites that most need to be read -
+// the e2e ones - enable V(1). Logging unconditionally buried the handful of lines that
+// explain a failure under thousands saying nothing had changed, which is how a debug log
+// stops being read at all.
+//
+// The comparison is against the FailingOver condition rather than against state kept here,
+// because that condition already carries the previous pass's reason and message: this runs
+// before the conditions for this pass are written, so what is on the object is exactly what
+// was decided last time.
+func logFailoverDecision(
+	ctx context.Context,
+	instance *pgelasticv1alpha1.PgInstance,
+	decision ha.Decision,
+) {
+	if !failoverDecisionIsNews(instance, decision) {
+		return
+	}
 	logf.FromContext(ctx).V(1).Info("failover decision", "phase", decision.Phase,
 		"reason", decision.Reason, "message", decision.Message)
-	return decision
+}
+
+// failoverDecisionIsNews reports whether this decision differs from the one the object
+// already records.
+func failoverDecisionIsNews(
+	instance *pgelasticv1alpha1.PgInstance,
+	decision ha.Decision,
+) bool {
+	previous := meta.FindStatusCondition(instance.Status.Conditions,
+		pgelasticv1alpha1.ConditionFailingOver)
+	return previous == nil || previous.Reason != failoverReason(decision) ||
+		previous.Message != decision.Message
 }
 
 // observeMembers asks every member directly and pairs its answer with the kubelet's verdict
