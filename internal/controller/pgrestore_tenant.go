@@ -29,6 +29,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 )
 
@@ -91,9 +92,15 @@ func (r *PgRestoreReconciler) reconcileTenantRestore(
 
 	status.Phase = pgelasticv1alpha1.RestorePhaseExtracting
 	if err := r.replaceTenant(ctx, restore, status, tenant, recovery); err != nil {
-		status.Error = err.Error()
+		// Terminal, rather than retried on the requeue. The copy loads with --clean, so a
+		// second attempt drops objects out of a live tenant database that somebody now needs
+		// to look at, and it would do that every fifteen seconds for ever. The recovery
+		// instance is deliberately left standing: it holds the only copy of what the tenant
+		// was supposed to end up containing.
 		log.Error(err, "the tenant could not be replaced from the recovered instance")
-		return restoreRequeue, nil
+		status.Phase = pgelasticv1alpha1.RestorePhaseFailed
+		status.Error = err.Error()
+		return 0, nil
 	}
 
 	// The recovery instance holds every other tenant of the source at the restored moment.
@@ -167,22 +174,71 @@ func (r *PgRestoreReconciler) replaceTenant(
 		return err
 	}
 
-	plan := migration.Plan{
-		Source:      recovered,
-		Target:      live,
-		Concurrency: migration.DefaultDumpJobs,
-		DumpDir:     filepath.Join(migration.ScratchDir, restore.Namespace+"_"+restore.Name),
+	// SourceConnInfo is the only thing that points pg_dump at the recovered instance. Both
+	// commands run inside the live target's own Pod, so plan.Source addresses nothing on the
+	// offline path: without a connection string libpq falls back to its defaults and dumps
+	// the target's own local database over the top of itself.
+	//
+	// The credential is the recovery instance's, and it works because a restored instance is
+	// given its source's credentials rather than fresh ones - its catalogue is the source's,
+	// copied verbatim by pgbackrest, so nothing else would authenticate.
+	password, err := replicationPassword(ctx, r.Client, restore.Namespace, recovery.Name)
+	if err != nil {
+		return fmt.Errorf("could not read the recovered instance's replication credential: %w", err)
 	}
 
-	if err := migration.FenceSource(ctx, r.SQL, live); err != nil {
+	plan := migration.Plan{
+		Source:         recovered,
+		Target:         live,
+		SourceConnInfo: sourceConnInfo(recovery, tenant.Spec.DatabaseName, password),
+		Concurrency:    migration.DefaultDumpJobs,
+		DumpDir:        filepath.Join(migration.ScratchDir, restore.Namespace+"_"+restore.Name),
+	}
+
+	// The replication role can authenticate against the recovered instance and cannot read a
+	// thing on it. A tenant's database revokes PUBLIC and grants CONNECT back to its own roles
+	// and the ops role only, and the recovered copy inherits exactly those grants, so pg_dump
+	// is refused before it reads a row. The migration path issues the same grants before its
+	// own offline copy.
+	//
+	// They do not die with the recovery instance, however throwaway it is. pg_dump captures
+	// ACLs and pg_restore writes them into what it loads, so these grants ride the dump into
+	// the live tenant - which would leave a credential that lives in every member's
+	// environment holding SELECT on a customer's data. The migration path revokes them on the
+	// far side for exactly this reason; so does the deferred revoke below.
+	if err := migration.GrantSourceReads(
+		ctx, r.SQL, recovered, provision.ReplicationRole); err != nil {
+		return fmt.Errorf("could not give the dump read access to the recovered tenant: %w", err)
+	}
+
+	// Registered before the unfence so that it runs after it: the tenant is fenced for the
+	// whole copy, and a fenced database refuses connections, so the revoke has nothing to
+	// connect to until the unfence has run. Deferred rather than sequential because a copy
+	// that failed half way can still have written the ACLs.
+	defer func() {
+		if err := migration.RevokeReplicationReads(ctx, r.SQL, live); err != nil {
+			logf.FromContext(ctx).Error(err, "the replication role was left holding reads on "+
+				"the restored tenant", "tenant", tenant.Name)
+		}
+	}()
+
+	// The roles to hold out come from the recovered copy, which carries the same ones: the
+	// live database is about to be rewritten from it, and enumerating there means the answer
+	// does not depend on a live database that is halfway through being replaced.
+	tenantRoles, err := migration.EnumerateTenantRoles(ctx, r.SQL, recovered)
+	if err != nil {
+		return fmt.Errorf("could not read the roles the tenant's database depends on: %w", err)
+	}
+
+	if err := migration.HoldTenantOut(ctx, r.SQL, live, tenantRoles); err != nil {
 		return fmt.Errorf("could not hold the tenant still for the copy: %w", err)
 	}
-	// Unfencing runs on every exit, successful or not. A tenant left refusing connections
+	// Readmission runs on every exit, successful or not. A tenant left unable to connect
 	// after a restore that failed halfway is an outage caused by the recovery rather than by
 	// whatever the recovery was for.
 	defer func() {
-		if err := migration.UnfenceSource(ctx, r.SQL, live); err != nil {
-			logf.FromContext(ctx).Error(err, "the tenant was left refusing connections",
+		if err := migration.ReadmitTenant(ctx, r.SQL, live, tenantRoles); err != nil {
+			logf.FromContext(ctx).Error(err, "the tenant was left unable to connect",
 				"tenant", tenant.Name)
 		}
 	}()

@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -217,7 +216,7 @@ func (r *PgTenantMigrationReconciler) resolve(
 		pool = nil
 	}
 
-	password, err := r.replicationPassword(ctx, object.Namespace, source.Name)
+	password, err := replicationPassword(ctx, r.Client, object.Namespace, source.Name)
 	if err != nil {
 		return migration.Run{}, err
 	}
@@ -426,25 +425,6 @@ func (r *PgTenantMigrationReconciler) now() time.Time {
 		return r.Now()
 	}
 	return time.Now()
-}
-
-// replicationPassword reads the source's replication credential, which is what the
-// subscriber and pg_dump dial the source as. The superuser cannot be used for either: it
-// has no password at all and is reachable only over a Unix socket.
-func (r *PgTenantMigrationReconciler) replicationPassword(
-	ctx context.Context, namespace, instance string,
-) (string, error) {
-	secret := &corev1.Secret{}
-	key := types.NamespacedName{Namespace: namespace, Name: provision.CredentialsSecretName(instance)}
-	if err := r.Get(ctx, key, secret); err != nil {
-		return "", fmt.Errorf("credentials Secret for %q: %w", instance, err)
-	}
-	password, ok := secret.Data[provision.SecretKeyReplicationPassword]
-	if !ok {
-		return "", fmt.Errorf("the credentials Secret for %q has no %s",
-			instance, provision.SecretKeyReplicationPassword)
-	}
-	return string(password), nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -263,6 +263,71 @@ END $pgelastic$;`,
 // The online path appends these to the dump file so they commit with the schema and the stamp.
 // Offline restores with pg_restore --jobs, which is not one transaction, so its equivalent runs
 // here as ordinary statements against the target.
+// HoldTenantOut keeps a tenant's own roles out of its database while the database is being
+// rewritten underneath them.
+//
+// It is not FenceSource. A migration fences a source it is about to abandon, so
+// ALTER DATABASE ... ALLOW_CONNECTIONS false costs it nothing. A restore-in-place is rewriting
+// the database it fenced, and that setting admits nobody at all - pg_restore included, which
+// fails with "database is not currently accepting connections" before it writes a row.
+//
+// Revoking CONNECT stops the tenant's roles specifically. The restore runs as the superuser
+// over the Unix socket, and a superuser bypasses privilege checks, so it still gets in. The
+// backends already connected are terminated, because a revoke does not close a session that
+// is already open.
+func HoldTenantOut(ctx context.Context, sql SQL, target Endpoint, roles []RoleSpec) error {
+	postgres := target.WithDatabase("postgres")
+	name := QuoteIdentifier(target.Database)
+	for _, role := range roles {
+		if role.Name == "" {
+			continue
+		}
+		if err := sql.Exec(ctx, postgres, fmt.Sprintf(
+			`REVOKE CONNECT, TEMPORARY ON DATABASE %s FROM %s`,
+			name, QuoteIdentifier(role.Name))); err != nil {
+			return fmt.Errorf("holding %q out of %q: %w", role.Name, target.Database, err)
+		}
+	}
+	return sql.Exec(ctx, postgres, fmt.Sprintf(
+		`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()`,
+		QuoteLiteral(target.Database)))
+}
+
+// ReadmitTenant puts back what HoldTenantOut took away.
+//
+// It runs on every exit from the copy, successful or not: a tenant left unable to connect
+// after a restore that failed half way is an outage caused by the recovery rather than by
+// whatever the recovery was for.
+func ReadmitTenant(ctx context.Context, sql SQL, target Endpoint, roles []RoleSpec) error {
+	postgres := target.WithDatabase("postgres")
+	name := QuoteIdentifier(target.Database)
+	for _, role := range roles {
+		if role.Name == "" {
+			continue
+		}
+		if err := sql.Exec(ctx, postgres, fmt.Sprintf(
+			`GRANT CONNECT, TEMPORARY ON DATABASE %s TO %s`,
+			name, QuoteIdentifier(role.Name))); err != nil {
+			return fmt.Errorf("readmitting %q to %q: %w", role.Name, target.Database, err)
+		}
+	}
+	return nil
+}
+
+// RevokeReplicationReads takes back the reads GrantSourceReads made, on the far side.
+//
+// The far side is the point. pg_dump captures ACLs and pg_restore writes them into the
+// database it loads, so the grants made on the source to let the dump read ride the dump into
+// the copy. They do not die with the source, however throwaway it was. Leaving them behind
+// permanently gives a credential that lives in every member's environment read access to the
+// tenant's data.
+func RevokeReplicationReads(ctx context.Context, sql SQL, target Endpoint) error {
+	if err := sql.Exec(ctx, target, revokeReplicationGrantsSQL()); err != nil {
+		return fmt.Errorf("revoking the replication role's reads on the target: %w", err)
+	}
+	return nil
+}
+
 func SettleTargetGrants(ctx context.Context, sql SQL, plan Plan, owner string) error {
 	roles, err := EnumerateTenantRoles(ctx, sql, plan.Source)
 	if err != nil {
@@ -274,8 +339,8 @@ func SettleTargetGrants(ctx context.Context, sql SQL, plan Plan, owner string) e
 			return fmt.Errorf("applying the target database's ACL: %w", err)
 		}
 	}
-	if err := sql.Exec(ctx, plan.Target, revokeReplicationGrantsSQL()); err != nil {
-		return fmt.Errorf("revoking the replication role's reads on the target: %w", err)
+	if err := RevokeReplicationReads(ctx, sql, plan.Target); err != nil {
+		return err
 	}
 	return nil
 }
