@@ -17,11 +17,15 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/ha"
@@ -148,8 +152,8 @@ func TestTheTargetInstanceNameDefaultsToTheRestoresOwn(t *testing.T) {
 	if got := restoreTargetInstance(restore); got != "recover-friday" {
 		t.Errorf("target = %q, want the restore's own name", got)
 	}
-	restore.Spec.TargetInstanceName = "pg-a-recovered"
-	if got := restoreTargetInstance(restore); got != "pg-a-recovered" {
+	restore.Spec.TargetInstanceName = recoveredInstanceName
+	if got := restoreTargetInstance(restore); got != recoveredInstanceName {
 		t.Errorf("target = %q, want the name that was asked for", got)
 	}
 }
@@ -187,6 +191,117 @@ func TestACompletedRestoreStaysCompleted(t *testing.T) {
 	}
 	if got := restorePhase(status); got != pgelasticv1alpha1.RestorePhaseCompleted {
 		t.Fatalf("phase = %q, want it to stay Completed", got)
+	}
+}
+
+// Naming a backup skipped the check the unnamed path does. A backup of somebody else carries
+// somebody else's stanza and repository, so the recovered instance would be a copy of an
+// instance this restore never named - while the credentials handed to it are the named
+// source's, which that catalogue has never seen. It is also the second route into handing an
+// arbitrary instance's live passwords to whoever asked.
+func TestABackupOfAnotherInstanceIsRefused(t *testing.T) {
+	scheme := credentialScheme(t)
+	stopped := metav1.NewTime(time.Date(2026, 8, 1, 2, 0, 0, 0, time.UTC))
+	somebodyElses := &pgelasticv1alpha1.PgBackup{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: backupName},
+		Spec: pgelasticv1alpha1.PgBackupSpec{
+			InstanceRef: corev1.LocalObjectReference{Name: "somebody-else"},
+		},
+		Status: pgelasticv1alpha1.PgBackupStatus{
+			Phase:     pgelasticv1alpha1.BackupPhaseCompleted,
+			StoppedAt: &stopped,
+			Stanza:    "pgelastic-somebody-else",
+		},
+	}
+	source := &pgelasticv1alpha1.PgInstance{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: sourceInstanceName},
+	}
+	restore := &pgelasticv1alpha1.PgRestore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: restoreObjectName},
+		Spec: pgelasticv1alpha1.PgRestoreSpec{
+			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
+			BackupRef:         &corev1.LocalObjectReference{Name: backupName},
+		},
+	}
+
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(somebodyElses, source, restore).Build()
+	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
+
+	plan, reason, err := reconciler.planRestore(context.Background(), restore)
+	if err != nil {
+		t.Fatalf("planning: %v", err)
+	}
+	if reason == "" {
+		t.Fatalf("planned %v from a backup of a different instance", plan)
+	}
+	if !strings.Contains(reason, "somebody-else") {
+		t.Errorf("reason = %q, want it to name whose backup it actually is", reason)
+	}
+}
+
+// A copy that failed half way is terminal, and has to survive the phase projection to say
+// so. It carries an error, and the Preflight case is written in terms of an error, so
+// without the terminal check first a failed restore reports itself as a planning problem -
+// sending whoever reads it to check a spec that was never the trouble.
+func TestAFailedRestoreStaysFailed(t *testing.T) {
+	status := &pgelasticv1alpha1.PgRestoreStatus{
+		Phase: pgelasticv1alpha1.RestorePhaseFailed,
+		Error: "pg_restore exited 1 half way through loading the tenant",
+	}
+	if got := restorePhase(status); got != pgelasticv1alpha1.RestorePhaseFailed {
+		t.Fatalf("phase = %q, want it to stay Failed", got)
+	}
+
+	restore := &pgelasticv1alpha1.PgRestore{ObjectMeta: metav1.ObjectMeta{Generation: 3}}
+	conditions := restoreConditions(restore, status)
+
+	// Accepted stays true: this restore was planned and then went wrong during the copy,
+	// which is a different thing from one that could never have been planned.
+	if accepted := findCondition(conditions, pgelasticv1alpha1.ConditionAccepted); accepted == nil ||
+		accepted.Status != metav1.ConditionTrue {
+		t.Errorf("accepted = %v, want True", accepted)
+	}
+	// Nothing is still converging towards a restore that has ended.
+	if progressing := findCondition(conditions,
+		pgelasticv1alpha1.ConditionProgressing); progressing == nil ||
+		progressing.Status != metav1.ConditionFalse {
+		t.Errorf("progressing = %v, want False", progressing)
+	}
+	ready := findCondition(conditions, pgelasticv1alpha1.ConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse {
+		t.Fatalf("ready = %v, want False", ready)
+	}
+	if ready.Reason != pgelasticv1alpha1.ReasonRestoreFailed {
+		t.Errorf("reason = %q, want %q", ready.Reason, pgelasticv1alpha1.ReasonRestoreFailed)
+	}
+	if ready.Message != status.Error {
+		t.Errorf("message = %q, want what went wrong", ready.Message)
+	}
+}
+
+// Both terminal phases have to be recognised as terminal, because converge asks this before
+// it does anything else. A tenant restore that reached here again rebuilt its recovery
+// instance and ran pg_restore --clean over the live tenant a second time.
+func TestBothEndingsAreTerminal(t *testing.T) {
+	for _, phase := range []pgelasticv1alpha1.RestorePhase{
+		pgelasticv1alpha1.RestorePhaseCompleted,
+		pgelasticv1alpha1.RestorePhaseFailed,
+	} {
+		if !isTerminalRestore(phase) {
+			t.Errorf("%s is not terminal, so a restore in it is reconciled again", phase)
+		}
+	}
+	for _, phase := range []pgelasticv1alpha1.RestorePhase{
+		"",
+		pgelasticv1alpha1.RestorePhasePreflight,
+		pgelasticv1alpha1.RestorePhaseRecovering,
+		pgelasticv1alpha1.RestorePhaseExtracting,
+		pgelasticv1alpha1.RestorePhaseLoading,
+	} {
+		if isTerminalRestore(phase) {
+			t.Errorf("%q is terminal, so a restore in it would never make progress", phase)
+		}
 	}
 }
 

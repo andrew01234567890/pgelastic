@@ -91,16 +91,27 @@ func (r *PgRestoreReconciler) reconcileTenantRestore(
 	}
 
 	status.Phase = pgelasticv1alpha1.RestorePhaseExtracting
-	if err := r.replaceTenant(ctx, restore, status, tenant, recovery); err != nil {
-		// Terminal, rather than retried on the requeue. The copy loads with --clean, so a
-		// second attempt drops objects out of a live tenant database that somebody now needs
-		// to look at, and it would do that every fifteen seconds for ever. The recovery
-		// instance is deliberately left standing: it holds the only copy of what the tenant
-		// was supposed to end up containing.
+	touched, err := r.replaceTenant(ctx, restore, status, tenant, recovery)
+	switch {
+	case err != nil && touched:
+		// Terminal only once the live tenant has been touched. The copy loads with --clean,
+		// so a second attempt drops objects out of a database somebody now needs to look at,
+		// and it would do that every fifteen seconds for ever. The recovery instance is
+		// deliberately left standing: it holds the only copy of what the tenant was supposed
+		// to end up containing.
 		log.Error(err, "the tenant could not be replaced from the recovered instance")
 		status.Phase = pgelasticv1alpha1.RestorePhaseFailed
 		status.Error = err.Error()
 		return 0, nil
+	case err != nil:
+		// Nothing has been written yet - reading a collation, resolving a credential, issuing
+		// a grant. These fail for reasons that pass, and a recovery instance that has only
+		// just gone Ready is the commonest of them. Failing terminally here would strand a
+		// restore that had done nothing wrong, and an immutable spec means the only way back
+		// is to create another one.
+		log.Error(err, "the tenant restore could not start its copy; retrying")
+		status.Error = err.Error()
+		return restoreRequeue, nil
 	}
 
 	// The recovery instance holds every other tenant of the source at the restored moment.
@@ -137,6 +148,11 @@ func (r *PgRestoreReconciler) startTenantRecovery(
 
 	if err := r.Create(ctx, plan); err != nil && !apierrors.IsAlreadyExists(err) {
 		status.Error = err.Error()
+		return restoreRequeue, nil
+	}
+	if err := r.handOverCredentials(
+		ctx, restore.Spec.SourceInstanceRef.Name, plan); err != nil {
+		status.Error = err.Error()
 	}
 	return restoreRequeue, nil
 }
@@ -148,13 +164,16 @@ func (r *PgRestoreReconciler) startTenantRecovery(
 // whatever was written during it, and unlike a migration there is no replication stream to
 // close that gap with - so the alternative to a pause is a restore that silently keeps some
 // of the data it was asked to discard.
+// The bool reports whether the live tenant was touched. Everything before the fence is a
+// read or a grant on the throwaway recovery instance, and can be retried; from the fence
+// onward the live database has been altered and a second pass would drop objects out of it.
 func (r *PgRestoreReconciler) replaceTenant(
 	ctx context.Context,
 	restore *pgelasticv1alpha1.PgRestore,
 	status *pgelasticv1alpha1.PgRestoreStatus,
 	tenant *pgelasticv1alpha1.PgTenant,
 	recovery *pgelasticv1alpha1.PgInstance,
-) error {
+) (touched bool, copyErr error) {
 	live := migration.Endpoint{
 		Namespace: restore.Namespace,
 		Instance:  tenant.Status.Binding.InstanceRef.Name,
@@ -171,7 +190,7 @@ func (r *PgRestoreReconciler) replaceTenant(
 	// instance inherits its collation from the backup it was restored from, so a source
 	// whose contract has since changed is caught here rather than at the first index scan.
 	if err := r.checkCollationMatches(ctx, recovered, live); err != nil {
-		return err
+		return false, err
 	}
 
 	// SourceConnInfo is the only thing that points pg_dump at the recovered instance. Both
@@ -184,7 +203,7 @@ func (r *PgRestoreReconciler) replaceTenant(
 	// copied verbatim by pgbackrest, so nothing else would authenticate.
 	password, err := replicationPassword(ctx, r.Client, restore.Namespace, recovery.Name)
 	if err != nil {
-		return fmt.Errorf("could not read the recovered instance's replication credential: %w", err)
+		return false, fmt.Errorf("could not read the recovered instance's replication credential: %w", err)
 	}
 
 	plan := migration.Plan{
@@ -208,17 +227,25 @@ func (r *PgRestoreReconciler) replaceTenant(
 	// far side for exactly this reason; so does the deferred revoke below.
 	if err := migration.GrantSourceReads(
 		ctx, r.SQL, recovered, provision.ReplicationRole); err != nil {
-		return fmt.Errorf("could not give the dump read access to the recovered tenant: %w", err)
+		return false, fmt.Errorf("could not give the dump read access to the recovered tenant: %w", err)
 	}
 
 	// Registered before the unfence so that it runs after it: the tenant is fenced for the
 	// whole copy, and a fenced database refuses connections, so the revoke has nothing to
 	// connect to until the unfence has run. Deferred rather than sequential because a copy
 	// that failed half way can still have written the ACLs.
+	// Failing the restore rather than logging. These reads are on the live tenant's own
+	// tables, and a restore that reported Completed with them still in place would never be
+	// looked at again - isTerminalRestore sees to that - so the grant would outlive everyone
+	// who could have noticed it. The migration path fails for the same reason.
 	defer func() {
 		if err := migration.RevokeReplicationReads(ctx, r.SQL, live); err != nil {
 			logf.FromContext(ctx).Error(err, "the replication role was left holding reads on "+
 				"the restored tenant", "tenant", tenant.Name)
+			if copyErr == nil {
+				copyErr = fmt.Errorf("the copy finished and the replication role's reads on "+
+					"%s could not be taken back: %w", tenant.Spec.DatabaseName, err)
+			}
 		}
 	}()
 
@@ -227,11 +254,11 @@ func (r *PgRestoreReconciler) replaceTenant(
 	// does not depend on a live database that is halfway through being replaced.
 	tenantRoles, err := migration.EnumerateTenantRoles(ctx, r.SQL, recovered)
 	if err != nil {
-		return fmt.Errorf("could not read the roles the tenant's database depends on: %w", err)
+		return false, fmt.Errorf("could not read the roles the tenant's database depends on: %w", err)
 	}
 
 	if err := migration.HoldTenantOut(ctx, r.SQL, live, tenantRoles); err != nil {
-		return fmt.Errorf("could not hold the tenant still for the copy: %w", err)
+		return false, fmt.Errorf("could not hold the tenant still for the copy: %w", err)
 	}
 	// Readmission runs on every exit, successful or not. A tenant left unable to connect
 	// after a restore that failed halfway is an outage caused by the recovery rather than by
@@ -252,7 +279,8 @@ func (r *PgRestoreReconciler) replaceTenant(
 	}()
 
 	status.Phase = pgelasticv1alpha1.RestorePhaseLoading
-	return migration.CopyOffline(ctx, r.Shell, plan)
+	touched, copyErr = true, migration.CopyOffline(ctx, r.Shell, plan)
+	return touched, copyErr
 }
 
 // checkCollationMatches refuses a copy between two databases whose text-handling identity

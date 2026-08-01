@@ -111,6 +111,7 @@ const (
 	ReasonRunning             = "Running"
 	ReasonBackupCompleted     = "BackupCompleted"
 	ReasonBackupFailed        = "BackupFailed"
+	ReasonRestoreFailed       = "RestoreFailed"
 	ReasonRecloning           = "Recloning"
 	ReasonPreflightFailed     = "PreflightFailed"
 	ReasonCutoverComplete     = "CutoverComplete"

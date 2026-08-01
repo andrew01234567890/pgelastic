@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -30,8 +31,10 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
 )
@@ -63,6 +66,7 @@ type PgRestoreReconciler struct {
 
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgrestores,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgrestores/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile converges one PgRestore.
 func (r *PgRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -109,6 +113,17 @@ func (r *PgRestoreReconciler) converge(
 	restore *pgelasticv1alpha1.PgRestore,
 	status *pgelasticv1alpha1.PgRestoreStatus,
 ) (time.Duration, error) {
+	// A restore is a one-shot fact with an immutable spec, so once it has ended there is
+	// nothing left to converge towards. Two things depend on saying so before anything else:
+	// a target deleted after the restore finished is somebody's decision about an instance
+	// rather than a regression of the restore that produced it, and - the reason this guard
+	// is above the scope switch rather than below it - a finished tenant restore reached
+	// here again on the very status write that recorded its success, and rebuilt the
+	// recovery instance and loaded the dump back over the live tenant every time.
+	if isTerminalRestore(status.Phase) {
+		return 0, nil
+	}
+
 	if restore.Spec.Scope == pgelasticv1alpha1.RestoreScopeTenant {
 		return r.reconcileTenantRestore(ctx, restore, status)
 	}
@@ -124,12 +139,6 @@ func (r *PgRestoreReconciler) converge(
 		return 0, err
 	}
 
-	if status.Phase == pgelasticv1alpha1.RestorePhaseCompleted {
-		// The target was deleted after the restore finished. That is somebody's decision
-		// about an instance, not a regression of the restore that produced it.
-		return 0, nil
-	}
-
 	plan, reason, err := r.planRestore(ctx, restore)
 	if err != nil {
 		return 0, err
@@ -142,6 +151,10 @@ func (r *PgRestoreReconciler) converge(
 	status.Error = ""
 	status.BackupID = plan.Spec.Restore.BackupID
 	if err := r.Create(ctx, plan); err != nil && !apierrors.IsAlreadyExists(err) {
+		status.Error = err.Error()
+		return restoreRequeue, nil
+	}
+	if err := r.handOverCredentials(ctx, restore.Spec.SourceInstanceRef.Name, plan); err != nil {
 		status.Error = err.Error()
 		return restoreRequeue, nil
 	}
@@ -202,6 +215,22 @@ func (r *PgRestoreReconciler) planRestore(
 			"restoring without the source instance needs its sizing, which is not yet "+
 				"recorded on a backup; recreate %s first", restore.Spec.SourceInstanceRef.Name)
 	}
+	// The recovered instance inherits the source's role passwords, because the catalogue it
+	// restores is the source's. Checking here means a missing Secret is a reason an operator
+	// can read on the restore, rather than an instance that provisions and never comes up.
+	credentials := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: restore.Namespace,
+		Name:      provision.CredentialsSecretName(source.Name),
+	}, credentials); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, "", err
+		}
+		return nil, fmt.Sprintf(
+			"%s has no credentials Secret, and a restored instance's roles keep the "+
+				"passwords its catalogue was backed up with, so there would be nothing able "+
+				"to reach the recovered instance", source.Name), nil
+	}
 
 	// The backup records where it was written but not what to authenticate with: the agent
 	// is configured with pgBackRest's own settings and never learns which Secret they were
@@ -257,6 +286,53 @@ func (r *PgRestoreReconciler) planRestore(
 	return instance, "", nil
 }
 
+// handOverCredentials gives the instance this restore just created the source's role
+// passwords, which are the ones its restored catalogue holds.
+//
+// It lives here rather than in the instance controller because of who is allowed to ask.
+// spec.restore is a plain field on a namespaced object, so an instance controller that
+// copied the Secret it names would hand anybody who can create a PgInstance the replication,
+// ops and rewind passwords of any instance they cared to name - all three live against the
+// instance they came from, and reachable over the network from anywhere pg_hba admits. This
+// path is reached only after resolveBackup has found a completed backup belonging to that
+// same source.
+//
+// The Secret is owned by the instance, so it is collected with it - which matters most for
+// the throwaway instance a tenant restore recovers into.
+func (r *PgRestoreReconciler) handOverCredentials(
+	ctx context.Context,
+	source string,
+	instance *pgelasticv1alpha1.PgInstance,
+) error {
+	target := provision.CredentialsSecretName(instance.Name)
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: instance.Namespace, Name: target}, existing)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	from := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: instance.Namespace, Name: provision.CredentialsSecretName(source),
+	}, from); err != nil {
+		return fmt.Errorf("reading %s's credentials, which %s's restored catalogue holds: %w",
+			source, instance.Name, err)
+	}
+
+	handed := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: target, Namespace: instance.Namespace},
+		Type:       from.Type,
+		Data:       from.Data,
+	}
+	if err := controllerutil.SetControllerReference(instance, handed, r.Scheme); err != nil {
+		return err
+	}
+	return client.IgnoreAlreadyExists(r.Create(ctx, handed))
+}
+
 // resolveBackup finds the base backup this restore starts from.
 //
 // A named backup is used as named. An unnamed one is chosen from the instance's completed
@@ -281,6 +357,14 @@ func (r *PgRestoreReconciler) resolveBackup(
 		case backup.Status.Phase != pgelasticv1alpha1.BackupPhaseCompleted:
 			return nil, fmt.Sprintf("%s is %s rather than Completed, so there is nothing to "+
 				"restore from", named.Name, backup.Status.Phase), nil
+		case backup.Spec.InstanceRef.Name != restore.Spec.SourceInstanceRef.Name:
+			// The unnamed branch filters by instance; naming one skipped the check entirely.
+			// A backup of somebody else carries somebody else's stanza and repository, so the
+			// recovered instance would be a copy of an instance this restore never named -
+			// and the credentials handed to it are the named source's, which its restored
+			// catalogue has never seen.
+			return nil, fmt.Sprintf("%s is a backup of %s, not of %s", named.Name,
+				backup.Spec.InstanceRef.Name, restore.Spec.SourceInstanceRef.Name), nil
 		}
 		return backup, "", nil
 	}
@@ -371,13 +455,17 @@ func restoreConditions(
 	restore *pgelasticv1alpha1.PgRestore,
 	status *pgelasticv1alpha1.PgRestoreStatus,
 ) []metav1.Condition {
-	accepted := status.Error == ""
+	// A restore that was planned and then failed part-way through the copy was accepted.
+	// What went wrong belongs on Ready, because reporting it as a preflight refusal would
+	// send whoever reads it back to check a spec that was never the problem.
+	failed := status.Phase == pgelasticv1alpha1.RestorePhaseFailed
+	accepted := status.Error == "" || failed
 	reason, message := pgelasticv1alpha1.ReasonAccepted, "the restore can be planned"
 	if !accepted {
 		reason, message = pgelasticv1alpha1.ReasonPreflightFailed, status.Error
 	}
 
-	done := status.Phase == pgelasticv1alpha1.RestorePhaseCompleted
+	done := isTerminalRestore(status.Phase)
 	conditions := make([]metav1.Condition, 0, 3)
 	conditions = append(conditions,
 		newCondition(status.Conditions, pgelasticv1alpha1.ConditionAccepted, accepted,
@@ -385,9 +473,9 @@ func restoreConditions(
 		newCondition(status.Conditions, pgelasticv1alpha1.ConditionProgressing,
 			accepted && !done, restore.Generation, progressingRestoreReason(status),
 			fmt.Sprintf("%s is recovering", status.TargetInstance)),
-		newCondition(status.Conditions, pgelasticv1alpha1.ConditionReady, done,
-			restore.Generation, readyRestoreReason(done),
-			fmt.Sprintf("%s is serving on its own timeline", status.TargetInstance)),
+		newCondition(status.Conditions, pgelasticv1alpha1.ConditionReady,
+			status.Phase == pgelasticv1alpha1.RestorePhaseCompleted,
+			restore.Generation, readyRestoreReason(status), readyRestoreMessage(status)),
 	)
 	return conditions
 }
@@ -399,20 +487,39 @@ func progressingRestoreReason(status *pgelasticv1alpha1.PgRestoreStatus) string 
 	return pgelasticv1alpha1.ReasonPending
 }
 
-func readyRestoreReason(done bool) string {
-	if done {
+func readyRestoreReason(status *pgelasticv1alpha1.PgRestoreStatus) string {
+	switch status.Phase {
+	case pgelasticv1alpha1.RestorePhaseCompleted:
 		return pgelasticv1alpha1.ReasonReady
+	case pgelasticv1alpha1.RestorePhaseFailed:
+		return pgelasticv1alpha1.ReasonRestoreFailed
+	default:
+		return pgelasticv1alpha1.ReasonPending
 	}
-	return pgelasticv1alpha1.ReasonPending
+}
+
+func readyRestoreMessage(status *pgelasticv1alpha1.PgRestoreStatus) string {
+	if status.Phase == pgelasticv1alpha1.RestorePhaseFailed {
+		return status.Error
+	}
+	return fmt.Sprintf("%s is serving on its own timeline", status.TargetInstance)
+}
+
+// isTerminalRestore reports whether a restore has ended, either way. A restore is a one-shot
+// fact and its spec is immutable, so trying again means creating another one.
+func isTerminalRestore(phase pgelasticv1alpha1.RestorePhase) bool {
+	return phase == pgelasticv1alpha1.RestorePhaseCompleted ||
+		phase == pgelasticv1alpha1.RestorePhaseFailed
 }
 
 // restorePhase derives the display phase. A restore that cannot be planned is Preflight
 // with the reason on its Accepted condition rather than Failed, because every one of those
-// reasons is something an operator can put right without starting again.
+// reasons is something an operator can put right without starting again - unlike a copy that
+// failed half way, which is terminal and says so.
 func restorePhase(status *pgelasticv1alpha1.PgRestoreStatus) pgelasticv1alpha1.RestorePhase {
 	switch {
-	case status.Phase == pgelasticv1alpha1.RestorePhaseCompleted:
-		return pgelasticv1alpha1.RestorePhaseCompleted
+	case isTerminalRestore(status.Phase):
+		return status.Phase
 	case status.Error != "":
 		return pgelasticv1alpha1.RestorePhasePreflight
 	case status.Phase == "":

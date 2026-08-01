@@ -34,12 +34,14 @@ import (
 )
 
 const (
-	credentialNamespace = "shop"
-	sourceInstanceName  = "pg-a"
-	sourcePassword      = "the-password-the-catalogue-was-backed-up-with"
-	backupName          = "friday"
-	repositoryPath      = "/pgelastic"
-	objectStoreSecret   = "object-store-credentials"
+	credentialNamespace   = "shop"
+	sourceInstanceName    = "pg-a"
+	sourcePassword        = "the-password-the-catalogue-was-backed-up-with"
+	backupName            = "friday"
+	repositoryPath        = "/pgelastic"
+	objectStoreSecret     = "object-store-credentials"
+	recoveredInstanceName = "pg-a-recovered"
+	restoreObjectName     = "put-it-back"
 )
 
 func credentialScheme(t *testing.T) *runtime.Scheme {
@@ -83,51 +85,59 @@ func recoveredInstance(name string) *pgelasticv1alpha1.PgInstance {
 // keep the source's passwords. A fresh Secret would describe a cluster that has never
 // existed: every standby fails SCRAM cloning from its own primary, and nothing on the
 // network can reach it - while the Secret itself looks perfectly well-formed.
-func TestARestoredInstanceInheritsItsSourcesCredentials(t *testing.T) {
+func TestARestoredInstanceIsHandedItsSourcesCredentials(t *testing.T) {
 	scheme := credentialScheme(t)
-	restored := recoveredInstance("pg-a-recovered")
+	restored := recoveredInstance(recoveredInstanceName)
 	kube := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(sourceCredentials(), restored).Build()
-	reconciler := &PgInstanceReconciler{Client: kube, Scheme: scheme}
+	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
 
-	if err := reconciler.ensureCredentials(context.Background(), restored); err != nil {
-		t.Fatalf("ensuring credentials: %v", err)
+	if err := reconciler.handOverCredentials(
+		context.Background(), sourceInstanceName, restored); err != nil {
+		t.Fatalf("handing over credentials: %v", err)
 	}
 
 	got := &corev1.Secret{}
 	if err := kube.Get(context.Background(), types.NamespacedName{
 		Namespace: credentialNamespace,
-		Name:      provision.CredentialsSecretName("pg-a-recovered"),
+		Name:      provision.CredentialsSecretName(recoveredInstanceName),
 	}, got); err != nil {
 		t.Fatalf("reading the restored instance's credentials: %v", err)
 	}
 
+	want := sourceCredentials()
 	for _, key := range []string{
 		provision.SecretKeyReplicationPassword,
 		provision.SecretKeyOpsPassword,
 		provision.SecretKeyRewindPassword,
 	} {
-		if string(got.Data[key]) != string(sourceCredentials().Data[key]) {
+		if string(got.Data[key]) != string(want.Data[key]) {
 			t.Errorf("%s = %q, want the source's", key, got.Data[key])
 		}
 	}
+	// Owned by the instance, so it is collected with it. The throwaway instance a tenant
+	// restore recovers into would otherwise leave the source's live passwords behind.
+	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].Name != recoveredInstanceName {
+		t.Errorf("ownerReferences = %+v, want the recovered instance", got.OwnerReferences)
+	}
 }
 
-// Failing is the only safe answer. Minting fresh passwords instead would produce an instance
-// that provisions cleanly, reports itself healthy, and cannot be reached by anything -
-// discovered during the restore it was needed for.
-func TestARestoreWithNoSourceCredentialsFailsLoudly(t *testing.T) {
+// spec.restore is a plain field on a namespaced object. An instance controller that copied
+// the Secret it names would hand anybody who can create a PgInstance the replication, ops and
+// rewind passwords of any instance they cared to name - all three live against the instance
+// they came from. So the instance controller mints nothing and copies nothing here; it waits
+// for the restore controller, which gets there only after resolving a backup that belongs to
+// the source.
+func TestAHandAuthoredRestoringInstanceIsGivenNoCredentials(t *testing.T) {
 	scheme := credentialScheme(t)
-	restored := recoveredInstance("pg-a-recovered")
-	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(restored).Build()
+	// The shape an attacker would write: name somebody else's instance as the source.
+	forged := recoveredInstance("attacker-owned")
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(sourceCredentials(), forged).Build()
 	reconciler := &PgInstanceReconciler{Client: kube, Scheme: scheme}
 
-	err := reconciler.ensureCredentials(context.Background(), restored)
-	if err == nil {
-		t.Fatal("credentials were invented for an instance whose catalogue has its own")
-	}
-	if !strings.Contains(err.Error(), sourceInstanceName) {
-		t.Errorf("error = %q, want it to name the source whose Secret is missing", err)
+	if err := reconciler.ensureCredentials(context.Background(), forged); err != nil {
+		t.Fatalf("ensuring credentials: %v", err)
 	}
 
 	secrets := &corev1.SecretList{}
@@ -135,8 +145,29 @@ func TestARestoreWithNoSourceCredentialsFailsLoudly(t *testing.T) {
 		client.InNamespace(credentialNamespace)); err != nil {
 		t.Fatalf("listing: %v", err)
 	}
-	if len(secrets.Items) != 0 {
-		t.Errorf("wrote %d Secret(s) anyway", len(secrets.Items))
+	for i := range secrets.Items {
+		if secrets.Items[i].Name == provision.CredentialsSecretName("attacker-owned") {
+			t.Fatalf("the instance controller handed over %s's credentials to an instance "+
+				"that merely named it", sourceInstanceName)
+		}
+	}
+}
+
+// Failing is the only safe answer. Minting fresh passwords instead would produce an instance
+// that provisions cleanly, reports itself healthy, and cannot be reached by anything -
+// discovered during the restore it was needed for.
+func TestAHandOverWithNoSourceCredentialsFailsLoudly(t *testing.T) {
+	scheme := credentialScheme(t)
+	restored := recoveredInstance(recoveredInstanceName)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(restored).Build()
+	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
+
+	err := reconciler.handOverCredentials(context.Background(), sourceInstanceName, restored)
+	if err == nil {
+		t.Fatal("credentials were invented for an instance whose catalogue has its own")
+	}
+	if !strings.Contains(err.Error(), sourceInstanceName) {
+		t.Errorf("error = %q, want it to name the source whose Secret is missing", err)
 	}
 }
 
@@ -184,7 +215,7 @@ func TestARestoreCarriesTheObjectStoreCredentialsForward(t *testing.T) {
 		},
 	}
 	restore := &pgelasticv1alpha1.PgRestore{
-		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-it-back"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: restoreObjectName},
 		Spec: pgelasticv1alpha1.PgRestoreSpec{
 			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
 			BackupRef:         &corev1.LocalObjectReference{Name: backupName},
@@ -240,7 +271,7 @@ func TestARestoreWithNoObjectStoreCredentialsIsRefused(t *testing.T) {
 		},
 	}
 	restore := &pgelasticv1alpha1.PgRestore{
-		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-it-back"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: restoreObjectName},
 		Spec: pgelasticv1alpha1.PgRestoreSpec{
 			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
 			BackupRef:         &corev1.LocalObjectReference{Name: backupName},
