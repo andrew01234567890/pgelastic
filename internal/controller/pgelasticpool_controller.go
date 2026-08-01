@@ -128,7 +128,7 @@ func (r *PgElasticPoolReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reader().Get(ctx, req.NamespacedName, pool); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if result, stop, err := unclaimed(ctx, r.ownership(), pool); stop {
+	if result, stop, err := unclaimed(ctx, r.ownership(), r.Client, finalizeAnyway, pool); stop {
 		return result, err
 	}
 	if !pool.DeletionTimestamp.IsZero() {
