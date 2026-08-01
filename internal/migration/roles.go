@@ -18,6 +18,7 @@ package migration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -275,43 +276,114 @@ END $pgelastic$;`,
 // over the Unix socket, and a superuser bypasses privilege checks, so it still gets in. The
 // backends already connected are terminated, because a revoke does not close a session that
 // is already open.
-func HoldTenantOut(ctx context.Context, sql SQL, target Endpoint, roles []RoleSpec) error {
+func HoldTenantOut(
+	ctx context.Context, sql SQL, target Endpoint, roles []RoleSpec,
+) ([]Held, error) {
 	postgres := target.WithDatabase("postgres")
+	held, err := heldPrivileges(ctx, sql, postgres, target.Database, roles)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"reading what the tenant's roles are allowed on %q: %w", target.Database, err)
+	}
+
 	name := QuoteIdentifier(target.Database)
-	for _, role := range roles {
-		if role.Name == "" {
-			continue
-		}
+	var failures []error
+	for _, one := range held {
 		if err := sql.Exec(ctx, postgres, fmt.Sprintf(
-			`REVOKE CONNECT, TEMPORARY ON DATABASE %s FROM %s`,
-			name, QuoteIdentifier(role.Name))); err != nil {
-			return fmt.Errorf("holding %q out of %q: %w", role.Name, target.Database, err)
+			`REVOKE %s ON DATABASE %s FROM %s`,
+			strings.Join(one.Privileges, ", "), name,
+			QuoteIdentifier(one.Role))); err != nil {
+			failures = append(failures,
+				fmt.Errorf("holding %q out of %q: %w", one.Role, target.Database, err))
 		}
 	}
-	return sql.Exec(ctx, postgres, fmt.Sprintf(
+	if err := sql.Exec(ctx, postgres, fmt.Sprintf(
 		`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()`,
-		QuoteLiteral(target.Database)))
+		QuoteLiteral(target.Database))); err != nil {
+		failures = append(failures, err)
+	}
+	// held is returned whatever happened, because it is what readmission needs and a
+	// hold-out that failed part way through is exactly when it is needed most.
+	return held, errors.Join(failures...)
 }
 
-// ReadmitTenant puts back what HoldTenantOut took away.
+// Held is what one role was allowed to do on the tenant's database before it was held out.
+//
+// Readmission puts back precisely this. Granting a fixed CONNECT, TEMPORARY instead would
+// hand access to a role an owner had deliberately revoked it from - the restore quietly
+// widening the database's privileges as a side effect of running.
+type Held struct {
+	Role       string
+	Privileges []string
+}
+
+// heldPrivileges reads the tenant database's ACL for the roles named.
+//
+// Roles come from the recovered instance's catalog, which is the source's as it was at the
+// restore point, so some of them may have been dropped on the live cluster since. Reading
+// the live ACL is what filters those out: a role that is gone holds nothing, so there is
+// nothing to revoke from it and nothing to put back.
+func heldPrivileges(
+	ctx context.Context, sql SQL, postgres Endpoint, database string, roles []RoleSpec,
+) ([]Held, error) {
+	names := make([]string, 0, len(roles))
+	for _, role := range roles {
+		if role.Name != "" {
+			names = append(names, role.Name)
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+
+	rows, err := sql.Query(ctx, postgres, fmt.Sprintf(
+		`SELECT pg_get_userbyid(acl.grantee), acl.privilege_type
+		 FROM pg_database d, aclexplode(d.datacl) acl
+		 WHERE d.datname = %s AND pg_get_userbyid(acl.grantee) = ANY (%s)
+		 ORDER BY 1, 2`,
+		QuoteLiteral(database), textArray(names)))
+	if err != nil {
+		return nil, err
+	}
+
+	var held []Held
+	for _, row := range rows {
+		if len(row) < 2 || row[0] == "" || row[1] == "" {
+			continue
+		}
+		if len(held) > 0 && held[len(held)-1].Role == row[0] {
+			held[len(held)-1].Privileges = append(held[len(held)-1].Privileges, row[1])
+			continue
+		}
+		held = append(held, Held{Role: row[0], Privileges: []string{row[1]}})
+	}
+	return held, nil
+}
+
+// ReadmitTenant puts back exactly what HoldTenantOut took away, per role.
 //
 // It runs on every exit from the copy, successful or not: a tenant left unable to connect
 // after a restore that failed half way is an outage caused by the recovery rather than by
 // whatever the recovery was for.
-func ReadmitTenant(ctx context.Context, sql SQL, target Endpoint, roles []RoleSpec) error {
+func ReadmitTenant(ctx context.Context, sql SQL, target Endpoint, held []Held) error {
 	postgres := target.WithDatabase("postgres")
 	name := QuoteIdentifier(target.Database)
-	for _, role := range roles {
-		if role.Name == "" {
+	var failures []error
+	for _, one := range held {
+		if one.Role == "" || len(one.Privileges) == 0 {
 			continue
 		}
 		if err := sql.Exec(ctx, postgres, fmt.Sprintf(
-			`GRANT CONNECT, TEMPORARY ON DATABASE %s TO %s`,
-			name, QuoteIdentifier(role.Name))); err != nil {
-			return fmt.Errorf("readmitting %q to %q: %w", role.Name, target.Database, err)
+			`GRANT %s ON DATABASE %s TO %s`,
+			strings.Join(one.Privileges, ", "), name,
+			QuoteIdentifier(one.Role))); err != nil {
+			failures = append(failures,
+				fmt.Errorf("readmitting %q to %q: %w", one.Role, target.Database, err))
 		}
 	}
-	return nil
+	// Every role is attempted. Stopping at the first failure leaves the rest of them locked
+	// out of a live database by a restore that has already given up.
+	return errors.Join(failures...)
 }
 
 // RevokeReplicationReads takes back the reads GrantSourceReads made, on the far side.
