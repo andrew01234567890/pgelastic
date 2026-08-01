@@ -179,6 +179,9 @@ jobs:
       - name: Run the placement suite
         run: make test-e2e-placement E2E_CONTEXT="kind-${KIND_CLUSTER}"
 
+      - name: Run the tenant database suite
+        run: make test-e2e-tenantdb E2E_CONTEXT="kind-${KIND_CLUSTER}"
+
       - name: Tear down the kind cluster
         if: always()
         run: make cleanup-test-e2e

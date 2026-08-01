@@ -33,13 +33,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
+	"github.com/andrew01234567890/pgelastic/internal/tenantdb"
 )
 
 const (
 	// provisioningClass is the development sizing tier: three postmasters fit on one node
 	// and it publishes 50 allocatable connections, which is the budget below.
 	provisioningClass = "dev-1"
-	// tenantBurstable is the ceiling mirrored onto the tenant's role.
+	// tenantBurstable is the workload class's burstable ceiling. It is the proxy's to
+	// enforce, not the role's.
 	tenantBurstable = 25
 	// instanceReadyTimeout covers initdb, two pg_basebackups and the quorum coming up.
 	instanceReadyTimeout = 12 * time.Minute
@@ -191,9 +194,14 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 	// This is the assertion the CR could not make. The tenant reported Ready above; here
 	// PostgreSQL is asked directly whether there is anything behind that claim.
 	It("has both databases and both roles in PostgreSQL's own catalog", func() {
+		// The owner role is derived from the tenant's identity, not taken from spec.owner:
+		// roles are cluster-global, so two tenants that named the same owner would otherwise
+		// share one identity. spec.owner survives only as a readable prefix. Asking PostgreSQL
+		// for the name the CR asked for rather than the one the controller creates is how this
+		// suite spent its whole life red while the controller was right.
 		for database, owner := range map[string]string{
-			reclaimedDB: reclaimedRole,
-			retainedDB:  retainedDB,
+			reclaimedDB: migration.BackendRoleName(provisioningNamespace, reclaimedName),
+			retainedDB:  migration.BackendRoleName(provisioningNamespace, retainedName),
 		} {
 			Expect(psql(primary, "postgres", countDatabase(database))).To(Equal("1"),
 				"database %q is not in pg_database on %s", database, primary)
@@ -209,10 +217,17 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 		Expect(psql(primary, reclaimedDB, "SELECT current_database()")).To(Equal(reclaimedDB))
 	})
 
-	It("mirrors the tenant's burstable ceiling onto the role as an in-database backstop", func() {
+	// rolconnlimit used to mirror the burstable ceiling as an in-database backstop, and this
+	// spec still asserted that long after the mirroring was deliberately removed. It has to be
+	// uncapped now that the proxy authenticates as this role: every backend the fleet opens
+	// counts against the limit, so N replicas each entitled to burstable would breach a cap of
+	// burstable N-fold, and whichever client happened to be last would get "too many
+	// connections for role". The ceiling that means anything is the proxy's fleet-wide ledger.
+	It("leaves the tenant's role uncapped, because the proxy is what counts connections", func() {
 		Expect(psql(primary, "postgres", fmt.Sprintf(
-			`SELECT rolconnlimit FROM pg_roles WHERE rolname = '%s'`, reclaimedRole))).
-			To(Equal(fmt.Sprintf("%d", tenantBurstable)))
+			`SELECT rolconnlimit FROM pg_roles WHERE rolname = '%s'`,
+			migration.BackendRoleName(provisioningNamespace, reclaimedName)))).
+			To(Equal(fmt.Sprintf("%d", tenantdb.NoConnectionLimit)))
 	})
 
 	It("publishes the oid PostgreSQL actually assigned", func() {
@@ -232,7 +247,9 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 
 		Expect(psql(primary, "postgres", countDatabase(retainedDB))).To(Equal("1"),
 			"Retain dropped the database it was supposed to leave alone")
-		Expect(psql(primary, "postgres", countRole(retainedDB))).To(Equal("1"))
+		Expect(psql(primary, "postgres", countRole(
+			migration.BackendRoleName(provisioningNamespace, retainedName)))).To(Equal("1"),
+			"Retain dropped the role it was supposed to leave alone")
 	})
 
 	It("drops the database and the role of a Delete tenant", func() {
@@ -241,7 +258,9 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 
 		Expect(psql(primary, "postgres", countDatabase(reclaimedDB))).To(Equal("0"),
 			"Delete left the database behind while releasing the finalizer")
-		Expect(psql(primary, "postgres", countRole(reclaimedRole))).To(Equal("0"))
+		Expect(psql(primary, "postgres", countRole(
+			migration.BackendRoleName(provisioningNamespace, reclaimedName)))).To(Equal("0"),
+			"Delete left the tenant's role behind")
 	})
 })
 
