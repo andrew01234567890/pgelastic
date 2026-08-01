@@ -113,6 +113,7 @@ const (
 	ReasonBackupFailed        = "BackupFailed"
 	ReasonRestoreFailed       = "RestoreFailed"
 	ReasonTenantsStillBound   = "TenantsStillBound"
+	ReasonAwaitingCredentials = "AwaitingRestoreCredentials"
 	ReasonRecloning           = "Recloning"
 	ReasonPreflightFailed     = "PreflightFailed"
 	ReasonCutoverComplete     = "CutoverComplete"
