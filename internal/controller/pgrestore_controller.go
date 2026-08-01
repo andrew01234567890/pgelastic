@@ -44,6 +44,16 @@ import (
 // nothing about it is made faster by asking more often.
 const restoreRequeue = 15 * time.Second
 
+// RecoveryInstanceFinalizer holds a tenant-scoped PgRestore open until the throwaway instance
+// it recovered into has been removed.
+//
+// Without it finalize is unreachable: an object with no finalizers is deleted by the API
+// server immediately, the reconciler observes NotFound rather than a deletion timestamp, and
+// the recovery instance - a full, running, readable copy of every tenant on the source -
+// outlives everything that knew about it. That matters most for a restore that failed, which
+// deliberately leaves the instance standing as evidence.
+const RecoveryInstanceFinalizer = "pgelastic.io/recovery-instance"
+
 // PgRestoreReconciler puts an instance back, into a new instance.
 //
 // Recovery is never performed in place. The instance being recovered from is very often the
@@ -79,6 +89,14 @@ func (r *PgRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	if !restore.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, r.finalize(ctx, restore)
+	}
+	// Before anything creates a recovery instance, so that deleting the restore can never
+	// destroy the only record that there is one to clean up.
+	if restore.Spec.Scope == pgelasticv1alpha1.RestoreScopeTenant &&
+		controllerutil.AddFinalizer(restore, RecoveryInstanceFinalizer) {
+		if err := r.Update(ctx, restore); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	status := restore.Status.DeepCopy()
@@ -540,7 +558,13 @@ func (r *PgRestoreReconciler) finalize(
 	if restore.Spec.Scope != pgelasticv1alpha1.RestoreScopeTenant {
 		return nil
 	}
-	return r.deleteRecoveryInstance(ctx, restore)
+	if err := r.deleteRecoveryInstance(ctx, restore); err != nil {
+		return err
+	}
+	if !controllerutil.RemoveFinalizer(restore, RecoveryInstanceFinalizer) {
+		return nil
+	}
+	return r.Update(ctx, restore)
 }
 
 func (r *PgRestoreReconciler) ownership() ownership.Resolver {
