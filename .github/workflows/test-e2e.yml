@@ -18,9 +18,17 @@ name: E2E Tests
 # every member Pod of a real instance and switches the primary away, so it costs several
 # minutes of real restarts that a per-push job cannot absorb.
 #
-# The split is a Ginkgo label, not a spec-name regex: the chaos Describe carries
-# Label("chaos"), so a new chaos spec is nightly by construction rather than by remembering
-# to update a pattern here.
+# The backup suite gets a PR-blocking job of its own. It was nightly-only until 2026-08-01,
+# on the reasoning that it needs egress for an object-store image - and in that time it never
+# ran once, because the nightly was failing on an earlier suite and nothing downstream of the
+# failure was reached. Four merged PRs of backup and PITR work were proven by nothing at all.
+# Its prerequisites are the cheapest of any suite here: instance images and CRDs, no
+# cert-manager and no Rust proxy build, so an hour of its own is what it costs to know.
+#
+# The split between per-PR and nightly is a Ginkgo label rather than a spec-name regex: the
+# chaos Describe carries Label("chaos"), so a new chaos spec is nightly by construction
+# rather than by remembering to update a pattern here. Which whole suites are gated where is
+# not expressible that way, so internal/hygiene/e2e_gate_test.go asserts it instead.
 on:
   # Restricted to main on push because an unrestricted push trigger runs every PR branch
   # twice; PRs still get the full job through pull_request.
@@ -82,6 +90,54 @@ jobs:
       - name: Run e2e without the chaos specs
         run: make test-e2e E2E_LABEL_FILTER='!chaos' E2E_HEAVY=false
 
+  # Its own job rather than another step on provisioning, so it gets its own hour and its own
+  # cluster, and so a slow day turns into a slow build rather than a timeout on a job that is
+  # already carrying two suites.
+  backup:
+    if: github.event_name != 'schedule'
+    permissions:
+      contents: read
+    name: backup and PITR e2e
+    runs-on: ubuntu-latest
+    # Ninety rather than sixty. The suite provisions three real three-node instances in
+    # sequence - the archive source, an instance recovered to a point in time, and the
+    # throwaway a tenant restore recovers into - plus an object store. On the two cores a
+    # hosted runner gives, that is comfortably over an hour's work, and a job that times out
+    # tells you nothing at all about what it was testing.
+    timeout-minutes: 90
+    env:
+      KIND_CLUSTER: pgelastic-backup
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl -fsSLo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-$(go env GOARCH)"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Create the kind cluster
+        run: make setup-test-e2e
+
+      - name: Run the backup suite
+        run: make test-e2e-backup E2E_CONTEXT="kind-${KIND_CLUSTER}"
+
+      - name: Tear down the kind cluster
+        if: always()
+        run: make cleanup-test-e2e
+
   chaos:
     if: github.event_name == 'schedule' || inputs.chaos
     permissions:
@@ -115,10 +171,17 @@ jobs:
       - name: Create the kind cluster
         run: make setup-test-e2e
 
+      # Every suite below carries `if: !cancelled()`, so one red suite reports its own failure
+      # instead of hiding the three behind it. Without it this job was fail-fast over five
+      # suites in sequence: a red migration suite on 07-29 and 07-30 meant nothing was known
+      # about proxy, backup or restart on either night, and the job simply said "failure".
+      # The job still fails if any suite does; what changes is how much is learned per run.
+
       # No label filter, so this is the whole instance suite - provisioning specs included.
       # Re-running them here costs a couple of minutes and means a chaos failure can be read
       # against a run where the uneventful path was proven on the same cluster.
       - name: Run the full instance suite
+        if: ${{ !cancelled() }}
         run: make test-e2e-instance E2E_CONTEXT="kind-${KIND_CLUSTER}"
 
       # Migration drives two full three-node instances through logical replication, which
@@ -126,6 +189,7 @@ jobs:
       # nowhere: the alternative was a longer timeout on the per-push job, which would only
       # have made the slow path flakier without covering it any better.
       - name: Run the migration suite
+        if: ${{ !cancelled() }}
         run: make test-e2e-migration E2E_CONTEXT="kind-${KIND_CLUSTER}"
 
       # The proxy suite is the only place a client reaches a tenant's database the way a
@@ -133,14 +197,8 @@ jobs:
       # a fleet in front of them, so it costs what the migration suite costs and belongs in
       # the same job.
       - name: Run the proxy suite
+        if: ${{ !cancelled() }}
         run: make test-e2e-proxy E2E_CONTEXT="kind-${KIND_CLUSTER}"
-
-      # The backup suite is the only place the claim "WAL reached the object store" is
-      # answered by fetching a segment back out of one. It stands up an S3-compatible store
-      # with a certificate it signs itself, so it needs egress for that image and a real
-      # three-node instance to archive from, which is why it is here rather than per-push.
-      - name: Run the backup suite
-        run: make test-e2e-backup E2E_CONTEXT="kind-${KIND_CLUSTER}"
 
       # The restart suite recreates every member Pod of a real instance and switches the
       # primary away under a client that never disconnects. It drives real restarts, so it
@@ -148,6 +206,7 @@ jobs:
       # drain-trap spec is excluded by its own label: kind here is one node, and a
       # switchover away from a node that is going away needs somewhere for the role to go.
       - name: Run the restart suite
+        if: ${{ !cancelled() }}
         run: make test-e2e-restart E2E_CONTEXT="kind-${KIND_CLUSTER}"
 
       - name: Tear down the kind cluster
