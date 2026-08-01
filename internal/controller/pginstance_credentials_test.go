@@ -18,11 +18,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -140,10 +142,13 @@ func TestAHandAuthoredRestoringInstanceIsGivenNoCredentials(t *testing.T) {
 		WithObjects(sourceCredentials(), forged).Build()
 	reconciler := &PgInstanceReconciler{Client: kube, Scheme: scheme}
 
-	if err := reconciler.ensureCredentials(context.Background(), forged); err != nil {
-		t.Fatalf("ensuring credentials: %v", err)
-	}
+	err := reconciler.ensureCredentials(context.Background(), forged)
 
+	// The wait is reported rather than swallowed, so the ladder above it stops instead of
+	// building Pods that reference a Secret nothing is going to create.
+	if !errors.Is(err, errAwaitingRestoreCredentials) {
+		t.Fatalf("ensureCredentials = %v, want the awaiting-credentials sentinel", err)
+	}
 	secrets := &corev1.SecretList{}
 	if err := kube.List(context.Background(), secrets,
 		client.InNamespace(credentialNamespace)); err != nil {
@@ -331,5 +336,83 @@ func TestAnOrdinaryInstanceGetsFreshCredentials(t *testing.T) {
 	}
 	if password == "" {
 		t.Error("no replication password was minted at all")
+	}
+}
+
+// A recovered instance waits for its source's Secret to be copied across, and that wait used
+// to be logged and nothing else. Everything below it in the ladder builds Pods, so the
+// instance filled up with containers stuck in ContainerCreating on a Secret nothing was going
+// to create, and the only account of why was a log line on the operator.
+func TestAWaitForRestoreCredentialsIsPublished(t *testing.T) {
+	scheme := credentialScheme(t)
+	recovered := recoveredInstance(recoveredInstanceName)
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(recovered).
+		WithStatusSubresource(&pgelasticv1alpha1.PgInstance{}).Build()
+	reconciler := &PgInstanceReconciler{Client: kube, Scheme: scheme}
+
+	if err := reconciler.publishAwaitingCredentials(context.Background(), recovered); err != nil {
+		t.Fatalf("publishing: %v", err)
+	}
+
+	held := &pgelasticv1alpha1.PgInstance{}
+	if err := kube.Get(context.Background(),
+		client.ObjectKeyFromObject(recovered), held); err != nil {
+		t.Fatalf("reading back: %v", err)
+	}
+	ready := apimeta.FindStatusCondition(held.Status.Conditions,
+		pgelasticv1alpha1.ConditionReady)
+	if ready == nil {
+		t.Fatal("no Ready condition, so kubectl describe explains none of the wait")
+	}
+	if ready.Status != metav1.ConditionFalse {
+		t.Errorf("Ready is %q while the instance cannot start", ready.Status)
+	}
+	if ready.Reason != pgelasticv1alpha1.ReasonAwaitingCredentials {
+		t.Errorf("reason = %q, want %q",
+			ready.Reason, pgelasticv1alpha1.ReasonAwaitingCredentials)
+	}
+	if !strings.Contains(ready.Message, sourceInstanceName) {
+		t.Errorf("the message does not name the source being waited on: %q", ready.Message)
+	}
+}
+
+// The hand-over is what a recovered instance waits on before it builds anything, and it used
+// to be attempted only on the pass that created that instance. One failure there - the source
+// Secret not readable for a moment, a conflict - left the instance waiting on a copy nothing
+// would ever make again, because every later pass took the branch for an instance that already
+// exists. It is idempotent, so asking on every pass costs one Get once it has happened.
+func TestTheCredentialsHandOverIsRetriedAfterTheInstanceExists(t *testing.T) {
+	scheme := credentialScheme(t)
+	restore := &pgelasticv1alpha1.PgRestore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: restoreObjectName},
+		Spec: pgelasticv1alpha1.PgRestoreSpec{
+			SourceInstanceRef: corev1.LocalObjectReference{Name: sourceInstanceName},
+		},
+	}
+	// The instance is already there, so the creating branch is not taken. Its credentials
+	// Secret is absent: the hand-over that should have made it did not.
+	target := &pgelasticv1alpha1.PgInstance{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: credentialNamespace, Name: restoreTargetInstance(restore),
+		},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(sourceCredentials(), target, restore).
+		WithStatusSubresource(&pgelasticv1alpha1.PgRestore{}).Build()
+	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
+
+	status := restore.Status.DeepCopy()
+	status.TargetInstance = restoreTargetInstance(restore)
+	if _, err := reconciler.converge(context.Background(), restore, status); err != nil {
+		t.Fatalf("converging: %v", err)
+	}
+
+	handed := &corev1.Secret{}
+	if err := kube.Get(context.Background(), client.ObjectKey{
+		Namespace: credentialNamespace,
+		Name:      provision.CredentialsSecretName(target.Name),
+	}, handed); err != nil {
+		t.Fatalf("the credentials were never handed over, so the instance waits for ever: %v", err)
 	}
 }

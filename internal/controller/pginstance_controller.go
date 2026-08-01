@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -149,6 +150,10 @@ func (r *PgInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	builder := r.builderFor(instance, class)
 
 	if err := r.ensureSupportingObjects(ctx, instance, builder); err != nil {
+		if errors.Is(err, errAwaitingRestoreCredentials) {
+			return ctrl.Result{RequeueAfter: credentialsRecheck},
+				r.publishAwaitingCredentials(ctx, instance)
+		}
 		return ctrl.Result{}, err
 	}
 	groups, err := r.ensurePVCGroups(ctx, instance, builder)
@@ -327,6 +332,8 @@ func (r *PgInstanceReconciler) finalize(
 
 // drainRecheck paces the wait for somebody to move the tenants off. Nothing about it is made
 // faster by asking more often, and a deletion that is blocked is blocked until a person acts.
+const credentialsRecheck = 10 * time.Second
+
 const drainRecheck = 30 * time.Second
 
 // ensureCredentials creates the two role passwords once and never rotates them here.
@@ -360,10 +367,7 @@ func (r *PgInstanceReconciler) ensureCredentials(
 	// the instance they were taken from. The restore controller reaches the same copy only
 	// after it has resolved a completed backup that belongs to that source.
 	if instance.Spec.Restore != nil {
-		logf.FromContext(ctx).Info("waiting for the restore to hand over the source's "+
-			"credentials", "instance", instance.Name,
-			"source", instance.Spec.Restore.SourceInstanceName)
-		return nil
+		return errAwaitingRestoreCredentials
 	}
 
 	replication, err := randomPassword()
@@ -1052,6 +1056,42 @@ func (r *PgInstanceReconciler) publishInvalid(
 		fieldConditions: []any{
 			condition(instance.Status.Conditions, pgelasticv1alpha1.ConditionReady, false,
 				instance.Generation, pgelasticv1alpha1.ReasonInvalidSpec, cause.Error()),
+		},
+	}
+	return r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(object),
+		client.FieldOwner("pgelastic-operator"), client.ForceOwnership)
+}
+
+// errAwaitingRestoreCredentials stops the provisioning ladder while a restore hands the
+// source's credentials over. It is a sentinel rather than a nil return because everything
+// below ensureCredentials builds Pods, and a Pod whose credentials Secret does not exist
+// stays in ContainerCreating with the reason buried in its events rather than on the
+// instance somebody is looking at.
+var errAwaitingRestoreCredentials = errors.New(
+	"waiting for the restore to hand over the source's credentials")
+
+// publishAwaitingCredentials says why a recovered instance has not started building yet.
+//
+// A restored cluster's pg_authid is its source's, copied verbatim, so its roles keep the
+// source's passwords and the PgRestore controller is what copies the matching Secret across.
+// Until it does, there is nothing to build with, and saying so is the difference between a
+// wait somebody can explain and one they have to dig for.
+func (r *PgInstanceReconciler) publishAwaitingCredentials(
+	ctx context.Context,
+	instance *pgelasticv1alpha1.PgInstance,
+) error {
+	object := statusApplyObject(instance)
+	object.Object["status"] = map[string]any{
+		fieldObservedGeneration: instance.Generation,
+		fieldPhase:              string(pgelasticv1alpha1.InstancePhasePending),
+		fieldConditions: []any{
+			condition(instance.Status.Conditions, pgelasticv1alpha1.ConditionReady, false,
+				instance.Generation, pgelasticv1alpha1.ReasonAwaitingCredentials,
+				fmt.Sprintf("this instance was restored from %q, so its roles carry that "+
+					"instance's passwords and its credentials are copied across rather than "+
+					"minted. Nothing is built until the PgRestore that owns this recovery "+
+					"hands them over",
+					instance.Spec.Restore.SourceInstanceName)),
 		},
 	}
 	return r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(object),

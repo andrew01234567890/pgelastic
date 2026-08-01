@@ -186,6 +186,16 @@ func (r *PgRestoreReconciler) converge(
 	}, target)
 	switch {
 	case err == nil:
+		// Retried on every pass while the instance exists. The hand-over is what the instance
+		// controller is waiting on, and it is only ever attempted below on the pass that
+		// creates the instance - so one failure there used to leave the instance waiting for
+		// a copy nothing would ever make again. It returns immediately once the Secret is
+		// there, so the cost of asking is one Get.
+		if err := r.handOverCredentials(
+			ctx, restore.Spec.SourceInstanceRef.Name, target); err != nil {
+			status.Error = err.Error()
+			return restoreRequeue, nil
+		}
 		return r.observeTarget(status, target), nil
 	case !apierrors.IsNotFound(err):
 		return 0, err

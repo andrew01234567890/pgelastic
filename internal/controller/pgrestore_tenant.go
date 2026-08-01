@@ -91,6 +91,15 @@ func (r *PgRestoreReconciler) reconcileTenantRestore(
 		return 0, err
 	}
 
+	// Retried on every pass, for the same reason as the instance-scope path: this is what the
+	// recovery instance is waiting on before it will build anything, and attempting it only
+	// where the instance is created means one failure strands it for good.
+	if err := r.handOverCredentials(
+		ctx, restore.Spec.SourceInstanceRef.Name, recovery); err != nil {
+		status.Error = err.Error()
+		return restoreRequeue, nil
+	}
+
 	if !meta.IsStatusConditionTrue(recovery.Status.Conditions, pgelasticv1alpha1.ConditionReady) {
 		status.Phase = pgelasticv1alpha1.RestorePhaseRecovering
 		return restoreRequeue, nil
