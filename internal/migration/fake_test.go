@@ -94,6 +94,14 @@ func (f *fakeSQL) matchFailure(statement string) error {
 }
 
 // ran reports the index of the first statement containing a fragment, or -1.
+// joined is every statement in order, for assertions that read better as one haystack than
+// as a loop.
+func (f *fakeSQL) joined() string {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	return strings.Join(f.statement, "\n")
+}
+
 func (f *fakeSQL) ran(fragment string) int {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()

@@ -44,6 +44,10 @@ import (
 // customers' pasts and must never be reachable.
 const recoverySuffix = "-recovery"
 
+// cleanupBudget bounds the defers that undo a copy. They run on a detached context, so nothing
+// else will stop them, and they run while the operator is most likely shutting down.
+const cleanupBudget = 30 * time.Second
+
 // recoveryInstanceName is the instance a tenant restore recovers into.
 func recoveryInstanceName(restore *pgelasticv1alpha1.PgRestore) string {
 	return restore.Name + recoverySuffix
@@ -234,6 +238,13 @@ func (r *PgRestoreReconciler) replaceTenant(
 		return fmt.Errorf("could not give the dump read access to the recovered tenant: %w", err)
 	}
 
+	// The cleanup defers run on a context that outlives this reconcile's. What they exist to
+	// undo is the copy being killed - a rolled Pod, a lost lease - and both of those cancel
+	// ctx, so a readmit issued on it could not send a single statement: the undo would be
+	// registered and unrunnable in exactly the case it was written for.
+	cleanup, stopCleanup := context.WithTimeout(context.WithoutCancel(ctx), cleanupBudget)
+	defer stopCleanup()
+
 	// Registered before the unfence so that it runs after it: the tenant is fenced for the
 	// whole copy, and a fenced database refuses connections, so the revoke has nothing to
 	// connect to until the unfence has run. Deferred rather than sequential because a copy
@@ -243,7 +254,7 @@ func (r *PgRestoreReconciler) replaceTenant(
 	// looked at again - isTerminalRestore sees to that - so the grant would outlive everyone
 	// who could have noticed it. The migration path fails for the same reason.
 	defer func() {
-		if err := migration.RevokeReplicationReads(ctx, r.SQL, live); err != nil {
+		if err := migration.RevokeReplicationReads(cleanup, r.SQL, live); err != nil {
 			logf.FromContext(ctx).Error(err, "the replication role was left holding reads on "+
 				"the restored tenant", "tenant", tenant.Name)
 			if copyErr == nil {
@@ -276,22 +287,36 @@ func (r *PgRestoreReconciler) replaceTenant(
 		return fmt.Errorf("could not record that the copy was about to start: %w", err)
 	}
 
-	if err := migration.HoldTenantOut(ctx, r.SQL, live, tenantRoles); err != nil {
-		return fmt.Errorf("could not hold the tenant still for the copy: %w", err)
-	}
-	// Readmission runs on every exit, successful or not. A tenant left unable to connect
-	// after a restore that failed halfway is an outage caused by the recovery rather than by
-	// whatever the recovery was for.
+	// Readmission runs on every exit, successful or not, and is registered before the
+	// hold-out rather than after it. A hold-out that fails part way through has already
+	// revoked from some of the roles, and returning with nothing registered leaves those
+	// roles locked out of a live production database permanently, recoverable only by a
+	// human issuing GRANT by hand. held is what was read before any revoke, so it is
+	// complete whether or not the revokes were.
+	var held []migration.Held
 	defer func() {
-		if err := migration.ReadmitTenant(ctx, r.SQL, live, tenantRoles); err != nil {
+		if err := migration.ReadmitTenant(cleanup, r.SQL, live, held); err != nil {
 			logf.FromContext(ctx).Error(err, "the tenant was left unable to connect",
 				"tenant", tenant.Name)
+			// Failing the restore rather than only logging. A restore that reported Completed
+			// would be terminal, so nothing would ever put these grants back, and the roles
+			// would hold nothing on their own database while every client authenticating as
+			// them got "permission denied". That is a live outage, and a louder one than the
+			// leftover reads the defer above fails for.
+			if copyErr == nil {
+				copyErr = fmt.Errorf("the copy finished but %s was left unable to connect: %w",
+					tenant.Spec.DatabaseName, err)
+			}
 		}
 	}()
+	held, err = migration.HoldTenantOut(ctx, r.SQL, live, tenantRoles)
+	if err != nil {
+		return fmt.Errorf("could not hold the tenant still for the copy: %w", err)
+	}
 	// The dump is the size of the tenant and lands on the target's data volume. Leaving one
 	// behind is how the next restore fails its headroom check for reasons nobody can find.
 	defer func() {
-		if err := migration.DiscardDump(ctx, r.Shell, plan); err != nil {
+		if err := migration.DiscardDump(cleanup, r.Shell, plan); err != nil {
 			logf.FromContext(ctx).Error(err, "the staged dump was left behind",
 				"dumpDir", plan.DumpDir)
 		}
