@@ -179,6 +179,22 @@ type GUCValue string
 
 // PgInstanceSpec is the desired state of one provisioned PostgreSQL instance and its
 // replica set.
+//
+// Whether the restore marker is set is fixed for the life of the instance, and that has to
+// be said at this level rather than on the field. A CEL rule written on an optional field is
+// not evaluated when the field is absent, so `self == oldSelf` on restore catches an edit to
+// it and catches neither its deletion nor its arrival - which are the two edits somebody
+// would actually make.
+//
+// Both directions corrupt something outside this object, in opposite ways. A restored
+// instance carries its source's system identifier verbatim, so its stanza IS the source's,
+// and the marker is the only thing stopping its agent archiving: clear it and the instance
+// pushes a forked timeline into the production archive it was recovered from, leaving
+// neither history restorable. Add it to an ordinary instance and the same switch goes the
+// other way - the agent starts returning success from archive_command without archiving, so
+// PostgreSQL recycles WAL that never reached the repository and the recovery window is gone
+// with no error anywhere. Neither is an edit; an instance is one kind or the other for life.
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.restore) == has(self.restore)",message="whether restore is set cannot change: this marker decides whether the agent archives at all, so adding it silently stops archiving and removing it starts a forked timeline in the source's own stanza"
 type PgInstanceSpec struct {
 	// poolRef names the PgElasticPool in the same namespace that owns this instance.
 	// It is immutable: the pool holds the reservation ledger that this instance's

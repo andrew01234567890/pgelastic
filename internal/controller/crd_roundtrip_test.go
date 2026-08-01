@@ -1074,6 +1074,78 @@ var _ = Describe("v1alpha1 CRD round-trip", Ordered, func() {
 			Expect(err.Error()).To(ContainSubstring("class is immutable"))
 		})
 
+		// Both edits corrupt something outside the object, in opposite ways, and the
+		// field-level immutability rule catches neither: CEL does not evaluate a rule on an
+		// optional field that is absent, which is true of the old object when the marker is
+		// added and of the new one when it is removed.
+		It("refuses to remove an instance's restore marker", func() {
+			restored := &pgelasticv1alpha1.PgInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pg-recovered-roundtrip", Namespace: roundTripNamespace,
+				},
+				Spec: pgelasticv1alpha1.PgInstanceSpec{
+					PoolRef: corev1.LocalObjectReference{Name: poolName},
+					Class:   "dev-1",
+					Storage: pgelasticv1alpha1.InstanceStorage{
+						Size:      resource.MustParse("1Gi"),
+						WALVolume: pgelasticv1alpha1.WALVolume{Size: resource.MustParse("1Gi")},
+					},
+					Restore: &pgelasticv1alpha1.InstanceRestore{
+						SourceInstanceName: "pg-source",
+						Stanza:             restoreTestStanza,
+						BackupID:           restoreTestBackupID,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, restored, strictFieldValidation)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, restored))).To(Succeed())
+			})
+
+			fetched := &pgelasticv1alpha1.PgInstance{}
+			Expect(k8sClient.Get(ctx, namespacedName("pg-recovered-roundtrip"), fetched)).To(Succeed())
+			fetched.Spec.Restore = nil
+			err := k8sClient.Update(ctx, fetched, strictFieldValidation)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("whether restore is set cannot change"))
+		})
+
+		// The other direction, and the more dangerous one: the marker makes the agent return
+		// success from archive_command without archiving, so an ordinary instance given one
+		// recycles WAL that never reached the repository and loses its recovery window with
+		// nothing logged as an error.
+		It("refuses to add a restore marker to an instance that never had one", func() {
+			ordinary := &pgelasticv1alpha1.PgInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pg-ordinary-roundtrip", Namespace: roundTripNamespace,
+				},
+				Spec: pgelasticv1alpha1.PgInstanceSpec{
+					PoolRef: corev1.LocalObjectReference{Name: poolName},
+					Class:   "dev-1",
+					Storage: pgelasticv1alpha1.InstanceStorage{
+						Size:      resource.MustParse("1Gi"),
+						WALVolume: pgelasticv1alpha1.WALVolume{Size: resource.MustParse("1Gi")},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, ordinary, strictFieldValidation)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, ordinary))).To(Succeed())
+			})
+
+			fetched := &pgelasticv1alpha1.PgInstance{}
+			Expect(k8sClient.Get(ctx, namespacedName("pg-ordinary-roundtrip"), fetched)).To(Succeed())
+			fetched.Spec.Restore = &pgelasticv1alpha1.InstanceRestore{
+				SourceInstanceName: "pg-source",
+				Stanza:             restoreTestStanza,
+				BackupID:           restoreTestBackupID,
+			}
+			err := k8sClient.Update(ctx, fetched, strictFieldValidation)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("whether restore is set cannot change"))
+		})
+
 		It("refuses to shrink an instance's data volume", func() {
 			fetched := &pgelasticv1alpha1.PgInstance{}
 			Expect(k8sClient.Get(ctx, namespacedName(primaryInstanceName), fetched)).To(Succeed())

@@ -631,6 +631,11 @@ spec:
             - poolRef
             - storage
             type: object
+            x-kubernetes-validations:
+            - message: 'whether restore is set cannot change: this marker decides
+                whether the agent archives at all, so adding it silently stops archiving
+                and removing it starts a forked timeline in the source''s own stanza'
+              rule: has(oldSelf.restore) == has(self.restore)
           status:
             description: status defines the observed state of PgInstance
             properties:
