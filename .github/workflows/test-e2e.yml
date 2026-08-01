@@ -138,6 +138,51 @@ jobs:
         if: always()
         run: make cleanup-test-e2e
 
+  # Placement and tenant provisioning are two label halves of one suite directory. Neither
+  # ran in any job at all until 2026-08-01 - not per-PR, not nightly - which is the same
+  # condition the backup suite was in when four PRs merged against it unproven. Placement
+  # stands up no PostgreSQL and tenantdb stands up one instance, so together they are the
+  # cheapest suite pair here after backup.
+  placement:
+    if: github.event_name != 'schedule'
+    permissions:
+      contents: read
+    name: placement and tenant databases e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KIND_CLUSTER: pgelastic-placement
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl -fsSLo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-$(go env GOARCH)"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Create the kind cluster
+        run: make setup-test-e2e
+
+      - name: Run the placement suite
+        run: make test-e2e-placement E2E_CONTEXT="kind-${KIND_CLUSTER}"
+
+      - name: Tear down the kind cluster
+        if: always()
+        run: make cleanup-test-e2e
+
   chaos:
     if: github.event_name == 'schedule' || inputs.chaos
     permissions:

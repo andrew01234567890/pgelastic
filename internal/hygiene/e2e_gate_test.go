@@ -39,11 +39,18 @@ var ungated = map[string]string{
 		"prerequisites as migration; nightly",
 	"test-e2e-restart": "recreates every member Pod of a real instance and switches the " +
 		"primary away, so it is minutes of real restarts; nightly",
-	"test-e2e-placement": "runs in no CI job at all. Decided on 2026-08-01 to record that " +
-		"rather than fix it in the same change as the backup gate",
-	"test-e2e-tenantdb": "runs in no CI job at all, except under E2E_HEAVY=true which " +
-		"nothing sets. Recorded on 2026-08-01 rather than fixed",
-	"test-e2e-coexistence": "runs in no CI job at all. Recorded on 2026-08-01 rather than fixed",
+	"test-e2e-tenantdb": "red. Run for the first time on 2026-08-01 it fails, with " +
+		"countRole(owner) returning 0 for the owner role of a tenant that has already " +
+		"reported Ready. Whether the fault is the controller's or the suite's is not settled: " +
+		"one reading is that Ready is published before the role exists, another is that the " +
+		"suite looks for the name it declared rather than the one the controller derives, and " +
+		"Ready is only written after a count of that derived role comes back non-zero. Either " +
+		"way it stays out, because gating a suite nobody has seen pass is the mistake the " +
+		"backup gate exists to stop repeating",
+	"test-e2e-coexistence": "needs a second operator already deployed on the cluster - the " +
+		"suite fails deliberately when there is nothing to coexist with - so it cannot simply " +
+		"be added to a job the way the others were. Still ungated for that reason, not by " +
+		"oversight",
 }
 
 // A suite that no merge-blocking job runs is a suite that does not run.
