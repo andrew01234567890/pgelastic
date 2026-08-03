@@ -96,6 +96,7 @@ func MemberReportOf(member string, state ProbeState) provision.MemberReport {
 		WALVolumeFull:           state.WALVolumeFull,
 		DataUsedBytes:           state.DataUsedBytes,
 		WALUsedBytes:            state.WALUsedBytes,
+		ClientBackends:          state.ClientBackends,
 		Rejoining:               string(state.Rejoin),
 		SynchronousStandbyNames: observation.SyncStandbyNames,
 		NumSync:                 observation.NumSync,

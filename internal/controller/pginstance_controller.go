@@ -672,6 +672,26 @@ func (r *PgInstanceReconciler) applyPrimaryLabel(
 // exists. Absent until a member has reported, because a zero would read as an empty volume and
 // the autoscaler treats "no usage" and "no measurement" differently - StorageExpand requires a
 // figure above zero precisely so that it cannot act on an instance it has never heard from.
+// inUseOf is how many connections the instance is currently carrying.
+//
+// The primary's count, for the same reason storage takes the primary's bytes: allocatable is
+// derived once from the sizing class and describes what one member sells, so comparing it
+// against a sum across three members would be comparing a three-member number to a
+// one-member budget and would read as saturation at a third of it.
+//
+// The cost of that choice, stated rather than hidden: a connection a reader is holding on a
+// standby is not counted here. Nothing in the tree routes tenant reads to standbys today, so
+// the figure is currently exact; the day something does, this is the line that has to change
+// and allocatable has to change with it.
+func inUseOf(instance *pgelasticv1alpha1.PgInstance) int32 {
+	for _, member := range instance.Status.Instances {
+		if member.Name == instance.Status.CurrentPrimary {
+			return member.ClientBackends
+		}
+	}
+	return 0
+}
+
 func storageStatus(instance *pgelasticv1alpha1.PgInstance) map[string]any {
 	storage := map[string]any{"allocated": instance.Spec.Storage.Size.String()}
 	for _, member := range instance.Status.Instances {
@@ -714,6 +734,7 @@ func (r *PgInstanceReconciler) publishStatus(
 			"reservedForAdmin": int64(capacity.SuperuserReserved + capacity.Reserved),
 			"replicationSlots": int64(capacity.ReplicationSlots),
 			"allocatable":      int64(allocatableOf(instance, capacity, roll, decision)),
+			"inUse":            int64(inUseOf(instance)),
 		},
 		"storage":   storageStatus(instance),
 		"instances": syncSetEntries(instance),

@@ -89,6 +89,9 @@ type MemberReport struct {
 	// which is what an agent that could not stat the path reports.
 	DataUsedBytes int64 `json:"dataUsedBytes,omitempty"`
 	WALUsedBytes  int64 `json:"walUsedBytes,omitempty"`
+
+	// ClientBackends is how many client connections this member is holding.
+	ClientBackends int32 `json:"clientBackends,omitempty"`
 	// Rejoining names the path a member is taking back onto the primary's history -
 	// rewinding or recloning - and is empty the rest of the time. A member rebuilding
 	// itself has to be visible: it takes minutes to hours, it leaves the instance at

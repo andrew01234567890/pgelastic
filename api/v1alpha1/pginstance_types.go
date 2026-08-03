@@ -762,6 +762,17 @@ type InstanceMemberStatus struct {
 	// +optional
 	WALUsedBytes int64 `json:"walUsedBytes,omitempty"`
 
+	// clientBackends is how many client connections this member is holding, as the
+	// postmaster counts them.
+	//
+	// Counted from pg_stat_activity rather than from the proxy's own book-keeping, because
+	// the two disagree in exactly the case that matters: a link the proxy believes it holds
+	// but the postmaster has already terminated is not capacity in use, and the whole point
+	// of this figure is to be the observed number rather than the intended one.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ClientBackends int32 `json:"clientBackends,omitempty"`
+
 	// rejoining names the path this member is taking back onto the primary's history after
 	// its own diverged: "rewinding" for pg_rewind, "recloning" for the pg_basebackup
 	// fallback. It is empty the rest of the time.
