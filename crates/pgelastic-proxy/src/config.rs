@@ -668,6 +668,41 @@ pub struct UserConfig {
     /// affordance only.
     #[serde(default)]
     pub password: Option<String>,
+
+    /// The `PostgreSQL` role *this login's* backend sessions run as.
+    ///
+    /// Per login rather than per tenant, which is the whole of what a contained
+    /// user is: a login dialling as its tenant's owner holds the owner's
+    /// privileges and is indistinguishable from it in `pg_stat_activity`,
+    /// however carefully the control plane names it. `SET ROLE` could not have
+    /// done this either - it moves `current_user` and leaves `session_user`
+    /// alone, and `session_user` is the one auditing follows.
+    ///
+    /// Empty until the operator has provisioned the role, and a login whose
+    /// tenant has an identity while it has none of its own is refused rather
+    /// than dialled as that tenant's owner. Falling back would be the whole
+    /// defect this field exists to fix, applied silently during a
+    /// config-propagation lag.
+    #[serde(default)]
+    pub backend_role: String,
+    /// The client half of this login's SCRAM credential, base64. On the backend
+    /// leg the proxy is the SCRAM *client*, so what it needs is
+    /// `SaltedPassword` rather than a server-side verifier.
+    #[serde(default)]
+    pub backend_salted_password: String,
+    /// The parameters that secret was derived under.
+    #[serde(default)]
+    pub backend_salt: String,
+    #[serde(default)]
+    pub backend_iterations: u32,
+    /// Bumped when the operator re-issues *this login's backend* credential, so
+    /// links opened under the old one drain out rather than being handed on.
+    ///
+    /// Named apart from the tenant's `credentialGeneration` because a login has
+    /// two credentials - the one it proves to the proxy and the one the proxy
+    /// proves to `PostgreSQL` - and only the second is a pool-key axis.
+    #[serde(default)]
+    pub backend_credential_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

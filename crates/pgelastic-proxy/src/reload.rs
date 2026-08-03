@@ -368,7 +368,10 @@ mod tests {
         let proxy = Arc::clone(&reloader.proxy);
         let instance = proxy.fleet.route("orders");
         assert_eq!(
-            proxy.backend_for(&instance, "orders").unwrap().user,
+            proxy
+                .backend_for(&instance, "orders", "owner")
+                .unwrap()
+                .user,
             "postgres",
             "a tenant with no published identity dials as the instance"
         );
@@ -382,12 +385,15 @@ mod tests {
 
         assert!(applied.identities, "the adoption reported nothing changed");
         assert_eq!(
-            proxy.backend_for(&instance, "orders").unwrap().user,
+            proxy
+                .backend_for(&instance, "orders", "owner")
+                .unwrap()
+                .user,
             "pgt_orders_c0ffee",
             "the replica is still dialling as the identity it started with"
         );
         assert_eq!(
-            proxy.credential_generation("orders"),
+            proxy.credential_generation("orders", "owner"),
             7,
             "the pool key still carries the generation this process started with, so a \
              rotation would not evict the links opened under the superseded credential"
@@ -485,6 +491,81 @@ mod tests {
             "a rotated credential kept the verifier derived from the old password"
         );
     }
+
+    /// A login with an identity of its own dials as *that* role, not its tenant's owner.
+    /// A contained user that dialled as the owner would hold the owner's privileges and be
+    /// indistinguishable from it in `pg_stat_activity`, which is the whole of what it exists
+    /// not to be.
+    #[test]
+    fn a_login_dials_the_backend_as_its_own_role_rather_than_its_tenants() {
+        let current = Config::from_str(BASE).unwrap();
+        let mut reloader = reloader(&current);
+        let proxy = Arc::clone(&reloader.proxy);
+        let instance = proxy.fleet.route("orders");
+
+        let next = Config::from_str(&format!(
+            "{}{ORDERS_IDENTITY}{APP_IDENTITY}",
+            BASE.replace("1-aaa", "2-bbb")
+        ))
+        .unwrap();
+        reloader.apply(&current, &next);
+
+        assert_eq!(
+            proxy.backend_for(&instance, "orders", "app").unwrap().user,
+            "pgtu_orders_app_deadbeef",
+            "the login dialled as somebody else"
+        );
+        assert_eq!(
+            proxy.credential_generation("orders", "app"),
+            3,
+            "the login's links are keyed on its tenant's generation, so rotating its own \
+             credential would not evict them"
+        );
+        // The tenant's own login is unaffected and still assumes the tenant role.
+        assert_eq!(
+            proxy
+                .backend_for(&instance, "orders", "owner")
+                .unwrap()
+                .user,
+            "pgt_orders_c0ffee",
+        );
+    }
+
+    /// A login that names a role but carries no credential is refused, never quietly dialled
+    /// as its tenant - that fallback is the defect the per-login identity exists to fix,
+    /// applied silently during a config-propagation lag.
+    #[test]
+    fn a_login_whose_credential_is_missing_is_refused_rather_than_downgraded() {
+        let current = Config::from_str(BASE).unwrap();
+        let mut reloader = reloader(&current);
+        let proxy = Arc::clone(&reloader.proxy);
+        let instance = proxy.fleet.route("orders");
+
+        let next = Config::from_str(&format!(
+            "{}{ORDERS_IDENTITY}\n[[auth.users]]\nname = \"app\"\npassword = \"x\"\n\
+             backendRole = \"pgtu_orders_app_deadbeef\"\n",
+            BASE.replace("1-aaa", "2-bbb")
+        ))
+        .unwrap();
+        reloader.apply(&current, &next);
+
+        assert!(
+            proxy.backend_for(&instance, "orders", "app").is_err(),
+            "a login with no credential was dialled as its tenant"
+        );
+    }
+
+    const APP_IDENTITY: &str = r#"
+        [[auth.users]]
+        name = "app"
+        tenant = "orders"
+        password = "hunter2"
+        backendRole = "pgtu_orders_app_deadbeef"
+        backendSaltedPassword = "c2FsdGVk"
+        backendSalt = "c2FsdA"
+        backendIterations = 4096
+        backendCredentialGeneration = 3
+    "#;
 
     const ORDERS_IDENTITY: &str = r#"
         [[pool.tenants]]

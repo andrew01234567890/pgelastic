@@ -82,15 +82,16 @@ impl Binding {
         proxy: &Arc<Proxy>,
         startup: &pgelastic_wire::StartupMessage,
         tenant_name: &str,
+        login: &str,
     ) -> Result<Self> {
         let instance = proxy.fleet.route(tenant_name);
-        let backend = Arc::new(proxy.backend_for(&instance, tenant_name)?);
+        let backend = Arc::new(proxy.backend_for(&instance, tenant_name, login)?);
         let key = crate::pool::pool_key(
             &proxy.config,
             &backend,
             startup,
             tenant_name,
-            proxy.credential_generation(tenant_name),
+            proxy.credential_generation(tenant_name, login),
         )
         .await?;
         let tenant = instance
@@ -168,6 +169,11 @@ pub struct Session<'a> {
     pub proxy: &'a Arc<Proxy>,
     pub startup: &'a pgelastic_wire::StartupMessage,
     pub tenant: String,
+    /// The login the client authenticated as, which decides the backend identity a checkout
+    /// dials with. Held on the session because a re-bind after a cutover has to reach the
+    /// same one - a login that changed identity mid-session would be a different principal
+    /// on the far side of the same client socket.
+    pub login: String,
     /// This tenant's admission gate, closed for the length of a cutover.
     pub gate: Arc<TenantGate>,
     pub binding: Binding,
@@ -916,6 +922,7 @@ impl Running<'_> {
             self.session.proxy,
             self.session.startup,
             &self.session.tenant,
+            &self.session.login,
         )
         .await?;
         debug!(
