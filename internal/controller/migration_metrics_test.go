@@ -1,0 +1,166 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"maps"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+)
+
+const (
+	phaseSeries     = "pgelastic_transition_phase"
+	totalSeries     = "pgelastic_transitions_total"
+	metricNamespace = "tenants"
+)
+
+func migrationStatus(phase pgelasticv1alpha1.TenantMigrationPhase) *pgelasticv1alpha1.PgTenantMigrationStatus {
+	return &pgelasticv1alpha1.PgTenantMigrationStatus{
+		Phase:       phase,
+		StartedAt:   ptr.To(metav1.NewTime(time.Unix(1000, 0))),
+		CompletedAt: ptr.To(metav1.NewTime(time.Unix(1090, 0))),
+	}
+}
+
+func gathered(t *testing.T, name string) int {
+	t.Helper()
+	count, err := testutil.GatherAndCount(metrics.Registry, name)
+	if err != nil {
+		t.Fatalf("gathering %s: %v", name, err)
+	}
+	return count
+}
+
+// outcomeTotal reads one counter out of the registry by its labels. The Transitions vectors
+// are the metering package's own, so a test in this package can only reach them the way a
+// scrape does.
+func outcomeTotal(t *testing.T, outcome string) float64 {
+	t.Helper()
+	families, err := metrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gathering: %v", err)
+	}
+	want := map[string]string{
+		labelNamespace: metricNamespace,
+		labelKind:      kindMigration,
+		"to":           outcome,
+	}
+	for _, family := range families {
+		if family.GetName() != totalSeries {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, pair := range metric.GetLabel() {
+				labels[pair.GetName()] = pair.GetValue()
+			}
+			if maps.Equal(labels, want) {
+				return metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+// The per-object series carry the migration's own name, which is the label the rest of the
+// metering package refuses everywhere else. It is affordable here only because a migration
+// ends: one that finished last Tuesday must not still be occupying series today.
+//
+// The metric this replaced never deleted anything, so every migration a pool had ever run
+// left its phases behind for the lifetime of the process.
+func TestAFinishedMigrationStopsOccupyingSeries(t *testing.T) {
+	const namespace, name = metricNamespace, "move-acme-retire"
+
+	recordMigrationPhase(namespace, name,
+		pgelasticv1alpha1.TenantMigrationPhaseProvisioning,
+		migrationStatus(pgelasticv1alpha1.TenantMigrationPhaseCopying),
+		time.Unix(1030, 0))
+
+	running := gathered(t, phaseSeries)
+	if running < len(migrationPhaseNames) {
+		t.Fatalf("a running migration holds %d series, want at least one per phase (%d)",
+			running, len(migrationPhaseNames))
+	}
+
+	recordMigrationPhase(namespace, name,
+		pgelasticv1alpha1.TenantMigrationPhaseCutover,
+		migrationStatus(pgelasticv1alpha1.TenantMigrationPhaseCompleted),
+		time.Unix(1090, 0))
+
+	if finished := gathered(t, phaseSeries); finished != running-len(migrationPhaseNames) {
+		t.Errorf("a completed migration left %d series behind, want its own %d dropped (was %d)",
+			finished, len(migrationPhaseNames), running)
+	}
+}
+
+// A terminal migration is reconciled for as long as it exists - it sits in Completed until
+// somebody deletes it. Counting on every one of those passes would turn a single move into
+// an ever-climbing total, which is worse than not counting it at all: the rate panel would
+// show migrations happening on an idle pool.
+func TestAMigrationIsCountedOnceHoweverOftenItIsReconciled(t *testing.T) {
+	const namespace, name = metricNamespace, "move-acme-once"
+
+	recordMigrationPhase(namespace, name,
+		pgelasticv1alpha1.TenantMigrationPhaseProvisioning,
+		migrationStatus(pgelasticv1alpha1.TenantMigrationPhaseCopying),
+		time.Unix(1030, 0))
+
+	before := outcomeTotal(t, "Completed")
+
+	recordMigrationPhase(namespace, name,
+		pgelasticv1alpha1.TenantMigrationPhaseCutover,
+		migrationStatus(pgelasticv1alpha1.TenantMigrationPhaseCompleted),
+		time.Unix(1090, 0))
+	for range 5 {
+		recordMigrationPhase(namespace, name,
+			pgelasticv1alpha1.TenantMigrationPhaseCompleted,
+			migrationStatus(pgelasticv1alpha1.TenantMigrationPhaseCompleted),
+			time.Unix(1200, 0))
+	}
+
+	if after := outcomeTotal(t, "Completed"); after != before+1 {
+		t.Errorf("six reconciles of one finished migration counted %v, want exactly one", after-before)
+	}
+}
+
+// A migration refused by its own preflight reaches a terminal phase having never been seen
+// in a running one. It is still a migration that happened, and an operator alerting on
+// failures is alerting on exactly these.
+func TestAMigrationThatFailsImmediatelyIsStillCounted(t *testing.T) {
+	const namespace, name = metricNamespace, "move-acme-refused"
+
+	before := outcomeTotal(t, "Failed")
+
+	recordMigrationPhase(namespace, name,
+		"",
+		migrationStatus(pgelasticv1alpha1.TenantMigrationPhaseFailed),
+		time.Unix(1000, 0))
+
+	if after := outcomeTotal(t, "Failed"); after != before+1 {
+		t.Errorf("a migration that failed on its first pass counted %v, want one", after-before)
+	}
+	if gathered(t, totalSeries) == 0 {
+		t.Error("the outcome counter carries no series at all")
+	}
+}
