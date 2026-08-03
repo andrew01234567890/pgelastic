@@ -75,25 +75,16 @@ func (r *PgTenantUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Resolved before the deletion branch, because releasing a finalizer is a write and a
-	// login this operator never claimed never carried one of ours to release.
-	//
-	// Deleting is handled ahead of the ordinary unclaimed gate rather than behind it. That
-	// gate requeues for ever on Unresolved, and a login being deleted alongside its tenant is
-	// exactly Unresolved - so going through it would spin on an object whose finalizer only
-	// this controller can clear, and take the namespace with it.
-	verdict, err := r.ownership().Of(ctx, user)
-	if err != nil {
-		return ctrl.Result{}, err
+	// releaseOnly, because this finalizer is a cleanup trigger rather than a refusal: it
+	// exists to drop a role on the world, not to stop a deletion. A login being deleted
+	// alongside its tenant resolves to Unresolved - the tenant is the only route to a class -
+	// and holding on then would hold for ever, since only this controller can clear it. The
+	// gate releases instead, which is the whole reason the two kinds are distinguished.
+	if result, stop, err := unclaimed(ctx, r.ownership(), r.Client, releaseOnly, user); stop {
+		return result, err
 	}
 	if !user.DeletionTimestamp.IsZero() {
-		if verdict == ownership.Foreign {
-			return ctrl.Result{}, nil
-		}
-		return r.finalize(ctx, user, verdict)
-	}
-	if result, stop, err := unclaimed(ctx, r.ownership(), user); stop {
-		return result, err
+		return r.finalize(ctx, user)
 	}
 
 	status := pgelasticv1alpha1.PgTenantUserStatus{
@@ -243,20 +234,18 @@ func (r *PgTenantUserReconciler) memberRoles(
 	return members, owned, "", nil
 }
 
-// finalize drops the login's role, and releases when it cannot be reached at all.
+// finalize drops the login's role before letting the object go.
 func (r *PgTenantUserReconciler) finalize(
 	ctx context.Context,
 	user *pgelasticv1alpha1.PgTenantUser,
-	verdict ownership.Verdict,
 ) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(user, PgTenantUserFinalizer) {
 		return ctrl.Result{}, nil
 	}
-	// Unresolved means the tenant has gone, and with it the route to a class. Holding on
-	// would hold for ever - only this controller can clear this finalizer, and nothing will
-	// ever answer for the object again - so the role is dropped if it still can be, and the
-	// finalizer released either way.
-	if err := r.reclaim(ctx, user); err != nil && verdict != ownership.Unresolved {
+	// A role that cannot be dropped holds the object open and says so. Leaking a
+	// cluster-global login is worse than a slow delete: it outlives the record of why it
+	// exists, and nothing left will ever drop it.
+	if err := r.reclaim(ctx, user); err != nil {
 		if reportErr := r.reportReclaimFailure(ctx, user, err); reportErr != nil {
 			return ctrl.Result{}, reportErr
 		}

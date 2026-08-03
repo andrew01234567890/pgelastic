@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/scram"
 )
 
@@ -123,4 +124,28 @@ func (r *PgTenantUserReconciler) ensureUserBackendCredential(
 		}
 	}
 	return credential, nil
+}
+
+// userBackendCredentialFor reads a login's backend credential for the fleet's configuration.
+//
+// Absence is reported rather than raised, for the reason the tenant's equivalent gives: the
+// login controller mints it on its own reconcile, and a pool reconcile that happens first
+// should render that login without an identity rather than fail the whole fleet's document.
+//
+// The role is derived here rather than read from status.roleName, so a login whose status has
+// not been written yet cannot cause the Secret to be rejected as belonging to something else.
+func (r *PgElasticPoolReconciler) userBackendCredentialFor(
+	ctx context.Context,
+	user *pgelasticv1alpha1.PgTenantUser,
+) (backendCredential, bool) {
+	secret := &corev1.Secret{}
+	key := client.ObjectKey{
+		Namespace: user.Namespace,
+		Name:      userBackendCredentialSecretName(user.Name),
+	}
+	if err := r.Get(ctx, key, secret); err != nil {
+		return backendCredential{}, false
+	}
+	role := migration.TenantUserRoleName(user.Namespace, user.Spec.TenantRef.Name, user.Name)
+	return readBackendCredential(secret, role)
 }

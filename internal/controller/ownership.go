@@ -98,6 +98,7 @@ const (
 var ourFinalizers = []string{
 	TenantDatabaseFinalizer,
 	RecoveryInstanceFinalizer,
+	PgTenantUserFinalizer,
 }
 
 // releaseOrphan takes this operator's finalizers off an object it cannot prove is its own,

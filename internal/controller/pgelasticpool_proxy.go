@@ -493,6 +493,13 @@ func (r *PgElasticPoolReconciler) containedUsers(
 		if !ours || login.Spec.CredentialsSecretRef == nil {
 			continue
 		}
+		// A group role authenticates nobody. Omitted rather than rendered-and-refused,
+		// because an omitted login gets the mock verifier and fails an exchange identically
+		// to a name that was never configured - which is the anti-enumeration property the
+		// handshake already gives, reused rather than reimplemented.
+		if login.Spec.Login != nil && !*login.Spec.Login {
+			continue
+		}
 		secret := &corev1.Secret{}
 		key := client.ObjectKey{Namespace: pool.Namespace, Name: login.Spec.CredentialsSecretRef.Name}
 		if err := r.Get(ctx, key, secret); err != nil {
@@ -505,11 +512,22 @@ func (r *PgElasticPoolReconciler) containedUsers(
 		if password == "" {
 			continue
 		}
-		users = append(users, proxy.User{
+		rendered := proxy.User{
 			Name:     login.Spec.UserName,
 			Tenant:   database,
 			Password: password,
-		})
+		}
+		// The login's own backend identity, when the reconciler has provisioned one. Rendered
+		// only once both the role and its credential exist, so that a proxy refusing a login
+		// means exactly "not provisioned yet" rather than "provisioned badly".
+		if credential, ok := r.userBackendCredentialFor(ctx, login); ok {
+			rendered.BackendRole = credential.Role
+			rendered.BackendSaltedPassword = credential.SaltedPassword
+			rendered.BackendSalt = credential.Salt
+			rendered.BackendIterations = credential.Iterations
+			rendered.BackendCredentialGeneration = credential.Generation
+		}
+		users = append(users, rendered)
 	}
 	return users, nil
 }

@@ -86,6 +86,26 @@ type User struct {
 	// then never holds anything it could replay against the backend.
 	Verifier string
 	Password string
+
+	// BackendRole is the PostgreSQL role *this login's* backend sessions run as, and
+	// BackendSaltedPassword the client half of the SCRAM credential that proves it.
+	//
+	// Per login rather than per tenant, which is the whole of what a contained user is: a
+	// login dialling as its tenant's owner has the owner's privileges and is indistinguishable
+	// from it in pg_stat_activity, however carefully the control plane names it.
+	//
+	// Empty until the operator has provisioned the role. Written all-or-none, because a role
+	// named without a credential to prove it is a login the proxy must refuse rather than
+	// quietly dial as somebody else.
+	BackendRole           string
+	BackendSaltedPassword string
+	BackendSalt           string
+	BackendIterations     int32
+	// BackendCredentialGeneration makes a rotation of *this login's* backend credential evict
+	// the links opened under the old one. Named apart from the tenant's because a login has
+	// two credentials - the one it proves to the proxy and the one the proxy proves to
+	// PostgreSQL - and only the second belongs in a pool key.
+	BackendCredentialGeneration int32
 }
 
 // Config is everything the rendered document is derived from.
@@ -214,6 +234,16 @@ func (c Config) renderAuth(out *strings.Builder, dynamic bool) {
 			writeString(out, "verifier", user.Verifier)
 		} else {
 			writeString(out, "password", user.Password)
+		}
+		// All five or none, exactly as a tenant's identity is written. A role named without
+		// the credential that proves it is a login the proxy refuses, and half a group is how
+		// a rendering bug turns into a refusal nobody can explain.
+		if user.BackendRole != "" && user.BackendSaltedPassword != "" {
+			writeString(out, "backendRole", user.BackendRole)
+			writeString(out, "backendSaltedPassword", user.BackendSaltedPassword)
+			writeString(out, "backendSalt", user.BackendSalt)
+			writeInt(out, "backendIterations", int64(user.BackendIterations))
+			writeInt(out, "backendCredentialGeneration", int64(user.BackendCredentialGeneration))
 		}
 		out.WriteString("\n")
 	}
