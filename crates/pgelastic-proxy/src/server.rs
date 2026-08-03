@@ -463,8 +463,35 @@ impl Proxy {
         &self,
         instance: &crate::route::Instance,
         tenant: &str,
+        login: &str,
     ) -> Result<crate::config::BackendConfig> {
         let dynamic = self.dynamic.load();
+
+        // The login's own identity wins. A contained user that dialled as its tenant's owner
+        // would hold the owner's privileges and be indistinguishable from it in
+        // `pg_stat_activity`, which is the whole of what this kind exists not to be - and no
+        // amount of care in the control plane's naming would show up on the far side.
+        if let Some(entry) = dynamic.users.iter().find(|u| u.name == login)
+            && !entry.backend_role.is_empty()
+        {
+            {
+                if entry.backend_salted_password.is_empty() {
+                    return Err(ProxyError::config(format!(
+                        "login {login:?} names backend role {:?} but carries no credential for \
+                         it; refusing rather than dialling as somebody else",
+                        entry.backend_role
+                    )));
+                }
+                return Ok(assume(
+                    instance,
+                    &entry.backend_role,
+                    &entry.backend_salted_password,
+                    &entry.backend_salt,
+                    entry.backend_iterations,
+                ));
+            }
+        }
+
         let Some(entry) = dynamic.tenants.iter().find(|t| t.name == tenant) else {
             // Not an error: a tenant with no [[pool.tenants]] entry at all is the
             // single-tenant shape, which has no per-tenant identity to assume.
@@ -480,26 +507,56 @@ impl Proxy {
                 entry.backend_role
             )));
         }
-        let mut backend = instance.backend.clone();
-        backend.user.clone_from(&entry.backend_role);
-        backend.salted_password = Some(crate::config::SaltedSecret {
-            salted_password: entry.backend_salted_password.clone(),
-            salt: entry.backend_salt.clone(),
-            iterations: entry.backend_iterations,
-        });
-        Ok(backend)
+        Ok(assume(
+            instance,
+            &entry.backend_role,
+            &entry.backend_salted_password,
+            &entry.backend_salt,
+            entry.backend_iterations,
+        ))
     }
 
-    /// The credential generation a tenant's pooled links are keyed on, so a rotation makes the
+    /// The credential generation a session's pooled links are keyed on, so a rotation makes the
     /// old ones unreachable rather than reusable.
-    pub fn credential_generation(&self, tenant: &str) -> u64 {
-        self.dynamic
-            .load()
+    ///
+    /// A login with an identity of its own is keyed on *its* generation. Otherwise rotating one
+    /// login's credential would evict every other login's links on the same tenant, and - the
+    /// half that matters - rotating it would not reliably evict its own.
+    pub fn credential_generation(&self, tenant: &str, login: &str) -> u64 {
+        let dynamic = self.dynamic.load();
+        if let Some(entry) = dynamic.users.iter().find(|u| u.name == login)
+            && !entry.backend_role.is_empty()
+        {
+            return entry.backend_credential_generation;
+        }
+        dynamic
             .tenants
             .iter()
             .find(|t| t.name == tenant)
             .map_or(0, |t| t.credential_generation)
     }
+}
+
+/// The instance's address and TLS posture, dialled as somebody else's role.
+///
+/// The split is the point: where a session connects is the instance's business, and who it
+/// connects as is the tenant's or the login's.
+fn assume(
+    instance: &crate::route::Instance,
+    role: &str,
+    salted_password: &str,
+    salt: &str,
+    iterations: u32,
+) -> crate::config::BackendConfig {
+    let mut backend = instance.backend.clone();
+    backend.user.clear();
+    backend.user.push_str(role);
+    backend.salted_password = Some(crate::config::SaltedSecret {
+        salted_password: salted_password.to_owned(),
+        salt: salt.to_owned(),
+        iterations,
+    });
+    backend
 }
 
 /// The shortest lease sweep interval, so a very short TTL cannot turn the
@@ -675,10 +732,10 @@ async fn serve(
     let instance = proxy.fleet.route(&tenant);
     let key = match crate::pool::pool_key(
         &proxy.config,
-        &proxy.backend_for(&instance, &tenant)?,
+        &proxy.backend_for(&instance, &tenant, &role)?,
         &session.startup,
         &tenant,
-        proxy.credential_generation(&tenant),
+        proxy.credential_generation(&tenant, &role),
     )
     .await
     {
@@ -694,9 +751,17 @@ async fn serve(
     // itself: a walsender stream has no transaction boundaries to release on,
     // and multiplexing one silently corrupts it.
     let result = if key.mode() == pgelastic_pool::PoolMode::Transaction {
-        multiplexed(proxy, &mut session, &tenant, &mut shutdown).await
+        multiplexed(proxy, &mut session, &tenant, &role, &mut shutdown).await
     } else {
-        bound(proxy, &mut session, &instance, &tenant, &mut shutdown).await
+        bound(
+            proxy,
+            &mut session,
+            &instance,
+            &tenant,
+            &role,
+            &mut shutdown,
+        )
+        .await
     };
 
     if let Err(error) = &result
@@ -713,6 +778,7 @@ async fn bound(
     session: &mut handshake::ClientSession,
     instance: &Arc<Instance>,
     tenant: &str,
+    login: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     // A session-mode client holds one backend for its whole life, so refusing
@@ -735,7 +801,7 @@ async fn bound(
     let _holding = proxy.quiesce.gate(tenant).hold();
 
     let mut link = match backend::connect(
-        &proxy.backend_for(instance, tenant)?,
+        &proxy.backend_for(instance, tenant, login)?,
         instance.tls.as_ref(),
         &proxy.kdf,
         &session.startup,
@@ -952,10 +1018,11 @@ async fn multiplexed(
     proxy: &Arc<Proxy>,
     session: &mut handshake::ClientSession,
     tenant: &str,
+    login: &str,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let gate = proxy.quiesce.gate(tenant);
-    let binding = crate::txn::Binding::open(proxy, &session.startup, tenant).await?;
+    let binding = crate::txn::Binding::open(proxy, &session.startup, tenant, login).await?;
 
     // The greeting is the first link's `ParameterStatus` set, cached per pool
     // key: a client that arrives twentieth must not have to hold a backend just
@@ -1018,6 +1085,7 @@ async fn multiplexed(
             proxy,
             startup: &session.startup,
             tenant: tenant.to_owned(),
+            login: login.to_owned(),
             gate,
             binding,
             route,
