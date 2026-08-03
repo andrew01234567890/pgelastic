@@ -20,14 +20,17 @@ struct Args {
     config: PathBuf,
 }
 
+/// The environment variable that selects human-readable output.
+///
+/// JSON is the default because a proxy's logs are read by a collector far more often than by a
+/// person, and because `spec.observability.logFormat` has defaulted to `Json` since the field
+/// existed. This is the escape hatch for the times it is a person: `kubectl exec`, a local run,
+/// a `kind` cluster somebody is staring at.
+const LOG_FORMAT_ENV: &str = "PGELASTIC_LOG_FORMAT";
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    init_logging();
     tls::install_crypto_provider();
 
     let args = Args::parse();
@@ -101,5 +104,26 @@ async fn wait_for_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Installs the subscriber, in JSON unless a human has asked otherwise.
+///
+/// The filter is read the same way either way, so `RUST_LOG` keeps working exactly as it did.
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let human = std::env::var(LOG_FORMAT_ENV).is_ok_and(|value| {
+        value.eq_ignore_ascii_case("text") || value.eq_ignore_ascii_case("console")
+    });
+    if human {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    } else {
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_env_filter(filter)
+            .init();
     }
 }

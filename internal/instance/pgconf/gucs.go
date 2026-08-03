@@ -208,7 +208,7 @@ var ownedParameters = map[string]Owned{
 	// scoped reaper necessary: syslogger.c sets SIG_IGN on SIGINT/SIGTERM/SIGQUIT, so the
 	// collector always outlives the postmaster.
 	GUCLoggingCollector:        {Ownership: OwnershipBlocked, Context: ContextPostmaster, Value: valueOn},
-	"log_destination":          {Ownership: OwnershipBlocked, Context: ContextSighup, Value: "csvlog"},
+	"log_destination":          {Ownership: OwnershipBlocked, Context: ContextSighup, Value: "jsonlog"},
 	"log_directory":            {Ownership: OwnershipFixed, Context: ContextSighup},
 	"log_filename":             {Ownership: OwnershipFixed, Context: ContextSighup},
 	"log_rotation_age":         {Ownership: OwnershipBlocked, Context: ContextSighup, Value: "0"},
