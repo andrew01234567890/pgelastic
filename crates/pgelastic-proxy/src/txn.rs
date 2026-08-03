@@ -85,7 +85,14 @@ impl Binding {
     ) -> Result<Self> {
         let instance = proxy.fleet.route(tenant_name);
         let backend = Arc::new(proxy.backend_for(&instance, tenant_name)?);
-        let key = crate::pool::pool_key(&proxy.config, &backend, startup, tenant_name).await?;
+        let key = crate::pool::pool_key(
+            &proxy.config,
+            &backend,
+            startup,
+            tenant_name,
+            proxy.credential_generation(tenant_name),
+        )
+        .await?;
         let tenant = instance
             .pools
             .ensure_tenant(tenant_name)

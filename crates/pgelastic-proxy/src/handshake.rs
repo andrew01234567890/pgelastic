@@ -71,6 +71,34 @@ impl ClientAuth {
         })
     }
 
+    /// The same table of logins, replaced, around the same mock secret.
+    ///
+    /// The property `verifier_for` exists to give is that an unknown login cannot be told from
+    /// a known one, and it has to survive an adoption to be worth anything. Getting that right
+    /// takes **both** halves, and one without the other is worse than neither:
+    ///
+    /// - the mock secret is carried here, so an unknown login's challenge salt does not move;
+    /// - and the caller must reuse the record of every login whose published configuration has
+    ///   not changed, so a known login's does not move either.
+    ///
+    /// The second is not an optimisation. The operator renders `password` rather than
+    /// `verifier` for every login, and `ScramVerifier::from_password` mints a fresh random salt
+    /// on each build - so rebuilding a record whose configuration is identical would move that
+    /// login's salt while the mock held an unknown login's still. One poll of each across a
+    /// publication would then say exactly which was which: the same oracle, pointing the other
+    /// way. Cache both or cache neither.
+    ///
+    /// `iterations` is carried for a duller reason: it is deliberately structural, because a
+    /// credential derived under one cost authenticates against nothing derived under another.
+    #[must_use]
+    pub fn rebuild(&self, users: HashMap<Vec<u8>, UserRecord>) -> Self {
+        Self {
+            users,
+            mock: self.mock.clone(),
+            iterations: self.iterations,
+        }
+    }
+
     /// True when no verifiers are configured at all, in which case every client
     /// is admitted without a challenge.
     ///
@@ -78,6 +106,14 @@ impl ClientAuth {
     /// is the only thing standing between an open listener and the backend.
     pub fn is_trust(&self) -> bool {
         self.users.is_empty()
+    }
+
+    /// The record this table already holds for a login, so a rebuild can keep a verifier whose
+    /// published configuration has not changed.
+    ///
+    /// That reuse is a security property rather than an optimisation - see `rebuild`.
+    pub fn record(&self, user: &[u8]) -> Option<&UserRecord> {
+        self.users.get(user)
     }
 
     /// The verifier to run the exchange against.
@@ -91,6 +127,14 @@ impl ClientAuth {
             || self.mock.verifier_for(user, self.iterations),
             |record| record.verifier.clone(),
         )
+    }
+
+    /// The salt this login would be challenged with, so a test can assert the property
+    /// `verifier_for` exists to give: that an unknown user cannot be told from a known one,
+    /// and that adopting a published document does not start telling them apart.
+    #[cfg(test)]
+    pub fn challenge_salt_for(&self, user: &[u8]) -> Vec<u8> {
+        self.verifier_for(user).salt.clone()
     }
 
     /// Whether an authenticated login may act as the tenant it asked for.
