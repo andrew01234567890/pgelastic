@@ -848,6 +848,18 @@ spec:
                         still in progress.
                       maxLength: 64
                       type: string
+                    clientBackends:
+                      description: |-
+                        clientBackends is how many client connections this member is holding, as the
+                        postmaster counts them.
+
+                        Counted from pg_stat_activity rather than from the proxy's own book-keeping, because
+                        the two disagree in exactly the case that matters: a link the proxy believes it holds
+                        but the postmaster has already terminated is not capacity in use, and the whole point
+                        of this figure is to be the observed number rather than the intended one.
+                      format: int32
+                      minimum: 0
+                      type: integer
                     dataUsedBytes:
                       description: |-
                         dataUsedBytes and walUsedBytes are the two volumes' usage as this member measured

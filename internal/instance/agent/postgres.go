@@ -91,7 +91,10 @@ type MemberObservation struct {
 	ConfigSHA256     string
 	PendingRestart   bool
 	MaxConnections   int32
-	PrimaryEpoch     int64
+	// ClientBackends is how many client connections the postmaster is holding right now,
+	// counted as PostgreSQL counts them rather than as the proxy believes it opened them.
+	ClientBackends int32
+	PrimaryEpoch   int64
 	// Archive is this member's view of its own WAL archiving.
 	Archive ArchiveObservation
 }
@@ -209,6 +212,8 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		       COALESCE(current_setting('pgelastic.config_sha256', true), ''),
 		       EXISTS (SELECT 1 FROM pg_settings WHERE pending_restart),
 		       current_setting('max_connections')::int,
+		       (SELECT count(*) FROM pg_stat_activity
+		         WHERE backend_type = 'client backend')::int,
 		       current_setting('synchronous_standby_names'),
 		       COALESCE(current_setting('pgelastic.primary_epoch', true), '0')::bigint,
 		       COALESCE((SELECT last_archived_wal FROM pg_stat_archiver), ''),
@@ -228,6 +233,7 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		&observation.ConfigSHA256,
 		&observation.PendingRestart,
 		&observation.MaxConnections,
+		&observation.ClientBackends,
 		&observation.SyncStandbyNames,
 		&observation.PrimaryEpoch,
 		&observation.Archive.LastArchivedWAL,

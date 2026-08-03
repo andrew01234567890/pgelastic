@@ -550,6 +550,7 @@ func (s *Supervisor) observe(ctx context.Context) {
 	}
 	observation.Archive = s.archiveObservation(observation.Archive)
 	s.update(func(state *ProbeState) {
+		state.ClientBackends = observation.ClientBackends
 		state.Role = observation.Role
 		state.ReplayLag = observation.ReplayLag
 		state.Observation = observation

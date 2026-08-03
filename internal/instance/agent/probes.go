@@ -68,6 +68,10 @@ type ProbeState struct {
 	// volume only because an initialised one is never actually zero.
 	DataUsedBytes int64
 	WALUsedBytes  int64
+	// ClientBackends is the postmaster's own count of client connections. Absent rather
+	// than zero when the postmaster cannot be reached: an instance nobody can ask is not an
+	// instance with no clients.
+	ClientBackends int32
 }
 
 // StartupProbe answers whether the postmaster has got far enough to be waited on.
