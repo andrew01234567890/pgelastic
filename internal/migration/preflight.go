@@ -34,6 +34,9 @@ const (
 	// CheckPreparedTransactions refuses a source holding a prepared transaction. It pins
 	// the oldest xmin, cannot be replicated, and cannot be drained by quiescing the tenant.
 	CheckPreparedTransactions CheckName = "PreparedTransactions"
+	// CheckPublishableRelations refuses a source holding relations logical replication
+	// cannot carry and the verifier cannot see are missing.
+	CheckPublishableRelations CheckName = "PublishableRelations"
 	// CheckSourceUtilization refuses to start while the source is busy, because logical
 	// decoding consumes exactly the capacity the move exists to relieve.
 	CheckSourceUtilization CheckName = "SourceUtilization"
@@ -178,7 +181,9 @@ func RunPreflight(ctx context.Context, sql SQL, in PreflightInput) PreflightResu
 		checks = append(checks, checkPreparedTransactions(ctx, sql, in.Source))
 	}
 	if in.Online {
-		checks = append(checks, CheckFailoverSlots(ctx, sql, in.Source, in.SourceStandbys))
+		checks = append(checks,
+			checkPublishableRelations(ctx, sql, in.Source),
+			CheckFailoverSlots(ctx, sql, in.Source, in.SourceStandbys))
 	}
 	return PreflightResult{Checks: checks}
 }
@@ -203,6 +208,46 @@ func checkReplicaIdentity(ctx context.Context, sql SQL, at Endpoint) Check {
 			len(offenders), strings.Join(offenders, ", ")))
 	}
 	return passed(CheckReplicaIdentity, "every replicated relation carries a replica identity")
+}
+
+// publishableQuery finds what `CREATE PUBLICATION ... FOR ALL TABLES` will not carry.
+//
+// `is_publishable_class` admits only RELKIND_RELATION and RELKIND_PARTITIONED_TABLE, and only
+// when relpersistence is PERMANENT. So an unlogged table is not even in the initial copy_data
+// COPY, and a materialized view is neither replicated nor - on the online path, which dumps
+// --schema-only - populated: pg_dump puts REFRESH MATERIALIZED VIEW in the *data* section and
+// the schema section emits WITH NO DATA.
+//
+// Neither is visible afterwards. The verifier's relation inventory excludes relkind 'm'
+// entirely, and nothing anywhere reads relispopulated - so an unlogged table shows up only as
+// a row-count mismatch at cutover, and a matview does not show up at all until the tenant's
+// first query gets "materialized view has not been populated".
+const publishableQuery = `SELECT n.nspname || '.' || c.relname || ' (' ||
+   CASE WHEN c.relkind = 'm' THEN 'materialized view' ELSE 'unlogged table' END || ')'
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE ` + UserSchemaPredicate + `
+  AND (c.relkind = 'm' OR (c.relkind IN ('r', 'p') AND c.relpersistence = 'u'))
+ORDER BY 1`
+
+func checkPublishableRelations(ctx context.Context, sql SQL, at Endpoint) Check {
+	offenders, err := firstColumn(ctx, sql, at, publishableQuery)
+	if err != nil {
+		return failed(CheckPublishableRelations,
+			"could not read the source's relation kinds: "+err.Error())
+	}
+	if len(offenders) > 0 {
+		return failed(CheckPublishableRelations, fmt.Sprintf(
+			"%d relation(s) cannot be carried by logical replication and would arrive empty or "+
+				"unpopulated with nothing reporting it: %s. An unlogged table is excluded from "+
+				"the publication and shows up only as a row-count mismatch at cutover; a "+
+				"materialized view is not published at all and the schema-only dump creates it "+
+				"WITH NO DATA, so the tenant's first query gets \"materialized view has not "+
+				"been populated\". Use the Offline strategy, which dumps and reloads both, or "+
+				"drop them and retry",
+			len(offenders), strings.Join(offenders, ", ")))
+	}
+	return passed(CheckPublishableRelations,
+		"every relation on the source is one logical replication can carry")
 }
 
 func checkPreparedTransactions(ctx context.Context, sql SQL, at Endpoint) Check {
