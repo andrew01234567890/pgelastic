@@ -90,3 +90,65 @@ func TestATenantsUsersAreDistinctFromEachOtherAndFromItsOwner(t *testing.T) {
 		t.Fatalf("a tenant's roles collided: %s %s %s", app, reporting, owner)
 	}
 }
+
+// The names above are short enough to hide the only failure that matters. PostgreSQL truncates
+// at 63 bytes silently, so a derivation that overflows does not error - two users become one
+// role holding the union of both their privileges, which is the single thing a contained user
+// exists not to allow.
+//
+// The tenant and the login are both attacker-chosen in the sense that matters: a tenant's own
+// operators pick them, and they only have to agree on a prefix.
+func TestALongTenantsUsersStayDistinctAfterPostgresTruncatesThem(t *testing.T) {
+	const namespace = "acme-corporation-production-workloads"
+	const tenant = "acme-corporation-billing-and-invoicing-service"
+
+	daily := TenantUserRoleName(namespace, tenant, "analytics-reporting-daily")
+	hourly := TenantUserRoleName(namespace, tenant, "analytics-reporting-hourly")
+
+	for _, name := range []string{daily, hourly} {
+		if len(name) > maxIdentifierLength {
+			t.Errorf("the derived role is %d bytes, so PostgreSQL will truncate it: %s", len(name), name)
+		}
+	}
+	if truncate(daily) == truncate(hourly) {
+		t.Fatalf("two of one tenant's users derived the same role once PostgreSQL truncated it:\n"+
+			"  %s\n  %s", truncate(daily), truncate(hourly))
+	}
+}
+
+// status.roleName is MaxLength=63, so a name that overflows is not merely truncated in
+// PostgreSQL - the API server refuses the status write and the reconciler loops on a validation
+// error for ever, never reporting why.
+func TestAUserRoleNameFitsTheStatusFieldItIsPublishedIn(t *testing.T) {
+	name := TenantUserRoleName(
+		strings.Repeat("n", 253), strings.Repeat("t", 253), strings.Repeat("u", 63))
+	if len(name) > maxIdentifierLength {
+		t.Fatalf("the derived role is %d bytes, over status.roleName's MaxLength=63: %s",
+			len(name), name)
+	}
+}
+
+// A user's role must not be mistakable for the tenant owner's, in \du or in an audit trail,
+// however long the names get.
+func TestALongTenantsUserIsDistinctFromItsOwnerAfterTruncation(t *testing.T) {
+	const namespace = "acme-corporation-production-workloads"
+	const tenant = "acme-corporation-billing-and-invoicing-service"
+
+	user := truncate(TenantUserRoleName(namespace, tenant, "app"))
+	owner := truncate(BackendRoleName(namespace, tenant))
+	if user == owner {
+		t.Fatalf("a tenant's user and its owner derived one role: %s", user)
+	}
+}
+
+// maxIdentifierLength is NAMEDATALEN-1: what PostgreSQL stores of any identifier, and what
+// status.roleName is bounded by.
+const maxIdentifierLength = 63
+
+// truncate is what PostgreSQL does to an over-long identifier, silently.
+func truncate(name string) string {
+	if len(name) <= maxIdentifierLength {
+		return name
+	}
+	return name[:maxIdentifierLength]
+}
