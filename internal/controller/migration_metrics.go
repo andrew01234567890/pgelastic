@@ -88,16 +88,19 @@ func recordMigrationPhase(
 	route migration.Plan,
 	now time.Time,
 ) {
-	if migration.Terminal(previous) {
-		return
-	}
-	transitions.Observe(namespace, kindMigration, name, string(status.Phase), migrationPhaseNames, now)
-	transitions.Route(namespace, kindMigration, name, route.Source.Instance, route.Target.Instance)
-	if !migration.Terminal(status.Phase) {
-		return
-	}
-	transitions.Forget(namespace, kindMigration, name, string(status.Phase),
-		migrationDuration(status), migrationPhaseNames)
+	recordTransition(transition{
+		Namespace: namespace,
+		Kind:      kindMigration,
+		Name:      name,
+		Previous:  string(previous),
+		Current:   string(status.Phase),
+		Phases:    migrationPhaseNames,
+		From:      route.Source.Instance,
+		To:        route.Target.Instance,
+		Took:      migrationDuration(status),
+	}, func(phase string) bool {
+		return migration.Terminal(pgelasticv1alpha1.TenantMigrationPhase(phase))
+	}, now)
 }
 
 // migrationDuration is how long the migration ran, or zero when it cannot be said. Zero is
