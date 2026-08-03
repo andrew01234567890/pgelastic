@@ -848,6 +848,17 @@ spec:
                         still in progress.
                       maxLength: 64
                       type: string
+                    dataUsedBytes:
+                      description: |-
+                        dataUsedBytes and walUsedBytes are the two volumes' usage as this member measured
+                        them, from the same statfs that decides walVolumeFull.
+
+                        Per member rather than per instance because that is where they can be measured: only
+                        the agent is inside the volume. The instance's own status.storage.used is the primary's
+                        figure, because a standby's is a replica of the same data and averaging them would
+                        describe no real filesystem.
+                      format: int64
+                      type: integer
                     healthy:
                       description: |-
                         healthy reports whether the member's status endpoint answered and its postmaster is
@@ -918,6 +929,9 @@ spec:
                         candidate must have had an active receiver when the failure was detected, and every
                         member must have its receiver down before promotion may proceed.
                       type: boolean
+                    walUsedBytes:
+                      format: int64
+                      type: integer
                     walVolumeFull:
                       description: |-
                         walVolumeFull refuses this member as a promotion candidate outright. A primary whose

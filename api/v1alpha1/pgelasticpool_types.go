@@ -1239,7 +1239,19 @@ type PoolObservability struct {
 	// perTenantMetrics labels pool metrics by tenant. Counters stay monotonic per tenant
 	// independent of pool object lifetime, so freeing an idle pool does not read as a
 	// counter reset downstream.
-	// +kubebuilder:default=true
+	//
+	// Off by default, and the default is the whole of the decision. At the design point of
+	// ~200 tenants per pool a single tenant label turns this fleet's 32 series into 6,400,
+	// and a Prometheus that falls over is worse than one that cannot break a number down.
+	// The per-tenant figures are published where an operator looks for them anyway - on the
+	// tenant's own CR - so this buys aggregation across tenants rather than visibility of
+	// them, and it should be turned on deliberately by somebody who has counted their
+	// tenants.
+	//
+	// It defaulted to true while nothing read it, which meant the API promised per-tenant
+	// metrics and the exposition refused to emit any label at all. Flipping the default is
+	// the honest half of making the field real.
+	// +kubebuilder:default=false
 	// +optional
 	PerTenantMetrics *bool `json:"perTenantMetrics,omitempty"`
 

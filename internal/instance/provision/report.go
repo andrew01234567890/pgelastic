@@ -80,6 +80,15 @@ type MemberReport struct {
 	WALReceiverActive bool `json:"walReceiverActive"`
 	// WALVolumeFull refuses this member as a candidate outright.
 	WALVolumeFull bool `json:"walVolumeFull"`
+	// DataUsedBytes and WALUsedBytes are the two volumes' usage, measured from the
+	// filesystem on the same tick that decides WALVolumeFull.
+	//
+	// Reported rather than discarded because the operator has no other source for them: the
+	// autoscaler's StorageExpand cannot fire while status.storage.used is absent, and
+	// nothing else in the tree can see inside a member's volume. Zero means "not measured",
+	// which is what an agent that could not stat the path reports.
+	DataUsedBytes int64 `json:"dataUsedBytes,omitempty"`
+	WALUsedBytes  int64 `json:"walUsedBytes,omitempty"`
 	// Rejoining names the path a member is taking back onto the primary's history -
 	// rewinding or recloning - and is empty the rest of the time. A member rebuilding
 	// itself has to be visible: it takes minutes to hours, it leaves the instance at
