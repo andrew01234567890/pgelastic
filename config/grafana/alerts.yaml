@@ -1,0 +1,160 @@
+# Alerts for pgelastic. Every expression here queries a metric the tree emits; the hygiene
+# test that checks the dashboard checks this file too.
+#
+# Severities are deliberately not all "warning". CloudNativePG ships seven alerts and every
+# one of them is warning, which means the two that describe a correctness failure page nobody
+# differently from the five that describe load. Split brain is not a warning.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: pgelastic
+  labels:
+    app.kubernetes.io/name: pgelastic
+spec:
+  groups:
+    - name: pgelastic.correctness
+      rules:
+        - alert: PgElasticSplitBrain
+          expr: max by (namespace, instance) (pgelastic_split_brain_observed) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: Two members of {{ $labels.instance }} both believe they are the primary
+            description: >-
+              Two members simultaneously report pg_is_in_recovery() = false. Writes may be
+              landing on both and diverging. There is no "for" delay on this deliberately:
+              waiting a minute to be sure is a minute of writes going to the wrong postmaster.
+
+        - alert: PgElasticInDoubtTransactions
+          expr: pgelastic_proxy_in_doubt_transactions > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: The proxy cannot say whether {{ $value }} transactions committed
+            description: >-
+              An in-doubt transaction is one the proxy sent and never learned the fate of.
+              Briefly non-zero across a cutover is expected; still non-zero after five minutes
+              means something is not resolving them.
+
+    - name: pgelastic.availability
+      rules:
+        - alert: PgElasticWritesStalled
+          expr: max by (namespace, instance) (pgelastic_write_stalled) > 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: Writes to {{ $labels.instance }} are blocking on synchronous replication
+            description: >-
+              Fewer standbys are streaming than the loaded synchronous_standby_names waits
+              for, so every commit is blocking. This is a full write outage for every tenant
+              on the instance, not a degradation.
+
+        - alert: PgElasticFailoverHeldBack
+          expr: max by (namespace, instance, veto) (pgelastic_failover_veto) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: A failover of {{ $labels.instance }} is held back by {{ $labels.veto }}
+            description: >-
+              The veto is a label rather than a metric of its own so that this one alert
+              covers every reason. Five minutes because a veto during a healthy roll is
+              normal and short.
+
+        - alert: PgElasticQuorumLost
+          expr: pgelastic_failover_quorum_reachable_voters < 1
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: No reachable voters for {{ $labels.instance }}
+            description: >-
+              R in the R + W > N failover gate has reached zero, so no failover can be
+              decided however unhealthy the primary becomes.
+
+    - name: pgelastic.transitions
+      rules:
+        # The pause is the product's central claim - a p99 under a second, clients queued and
+        # never dropped. An alert on it is an alert on the promise itself.
+        - alert: PgElasticCutoverPauseExceedsPromise
+          expr: >-
+            histogram_quantile(0.99, sum by (le, namespace) (rate(
+              pgelastic_migration_pause_seconds_bucket{strategy="Online"}[30m]))) > 1
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: Online cutover p99 pause is {{ $value | humanizeDuration }}
+            description: >-
+              Scoped to the online strategy because the offline pause is tens of seconds by
+              design; alerting on both together would fire on correct behaviour.
+
+        - alert: PgElasticTransitionStuck
+          expr: >-
+            time() - pgelastic_transition_phase_since_seconds > 3600
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: >-
+              {{ $labels.kind }}/{{ $labels.name }} has been in one phase for
+              {{ $value | humanizeDuration }}
+            description: >-
+              The series is dropped when the transition reaches a terminal phase, so this can
+              only fire for something still in flight. A migration legitimately takes hours;
+              an hour in a single phase is not the same thing.
+
+        - alert: PgElasticMigrationOrphansAccumulating
+          expr: sum by (namespace) (rate(pgelastic_migration_orphans_swept_total[1h])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: The orphan sweeper is reaping migration objects in {{ $labels.namespace }}
+            description: >-
+              An abandoned replication slot pins the source primary's WAL until
+              max_slot_wal_keep_size invalidates it. A non-zero rate is evidence of migrations
+              dying without running their own cleanup ladder.
+
+    - name: pgelastic.capacity
+      rules:
+        - alert: PgElasticMeteringStale
+          expr: max by (namespace, pool) (pgelastic_metering_stale) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Capacity samples for {{ $labels.pool }} are stale
+            description: >-
+              The autoscaler is planning from figures nobody is refreshing. This is the brake
+              that stops a plan being computed from stale samples, and it firing means the
+              plan is already suspect.
+
+        - alert: PgElasticPoolNearCapacity
+          expr: >-
+            sum by (namespace, pool) (pgelastic_metering_pool_connections{statistic="in_use"})
+            /
+            sum by (namespace, pool) (pgelastic_metering_pool_connections{statistic="allocatable"})
+            > 0.9
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.pool }} is at {{ $value | humanizePercentage }} of allocatable connections"
+            description: >-
+              Connections are the unit this product sells capacity in, so this is the fraction
+              that matters rather than CPU or memory.
+
+        - alert: PgElasticClientsBeingRejected
+          expr: rate(pgelastic_proxy_client_connections_rejected_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: The proxy is rejecting client connections
+            description: >-
+              Rejected is not queued. The capacity model queues clients and holds their
+              sockets open; a rejection means something declined a connection outright.
