@@ -356,6 +356,7 @@ func (r *PgTenantMigrationReconciler) record(
 		status.CompletedAt = ptr.To(metav1.NewTime(r.now()))
 	}
 
+	previousPhase := status.Phase
 	status.Phase = decision.Phase
 	// A settled decision leaves the conditions exactly as the reconcile that ended the
 	// migration wrote them. The message saying why it failed is the most valuable thing it
@@ -368,7 +369,7 @@ func (r *PgTenantMigrationReconciler) record(
 			conditionStatus(decision.Phase == pgelasticv1alpha1.TenantMigrationPhaseCompleted),
 			decision.Reason, servingMessage(decision, run))
 	}
-	recordMigrationPhase(run.Migration.Namespace, run.Migration.Name, decision.Phase)
+	recordMigrationPhase(run.Migration.Namespace, run.Migration.Name, previousPhase, status, r.now())
 }
 
 func (r *PgTenantMigrationReconciler) publish(

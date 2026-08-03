@@ -17,14 +17,14 @@ limitations under the License.
 package controller
 
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 )
-
-const labelMigration = "migration"
 
 // migrationPauseSeconds is a product commitment rather than a diagnostic. The target is a
 // p99 below one second with clients queued and never dropped, and the buckets are placed
@@ -39,16 +39,11 @@ var migrationPauseSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 	Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120},
 }, []string{labelNamespace, "strategy"})
 
-// migrationPhase carries one series per phase so that a phase being left drives its series
-// back to zero. A gauge latched at its last value is how a finished migration goes on
-// looking like a running one.
-var migrationPhase = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "pgelastic_migration_phase",
-	Help: "1 for the phase a migration is currently in.",
-}, []string{labelNamespace, labelMigration, fieldPhase})
-
-// migrationPhases is every phase the gauge can report.
-var migrationPhases = []pgelasticv1alpha1.TenantMigrationPhase{
+// migrationPhaseNames is every phase a migration's series are written for. The exporter
+// writes all of them on every observation, not just the current one, so that leaving a
+// phase drives its series back to zero: a gauge latched at its last value is how a finished
+// migration goes on looking like a running one.
+var migrationPhaseNames = phaseNames(
 	pgelasticv1alpha1.TenantMigrationPhasePreflight,
 	pgelasticv1alpha1.TenantMigrationPhaseProvisioning,
 	pgelasticv1alpha1.TenantMigrationPhasePreWarm,
@@ -60,17 +55,57 @@ var migrationPhases = []pgelasticv1alpha1.TenantMigrationPhase{
 	pgelasticv1alpha1.TenantMigrationPhaseFailed,
 	pgelasticv1alpha1.TenantMigrationPhaseAborted,
 	pgelasticv1alpha1.TenantMigrationPhaseRolledBack,
+)
+
+func phaseNames(phases ...pgelasticv1alpha1.TenantMigrationPhase) []string {
+	names := make([]string, 0, len(phases))
+	for _, phase := range phases {
+		names = append(names, string(phase))
+	}
+	return names
 }
 
 func init() {
-	metrics.Registry.MustRegister(migrationPauseSeconds, migrationPhase)
+	metrics.Registry.MustRegister(migrationPauseSeconds)
 }
 
-func recordMigrationPhase(namespace, name string, phase pgelasticv1alpha1.TenantMigrationPhase) {
-	for _, candidate := range migrationPhases {
-		migrationPhase.WithLabelValues(namespace, name, string(candidate)).
-			Set(boolValue(candidate == phase))
+// recordMigrationPhase reports where one migration has got to, and retires it when it
+// arrives. previous is the phase the last reconcile left behind, and it is what makes both
+// halves fire exactly once.
+//
+// Arriving at a terminal phase is observed and then immediately forgotten, in that order.
+// The observation is what makes the exporter count the migration - it counts what it
+// watched finish - and it matters for a migration that fails its very first preflight,
+// which would otherwise reach a terminal phase having never been seen at all. The forget is
+// what drops the per-object series, which is the whole reason the name label is affordable.
+//
+// A migration that was already terminal when this process first saw it is deliberately
+// neither: an operator restart must not re-count every migration in the namespace's history.
+func recordMigrationPhase(
+	namespace, name string,
+	previous pgelasticv1alpha1.TenantMigrationPhase,
+	status *pgelasticv1alpha1.PgTenantMigrationStatus,
+	now time.Time,
+) {
+	if migration.Terminal(previous) {
+		return
 	}
+	transitions.Observe(namespace, kindMigration, name, string(status.Phase), migrationPhaseNames, now)
+	if !migration.Terminal(status.Phase) {
+		return
+	}
+	transitions.Forget(namespace, kindMigration, name, string(status.Phase),
+		migrationDuration(status), migrationPhaseNames)
+}
+
+// migrationDuration is how long the migration ran, or zero when it cannot be said. Zero is
+// not observed into the histogram, because a migration recorded as having taken no time is
+// worse than one that is missing from the distribution.
+func migrationDuration(status *pgelasticv1alpha1.PgTenantMigrationStatus) time.Duration {
+	if status.StartedAt == nil || status.CompletedAt == nil {
+		return 0
+	}
+	return status.CompletedAt.Sub(status.StartedAt.Time)
 }
 
 // migrationOrphansSwept counts the physical objects the sweeper reaped. An abandoned slot
@@ -79,7 +114,7 @@ func recordMigrationPhase(namespace, name string, phase pgelasticv1alpha1.Tenant
 var migrationOrphansSwept = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "pgelastic_migration_orphans_swept_total",
 	Help: "Migration-owned publications, slots and subscriptions reaped by the orphan sweeper.",
-}, []string{labelNamespace, labelInstance, "kind"})
+}, []string{labelNamespace, labelInstance, labelKind})
 
 func init() {
 	metrics.Registry.MustRegister(migrationOrphansSwept)
