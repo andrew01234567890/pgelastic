@@ -95,4 +95,51 @@ var _ = Describe("PgTenantUser containment", Ordered, func() {
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("cannot be a member of itself"))
 	})
+
+	// Two logins of one tenant that answer to the same name are one identity, not two: the
+	// proxy authenticates a client against the name it sends, and the role is derived from it.
+	// Admitting both leaves whichever reconciles last deciding who the name belongs to.
+	It("refuses a second login of the same tenant claiming a name already taken", func() {
+		mustCreate(makeUser("wh-dup-first", tenantA, "duplicated"))
+
+		err := k8sClient.Create(ctx, makeUser("wh-dup-second", tenantA, "duplicated"))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("already has a login called"))
+	})
+
+	// The role a login maps to is derived from the tenant it belongs to and its own object
+	// name. Letting either move would leave the role it was provisioned under standing in
+	// pg_authid with nothing referring to it - and, for tenantRef, would relocate a live login
+	// into a tenant whose data it was never meant to reach.
+	It("refuses moving a login to another tenant", func() {
+		user := makeUser("wh-immutable-tenant", tenantA, "settled")
+		mustCreate(user)
+
+		user.Spec.TenantRef = corev1.LocalObjectReference{Name: tenantB}
+		err := k8sClient.Update(ctx, user)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("tenantRef is immutable"))
+	})
+
+	It("refuses renaming a login", func() {
+		user := makeUser("wh-immutable-name", tenantA, "renamed")
+		mustCreate(user)
+
+		user.Spec.UserName = "renamed-again"
+		err := k8sClient.Update(ctx, user)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("userName is immutable"))
+	})
+
+	// A group role authenticates nobody, so a credential attached to one is a contradiction
+	// rather than a harmless extra: it reads as though somebody may log in with it.
+	It("refuses a credentials Secret on a login that may not log in", func() {
+		user := makeUser("wh-group-with-secret", tenantA, "grouped")
+		user.Spec.Login = ptrTo(false)
+		user.Spec.CredentialsSecretRef = &corev1.LocalObjectReference{Name: "wh-unused"}
+
+		err := k8sClient.Create(ctx, user)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("may not log in"))
+	})
 })

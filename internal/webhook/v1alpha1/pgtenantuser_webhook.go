@@ -104,7 +104,18 @@ func (v *PgTenantUserCustomValidator) validate(
 			fmt.Sprintf("no PgTenant of that name exists in namespace %q", user.Namespace))})
 	}
 
-	if len(user.Spec.MemberOf) > 0 {
+	// A group role authenticates nobody, so a credential on one is a contradiction rather than
+	// an unused field: it reads as though somebody may log in with it, and nothing downstream
+	// would ever prove that wrong.
+	if user.Spec.Login != nil && !*user.Spec.Login && user.Spec.CredentialsSecretRef != nil {
+		problems = append(problems, field.Invalid(
+			field.NewPath("spec", "credentialsSecretRef"), user.Spec.CredentialsSecretRef.Name,
+			"this login may not log in, so a credential for it authenticates nobody; unset "+
+				"one of credentialsSecretRef or login"))
+	}
+
+	// One List serves both remaining rules, and both need every login of the same tenant.
+	{
 		siblings := &pgelasticv1alpha1.PgTenantUserList{}
 		if err := v.Reader.List(ctx, siblings, client.InNamespace(user.Namespace)); err != nil {
 			return err
@@ -112,8 +123,25 @@ func (v *PgTenantUserCustomValidator) validate(
 		known := map[string]bool{}
 		for i := range siblings.Items {
 			sibling := &siblings.Items[i]
-			if sibling.Spec.TenantRef.Name == user.Spec.TenantRef.Name {
-				known[sibling.Spec.UserName] = true
+			if sibling.Spec.TenantRef.Name != user.Spec.TenantRef.Name {
+				continue
+			}
+			known[sibling.Spec.UserName] = true
+			// Two logins of one tenant answering to the same name are one identity, not two:
+			// the proxy authenticates a client against the name it sends and the PostgreSQL
+			// role is derived from it, so admitting both leaves whichever reconciles last
+			// deciding whose credential the name accepts.
+			//
+			// Checked against the uncached reader, and still only best effort - two creates
+			// racing each other both read a cluster without the other. PostgreSQL is not a
+			// backstop here the way it is for a membership cycle, so the reconciler has to
+			// refuse the loser as well; this turns the ordinary case into an admission error
+			// naming both objects.
+			if sibling.Name != user.Name && sibling.Spec.UserName == user.Spec.UserName {
+				problems = append(problems, field.Duplicate(
+					field.NewPath("spec", "userName"),
+					fmt.Sprintf("PgTenant %q already has a login called %q, as PgTenantUser %q",
+						user.Spec.TenantRef.Name, user.Spec.UserName, sibling.Name)))
 			}
 		}
 		memberPath := field.NewPath("spec", "memberOf")
