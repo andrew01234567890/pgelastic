@@ -281,6 +281,12 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 // outright. Restoring under a different collation produces indexes silently inconsistent
 // with their heap ordering: no error, wrong results, discovered by a customer.
 func CollationContract(ctx context.Context, conn *pgx.Conn) (Contract, error) {
+	// data_checksums is compared rather than cast. It is a bool on PG18 and an enum on PG19
+	// - on, off, inprogress-on, inprogress-off - because 19 can turn checksums on and off
+	// while the cluster runs. 'inprogress-on'::boolean is a 22P02, and it would take this
+	// whole query with it: the system identifier, the WAL segment size and the locale tuple
+	// that the migration preflight and the pool-join gate both read. A tenant would be unable
+	// to move, and the reason would be a cast nobody was looking at.
 	const query = `
 		SELECT pg_encoding_to_char(d.encoding),
 		       d.datlocprovider::text,
@@ -290,7 +296,7 @@ func CollationContract(ctx context.Context, conn *pgx.Conn) (Contract, error) {
 		       COALESCE(d.daticurules, ''),
 		       (SELECT system_identifier::text FROM pg_control_system()),
 		       (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size'),
-		       current_setting('data_checksums')::boolean
+		       current_setting('data_checksums') IN ('on', 'inprogress-on')
 		FROM pg_database d WHERE d.datname = current_database()`
 	var contract Contract
 	err := conn.QueryRow(ctx, query).Scan(
