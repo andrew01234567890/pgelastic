@@ -186,6 +186,26 @@ func scramIterationsOf(resolved resolution) int32 {
 	return *resolved.pool.Spec.Auth.ScramIterations
 }
 
+// scramIterationsOfPool is the same cost, resolved for a caller that holds a tenant rather
+// than a resolution. A pool that cannot be read falls back to the CRD default, because a
+// credential is better derived under the documented cost than not derived at all - and the
+// tenant's own credential took that same default in the same situation.
+func scramIterationsOfPool(
+	ctx context.Context,
+	reader client.Reader,
+	tenant *pgelasticv1alpha1.PgTenant,
+) int32 {
+	if tenant.Spec.PoolRef.Name == "" {
+		return defaultScramIterations
+	}
+	pool := &pgelasticv1alpha1.PgElasticPool{}
+	key := client.ObjectKey{Namespace: tenant.Namespace, Name: tenant.Spec.PoolRef.Name}
+	if err := reader.Get(ctx, key, pool); err != nil {
+		return defaultScramIterations
+	}
+	return scramIterationsOf(resolution{pool: pool})
+}
+
 // nextGeneration bumps past whatever the previous credential carried, so a re-mint is visible
 // to the pool key and the links opened under the old secret become unreachable.
 func nextGeneration(secret *corev1.Secret) int32 {

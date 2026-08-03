@@ -141,6 +141,7 @@ rules:
   - pginstances/finalizers
   - pgtenantmigrations/finalizers
   - pgtenants/finalizers
+  - pgtenantusers/finalizers
   - pgworkloadclasses/finalizers
   verbs:
   - update
@@ -151,6 +152,8 @@ rules:
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - policy

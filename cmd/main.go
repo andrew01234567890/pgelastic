@@ -289,6 +289,15 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "pgtenant")
 		os.Exit(1)
 	}
+	if err := (&controller.PgTenantUserReconciler{
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		SQL:            migrationSQL,
+		ControllerName: controllerName,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "pgtenantuser")
+		os.Exit(1)
+	}
 	// The routing table of record, and the fleet that makes a flip immediate, composed
 	// rather than chosen between. status.binding is what a replica that restarts or one
 	// added later resolves the tenant through, so it is written on every path; the control
