@@ -1295,6 +1295,7 @@ pub async fn pool_key(
     backend: &crate::config::BackendConfig,
     startup: &StartupMessage,
     tenant: &str,
+    credential_generation: u64,
 ) -> Result<PoolKey> {
     use pgelastic_pool::{
         BackendTarget, CredentialGeneration, DatabaseName, FingerprintPolicy, PoolKeySpec,
@@ -1342,14 +1343,12 @@ pub async fn pool_key(
         // under the old one unreachable from any new binding: they drain out through
         // serverLifetime rather than being handed to somebody holding a secret PostgreSQL no
         // longer accepts.
-        credentials: CredentialGeneration::new(
-            config
-                .pool
-                .tenants
-                .iter()
-                .find(|t| t.name == tenant)
-                .map_or(0, |t| t.credential_generation),
-        ),
+        //
+        // Passed in rather than looked up here. The generation lives in the half of the
+        // document a running process adopts, and this function is handed the half it was
+        // started with - so reading it from `config` would key every link on the generation
+        // this process booted with and quietly undo the eviction above.
+        credentials: CredentialGeneration::new(credential_generation),
     }))
 }
 

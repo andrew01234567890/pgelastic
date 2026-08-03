@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
 
     let (shutdown, receiver) = watch::channel(false);
     let proxy = Proxy::new(config.clone(), Arc::clone(&metrics))?;
-    let reloader = Reloader::new(&config, Arc::clone(&proxy.fleet), Arc::clone(&metrics));
+    let reloader = Reloader::new(&config, Arc::clone(&proxy), Arc::clone(&metrics));
     let running = server::spawn(proxy, shutdown.clone()).await?;
 
     if let Some(listener) = metrics_listener {

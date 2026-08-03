@@ -33,7 +33,6 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, SecretSource};
 use crate::metrics::Metrics;
-use crate::route::Fleet;
 
 /// The annotation a replica publishes its applied `configVersion` under.
 ///
@@ -51,7 +50,7 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Everything the reload loop touches.
 pub struct Reloader {
-    pub fleet: Arc<Fleet>,
+    pub proxy: Arc<crate::server::Proxy>,
     pub metrics: Arc<Metrics>,
     pub source: SecretSource,
     pub interval: Duration,
@@ -71,7 +70,11 @@ impl std::fmt::Debug for Reloader {
 }
 
 impl Reloader {
-    pub fn new(config: &Config, fleet: Arc<Fleet>, metrics: Arc<Metrics>) -> Option<Self> {
+    pub fn new(
+        config: &Config,
+        proxy: Arc<crate::server::Proxy>,
+        metrics: Arc<Metrics>,
+    ) -> Option<Self> {
         let source = config.reload.secret.clone()?;
         let pod = config
             .reload
@@ -85,7 +88,7 @@ impl Reloader {
             );
         }
         Some(Self {
-            fleet,
+            proxy,
             metrics,
             source,
             interval: config.reload.interval(),
@@ -101,18 +104,32 @@ impl Reloader {
     /// disagreeing with the document it claims to be serving.
     pub fn apply(&mut self, current: &Config, next: &Config) -> Applied {
         let structural = !current.is_dynamic_change(next);
-        let routes = self.fleet.apply_routes(&next.routing.tenants);
+        let fleet = &self.proxy.fleet;
+        let routes = fleet.apply_routes(&next.routing.tenants);
         let mut claims = 0;
-        for instance in self.fleet.instances() {
+        for instance in fleet.instances() {
             claims += instance.pools.apply_tenants(&next.pool.tenants);
         }
-        self.fleet.publish_budget_now();
+        fleet.publish_budget_now();
+        // The logins and the per-tenant backend identities. A failure here leaves the previous
+        // pair in place rather than half of each: the alternative is a replica authenticating
+        // against one document and dialling with another.
+        let identities = match self.proxy.adopt(next) {
+            Ok(changed) => changed,
+            Err(error) => {
+                warn!(%error, version = next.config_version,
+                      "the published logins could not be adopted; the running ones are kept");
+                self.metrics.config_rejected();
+                false
+            }
+        };
         self.applied.clone_from(&next.config_version);
         self.metrics.config_applied(&next.config_version);
         Applied {
             version: next.config_version.clone(),
             routes,
             claims,
+            identities,
             structural,
         }
     }
@@ -128,6 +145,10 @@ pub struct Applied {
     pub version: String,
     pub routes: usize,
     pub claims: usize,
+    /// Whether the logins or the per-tenant backend identities moved. Reported separately
+    /// from `claims` because a tenant can gain a role and a credential without its capacity
+    /// claim changing at all, and that is the case onboarding one actually produces.
+    pub identities: bool,
     /// The published document also changed something only a restart can apply.
     /// The operator rolls the fleet for that; this is the log line that says the
     /// running process is not the whole of what was published.
@@ -193,6 +214,7 @@ pub async fn run(mut reloader: Reloader, current: Config, mut shutdown: watch::R
                     version = applied.version,
                     routes = applied.routes,
                     claims = applied.claims,
+                    identities = applied.identities,
                     "applied a published proxy configuration"
                 );
                 publish_applied(&reloader, &mut client, &applied.version).await;
@@ -310,9 +332,10 @@ mod tests {
 
     fn reloader(config: &Config) -> Reloader {
         let metrics = Metrics::new();
-        let fleet = Fleet::build(config, &metrics).expect("the fleet builds");
+        let proxy = crate::server::Proxy::new(config.clone(), Arc::clone(&metrics))
+            .expect("the proxy builds");
         Reloader {
-            fleet,
+            proxy,
             metrics,
             source: SecretSource {
                 namespace: "ns".to_owned(),
@@ -325,11 +348,160 @@ mod tests {
         }
     }
 
+    /// The identity a tenant's backend sessions run as has to reach a running replica.
+    ///
+    /// A fleet's last structural change is its instances appearing; tenants are onboarded
+    /// afterwards. `Config::structural` clears `pool.tenants` and `auth.users` precisely so
+    /// that onboarding one does not restart every replica and drop every other tenant's
+    /// clients - but removing the restart is only half of it, and nothing here adopted the
+    /// half that was left behind.
+    ///
+    /// Until it does, a tenant created after this process started is invisible to
+    /// `backend_for`, which falls through to the instance's own identity: the control
+    /// plane's role, running that tenant's SQL, with `session_user` naming the wrong
+    /// principal in every audit trail. That is the fallback the tenant branch already
+    /// refuses by name the moment it can see the tenant at all.
+    #[test]
+    fn a_tenants_published_identity_reaches_a_running_replica() {
+        let current = Config::from_str(BASE).unwrap();
+        let mut reloader = reloader(&current);
+        let proxy = Arc::clone(&reloader.proxy);
+        let instance = proxy.fleet.route("orders");
+        assert_eq!(
+            proxy.backend_for(&instance, "orders").unwrap().user,
+            "postgres",
+            "a tenant with no published identity dials as the instance"
+        );
+
+        let next = Config::from_str(&format!(
+            "{}{ORDERS_IDENTITY}",
+            BASE.replace("1-aaa", "2-bbb")
+        ))
+        .unwrap();
+        let applied = reloader.apply(&current, &next);
+
+        assert!(applied.identities, "the adoption reported nothing changed");
+        assert_eq!(
+            proxy.backend_for(&instance, "orders").unwrap().user,
+            "pgt_orders_c0ffee",
+            "the replica is still dialling as the identity it started with"
+        );
+        assert_eq!(
+            proxy.credential_generation("orders"),
+            7,
+            "the pool key still carries the generation this process started with, so a \
+             rotation would not evict the links opened under the superseded credential"
+        );
+    }
+
+    /// An unknown login must be indistinguishable from a known one, and an adoption must not
+    /// start telling them apart.
+    ///
+    /// Both halves are asserted because either alone is an oracle pointing one way or the
+    /// other. The operator renders `password`, not `verifier`, so a rebuilt record gets a fresh
+    /// random salt: carrying only the mock would freeze the unknown login and move every known
+    /// one, which is just as much of a tell as the reverse.
+    #[test]
+    fn an_adoption_moves_neither_an_unknown_nor_an_unchanged_logins_challenge() {
+        let alice = "\n[[auth.users]]\nname = \"alice\"\npassword = \"hunter2\"\n";
+        let current = Config::from_str(&format!("{BASE}{alice}")).unwrap();
+        let mut reloader = reloader(&current);
+        let unknown_before = reloader.proxy.auth().challenge_salt_for(b"nobody");
+        let alice_before = reloader.proxy.auth().challenge_salt_for(b"alice");
+
+        // Onboarding bob is the publication an attacker can provoke: it changes the login
+        // table without touching alice's own entry.
+        let next = Config::from_str(&format!(
+            "{}{alice}[[auth.users]]\nname = \"bob\"\npassword = \"correct-horse\"\n",
+            BASE.replace("1-aaa", "2-bbb")
+        ))
+        .unwrap();
+        reloader.apply(&current, &next);
+
+        assert_eq!(
+            unknown_before,
+            reloader.proxy.auth().challenge_salt_for(b"nobody"),
+            "adopting a login moved the salt an unknown user is challenged with"
+        );
+        assert_eq!(
+            alice_before,
+            reloader.proxy.auth().challenge_salt_for(b"alice"),
+            "adopting an unrelated login moved an unchanged login's salt, which tells an \
+             attacker polling both that this one is real"
+        );
+    }
+
+    /// Trust mode admits every client with no challenge at all, and it is a decision the
+    /// process makes once, at start-up, from the document it was built with.
+    ///
+    /// It must not become reachable by adoption. The operator drops any login whose credentials
+    /// Secret it cannot read, so a document with no logins is something a transient control-plane
+    /// failure produces rather than something anybody asks for - and `auth.users` is cleared by
+    /// `Config::structural`, so such a document rolls nothing and every replica would take it
+    /// inside one interval.
+    #[test]
+    fn a_document_that_has_lost_its_logins_does_not_open_the_fleet() {
+        let current = Config::from_str(&format!(
+            "{BASE}\n[[auth.users]]\nname = \"alice\"\npassword = \"hunter2\"\n"
+        ))
+        .unwrap();
+        let mut reloader = reloader(&current);
+        assert!(!reloader.proxy.auth().is_trust());
+
+        let next = Config::from_str(&BASE.replace("1-aaa", "2-bbb")).unwrap();
+        let applied = reloader.apply(&current, &next);
+
+        assert!(
+            !reloader.proxy.auth().is_trust(),
+            "adopting a document with no logins turned an authenticating fleet into an open one"
+        );
+        assert!(
+            !applied.identities,
+            "the adoption reported the logins as taken up when it refused them"
+        );
+    }
+
+    /// A login whose credential really did change must get a new salt, or a rotation would be
+    /// indistinguishable from no rotation at all.
+    #[test]
+    fn a_login_whose_password_changed_is_rebuilt_rather_than_carried() {
+        let current = Config::from_str(&format!(
+            "{BASE}\n[[auth.users]]\nname = \"alice\"\npassword = \"hunter2\"\n"
+        ))
+        .unwrap();
+        let mut reloader = reloader(&current);
+        let before = reloader.proxy.auth().challenge_salt_for(b"alice");
+
+        let next = Config::from_str(&format!(
+            "{}\n[[auth.users]]\nname = \"alice\"\npassword = \"rotated\"\n",
+            BASE.replace("1-aaa", "2-bbb")
+        ))
+        .unwrap();
+        reloader.apply(&current, &next);
+
+        assert_ne!(
+            before,
+            reloader.proxy.auth().challenge_salt_for(b"alice"),
+            "a rotated credential kept the verifier derived from the old password"
+        );
+    }
+
+    const ORDERS_IDENTITY: &str = r#"
+        [[pool.tenants]]
+        name = "orders"
+        burstable = 10
+        backendRole = "pgt_orders_c0ffee"
+        backendSaltedPassword = "c2FsdGVk"
+        backendSalt = "c2FsdA"
+        backendIterations = 4096
+        credentialGeneration = 7
+    "#;
+
     #[test]
     fn a_new_route_moves_the_tenant_without_touching_the_process() {
         let current = Config::from_str(BASE).unwrap();
         let mut reloader = reloader(&current);
-        assert_eq!(reloader.fleet.route("orders").id.as_str(), "inst-a");
+        assert_eq!(reloader.proxy.fleet.route("orders").id.as_str(), "inst-a");
 
         let next = Config::from_str(&format!(
             "{}\n[routing]\ntenants = {{ orders = \"inst-b\" }}\n",
@@ -341,7 +513,7 @@ mod tests {
         assert_eq!(applied.routes, 1);
         assert!(!applied.structural);
         assert_eq!(applied.version, "2-bbb");
-        assert_eq!(reloader.fleet.route("orders").id.as_str(), "inst-b");
+        assert_eq!(reloader.proxy.fleet.route("orders").id.as_str(), "inst-b");
         assert_eq!(reloader.applied_version(), "2-bbb");
     }
 
@@ -352,11 +524,11 @@ mod tests {
         ))
         .unwrap();
         let mut reloader = reloader(&current);
-        assert_eq!(reloader.fleet.route("orders").id.as_str(), "inst-b");
+        assert_eq!(reloader.proxy.fleet.route("orders").id.as_str(), "inst-b");
 
         let next = Config::from_str(&BASE.replace("1-aaa", "2-bbb")).unwrap();
         reloader.apply(&current, &next);
-        assert_eq!(reloader.fleet.route("orders").id.as_str(), "inst-a");
+        assert_eq!(reloader.proxy.fleet.route("orders").id.as_str(), "inst-a");
     }
 
     #[test]
@@ -389,6 +561,7 @@ mod tests {
         assert!(applied.structural);
         assert_eq!(
             reloader
+                .proxy
                 .fleet
                 .get(&crate::route::InstanceId::new("inst-a"))
                 .unwrap()
@@ -409,8 +582,8 @@ mod tests {
         // that has an instance its own process was not built with.
         let mut routes = std::collections::BTreeMap::new();
         routes.insert("orders".to_owned(), "inst-z".to_owned());
-        assert_eq!(reloader.fleet.apply_routes(&routes), 0);
-        assert_eq!(reloader.fleet.route("orders").id.as_str(), "inst-a");
+        assert_eq!(reloader.proxy.fleet.apply_routes(&routes), 0);
+        assert_eq!(reloader.proxy.fleet.route("orders").id.as_str(), "inst-a");
         let _ = &mut reloader;
     }
 

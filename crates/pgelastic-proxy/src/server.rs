@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use pgelastic_wire::{BackendMessage, TransactionStatus};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -24,11 +25,26 @@ use crate::session::{self, Ending};
 use crate::stream::ClientStream;
 use crate::tenant::TenantResolver;
 
+/// The half of a published document a running process can adopt.
+///
+/// Held behind an `ArcSwap` for the same reason `Fleet::routes` is: every connection reads it
+/// and the reload loop writes it at most once an interval. Both fields are cleared by
+/// `Config::structural`, which is the definition of belonging here - that function decides what
+/// a change may not roll the fleet for, and this is what then has to pick the change up.
+struct Dynamic {
+    /// The per-tenant claims, which carry each tenant's backend identity.
+    tenants: Vec<crate::config::TenantConfig>,
+    /// What `auth` was built from, kept so that an adoption which does not touch the logins
+    /// can reuse the table rather than deriving every password-configured verifier again.
+    users: Vec<crate::config::UserConfig>,
+    auth: Arc<ClientAuth>,
+}
+
 /// Everything a connection task needs, shared by `Arc`.
 pub struct Proxy {
     pub config: Config,
     pub acceptor: Option<TlsAcceptor>,
-    pub auth: Arc<ClientAuth>,
+    dynamic: ArcSwap<Dynamic>,
     pub kdf: KdfPool,
     pub cancels: Arc<CancelRegistry>,
     pub metrics: Arc<Metrics>,
@@ -62,32 +78,7 @@ impl Proxy {
             .transpose()?;
         let iterations = NonZeroU32::new(config.auth.scram_iterations)
             .ok_or_else(|| ProxyError::config("auth.scramIterations must be non-zero"))?;
-        let mut users = HashMap::new();
-        for user in &config.auth.users {
-            let verifier = match (&user.verifier, &user.password) {
-                (Some(secret), _) => ScramVerifier::parse(secret)
-                    .map_err(|e| ProxyError::config(format!("auth user {:?}: {e}", user.name)))?,
-                (None, Some(password)) => ScramVerifier::from_password(
-                    password,
-                    crate::scram::crypto::random_bytes::<{ crate::scram::verifier::SALT_LEN }>()?
-                        .to_vec(),
-                    iterations,
-                ),
-                (None, None) => {
-                    return Err(ProxyError::config(format!(
-                        "auth user {:?} has neither a verifier nor a password",
-                        user.name
-                    )));
-                }
-            };
-            users.insert(
-                user.name.as_bytes().to_vec(),
-                crate::handshake::UserRecord {
-                    verifier,
-                    tenant: user.tenant.clone(),
-                },
-            );
-        }
+        let users = login_table(&config.auth.users, iterations)?;
 
         let permits = Arc::new(Semaphore::new(config.listen.max_client_connections.max(1)));
         let kdf = KdfPool::new(config.auth.kdf_concurrency);
@@ -95,7 +86,11 @@ impl Proxy {
         metrics.in_doubt(fleet.default_instance().fence.fence.in_doubt().len());
 
         Ok(Arc::new(Self {
-            auth: Arc::new(ClientAuth::new(users, iterations)?),
+            dynamic: ArcSwap::from_pointee(Dynamic {
+                tenants: config.pool.tenants.clone(),
+                users: config.auth.users.clone(),
+                auth: Arc::new(ClientAuth::new(users, iterations)?),
+            }),
             tenant: TenantResolver::new(&config.routing),
             config,
             acceptor,
@@ -108,6 +103,64 @@ impl Proxy {
         }))
     }
 
+    /// Everything the client leg needs to authenticate a peer, as last published.
+    ///
+    /// Load it once per connection and hold the result: the exchange and the `admits` check
+    /// that follows it must run against the same generation, or a login could prove itself
+    /// against one table and be bound against another.
+    pub fn auth(&self) -> Arc<ClientAuth> {
+        Arc::clone(&self.dynamic.load().auth)
+    }
+
+    /// Takes up the half of `next` this process can apply without being restarted, and reports
+    /// whether anything actually moved.
+    ///
+    /// The structural half is deliberately not applied: the process was built from it, and a
+    /// running proxy that claimed otherwise would disagree with the document it says it serves.
+    pub fn adopt(&self, next: &Config) -> Result<bool> {
+        let current = self.dynamic.load();
+        let logins_changed = current.users != next.auth.users;
+        if !logins_changed && current.tenants == next.pool.tenants {
+            return Ok(false);
+        }
+        // Trust mode is a start-up decision and has to stay one. `ClientAuth::is_trust` admits
+        // every client with no challenge at all and binds it to whatever tenant it names, so a
+        // replica that adopted a document which had lost its logins would turn an authenticating
+        // fleet into an open one - inside one interval, with nothing rolled, because
+        // `Config::structural` clears `auth.users` precisely so that editing them does not
+        // restart anybody.
+        //
+        // And an empty list is not a thing an operator asks for. The control plane drops any
+        // login whose credentials Secret it cannot read, so one unreadable Secret per tenant is
+        // enough to render this document; `proxyUsers` says an empty list "is reported rather
+        // than quietly accepted", and no such report exists. Refusing here is the half of that
+        // sentence which is true.
+        if !current.users.is_empty() && next.auth.users.is_empty() {
+            return Err(ProxyError::config(
+                "the published configuration carries no logins while this replica is \
+                 authenticating against some; refusing it rather than admitting every client \
+                 without a challenge",
+            ));
+        }
+        let auth = if logins_changed {
+            let iterations = NonZeroU32::new(self.config.auth.scram_iterations)
+                .ok_or_else(|| ProxyError::config("auth.scramIterations must be non-zero"))?;
+            Arc::new(current.auth.rebuild(adopted_login_table(
+                &current,
+                &next.auth.users,
+                iterations,
+            )?))
+        } else {
+            Arc::clone(&current.auth)
+        };
+        self.dynamic.store(Arc::new(Dynamic {
+            tenants: next.pool.tenants.clone(),
+            users: next.auth.users.clone(),
+            auth,
+        }));
+        Ok(true)
+    }
+
     /// The control-plane facade over this proxy's fleet.
     pub fn control(&self) -> crate::control::Control {
         crate::control::Control {
@@ -117,6 +170,85 @@ impl Proxy {
             config: self.config.control.clone(),
         }
     }
+}
+
+/// Turns the published logins into the table the client leg authenticates against.
+///
+/// A malformed verifier is refused here rather than at login, so a document that cannot
+/// authenticate anybody fails where somebody is looking. On the adoption path that means one
+/// bad login costs the whole adoption and the replica keeps the table it had - which is the
+/// right way round, because the alternative is a fleet half of which admits a login the rest
+/// refuses.
+fn login_table(
+    users: &[crate::config::UserConfig],
+    iterations: NonZeroU32,
+) -> Result<HashMap<Vec<u8>, crate::handshake::UserRecord>> {
+    let mut table = HashMap::with_capacity(users.len());
+    for user in users {
+        table.insert(
+            user.name.as_bytes().to_vec(),
+            login_record(user, iterations)?,
+        );
+    }
+    Ok(table)
+}
+
+/// The next login table, keeping the record of every login whose published configuration is
+/// unchanged.
+///
+/// The reuse is a security property. `ScramVerifier::from_password` mints a fresh random salt
+/// on every build and the operator renders `password` rather than `verifier` for every login,
+/// so rebuilding an unchanged record would move that login's challenge salt. Paired with a
+/// carried mock secret - which holds an *unknown* login's salt still - that would make the two
+/// distinguishable across any publication an attacker can provoke. See `ClientAuth::rebuild`.
+///
+/// It also keeps a PBKDF2 per login off the reload tick, but that is the lesser reason.
+fn adopted_login_table(
+    previous: &Dynamic,
+    next: &[crate::config::UserConfig],
+    iterations: NonZeroU32,
+) -> Result<HashMap<Vec<u8>, crate::handshake::UserRecord>> {
+    let mut table = HashMap::with_capacity(next.len());
+    for user in next {
+        let key = user.name.as_bytes().to_vec();
+        let carried = previous
+            .users
+            .iter()
+            .any(|previous| previous == user)
+            .then(|| previous.auth.record(&key))
+            .flatten();
+        match carried {
+            Some(record) => table.insert(key, record.clone()),
+            None => table.insert(key, login_record(user, iterations)?),
+        };
+    }
+    Ok(table)
+}
+
+/// One login's record: what proves it, and which tenant it may be.
+fn login_record(
+    user: &crate::config::UserConfig,
+    iterations: NonZeroU32,
+) -> Result<crate::handshake::UserRecord> {
+    let verifier = match (&user.verifier, &user.password) {
+        (Some(secret), _) => ScramVerifier::parse(secret)
+            .map_err(|e| ProxyError::config(format!("auth user {:?}: {e}", user.name)))?,
+        (None, Some(password)) => ScramVerifier::from_password(
+            password,
+            crate::scram::crypto::random_bytes::<{ crate::scram::verifier::SALT_LEN }>()?.to_vec(),
+            iterations,
+        ),
+        (None, None) => {
+            return Err(ProxyError::config(format!(
+                "auth user {:?} has neither a verifier nor a password",
+                user.name
+            )));
+        }
+    };
+    Ok(crate::handshake::UserRecord {
+        verifier,
+        tenant: user.tenant.clone(),
+    })
 }
 
 /// How long the supervisor waits beyond a session's own forced-drain deadline.
@@ -332,7 +464,8 @@ impl Proxy {
         instance: &crate::route::Instance,
         tenant: &str,
     ) -> Result<crate::config::BackendConfig> {
-        let Some(entry) = self.config.pool.tenants.iter().find(|t| t.name == tenant) else {
+        let dynamic = self.dynamic.load();
+        let Some(entry) = dynamic.tenants.iter().find(|t| t.name == tenant) else {
             // Not an error: a tenant with no [[pool.tenants]] entry at all is the
             // single-tenant shape, which has no per-tenant identity to assume.
             return Ok(instance.backend.clone());
@@ -360,8 +493,8 @@ impl Proxy {
     /// The credential generation a tenant's pooled links are keyed on, so a rotation makes the
     /// old ones unreachable rather than reusable.
     pub fn credential_generation(&self, tenant: &str) -> u64 {
-        self.config
-            .pool
+        self.dynamic
+            .load()
             .tenants
             .iter()
             .find(|t| t.name == tenant)
@@ -494,7 +627,11 @@ async fn serve(
     handshake::negotiate_protocol_version(&mut session).await?;
 
     let user = session.user()?.clone();
-    if let Err(error) = handshake::authenticate_client(&mut session, &proxy.auth).await {
+    // Loaded once and held. Proving a password and binding the login to a tenant are two
+    // reads of the same table, and an adoption landing between them would decide the second
+    // against a table the first never saw.
+    let auth = proxy.auth();
+    if let Err(error) = handshake::authenticate_client(&mut session, &auth).await {
         proxy.metrics.client_auth(AuthOutcome::Failure);
         proxy.metrics.client_rejected(RejectReason::Handshake);
         handshake::report(&mut session.stream, Some(&user), &error).await;
@@ -525,7 +662,7 @@ async fn serve(
     // metrics as a wrong password, because the alternative tells the caller that
     // the credential was good and only the tenant was wrong. That is an oracle
     // for which tenants exist and which login belongs to which.
-    if !proxy.auth.admits(&user, tenant.as_str()) {
+    if !auth.admits(&user, tenant.as_str()) {
         proxy.metrics.client_auth(AuthOutcome::Failure);
         proxy.metrics.client_rejected(RejectReason::Handshake);
         let error = ProxyError::AuthenticationFailed;
@@ -541,6 +678,7 @@ async fn serve(
         &proxy.backend_for(&instance, &tenant)?,
         &session.startup,
         &tenant,
+        proxy.credential_generation(&tenant),
     )
     .await
     {
@@ -999,7 +1137,7 @@ mod tests {
         let source =
             format!("{MINIMAL}\n[[auth.users]]\nname = \"alice\"\npassword = \"hunter2\"\n");
         let proxy = Proxy::new(config(&source), Metrics::new()).unwrap();
-        assert!(!proxy.auth.is_trust());
+        assert!(!proxy.auth().is_trust());
     }
 
     #[tokio::test]
