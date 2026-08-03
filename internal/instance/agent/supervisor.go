@@ -509,10 +509,18 @@ func (s *Supervisor) observe(ctx context.Context) {
 	// the answer survives a postmaster that has already stopped, which is precisely the
 	// state a candidate is in when the veto has to be evaluated.
 	usage, usageErr := MeasureVolume(s.options.WALDir)
+	// Measured on the same tick and from the same place, because the operator has no other
+	// way to see inside a member's volumes and an autoscaler that cannot read usage cannot
+	// act on it.
+	dataUsage, dataUsageErr := MeasureVolume(s.options.DataDir)
 	s.update(func(state *ProbeState) {
 		state.LastPing = ping
 		if usageErr == nil {
 			state.WALVolumeFull = usage.Full()
+			state.WALUsedBytes = usage.UsedBytes()
+		}
+		if dataUsageErr == nil {
+			state.DataUsedBytes = dataUsage.UsedBytes()
 		}
 	})
 	if ping != pgtool.PingOK {
@@ -534,6 +542,12 @@ func (s *Supervisor) observe(ctx context.Context) {
 		return
 	}
 	observation.WALVolumeFull = usageErr == nil && usage.Full()
+	if usageErr == nil {
+		observation.WALUsedBytes = usage.UsedBytes()
+	}
+	if dataUsageErr == nil {
+		observation.DataUsedBytes = dataUsage.UsedBytes()
+	}
 	observation.Archive = s.archiveObservation(observation.Archive)
 	s.update(func(state *ProbeState) {
 		state.Role = observation.Role

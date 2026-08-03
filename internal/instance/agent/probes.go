@@ -63,6 +63,11 @@ type ProbeState struct {
 	// WALVolumeFull is measured from the filesystem rather than from PostgreSQL, so it is
 	// still answerable when the postmaster is not.
 	WALVolumeFull bool
+	// DataUsedBytes and WALUsedBytes are the two volumes' usage from the same measurement.
+	// Zero means the agent could not stat the path, which is distinguishable from an empty
+	// volume only because an initialised one is never actually zero.
+	DataUsedBytes int64
+	WALUsedBytes  int64
 }
 
 // StartupProbe answers whether the postmaster has got far enough to be waited on.

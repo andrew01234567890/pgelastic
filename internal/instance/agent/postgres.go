@@ -71,6 +71,12 @@ type MemberObservation struct {
 	// that the answer survives a postmaster that has already stopped - which is precisely
 	// the state a candidate is in when the veto has to be evaluated.
 	WALVolumeFull bool
+	// DataUsedBytes and WALUsedBytes are what the two volumes are using, from the same
+	// measurement that decides WALVolumeFull. Carried rather than dropped because
+	// status.storage.used has no other producer, and the autoscaler cannot expand a volume
+	// whose usage it cannot see.
+	DataUsedBytes int64
+	WALUsedBytes  int64
 	// SyncStandbys and StreamingStandbys come from pg_stat_replication and describe what is
 	// happening right now.
 	SyncStandbys      []string

@@ -31,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -664,6 +665,29 @@ func (r *PgInstanceReconciler) applyPrimaryLabel(
 	return nil
 }
 
+// storageStatus is what the volumes are actually holding, taken from the primary's own report.
+//
+// The primary rather than an aggregate: a standby's volume holds a replica of the same data, so
+// summing them would count it twice and averaging them would describe no filesystem that
+// exists. Absent until a member has reported, because a zero would read as an empty volume and
+// the autoscaler treats "no usage" and "no measurement" differently - StorageExpand requires a
+// figure above zero precisely so that it cannot act on an instance it has never heard from.
+func storageStatus(instance *pgelasticv1alpha1.PgInstance) map[string]any {
+	storage := map[string]any{"allocated": instance.Spec.Storage.Size.String()}
+	for _, member := range instance.Status.Instances {
+		if member.Name != instance.Status.CurrentPrimary {
+			continue
+		}
+		if member.DataUsedBytes > 0 {
+			storage["used"] = resource.NewQuantity(member.DataUsedBytes, resource.BinarySI).String()
+		}
+		if member.WALUsedBytes > 0 {
+			storage["walUsed"] = resource.NewQuantity(member.WALUsedBytes, resource.BinarySI).String()
+		}
+	}
+	return storage
+}
+
 // publishStatus applies the fields the operator owns.
 //
 // It is a server-side apply under the operator's own field manager, and it deliberately
@@ -691,9 +715,7 @@ func (r *PgInstanceReconciler) publishStatus(
 			"replicationSlots": int64(capacity.ReplicationSlots),
 			"allocatable":      int64(allocatableOf(instance, capacity, roll, decision)),
 		},
-		"storage": map[string]any{
-			"allocated": instance.Spec.Storage.Size.String(),
-		},
+		"storage":   storageStatus(instance),
 		"instances": syncSetEntries(instance),
 		fieldConditions: append(conditionsFor(instance, groups, pods, decision, builder.Replicas()),
 			rollCondition(instance, roll)),
