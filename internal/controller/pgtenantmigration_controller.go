@@ -369,7 +369,8 @@ func (r *PgTenantMigrationReconciler) record(
 			conditionStatus(decision.Phase == pgelasticv1alpha1.TenantMigrationPhaseCompleted),
 			decision.Reason, servingMessage(decision, run))
 	}
-	recordMigrationPhase(run.Migration.Namespace, run.Migration.Name, previousPhase, status, r.now())
+	recordMigrationPhase(run.Migration.Namespace, run.Migration.Name, previousPhase, status,
+		run.Plan, r.now())
 }
 
 func (r *PgTenantMigrationReconciler) publish(
