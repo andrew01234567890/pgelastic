@@ -85,12 +85,14 @@ func recordMigrationPhase(
 	namespace, name string,
 	previous pgelasticv1alpha1.TenantMigrationPhase,
 	status *pgelasticv1alpha1.PgTenantMigrationStatus,
+	route migration.Plan,
 	now time.Time,
 ) {
 	if migration.Terminal(previous) {
 		return
 	}
 	transitions.Observe(namespace, kindMigration, name, string(status.Phase), migrationPhaseNames, now)
+	transitions.Route(namespace, kindMigration, name, route.Source.Instance, route.Target.Instance)
 	if !migration.Terminal(status.Phase) {
 		return
 	}

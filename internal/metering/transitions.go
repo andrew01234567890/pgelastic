@@ -47,6 +47,7 @@ const (
 // this package refuses.
 type Transitions struct {
 	phase    *prometheus.GaugeVec
+	route    *prometheus.GaugeVec
 	since    *prometheus.GaugeVec
 	total    *prometheus.CounterVec
 	duration *prometheus.HistogramVec
@@ -70,6 +71,17 @@ func NewTransitions(registerer prometheus.Registerer) (*Transitions, error) {
 				"not. One series per phase so a dashboard can draw a state timeline; the " +
 				"whole set is dropped when the transition reaches a terminal phase.",
 		}, []string{labelNamespace, labelKind, labelName, labelPhase}),
+
+		// The route is its own series rather than two more labels on the phase gauge. Putting
+		// them there would multiply every phase by every pair of instances a transition could
+		// run between, and the phase timeline is the one thing here written eleven times per
+		// observation. One series per in-flight object, joined to the phase by name, costs a
+		// single line in a dashboard query and nothing in cardinality.
+		route: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pgelastic_transition_route",
+			Help: "1 while a transition is moving an object, labelled with where from and " +
+				"where to. Dropped with the rest of the object's series when it settles.",
+		}, []string{labelNamespace, labelKind, labelName, labelFrom, labelTo}),
 
 		since: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "pgelastic_transition_phase_since_seconds",
@@ -95,7 +107,8 @@ func NewTransitions(registerer prometheus.Registerer) (*Transitions, error) {
 		known: map[transitionKey]string{},
 	}
 	for _, collector := range []prometheus.Collector{
-		transitions.phase, transitions.since, transitions.total, transitions.duration,
+		transitions.phase, transitions.route, transitions.since,
+		transitions.total, transitions.duration,
 	} {
 		if err := registerer.Register(collector); err != nil {
 			return nil, err
@@ -134,6 +147,32 @@ func (t *Transitions) Observe(namespace, kind, name, phase string, phases []stri
 	}
 }
 
+// Route records where a transition is moving something from and to - which instance a tenant
+// is leaving and which it is arriving at, which instance a restore is landing on.
+//
+// The old series for the object is dropped before the new one is written, so a route that is
+// only half known when the transition starts does not leave a second series behind when the
+// other half resolves. A migration learns its source from its own status, one reconcile after
+// it learns its target, and without this it would report both routes at once for ever.
+//
+// Nothing is written when neither end is known, because a route labelled with two empty
+// strings says less than no series at all.
+func (t *Transitions) Route(namespace, kind, name, from, to string) {
+	if t == nil || (from == "" && to == "") {
+		return
+	}
+	t.dropRoute(namespace, kind, name)
+	t.route.WithLabelValues(namespace, kind, name, from, to).Set(1)
+}
+
+func (t *Transitions) dropRoute(namespace, kind, name string) {
+	t.route.DeletePartialMatch(prometheus.Labels{
+		labelNamespace: namespace,
+		labelKind:      kind,
+		labelName:      name,
+	})
+}
+
 // Forget drops one object's per-object series and records how it ended.
 //
 // Called when a transition reaches a terminal phase or the object goes away. The counter and
@@ -154,6 +193,7 @@ func (t *Transitions) Forget(namespace, kind, name, outcome string, took time.Du
 		t.phase.DeleteLabelValues(namespace, kind, name, candidate)
 	}
 	t.since.DeleteLabelValues(namespace, kind, name)
+	t.dropRoute(namespace, kind, name)
 
 	// Counted once. Forget is reached on every reconcile after a transition terminates - the
 	// object sits in its terminal phase until somebody deletes it - so counting
