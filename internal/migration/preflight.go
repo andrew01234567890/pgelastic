@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -64,6 +65,11 @@ const (
 	// CREATEROLE in particular would let it mint cluster-global roles of its own on the far
 	// side - which is the one attribute that defeats every naming scheme above it.
 	CheckTenantRoleAttributes CheckName = "TenantRoleAttributes"
+	// CheckVersionCompatibility refuses a move the copy mechanism cannot perform. Both this
+	// tree's dumps run in the *target* pod, so the binary is always the target's, and pg_dump
+	// refuses outright to read a server newer than itself.
+	CheckVersionCompatibility CheckName = "VersionCompatibility"
+
 	// CheckDatabaseConnectPrivilege refuses a source database that still lets PUBLIC connect.
 	// Roles are cluster-global, so on an instance where tenant roles can authenticate, PUBLIC
 	// CONNECT means every tenant's role can open a session on this tenant's database. Refusing
@@ -173,6 +179,7 @@ func RunPreflight(ctx context.Context, sql SQL, in PreflightInput) PreflightResu
 		checkTenantIsCold(in),
 		checkTenantRoleAttributes(ctx, sql, in.Source),
 		checkDatabaseConnectPrivilege(ctx, sql, in.Source),
+		checkVersionCompatibility(ctx, sql, in),
 	}
 	if in.RequireReplicaIdentity {
 		checks = append(checks, checkReplicaIdentity(ctx, sql, in.Source))
@@ -334,6 +341,69 @@ FROM pg_database d WHERE d.datname = current_database()`
 // wrong results, discovered by a customer.
 func ReadCollation(ctx context.Context, sql SQL, at Endpoint) (string, error) {
 	return scalar(ctx, sql, at, collationQuery)
+}
+
+// serverVersionQuery reads the major version as a number rather than parsing version(). The
+// text form carries a beta suffix during a beta cycle and a distribution's own build string
+// the rest of the time, neither of which is orderable.
+const serverVersionQuery = `SELECT current_setting('server_version_num')::int / 10000`
+
+// checkVersionCompatibility refuses a move the copy mechanism cannot perform.
+//
+// Both the offline dump and the online schema copy run pg_dump *in the target's container*,
+// reaching the source over the pod network - so the binary is always the target's version.
+// pg_dump refuses to read a server newer than itself and says so plainly; without this check
+// that refusal arrives as an exit code inside a shell pipeline, wrapped in a retry budget
+// that spends itself re-running a command which could never have worked. The tenant sees a
+// migration that fails slowly for no stated reason.
+//
+// Cross-major in the supported direction is fine and is deliberately allowed: an older
+// publisher with a newer subscriber is documented, and the logical replication protocol
+// version is chosen from the publisher's server version, so a newer subscriber negotiates
+// down. That is the whole basis of the recommended upgrade route - provision an instance on
+// the new major and migrate tenants onto it one at a time - so refusing it would refuse the
+// thing this check exists to make safe.
+func checkVersionCompatibility(ctx context.Context, sql SQL, in PreflightInput) Check {
+	source, err := scalar(ctx, sql, in.Source, serverVersionQuery)
+	if err != nil {
+		return failed(CheckVersionCompatibility,
+			"could not read the source's server version: "+err.Error())
+	}
+	target, err := scalar(ctx, sql, in.Target.WithDatabase("postgres"), serverVersionQuery)
+	if err != nil {
+		return failed(CheckVersionCompatibility,
+			"could not read the target's server version: "+err.Error())
+	}
+
+	sourceMajor, sourceErr := strconv.Atoi(strings.TrimSpace(source))
+	targetMajor, targetErr := strconv.Atoi(strings.TrimSpace(target))
+	if sourceErr != nil || targetErr != nil {
+		return failed(CheckVersionCompatibility, fmt.Sprintf(
+			"the server versions did not read as numbers: source %q, target %q", source, target))
+	}
+
+	if targetMajor < sourceMajor {
+		return failed(CheckVersionCompatibility, fmt.Sprintf(
+			"the target runs PostgreSQL %d and the source runs %d. Both dumps run in the "+
+				"target's container, and pg_dump refuses to read a server newer than itself, "+
+				"so this move would fail inside a shell pipeline rather than here",
+			targetMajor, sourceMajor))
+	}
+	if targetMajor > sourceMajor+1 {
+		return failed(CheckVersionCompatibility, fmt.Sprintf(
+			"the target runs PostgreSQL %d and the source runs %d, which is a jump of %d "+
+				"majors. One major at a time is the path that gets tested; further is a "+
+				"combination nobody has run",
+			targetMajor, sourceMajor, targetMajor-sourceMajor))
+	}
+	if targetMajor != sourceMajor {
+		return passed(CheckVersionCompatibility, fmt.Sprintf(
+			"the target runs PostgreSQL %d and the source runs %d: the supported direction, "+
+				"with the newer pg_dump reading the older server",
+			targetMajor, sourceMajor))
+	}
+	return passed(CheckVersionCompatibility, fmt.Sprintf(
+		"both instances run PostgreSQL %d", sourceMajor))
 }
 
 func checkCollation(ctx context.Context, sql SQL, in PreflightInput) Check {
