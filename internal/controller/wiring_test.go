@@ -60,9 +60,13 @@ var _ = Describe("manager wiring", func() {
 		Expect((&PgTenantMigrationReconciler{
 			Client: manager.GetClient(), Scheme: manager.GetScheme(),
 		}).SetupWithManager(manager)).To(Succeed())
+		Expect((&PgTenantUserReconciler{
+			Client: manager.GetClient(), Scheme: manager.GetScheme(),
+		}).SetupWithManager(manager)).To(Succeed())
 
 		Expect(webhookv1alpha1.SetupPgElasticPoolWebhookWithManager(manager)).To(Succeed())
 		Expect(webhookv1alpha1.SetupPgTenantWebhookWithManager(manager)).To(Succeed())
+		Expect(webhookv1alpha1.SetupPgTenantUserWebhookWithManager(manager)).To(Succeed())
 		Expect(webhookv1alpha1.SetupPgWorkloadClassWebhookWithManager(manager)).To(Succeed())
 	})
 })
