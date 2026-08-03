@@ -45,6 +45,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/metering"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/proxy"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 	webhookv1alpha1 "github.com/andrew01234567890/pgelastic/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
@@ -73,6 +74,11 @@ func init() {
 }
 
 // nolint:gocyclo
+// operatorVersion is stamped at build time with -ldflags "-X main.operatorVersion=...". The
+// default is "dev" rather than "unknown": a build nobody stamped is a development build, and
+// saying so is more use in a trace than admitting ignorance.
+var operatorVersion = "dev"
+
 func main() {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
@@ -384,9 +390,27 @@ func main() {
 		os.Exit(1)
 	}
 
+	signals := ctrl.SetupSignalHandler()
+
+	// Started after the manager is built and before it runs, so a failure to reach the
+	// collector is fatal here rather than surfacing later as traces that silently never
+	// arrive. Absent OTEL_EXPORTER_OTLP_ENDPOINT this is a no-op and costs nothing.
+	stopTracing, err := tracing.Start(signals, operatorVersion)
+	if err != nil {
+		setupLog.Error(err, "Failed to start trace export")
+		os.Exit(1)
+	}
+
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "Failed to run manager")
+	runErr := mgr.Start(signals)
+
+	// Flushed before exit even when the manager failed. The spans describing a crash are the
+	// ones worth having, and they are buffered at exactly the moment they would be dropped.
+	if err := stopTracing(signals); err != nil {
+		setupLog.Error(err, "Failed to flush traces")
+	}
+	if runErr != nil {
+		setupLog.Error(runErr, "Failed to run manager")
 		os.Exit(1)
 	}
 }
