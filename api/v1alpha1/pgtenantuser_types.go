@@ -50,7 +50,13 @@ type PgTenantUserSpec struct {
 	// TenantRef is the tenant this login belongs to, in the same namespace. A login is
 	// meaningless without one: the tenant is what decides which database it reaches and which
 	// PostgreSQL role it becomes.
+	//
+	// Immutable. The PostgreSQL role is derived from the tenant's identity, so moving a login
+	// between tenants would leave the role it was provisioned under standing in pg_authid with
+	// nothing referring to it - and would point a credential somebody already holds at a
+	// database it was never granted.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="tenantRef is immutable: the PostgreSQL role is derived from the tenant, so moving a login would orphan the role it was provisioned under and hand an existing credential a database it was never granted"
 	TenantRef corev1.LocalObjectReference `json:"tenantRef"`
 
 	// UserName is the name a client sends in its startup packet.
@@ -58,9 +64,13 @@ type PgTenantUserSpec struct {
 	// Unique within the tenant rather than within the cluster, which is the containment
 	// property: two tenants may each have a user called `app`, and they are different
 	// identities with different credentials that cannot reach each other's data.
+	//
+	// Immutable, for the same reason as tenantRef: it is an input to the derived role, and a
+	// rename would strand the old one.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_]*$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="userName is immutable: it is an input to the derived PostgreSQL role, so renaming a login would strand the role it was provisioned under"
 	UserName string `json:"userName"`
 
 	// CredentialsSecretRef holds the login's password, in the same namespace.
@@ -86,8 +96,14 @@ type PgTenantUserSpec struct {
 	// +kubebuilder:validation:MaxItems=32
 	MemberOf []string `json:"memberOf,omitempty"`
 
-	// ConnectionLimit bounds sessions this user may hold, as an in-database backstop. The
-	// proxy's ledger is the enforcement point. -1 leaves it uncapped, which is the default.
+	// ConnectionLimit bounds the sessions this login may hold. The proxy's ledger is the
+	// enforcement point and the only one; -1 leaves it unbounded, which is the default.
+	//
+	// Deliberately **not** mirrored onto the PostgreSQL role. Once the proxy authenticates as
+	// that role, every backend the fleet opens counts against rolconnlimit, so N replicas each
+	// entitled to this many would breach it N-fold and deliver "too many connections for role"
+	// to whichever client happened to be last. The tenant's own role is left uncapped for
+	// exactly this reason - see connectionLimitOf in the tenant controller.
 	// +optional
 	// +kubebuilder:validation:Minimum=-1
 	ConnectionLimit *int32 `json:"connectionLimit,omitempty"`
