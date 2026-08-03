@@ -152,12 +152,14 @@ func RenderCustomConf(config InstanceConfig) []Setting {
 	}
 	maps.Copy(settings, BlockedDefaults())
 
-	if config.SharedBuffers != "" {
-		settings["shared_buffers"] = config.SharedBuffers
-	}
-	if config.EffectiveCacheSize != "" {
-		settings["effective_cache_size"] = config.EffectiveCacheSize
-	}
+	// Emitted unconditionally, never omitted when empty. This file's own rule at the top
+	// says why: pending_restart is set only when a parameter appears in or disappears from
+	// the configuration file, so a parameter left implicit is one whose restart requirement
+	// PostgreSQL will never report - and shared_buffers is the most expensive possible
+	// instance of that case. Omission is also how these two were never once emitted: nothing
+	// in the tree sets spec.resources, so the guard that used to stand here was always taken.
+	settings["shared_buffers"] = config.SharedBuffers
+	settings["effective_cache_size"] = config.EffectiveCacheSize
 	for name, value := range config.UserParameters {
 		// IsPinned rather than IsOwned, so a Tuned parameter the user set survives to here
 		// and overwrites the computed value written earlier in this same map. This stays a

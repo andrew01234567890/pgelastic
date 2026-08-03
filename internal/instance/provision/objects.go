@@ -98,6 +98,10 @@ type Builder struct {
 	AgentImage string
 	// Capacity is the derived max_connections split.
 	Capacity pgconf.Capacity
+	// SizingClass is the shape the instance was sold as. It is what the memory derivation
+	// falls back to when spec.resources says nothing, which is every PgInstance in this
+	// repository.
+	SizingClass pgconf.SizingClass
 	// AntiAffinity selects the placement strictness.
 	AntiAffinity AntiAffinityPolicy
 	// ProxySources are the CIDRs the proxy dials from.
@@ -194,8 +198,8 @@ func (b Builder) AgentConfig() AgentConfig {
 		SynchronousCommit:        string(synchronousCommit(spec)),
 		AutovacuumWorkerSlots:    16,
 		ActiveReplicationOrigins: 64,
-		SharedBuffers:            memoryFraction(spec.Resources, 4),
-		EffectiveCacheSize:       memoryFraction(spec.Resources, 2),
+		SharedBuffers:            sharedBuffersFor(spec.Resources, b.SizingClass),
+		EffectiveCacheSize:       effectiveCacheSizeFor(spec.Resources, b.SizingClass),
 		// The epoch is bound into the postmaster as a custom GUC so the proxy can read it
 		// off any backend connection with a plain SHOW, where it cannot drift from the
 		// running postmaster the way a value fetched from the API server can.
@@ -720,20 +724,70 @@ func ConcurrentDumps(spec pgelasticv1alpha1.PgInstanceSpec) int32 {
 // size literal, or the empty string when the pod declares no memory at all. Inventing a
 // number in that case would be worse than leaving the boot default: the default is at
 // least a value somebody chose.
-func memoryFraction(resources *corev1.ResourceRequirements, divisor int64) string {
-	if resources == nil {
-		return ""
-	}
-	memory, ok := resources.Limits[corev1.ResourceMemory]
-	if !ok {
-		if memory, ok = resources.Requests[corev1.ResourceMemory]; !ok {
-			return ""
+// nonPostgresReserve is what the Pod runs besides the postmaster: the instance agent, the
+// physical-backup shim and the syslogger.
+//
+// It is subtracted by name rather than absorbed into a smaller fraction. A Kubernetes memory
+// limit is a cgroup ceiling - gross, and a hard OOM-kill boundary - whereas the 25% that RDS
+// applies is a fraction of a figure AWS has already netted the OS and its own agents out of.
+// Taking 25% of the gross number is therefore *more* aggressive than RDS is, by exactly the
+// overhead they never publish. Zalando solves the same problem by quietly using a fifth
+// rather than a quarter inside a container; naming the subtraction instead means somebody can
+// audit it against real pod RSS and argue with the number.
+const nonPostgresReserve = int64(512) << 20
+
+// minSharedBuffers is a floor rather than a fraction. Each of ~200 tenant databases carries
+// its own copy of every catalog and its own pg_internal.init - at least 269 relations before
+// a single tenant object exists - and none of that is optional. A dev-1's quarter-share would
+// otherwise land below what the catalogs alone need warm.
+const minSharedBuffers = int64(512) << 20
+
+// maxSharedBuffers caps the quarter-share. DropDatabaseBuffers scans the entire buffer pool
+// on every DROP DATABASE - an unconditional walk of NBuffers - so on a pool with tenant churn
+// the cost of a larger cache is paid again on every tenant deletion.
+const maxSharedBuffers = int64(16) << 30
+
+// instanceMemory is how much memory the postmaster may plan around, and where the figure
+// came from.
+//
+// Precedence is limits, then requests, then the class rating. There is no fourth step and no
+// zero case: spec.resources is unset on every PgInstance in this repository, so "no resources
+// declared" is not an edge case, it is the only case that has ever run - and it currently
+// means shared_buffers is omitted entirely and PostgreSQL boots on its 128 MB default
+// whether the class sold 50 connections or 1200.
+func instanceMemory(resources *corev1.ResourceRequirements, class pgconf.SizingClass) int64 {
+	declared := int64(0)
+	if resources != nil {
+		if memory, ok := resources.Limits[corev1.ResourceMemory]; ok {
+			declared = memory.Value()
+		} else if memory, ok := resources.Requests[corev1.ResourceMemory]; ok {
+			declared = memory.Value()
 		}
 	}
-	bytes := memory.Value() / divisor
-	if bytes <= 0 {
-		return ""
+	if declared <= 0 {
+		declared = class.RatedMemoryBytes
 	}
+	return max(declared-nonPostgresReserve, minSharedBuffers)
+}
+
+// sharedBuffersFor is a quarter of what is left after the reserve, floored and capped.
+func sharedBuffersFor(resources *corev1.ResourceRequirements, class pgconf.SizingClass) string {
+	usable := instanceMemory(resources, class)
+	return megabytes(min(max(usable/4, minSharedBuffers), maxSharedBuffers))
+}
+
+// effectiveCacheSizeFor is half, ratifying the divisor the tree already used - and not the
+// three quarters pgtune and timescaledb-tune advise.
+//
+// Their 75% is single-tenant advice. The planner pro-rates this figure across the tables in
+// the *current query* only, never across concurrent sessions and never across databases, so
+// telling each of ~200 tenants that three quarters of RAM is available to it is optimistic by
+// roughly the tenant count and biases every plan toward index scans.
+func effectiveCacheSizeFor(resources *corev1.ResourceRequirements, class pgconf.SizingClass) string {
+	return megabytes(instanceMemory(resources, class) / 2)
+}
+
+func megabytes(bytes int64) string {
 	return strconv.FormatInt(bytes/(1<<20), 10) + "MB"
 }
 
