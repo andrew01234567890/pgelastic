@@ -50,6 +50,11 @@ const (
 	// this index still returns tenants is deleting their data, so the index is what the
 	// drain guard reads.
 	TenantByInstance = "status.binding.instanceRef.name"
+	// TenantUserByTenant indexes PgTenantUser on the tenant whose database it reaches.
+	// Every read of a login is scoped to one tenant - the roles it may be a member of, the
+	// names it may not duplicate, the set the reconciler fences revocation to - so listing
+	// a namespace and filtering would be the wrong shape at ~200 tenants per pool.
+	TenantUserByTenant = "spec.tenantRef.name"
 )
 
 // Setup registers every pgelastic field index on a cache's indexer.
@@ -84,6 +89,17 @@ func Setup(ctx context.Context, indexer client.FieldIndexer) error {
 				return nil
 			}
 			return []string{tenant.Status.Binding.InstanceRef.Name}
+		}); err != nil {
+		return err
+	}
+
+	if err := indexer.IndexField(ctx, &pgelasticv1alpha1.PgTenantUser{}, TenantUserByTenant,
+		func(object client.Object) []string {
+			user, ok := object.(*pgelasticv1alpha1.PgTenantUser)
+			if !ok || user.Spec.TenantRef.Name == "" {
+				return nil
+			}
+			return []string{user.Spec.TenantRef.Name}
 		}); err != nil {
 		return err
 	}
