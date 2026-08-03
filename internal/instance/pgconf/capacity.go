@@ -100,17 +100,42 @@ type SizingClass struct {
 	Name string
 	// AllocatableConnections is A for this class.
 	AllocatableConnections int32
+	// RatedCPUMillis and RatedMemoryBytes are the shape the connection rating assumes.
+	//
+	// They are not a request: the Pod's resources come from spec.resources, and these are
+	// what the parameter derivation falls back to when it has nothing else to read. Without
+	// them a gp-32 rated at 1200 connections and a dev-1 rated at 50 get byte-identical
+	// PostgreSQL memory settings, which is what happens today because nothing in the tree
+	// sets spec.resources at all.
+	RatedCPUMillis   int64
+	RatedMemoryBytes int64
 }
+
+const (
+	gibibyte = int64(1) << 30
+	// memoryPerVCPU is the ratio the gp- ratings are built on. It is a ratification of the
+	// naming convention rather than a derivation from it: gp-N tracks N vCPU and the
+	// connection counts follow ~25/vCPU up to gp-16. gp-32 breaks that pattern - 1200 rather
+	// than 1600 - which reads as a deliberate density ceiling nobody wrote down, so its
+	// rating follows the name and not the connection count.
+	memoryPerVCPU = 4 * gibibyte
+)
 
 var sizingClasses = map[string]SizingClass{
 	// dev-1 exists for kind and for CI: small enough that three postmasters fit on one
 	// node, large enough that the derivation is still exercised end to end.
-	"dev-1": {Name: "dev-1", AllocatableConnections: 50},
-	"gp-2":  {Name: "gp-2", AllocatableConnections: 100},
-	"gp-4":  {Name: "gp-4", AllocatableConnections: 200},
-	"gp-8":  {Name: "gp-8", AllocatableConnections: 400},
-	"gp-16": {Name: "gp-16", AllocatableConnections: 800},
-	"gp-32": {Name: "gp-32", AllocatableConnections: 1200},
+	"dev-1": {Name: "dev-1", AllocatableConnections: 50,
+		RatedCPUMillis: 1000, RatedMemoryBytes: 2 * gibibyte},
+	"gp-2": {Name: "gp-2", AllocatableConnections: 100,
+		RatedCPUMillis: 2000, RatedMemoryBytes: 2 * memoryPerVCPU},
+	"gp-4": {Name: "gp-4", AllocatableConnections: 200,
+		RatedCPUMillis: 4000, RatedMemoryBytes: 4 * memoryPerVCPU},
+	"gp-8": {Name: "gp-8", AllocatableConnections: 400,
+		RatedCPUMillis: 8000, RatedMemoryBytes: 8 * memoryPerVCPU},
+	"gp-16": {Name: "gp-16", AllocatableConnections: 800,
+		RatedCPUMillis: 16000, RatedMemoryBytes: 16 * memoryPerVCPU},
+	"gp-32": {Name: "gp-32", AllocatableConnections: 1200,
+		RatedCPUMillis: 32000, RatedMemoryBytes: 32 * memoryPerVCPU},
 }
 
 // LookupSizingClass resolves a class name. An unknown class is an error rather than a

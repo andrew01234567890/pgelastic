@@ -226,6 +226,7 @@ func (r *PgInstanceReconciler) builderFor(
 		Instance:      instance,
 		PostgresImage: r.PostgresImage,
 		AgentImage:    r.AgentImage,
+		SizingClass:   class,
 		Capacity: pgconf.DeriveCapacity(
 			class.AllocatableConnections,
 			provision.ConcurrentDumps(instance.Spec),
