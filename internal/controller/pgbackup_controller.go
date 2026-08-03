@@ -81,6 +81,8 @@ func (r *PgBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
+	previousPhase := backup.Status.Phase
+
 	status := backup.Status.DeepCopy()
 	status.ObservedGeneration = backup.Generation
 	r.orphanIfNobodyIsTakingIt(status, instance)
@@ -93,6 +95,7 @@ func (r *PgBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return ctrl.Result{}, err
 		}
 	}
+	recordBackupPhase(backup.Namespace, backup.Name, previousPhase, status, time.Now())
 	if status.Phase == pgelasticv1alpha1.BackupPhasePending {
 		return ctrl.Result{RequeueAfter: backupRequeue}, nil
 	}

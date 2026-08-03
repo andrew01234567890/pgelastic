@@ -66,10 +66,10 @@ func gathered(t *testing.T, name string) int {
 	return count
 }
 
-// outcomeTotal reads one counter out of the registry by its labels. The Transitions vectors
+// outcomeTotalFor reads one counter out of the registry by its labels. The Transitions vectors
 // are the metering package's own, so a test in this package can only reach them the way a
 // scrape does.
-func outcomeTotal(t *testing.T, outcome string) float64 {
+func outcomeTotalFor(t *testing.T, kind, outcome string) float64 {
 	t.Helper()
 	families, err := metrics.Registry.Gather()
 	if err != nil {
@@ -77,7 +77,7 @@ func outcomeTotal(t *testing.T, outcome string) float64 {
 	}
 	want := map[string]string{
 		labelNamespace: metricNamespace,
-		labelKind:      kindMigration,
+		labelKind:      kind,
 		"to":           outcome,
 	}
 	for _, family := range families {
@@ -140,7 +140,7 @@ func TestAMigrationIsCountedOnceHoweverOftenItIsReconciled(t *testing.T) {
 		migrationStatus(pgelasticv1alpha1.TenantMigrationPhaseCopying),
 		acmeRoute, time.Unix(1030, 0))
 
-	before := outcomeTotal(t, "Completed")
+	before := outcomeTotalFor(t, kindMigration, "Completed")
 
 	recordMigrationPhase(namespace, name,
 		pgelasticv1alpha1.TenantMigrationPhaseCutover,
@@ -153,7 +153,7 @@ func TestAMigrationIsCountedOnceHoweverOftenItIsReconciled(t *testing.T) {
 			acmeRoute, time.Unix(1200, 0))
 	}
 
-	if after := outcomeTotal(t, "Completed"); after != before+1 {
+	if after := outcomeTotalFor(t, kindMigration, "Completed"); after != before+1 {
 		t.Errorf("six reconciles of one finished migration counted %v, want exactly one", after-before)
 	}
 }
@@ -164,14 +164,14 @@ func TestAMigrationIsCountedOnceHoweverOftenItIsReconciled(t *testing.T) {
 func TestAMigrationThatFailsImmediatelyIsStillCounted(t *testing.T) {
 	const namespace, name = metricNamespace, "move-acme-refused"
 
-	before := outcomeTotal(t, "Failed")
+	before := outcomeTotalFor(t, kindMigration, "Failed")
 
 	recordMigrationPhase(namespace, name,
 		"",
 		migrationStatus(pgelasticv1alpha1.TenantMigrationPhaseFailed),
 		acmeRoute, time.Unix(1000, 0))
 
-	if after := outcomeTotal(t, "Failed"); after != before+1 {
+	if after := outcomeTotalFor(t, kindMigration, "Failed"); after != before+1 {
 		t.Errorf("a migration that failed on its first pass counted %v, want one", after-before)
 	}
 	if gathered(t, totalSeries) == 0 {
