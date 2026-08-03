@@ -67,13 +67,16 @@ func SubscriptionName(namespace, name string) string {
 // on a slot - which would mean one migration dropping the other's slot during cleanup.
 func objectName(prefix, namespace, name string) string {
 	digest := sha256.Sum256([]byte(namespace + "/" + name))
-	return prefix + transliterate(name) + "_" + hex.EncodeToString(digest[:4])
+	return prefix + transliterate(name, nameBudget) + "_" + hex.EncodeToString(digest[:4])
 }
 
 // transliterate reduces a Kubernetes name to the character set PostgreSQL object names
 // admit without quoting, so that every generated name can be spelled unquoted in the
 // catalog queries the sweeper runs.
-func transliterate(name string) string {
+//
+// The budget is a parameter because a name built from two Kubernetes names has to divide
+// 63 bytes between them, and a name built from one does not.
+func transliterate(name string, budget int) string {
 	var builder strings.Builder
 	for _, character := range strings.ToLower(name) {
 		switch {
@@ -82,7 +85,7 @@ func transliterate(name string) string {
 		default:
 			builder.WriteByte('_')
 		}
-		if builder.Len() >= nameBudget {
+		if builder.Len() >= budget {
 			break
 		}
 	}
@@ -129,18 +132,44 @@ const ScratchDir = provision.DataMountPath + "/pgelastic-migration"
 
 // DumpDir is the per-migration dump directory under ScratchDir.
 func DumpDir(namespace, name string) string {
-	return ScratchDir + "/" + transliterate(namespace) + "_" + transliterate(name)
+	return ScratchDir + "/" + transliterate(namespace, nameBudget) + "_" +
+		transliterate(name, nameBudget)
 }
+
+// TenantUserRolePrefix marks every role pgelastic owns on behalf of one of a tenant's logins.
+//
+// Distinct from BackendRolePrefix so that \du and pg_stat_activity separate a tenant's owner
+// from its logins at a glance, and so that no derivation of one can ever equal a derivation of
+// the other however the readable halves are truncated. "pgt_" is not a prefix of "pgtu_", so
+// anything matching on either prefix still partitions the two cleanly.
+const TenantUserRolePrefix = "pgtu_"
+
+// loginNameBudget is what each readable half of a login's role name may spend. The layout is
+// 5 + 20 + 1 + 20 + 1 + 8 = 55, which leaves the digest inside 63 bytes for any pair of names
+// Kubernetes admits - and the digest being last is what makes truncation impossible rather than
+// merely unlikely.
+const loginNameBudget = 20
 
 // TenantUserRoleName is the cluster-global name of one of a tenant's logins.
 //
-// Namespaced by the same digest as the tenant's own role, and for the same reason: two tenants
-// may each have a user called `app`, and Azure's contained-user model requires those to be
-// wholly independent identities. PostgreSQL cannot give that - pg_authid is shared - so the
-// name has to carry it, or one tenant's `app` and another's become one role with the union of
-// both their privileges.
-func TenantUserRoleName(namespace, tenant, user string) string {
-	digest := sha256.Sum256([]byte(namespace + "/" + tenant))
-	return BackendRolePrefix + transliterate(tenant) + "_" +
-		hex.EncodeToString(digest[:4]) + "_" + transliterate(user)
+// Namespaced for the same reason the tenant's own role is: two tenants may each have a user
+// called `app`, and Azure's contained-user model requires those to be wholly independent
+// identities. PostgreSQL cannot give that - pg_authid is shared - so the name has to carry it,
+// or one tenant's `app` and another's become one role with the union of both their privileges.
+//
+// The digest is last and covers all three inputs. Both of those matter and neither is
+// decorative: PostgreSQL truncates an over-long identifier silently rather than refusing it, so
+// a digest anywhere but the end is a digest that can be cut off - and one covering only the
+// tenant would leave two of that tenant's own logins separated by nothing but the readable
+// suffix truncation eats first.
+//
+// Derived from the tenant's and the login's Kubernetes identity rather than from spec.userName,
+// which is a wire-protocol string the client sends in its startup packet and must stay free to
+// change without renaming a role that may already own objects.
+func TenantUserRoleName(namespace, tenant, login string) string {
+	digest := sha256.Sum256([]byte(namespace + "/" + tenant + "/" + login))
+	return TenantUserRolePrefix +
+		transliterate(tenant, loginNameBudget) + "_" +
+		transliterate(login, loginNameBudget) + "_" +
+		hex.EncodeToString(digest[:4])
 }
