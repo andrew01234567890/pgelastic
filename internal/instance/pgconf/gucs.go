@@ -67,6 +67,20 @@ const (
 	// Blocking is about safety rather than sizing: these are the parameters that let a
 	// user route around the operator or invalidate a guarantee the product sells.
 	OwnershipBlocked Ownership = "Blocked"
+	// OwnershipTuned means the operator computes a value from the instance's own shape and
+	// the user may replace it. It is the level for a parameter whose default should follow
+	// the container rather than PostgreSQL's boot constant, but whose wrong value costs the
+	// tenant that chose it and nobody else.
+	//
+	// A parameter belongs here only if all three hold. It is not one of EnforcedParameters,
+	// because a standby raises those to the primary's value and would silently discard the
+	// override - an override that appears accepted and does not take effect is worse than one
+	// refused. It does not denominate capacity, because admission, the reservation ledger and
+	// chargeback are all sold in those units. And over-setting it cannot take the postmaster
+	// down, because ~200 tenants share it and restart_after_crash is Blocked off.
+	//
+	// max_connections fails all three and is the canonical example of what does not belong.
+	OwnershipTuned Ownership = "Tuned"
 	// OwnershipUser means the parameter is the tenant's to set.
 	OwnershipUser Ownership = "User"
 )
@@ -251,11 +265,46 @@ func Classify(name string) Owned {
 	return Owned{Ownership: OwnershipUser, Context: ContextUser}
 }
 
-// IsOwned reports whether the operator owns a parameter, whether by computing its value
-// or by pinning it.
+// IsOwned reports whether the operator has an opinion about a parameter at all - whether by
+// computing its value, by pinning it, or by tuning a default the user may replace.
+//
+// This is the *membership* question, and it is deliberately not the authorization one. The two
+// had the same answer for every entry while every owned parameter was pinned, which is why one
+// predicate served both; the moment a computed value became overridable they diverged, and a
+// call site that asks the wrong one either drops an override that should have won or refuses a
+// parameter the user is entitled to set.
 func IsOwned(name string) bool {
 	_, ok := ownedParameters[name]
 	return ok
+}
+
+// IsPinned reports whether a user-supplied value for a parameter is refused.
+//
+// The *authorization* question, and the one every rejection path must ask. Fixed and Blocked
+// are pinned; Tuned is not, because the whole point of Tuned is that the computed value is a
+// default rather than a decision.
+func IsPinned(name string) bool {
+	switch Classify(name).Ownership {
+	case OwnershipFixed, OwnershipBlocked:
+		return true
+	default:
+		return false
+	}
+}
+
+// PinnedNames lists every parameter a user may not set, in sorted order.
+//
+// This rather than OwnedNames is what an admission error quotes: naming a Tuned parameter in a
+// refusal would tell an operator the opposite of the truth.
+func PinnedNames() []string {
+	pinned := make([]string, 0, len(ownedParameters))
+	for name := range ownedParameters {
+		if IsPinned(name) {
+			pinned = append(pinned, name)
+		}
+	}
+	slices.Sort(pinned)
+	return pinned
 }
 
 // OwnedNames lists every operator-owned parameter in sorted order.
@@ -271,7 +320,11 @@ func UserParameters(parameters map[string]pgelasticv1alpha1.GUCValue) (map[strin
 	kept := make(map[string]string, len(parameters))
 	var dropped []string
 	for name, value := range parameters {
-		if IsOwned(name) || !RenderableParameter(name, string(value)) {
+		// IsPinned, not IsOwned: a Tuned parameter is owned and is still the user's to set,
+		// so it has to survive into the rendered configuration to overwrite the computed
+		// value. Malformed names stay refused at every level - well-formedness is a separate
+		// axis from ownership and folding the two together is how `fsync = off` gets in.
+		if IsPinned(name) || !RenderableParameter(name, string(value)) {
 			dropped = append(dropped, name)
 			continue
 		}

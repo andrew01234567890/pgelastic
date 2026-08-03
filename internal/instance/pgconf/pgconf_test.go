@@ -332,3 +332,47 @@ func TestRenderableParameterAcceptsTheNamesPostgresAccepts(t *testing.T) {
 		}
 	}
 }
+
+// IsOwned answers "does the operator have an opinion about this?" and IsPinned answers "may
+// the user set it?". Those were the same question while every owned parameter was pinned, and
+// a call site asking the wrong one now either drops an override that should have won or
+// refuses a parameter the user is entitled to set.
+func TestOwnershipSeparatesHavingAnOpinionFromForbiddingOne(t *testing.T) {
+	// max_connections is the canonical Fixed parameter: it is the unit the pool's rating,
+	// the reservation ledger, oversubscription and chargeback are all denominated in.
+	if !IsPinned(GUCMaxConnections) {
+		t.Error("max_connections is settable by a tenant, which hands it capacity the pool never sold")
+	}
+	if !IsOwned(GUCMaxConnections) {
+		t.Error("max_connections is not owned at all")
+	}
+
+	// An unknown parameter is neither owned nor pinned - the table enumerates what pgelastic
+	// takes, not what PostgreSQL offers.
+	if IsOwned("some_extension.setting") || IsPinned("some_extension.setting") {
+		t.Error("a parameter nobody owns was claimed by the ownership table")
+	}
+
+	for _, name := range PinnedNames() {
+		if !IsOwned(name) {
+			t.Errorf("%s is pinned but not owned, which cannot be true", name)
+		}
+	}
+}
+
+// The level exists so a computed value can be a default rather than a decision. If a Tuned
+// parameter were dropped like a Fixed one, the override would be silently discarded and the
+// whole level would be a no-op that looked like it worked.
+func TestATunedParametersUserValueSurvivesIntoTheRenderedConfiguration(t *testing.T) {
+	const tuned = "pgelastic_test.tuned"
+	ownedParameters[tuned] = Owned{Ownership: OwnershipTuned, Context: ContextUser}
+	t.Cleanup(func() { delete(ownedParameters, tuned) })
+
+	if IsPinned(tuned) {
+		t.Fatal("a Tuned parameter refuses the user value it exists to accept")
+	}
+	kept, dropped := UserParameters(map[string]pgelasticv1alpha1.GUCValue{tuned: "7"})
+	if kept[tuned] != "7" {
+		t.Errorf("the user's value was dropped: kept=%v dropped=%v", kept, dropped)
+	}
+}
