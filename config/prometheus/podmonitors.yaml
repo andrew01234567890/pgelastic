@@ -1,0 +1,83 @@
+# Examples, not something the operator reconciles.
+#
+# CloudNativePG shipped an `enablePodMonitor` field that made the operator own a PodMonitor
+# and overwrite the user's spec on every reconcile, then deprecated it: a scrape config is
+# the cluster owner's to tune - interval, relabelling, metric_relabel_configs to drop what
+# they do not want to pay for - and an operator that rewrites it every thirty seconds turns a
+# reasonable edit into a fight. Copy these, change them, and apply them yourself.
+#
+# Requires the Prometheus Operator CRDs. If PodMonitor is not a kind in your cluster, the
+# equivalent is a scrape_config matching the same labels and ports.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: pgelastic-proxy
+  labels:
+    app.kubernetes.io/name: pgelastic
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: proxy
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+---
+# The instance agent serves /metrics on the port it already exposes for status. It is
+# in-process in the agent rather than a sidecar, which is what CloudNativePG settled on too:
+# a sidecar has to open its own connection to a postmaster the agent is already connected to.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: pgelastic-instances
+  labels:
+    app.kubernetes.io/name: pgelastic
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: instance
+  podMetricsEndpoints:
+    - port: status
+      path: /metrics
+      interval: 30s
+      # The member name is what every per-instance panel groups by, and it is on the Pod
+      # rather than on the series.
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_pgelastic_io_member]
+          targetLabel: member
+        - sourceLabels: [__meta_kubernetes_pod_label_pgelastic_io_instance]
+          targetLabel: instance
+---
+# The operator's own metrics, including every transition series. These come from the operator
+# rather than from the instance agent deliberately: instance-hosted control-plane metrics go
+# dark exactly when the instance is the thing that has gone wrong, which is when a transition
+# is most worth watching.
+#
+# Note the operator's metrics endpoint is behind authn/authz and defaults to disabled
+# (--metrics-bind-address=0). Turn it on before expecting this to scrape anything.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: pgelastic-operator
+  labels:
+    app.kubernetes.io/name: pgelastic
+spec:
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+  endpoints:
+    - port: https
+      scheme: https
+      path: /metrics
+      interval: 30s
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        # Point this at the CA that signed the operator's serving certificate. The kubebuilder
+        # scaffold ships insecureSkipVerify: true, which is fine for a kind cluster and is not
+        # fine anywhere the token being sent is worth stealing.
+        insecureSkipVerify: false
+        ca:
+          secret:
+            name: metrics-server-cert
+            key: ca.crt
