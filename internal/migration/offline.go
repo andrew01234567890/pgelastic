@@ -77,10 +77,17 @@ func DiscardDump(ctx context.Context, shell Shell, plan Plan) error {
 }
 
 func offlineDumpCommand(plan Plan, jobs int32) string {
+	// --statistics because pg_dump's default is --no-statistics, so without it every migrated
+	// tenant arrives with an empty pg_statistic and the planner's first estimates for it are
+	// guesses. That lands the moment the cutover completes, on a path whose whole product
+	// promise is a sub-second pause - and the tenant experiences it as the move having made
+	// their database slow. pg_upgrade has carried statistics since PG18; a logical move has no
+	// excuse not to.
+	//
 	// pg_dump creates the dump directory but not its parent, so the scratch root is made
 	// first rather than left to fail on a fresh volume.
 	return fmt.Sprintf(`set -e; mkdir -p %s; rm -rf %s; `+
-		`pg_dump --format=directory --jobs=%s `+
+		`pg_dump --format=directory --jobs=%s --statistics `+
 		`--quote-all-identifiers --file=%s --dbname=%s`,
 		shellQuote(ScratchDir), shellQuote(plan.DumpDir), strconv.FormatInt(int64(jobs), 10),
 		shellQuote(plan.DumpDir), shellQuote(plan.SourceConnInfo))
