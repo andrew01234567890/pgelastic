@@ -194,7 +194,15 @@ type Plan struct {
 	// and only needs to know whether the pool can carry a move right now.
 	MigrationsPermitted      bool
 	MigrationsRefusedBecause string
-	Summary                  string
+	// EvacuationPermitted is what an operator-ordered drain has to clear: the pool not being
+	// paused, no blackout window open, and the disruption budget. It is a superset of the
+	// budget alone, and separate from it because the two have different callers.
+	EvacuationPermitted      bool
+	EvacuationRefusedBecause string
+	// policy is kept so a caller can ask the guardrails a question the plan did not already
+	// answer - an evacuation judges its moves by different rules from a rebalance.
+	policy  Policy
+	Summary string
 
 	InstanceTargets []InstanceTarget
 	Moves           []Move
@@ -252,6 +260,7 @@ func (p Plan) EligibleMoves() []Move {
 // Plan.Selected().
 func Recommend(signals Signals, policy Policy) Plan {
 	plan := Plan{
+		policy:                   policy,
 		ComputedAt:               signals.Now,
 		Mode:                     policy.Mode,
 		ObservedInstances:        signals.InstanceCount(),
@@ -291,6 +300,9 @@ func Recommend(signals Signals, policy Policy) Plan {
 	migrations := guard.migrationBudget()
 	plan.MigrationsPermitted = migrations.permitted
 	plan.MigrationsRefusedBecause = migrations.message
+	evacuation := guard.evacuation()
+	plan.EvacuationPermitted = evacuation.permitted
+	plan.EvacuationRefusedBecause = evacuation.message
 
 	plan.Actions = actions(signals, policy, guard, plan)
 	plan.Summary = summarise(plan)
@@ -562,4 +574,45 @@ func clamp(value, low, high int32) int32 {
 		high = low
 	}
 	return min(max(value, low), high)
+}
+
+// EvacuationMoves is the moves an operator-ordered drain may make, judged by the rules an
+// evacuation is subject to rather than by the ones a rebalance is.
+//
+// The plan's own Move.Eligible is a rebalancing verdict, and Move.Blocker is only the first
+// refusal found - so neither can be read to mean "everything except heat passed". This asks
+// the question again with the heat rule off and every safety rule on.
+func (p Plan) EvacuationMoves(signals Signals) []Move {
+	guard := Guard{Policy: p.policy, Signals: signals, ConsolidationTarget: p.ConsolidationTarget}
+	moves := make([]Move, 0, len(p.Moves))
+	for _, move := range p.Moves {
+		tenant, source := signalsFor(signals, move)
+		eligible, blocker, why := guard.EvacuationEligible(tenant, source)
+		if !eligible {
+			move.Eligible, move.Blocker, move.BlockedBy = false, blocker, why
+			continue
+		}
+		move.Eligible, move.Blocker, move.BlockedBy = true, "", ""
+		moves = append(moves, move)
+	}
+	return moves
+}
+
+// signalsFor resolves one move back to the tenant and instance signals it was computed from.
+func signalsFor(signals Signals, move Move) (TenantSignal, InstanceSignal) {
+	var tenant TenantSignal
+	for _, candidate := range signals.Tenants {
+		if candidate.Name == move.Tenant {
+			tenant = candidate
+			break
+		}
+	}
+	var source InstanceSignal
+	for _, candidate := range signals.Instances {
+		if candidate.Name == move.From {
+			source = candidate
+			break
+		}
+	}
+	return tenant, source
 }

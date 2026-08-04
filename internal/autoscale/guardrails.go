@@ -190,6 +190,29 @@ func (g Guard) rebalance() verdict {
 	return g.migrationBudget()
 }
 
+// evacuation is what an operator-ordered drain has to clear.
+//
+// Not `Evaluate`: a drain is an instruction rather than a recommendation, so it is not subject
+// to the Recommend/Auto mode split, to the rebalancer being enabled, or to a stabilization
+// window. It IS subject to the pool being paused and to a declared blackout window, because
+// both are somebody saying "not now" about exactly this kind of work, and to the disruption
+// budget, which protects the tenants being moved.
+//
+// RolloutInProgress is deliberately absent. It is true whenever any member of any instance is
+// not Ready, and a drained instance is frequently one of those - so including it would let an
+// instance deadlock its own evacuation. Stale metrics are absent for the same shape of reason:
+// there is no override, and freezing an operator-ordered drain on a metrics gap would leave
+// no way to retire hardware.
+func (g Guard) evacuation() verdict {
+	if g.Signals.Paused {
+		return refuse(ReasonPoolPaused, "the pool is paused")
+	}
+	if verdict := g.blackout(); !verdict.permitted {
+		return verdict
+	}
+	return g.migrationBudget()
+}
+
 // migrationBudget is the Karpenter-shaped disruption budget: a concurrency cap, a rate cap
 // over the window, and cron windows outside which the budget is zero.
 func (g Guard) migrationBudget() verdict {
@@ -253,6 +276,27 @@ func (g Guard) scaleIn() verdict {
 // It is separate from the class-level budget because the eviction and the destination are
 // decided as one plan, and a plan whose evictions are individually forbidden is not a plan
 // that can be partially executed.
+// EvacuationEligible is MoveEligible with the heat rule disabled.
+//
+// "The tenant is hot, so moving it would consume the capacity the move is meant to relieve"
+// is an argument about whether a *rebalance* is worth making. An evacuation has already
+// answered it: the operator said empty this instance. Every other refusal is about safety -
+// the workload class forbids automatic migration at all, the source is too loaded to decode a
+// move off, a move from it is already streaming - and those hold whatever the reason.
+//
+// It re-evaluates rather than inspecting the blocker MoveEligible returned, because that
+// function reports the FIRST refusal it finds. A move blocked by heat may be blocked by three
+// other things as well, and "the blocker was heat" says nothing about them.
+func (g Guard) EvacuationEligible(tenant TenantSignal, source InstanceSignal) (bool, Blocker, string) {
+	policy := g.Policy
+	policy.RebalanceColdOnly = false
+	return Guard{
+		Policy:              policy,
+		Signals:             g.Signals,
+		ConsolidationTarget: g.ConsolidationTarget,
+	}.MoveEligible(tenant, source)
+}
+
 func (g Guard) MoveEligible(tenant TenantSignal, source InstanceSignal) (bool, Blocker, string) {
 	if !tenant.MigrationAllowed {
 		return false, BlockedByWorkloadClass,

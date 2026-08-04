@@ -622,12 +622,12 @@ var _ = Describe("auto mode", Ordered, func() {
 		// A small instance next to a large, nearly empty one: best-fit packs the tenants onto
 		// the small one and leaves the large one to be reclaimed.
 		small := makeReadyInstance(namespace, "rb-a", poolName, 30, 0)
-		large := makeReadyInstance(namespace, "rb-b", poolName, 225, 10)
+		large := makeReadyInstance(namespace, crowded, poolName, 225, 10)
 
 		for i := range 4 {
 			tenant := makeTenant(namespace, fmt.Sprintf("rb-t%d", i), poolName, fmt.Sprintf("rb_t%d", i))
 			Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
-			bindTenant(tenant, "rb-b")
+			bindTenant(tenant, crowded)
 			tenants = append(tenants, tenant)
 		}
 
@@ -686,7 +686,7 @@ var _ = Describe("auto mode", Ordered, func() {
 		plan := refetch(pool).Status.Autoscaling
 		Expect(plan.Moves).NotTo(BeEmpty())
 		for _, move := range plan.Moves {
-			Expect(move.From).To(Equal("rb-b"))
+			Expect(move.From).To(Equal(crowded))
 			Expect(move.To).To(Equal("rb-a"))
 			Expect(move.Eligible).To(BeTrue(), "blocked by %s", move.BlockedBy)
 		}
@@ -741,7 +741,7 @@ var _ = Describe("auto mode", Ordered, func() {
 
 	It("takes no action at all while an instance is rolling out", func() {
 		instance := &pgelasticv1alpha1.PgInstance{}
-		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "rb-b"}, instance)).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: crowded}, instance)).To(Succeed())
 		instance.Status.Conditions = []metav1.Condition{{
 			Type:               pgelasticv1alpha1.ConditionProgressing,
 			Status:             metav1.ConditionTrue,

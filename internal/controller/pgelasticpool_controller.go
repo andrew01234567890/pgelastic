@@ -149,10 +149,15 @@ func (r *PgElasticPoolReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	plan := autoscale.Recommend(view.signals, view.policy)
-	if err := r.evacuateDraining(ctx, pool, view, plan); err != nil {
+	// A drain and the autoscaler spend the same migration budget, and both read the count
+	// this pass started with. Without telling execute what the drain already did, one
+	// reconcile emits two migrations against a cap of one - and both off the same source,
+	// which is the pair the per-source guard exists to prevent.
+	evacuated, err := r.evacuateDraining(ctx, pool, view, plan)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	executed, err := r.execute(ctx, pool, view, plan)
+	executed, err := r.execute(ctx, pool, view, plan, evacuated)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -603,10 +608,23 @@ func (r *PgElasticPoolReconciler) execute(
 	pool *pgelasticv1alpha1.PgElasticPool,
 	view *poolView,
 	plan autoscale.Plan,
+	evacuated bool,
 ) (executed, error) {
 	action, ok := plan.Selected()
 	if !ok {
 		return executed{}, nil
+	}
+	// The drain has already spent this pass's migration budget, so the two classes that
+	// would spend it again are refused rather than silently doubling it. Said out loud in
+	// the plan, because an operator reading "no rebalance happened" is owed the reason.
+	if evacuated && (action.Class == pgelasticv1alpha1.AutoActionRebalance ||
+		action.Class == pgelasticv1alpha1.AutoActionScaleIn) {
+		return executed{
+			class:      action.Class,
+			at:         r.now(),
+			detail:     action.Detail,
+			failReason: autoscale.ReasonMigrationBudget,
+		}, nil
 	}
 
 	result := executed{class: action.Class, at: r.now(), detail: action.Detail}
@@ -617,7 +635,7 @@ func (r *PgElasticPoolReconciler) execute(
 	case pgelasticv1alpha1.AutoActionScaleOut:
 		result.applied, err = r.scaleOut(ctx, pool, plan)
 	case pgelasticv1alpha1.AutoActionRebalance:
-		result.applied, err = r.emitMigrations(ctx, pool, plan.EligibleMoves(), 1)
+		result.applied, err = r.emitMigrations(ctx, pool, plan.EligibleMoves(), 1, nil)
 	case pgelasticv1alpha1.AutoActionScaleIn:
 		result.applied, err = r.scaleIn(ctx, pool, view, plan)
 	default:
@@ -713,7 +731,7 @@ func (r *PgElasticPoolReconciler) scaleIn(
 		}
 	}
 	if len(evacuation) > 0 {
-		return r.emitMigrations(ctx, pool, evacuation, 1)
+		return r.emitMigrations(ctx, pool, evacuation, 1, nil)
 	}
 
 	for i := range view.instances {
@@ -768,7 +786,7 @@ func (r *PgElasticPoolReconciler) evacuateDraining(
 	pool *pgelasticv1alpha1.PgElasticPool,
 	view *poolView,
 	plan autoscale.Plan,
-) error {
+) (bool, error) {
 	draining := map[string]bool{}
 	for index := range view.instances {
 		if drainRequested(&view.instances[index]) {
@@ -776,35 +794,31 @@ func (r *PgElasticPoolReconciler) evacuateDraining(
 		}
 	}
 	if len(draining) == 0 {
-		return nil
+		return false, nil
 	}
 	// The disruption budget, and only that: the concurrency cap, the rate cap and the
 	// migration windows. Not `rebalance()`, which would also require the rebalancer to be
 	// switched on - an operator draining an instance has already decided, and a pool that
 	// never rebalances still has to be able to evacuate hardware.
-	if !plan.MigrationsPermitted {
+	if !plan.EvacuationPermitted {
 		for _, name := range slices.Sorted(maps.Keys(draining)) {
 			if stranded := boundTo(view, name); stranded > 0 {
 				r.event(pool, corev1.EventTypeNormal, eventDrainStalled, actionEmitMigration,
-					"%s is draining with %d tenant(s) still on it, waiting for the pool's "+
-						"migration budget: %s", name, stranded, plan.MigrationsRefusedBecause)
+					"%s is draining with %d tenant(s) still on it, and the pool is not "+
+						"admitting a move right now: %s", name, stranded, plan.EvacuationRefusedBecause)
 			}
 		}
-		return nil
+		return false, nil
 	}
 
+	// Re-evaluated with the heat rule disabled rather than filtered on the blocker the plan
+	// recorded. MoveEligible reports the FIRST refusal it finds, so "blocked by heat" says
+	// nothing about whether the source is also too loaded to decode a move off, or already
+	// streaming one - and admitting on that basis would have let a drain do exactly what this
+	// function's own comment promises it never does.
 	evacuation := make([]autoscale.Move, 0, len(plan.Moves))
-	for _, move := range plan.Moves {
-		if !draining[move.From] {
-			continue
-		}
-		// Heat is the one refusal a drain overrules. "The tenant is hot, so moving it would
-		// consume the capacity the move is meant to relieve" is an argument about whether a
-		// rebalance is worth it, and an evacuation has already answered that: the operator
-		// said empty this instance. Every other blocker is about safety - the source is too
-		// busy to decode a move, a move from it is already streaming, the workload class
-		// forbids automatic migration at all - and those hold whatever the reason.
-		if move.Eligible || move.Blocker == autoscale.BlockedByHeat {
+	for _, move := range plan.EvacuationMoves(view.signals) {
+		if draining[move.From] {
 			evacuation = append(evacuation, move)
 		}
 	}
@@ -820,11 +834,15 @@ func (r *PgElasticPoolReconciler) evacuateDraining(
 						"or the guardrails are holding every move back", name, stranded)
 			}
 		}
-		return nil
+		return false, nil
 	}
 
-	_, err := r.emitMigrations(ctx, pool, evacuation, 1)
-	return err
+	// The override has to travel on the object, not merely be applied here. The migration's
+	// own preflight defaults requireColdTenant to true and then reads the same coldness
+	// verdict the pool just overruled, so a drain that emitted a bare spec would emit a
+	// migration guaranteed to be refused - the override would look applied and do nothing.
+	return r.emitMigrations(ctx, pool, evacuation, 1,
+		&pgelasticv1alpha1.TenantMigrationPreflight{RequireColdTenant: ptr.To(false)})
 }
 
 // boundTo counts the tenants still bound to one instance.
@@ -856,6 +874,7 @@ func (r *PgElasticPoolReconciler) emitMigrations(
 	pool *pgelasticv1alpha1.PgElasticPool,
 	moves []autoscale.Move,
 	limit int,
+	preflight *pgelasticv1alpha1.TenantMigrationPreflight,
 ) (bool, error) {
 	emitted := false
 	for _, move := range moves {
@@ -874,6 +893,7 @@ func (r *PgElasticPoolReconciler) emitMigrations(
 			Spec: pgelasticv1alpha1.PgTenantMigrationSpec{
 				TenantRef:         corev1.LocalObjectReference{Name: move.Tenant},
 				TargetInstanceRef: corev1.LocalObjectReference{Name: move.To},
+				Preflight:         preflight.DeepCopy(),
 			},
 		}
 		if err := r.Create(ctx, migration); err != nil {
