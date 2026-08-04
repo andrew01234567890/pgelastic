@@ -116,6 +116,15 @@ func (v *PgElasticPoolCustomValidator) validate(ctx context.Context, pool *pgela
 	problems = append(problems,
 		replicaBudgetProblems(pool, ledger, field.NewPath("spec", "proxy", "replicas"))...)
 
+	// The same refusal the instance webhook applies, on the template a pool would stamp its
+	// members out of. Nothing reads that template yet, which is exactly why it is cheap to
+	// gate now: once a pool controller provisions from it, a template carrying a pinned
+	// parameter would produce instances that silently dropped it, and the refusal would then
+	// arrive on objects the user did not write.
+	problems = append(problems, parameterProblems(
+		field.NewPath("spec", "instances", "template", "parameters"),
+		pool.Spec.Instances.Template.Parameters)...)
+
 	return invalid(pool, problems)
 }
 

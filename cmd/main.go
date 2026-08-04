@@ -361,6 +361,7 @@ func main() {
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
 		webhooks := map[string]func(ctrl.Manager) error{
 			"PgElasticPool":   webhookv1alpha1.SetupPgElasticPoolWebhookWithManager,
+			"PgInstance":      webhookv1alpha1.SetupPgInstanceWebhookWithManager,
 			"PgTenant":        webhookv1alpha1.SetupPgTenantWebhookWithManager,
 			"PgTenantUser":    webhookv1alpha1.SetupPgTenantUserWebhookWithManager,
 			"PgWorkloadClass": webhookv1alpha1.SetupPgWorkloadClassWebhookWithManager,

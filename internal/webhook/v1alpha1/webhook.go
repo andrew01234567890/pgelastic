@@ -45,6 +45,8 @@ func invalid(object client.Object, problems field.ErrorList) error {
 			kind.Kind = "PgElasticPool"
 		case *pgelasticv1alpha1.PgWorkloadClass:
 			kind.Kind = "PgWorkloadClass"
+		case *pgelasticv1alpha1.PgInstance:
+			kind.Kind = "PgInstance"
 		}
 	}
 	return apierrors.NewInvalid(kind, object.GetName(), problems)

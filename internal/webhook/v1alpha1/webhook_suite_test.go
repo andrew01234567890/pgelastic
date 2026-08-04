@@ -121,6 +121,9 @@ var _ = BeforeSuite(func() {
 	err = SetupPgWorkloadClassWebhookWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
+	err = SetupPgInstanceWebhookWithManager(mgr)
+	Expect(err).NotTo(HaveOccurred())
+
 	// +kubebuilder:scaffold:webhook
 
 	go func() {
