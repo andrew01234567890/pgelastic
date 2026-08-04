@@ -73,12 +73,12 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
-// nolint:gocyclo
 // operatorVersion is stamped at build time with -ldflags "-X main.operatorVersion=...". The
 // default is "dev" rather than "unknown": a build nobody stamped is a development build, and
 // saying so is more use in a trace than admitting ignorance.
 var operatorVersion = "dev"
 
+// nolint:gocyclo
 func main() {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
@@ -392,9 +392,16 @@ func main() {
 
 	signals := ctrl.SetupSignalHandler()
 
-	// Started after the manager is built and before it runs, so a failure to reach the
-	// collector is fatal here rather than surfacing later as traces that silently never
-	// arrive. Absent OTEL_EXPORTER_OTLP_ENDPOINT this is a no-op and costs nothing.
+	// Started before the manager runs, so the first reconcile already has somewhere to send
+	// its spans.
+	//
+	// Nothing here contacts the collector: the gRPC channel connects lazily and reconnects in
+	// the background, so an unreachable collector costs traces - the batch processor drops
+	// them once its queue fills - and never costs the operator. That is the right trade, and
+	// worth stating because the opposite is the tempting one: making startup wait for the
+	// collector would let a collector rollout stop the operator starting.
+	//
+	// With no endpoint configured this is a no-op and costs nothing.
 	stopTracing, err := tracing.Start(signals, operatorVersion)
 	if err != nil {
 		setupLog.Error(err, "Failed to start trace export")

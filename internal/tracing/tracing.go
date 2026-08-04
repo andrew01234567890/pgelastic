@@ -30,6 +30,7 @@ limitations under the License.
 package tracing
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"os"
@@ -49,6 +50,16 @@ import (
 // is deliberate: there is no pgelastic-specific flag to learn, and an operator that already
 // runs a collector gets traces by pointing at it the same way everything else does.
 const EndpointEnv = "OTEL_EXPORTER_OTLP_ENDPOINT"
+
+// TracesEndpointEnv is the signal-specific override, and it has to be read here as well as by
+// the exporter.
+//
+// The exporter honours it on its own, so a deployment that sends traces and metrics to
+// different collectors sets only this one - and the gate below, reading only the general
+// variable, would then decide tracing was switched off and never build the exporter at all.
+// Traces would silently not appear, with the configuration that asks for them present and
+// correct.
+const TracesEndpointEnv = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
 
 // ServiceName names the operator in the collector.
 const ServiceName = "pgelastic-operator"
@@ -75,7 +86,9 @@ type Shutdown func(context.Context) error
 // A version is required rather than defaulted. A trace whose service.version is "unknown" is
 // the trace you cannot correlate with a rollout, which is the main thing you want it for.
 func Start(ctx context.Context, version string) (Shutdown, error) {
-	endpoint := os.Getenv(EndpointEnv)
+	// Read for the gate and for the error message only. Which endpoint the exporter actually
+	// uses, and how the two variables take precedence, is the exporter's own business.
+	endpoint := cmp.Or(os.Getenv(TracesEndpointEnv), os.Getenv(EndpointEnv))
 	if endpoint == "" {
 		return func(context.Context) error { return nil }, nil
 	}
@@ -85,8 +98,18 @@ func Start(ctx context.Context, version string) (Shutdown, error) {
 		return nil, fmt.Errorf("building the OTLP trace exporter for %s: %w", endpoint, err)
 	}
 
-	attributes, err := resource.Merge(resource.Default(), resource.NewWithAttributes(
-		semconv.SchemaURL,
+	// Schemaless, and that is a correctness requirement rather than a shortcut.
+	// resource.Merge refuses to merge two resources carrying *different* schema URLs, and
+	// resource.Default() carries whichever schema the SDK was built against. Naming a schema
+	// here pins this file to that choice, so the two disagree the moment the SDK is upgraded -
+	// Merge returns ErrSchemaURLConflict, Start returns an error, and main exits. The operator
+	// would then CrashLoopBackOff for exactly as long as somebody had OTEL_EXPORTER_OTLP_ENDPOINT
+	// set, which is the one configuration where tracing was wanted.
+	//
+	// Pinning a matching version would fix it once and reopen it on the next upgrade. A
+	// resource with no schema URL merges with any of them, which is what this needs: the
+	// attribute keys still come from semconv, and only the version claim is dropped.
+	attributes, err := resource.Merge(resource.Default(), resource.NewSchemaless(
 		semconv.ServiceName(ServiceName),
 		semconv.ServiceVersion(version),
 	))

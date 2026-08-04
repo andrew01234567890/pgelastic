@@ -38,6 +38,7 @@ import (
 // capability nobody wired is the failure this project keeps repeating.
 func TestTracingIsOffWithNoEndpointConfigured(t *testing.T) {
 	t.Setenv(EndpointEnv, "")
+	t.Setenv(TracesEndpointEnv, "")
 
 	shutdown, err := Start(t.Context(), "test")
 	if err != nil {
@@ -132,5 +133,35 @@ func TestAReconcilePassIsOneSpan(t *testing.T) {
 	}
 	if !named {
 		t.Error("the span does not name the object the pass was about")
+	}
+}
+
+// The path an operator reaches by setting the standard endpoint variable, which had no test at
+// all - and so shipped a defect that made the operator exit(1) on startup, every time, for
+// exactly the people who had asked for tracing.
+//
+// No span is created here on purpose: a queued span makes Shutdown wait out its full timeout
+// against a collector that does not exist.
+func TestAConfiguredEndpointInstallsAProvider(t *testing.T) {
+	t.Cleanup(func() { otel.SetTracerProvider(noop.NewTracerProvider()) })
+	// The signal-specific variable alone, which is what a deployment sending traces and
+	// metrics to different collectors sets - and which the gate used not to read.
+	t.Setenv(EndpointEnv, "")
+	t.Setenv(TracesEndpointEnv, "http://127.0.0.1:14317")
+
+	shutdown, err := Start(t.Context(), "test")
+	if err != nil {
+		t.Fatalf("starting with an endpoint configured: %v", err)
+	}
+	if _, isNoop := otel.GetTracerProvider().(noop.TracerProvider); isNoop {
+		t.Error("an endpoint was configured and the global provider is still the no-op one")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- shutdown(t.Context()) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Error("shutdown did not return; an unreachable collector must not hold the process open")
 	}
 }

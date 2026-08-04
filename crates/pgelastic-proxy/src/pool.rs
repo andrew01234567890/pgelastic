@@ -620,8 +620,10 @@ impl PoolManager {
     /// many waited and the histogram says how long they waited in aggregate, but neither can
     /// answer "why was *this* statement slow", which is the question somebody actually has.
     ///
-    /// `outcome` and `waited_ms` are recorded on the span rather than logged, so a trace shows
-    /// the wait as a span with a duration next to the work it delayed.
+    /// `outcome` and `waited_ms` are recorded on the span rather than logged as events, so the
+    /// wait is one record with a duration rather than two lines to correlate. The subscriber
+    /// emits span close records, which is what makes those fields observable at all; the shape
+    /// is the one an OTLP layer will export when the proxy grows one, which it has not yet.
     #[tracing::instrument(
         name = "proxy.admission_wait",
         skip_all,
@@ -661,9 +663,7 @@ impl PoolManager {
                 grant = &mut waiter => {
                     ticket.settled = true;
                     self.metrics.admission_dequeued();
-                    let span = tracing::Span::current();
-                    span.record("outcome", "granted");
-                    span.record("waited_ms", u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+                    Self::record_wait("granted", started.elapsed());
                     return grant.map_err(|_| Denial::backend("the pool is shutting down"));
                 }
                 () = &mut notice, if !notified => {
@@ -687,13 +687,25 @@ impl PoolManager {
                         waited: started.elapsed(),
                     };
                     self.metrics.admission_denied(reason.code());
-                    let span = tracing::Span::current();
-                    span.record("outcome", "timed_out");
-                    span.record("waited_ms", u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+                    Self::record_wait("timed_out", started.elapsed());
                     return Err(Denial::from_reason(&reason));
                 }
             }
         }
+    }
+
+    /// Records how the admission wait ended, on the span the caller is inside.
+    ///
+    /// A span whose `outcome` is unset is a wait that never returned at all: the client hung
+    /// up and the future was dropped. That is a real state and worth being able to see, which
+    /// is why this does not try to be a `Drop` guard that always fires.
+    fn record_wait(outcome: &'static str, waited: std::time::Duration) {
+        let span = tracing::Span::current();
+        span.record("outcome", outcome);
+        span.record(
+            "waited_ms",
+            u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        );
     }
 
     /// Severs every parked link opened under a superseded epoch.
