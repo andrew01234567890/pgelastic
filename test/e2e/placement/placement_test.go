@@ -123,13 +123,17 @@ var _ = Describe("placing a tenant population across a pool", Ordered, func() {
 				},
 			},
 		}
-		Expect(k8sClient.Create(suiteCtx, pool)).To(Succeed())
-
+		// Members before the pool, deliberately. A pool provisions the members it declares, so
+		// creating it first opens a window in which it makes its own - and those never become
+		// Ready in a suite that stands up no PostgreSQL, which leaves the pool holding members
+		// that can never take a tenant and skews every distribution asserted below.
 		for i := range instanceCount {
 			name := fmt.Sprintf("e2e-pg-%c", 'a'+i)
 			instances = append(instances, name)
 			createReadyInstance(namespace, name, poolName, allocatablePerInstance)
 		}
+
+		Expect(k8sClient.Create(suiteCtx, pool)).To(Succeed())
 
 		DeferCleanup(func() {
 			Expect(client.IgnoreNotFound(k8sClient.Delete(suiteCtx, &corev1.Namespace{

@@ -596,16 +596,19 @@ var _ = Describe("Moving a tenant between two PostgreSQL 18 instances", Ordered,
 		namespace = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: e2eNamespace}}
 		Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, namespace))).To(Succeed())
 
-		for _, object := range poolObjects() {
-			Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, object))).To(Succeed())
-		}
-
+		// The members go first, and the pool last. A pool provisions the members it declares,
+		// so creating it ahead of them opens a window in which it makes its own.
+		//
 		// The source's WAL volume is deliberately small, so max_slot_wal_keep_size - two
 		// fifths of it - is a bound this suite can actually push a slot past.
 		Expect(client.IgnoreAlreadyExists(
 			k8sClient.Create(suiteCtx, makeInstance(instanceA, "512Mi")))).To(Succeed())
 		Expect(client.IgnoreAlreadyExists(
 			k8sClient.Create(suiteCtx, makeInstance(instanceB, "512Mi")))).To(Succeed())
+
+		for _, object := range poolObjects() {
+			Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, object))).To(Succeed())
+		}
 
 		awaitReady(instanceA)
 		awaitReady(instanceB)

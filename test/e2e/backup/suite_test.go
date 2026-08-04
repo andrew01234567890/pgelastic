@@ -46,6 +46,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -96,6 +97,9 @@ func claimNamespace(namespace string) {
 			},
 			Capacity: pgelasticv1alpha1.PoolCapacity{BackendConnections: 100},
 			Instances: pgelasticv1alpha1.PoolInstances{
+				// Declared, rather than left to the CRD's default of three. This suite stands
+				// up one member by hand, and a pool provisions the members it declares.
+				Replicas: ptr.To(int32(1)),
 				Template: pgelasticv1alpha1.PgInstanceTemplate{
 					Class: sizingClass,
 					Storage: pgelasticv1alpha1.InstanceStorage{

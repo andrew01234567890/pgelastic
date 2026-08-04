@@ -329,6 +329,7 @@ var _ = Describe("pool capacity planning", Ordered, func() {
 		ensureNamespace(namespace)
 		elasticClass := makeElasticClass(className, defaultControllerName)
 		pool = makePool(namespace, poolName, className, 900)
+		pool.Spec.Instances.Replicas = ptrTo(int32(3))
 		pool.Spec.Admission = &pgelasticv1alpha1.PoolAdmission{DefaultWorkloadClassName: workload}
 		class := makeWorkloadClass(workload, 2, 40)
 
