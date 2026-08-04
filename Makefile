@@ -280,9 +280,13 @@ preflight: ## Run everything CI runs, in CI's order. Do this before pushing.
 	@#
 	@# Fails on the first problem rather than collecting them, because the second check's output
 	@# is rarely worth reading once the first has failed.
-	cargo fmt --all --check
-	cargo clippy --workspace --all-targets --all-features
-	cargo test --workspace --all-features
+	@# RUSTFLAGS matches the value rust.yml sets on the check job. Without it clippy warns
+	@# and exits zero here while CI turns the same warning into a failed build, so a clean
+	@# preflight would still be followed by a red build -- the exact outcome this target
+	@# exists to prevent. It has already happened once, over three missing backticks.
+	RUSTFLAGS="-D warnings" cargo fmt --all --check
+	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --all-features
+	RUSTFLAGS="-D warnings" cargo test --workspace --all-features
 	go build ./...
 	$(MAKE) test
 	$(MAKE) lint
