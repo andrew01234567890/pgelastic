@@ -34,5 +34,20 @@ jobs:
       - name: Download modules
         run: go mod download
 
+      # Three tests start a real PostgreSQL through testcontainers, and testcontainers pulls
+      # the image inside the test with a deadline it does not retry. A Docker Hub that is slow
+      # for fifteen seconds therefore reds the build with "context deadline exceeded" from a
+      # test that has nothing to do with the change. Pulling first, with retries, moves that
+      # failure to a step whose only job is the pull - and usually removes it.
+      - name: Pull the PostgreSQL image the container tests use
+        run: |
+          for attempt in 1 2 3; do
+            docker pull postgres:18 && exit 0
+            echo "pull attempt $attempt failed; retrying"
+            sleep $((attempt * 10))
+          done
+          echo "could not pull postgres:18 after three attempts"
+          exit 1
+
       - name: Running Tests
         run: make test
