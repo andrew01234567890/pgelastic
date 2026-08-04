@@ -251,6 +251,14 @@ pub struct PoolManager {
     fence: FenceRuntime,
     metrics: Arc<Metrics>,
     next_link_id: AtomicU64,
+    /// The statement deadline in seconds, zero for none.
+    ///
+    /// An atomic rather than a field of `config`, because this is read once per
+    /// statement on every link in the estate and `config` is only replaced by
+    /// building a new process. It is deliberately not behind `inner`: taking
+    /// the pool's mutex per statement would put a contended lock on the hot
+    /// path of every query the proxy carries.
+    query_deadline_seconds: AtomicU64,
     /// When the budget gauges were last refreshed, in milliseconds since
     /// `budget_epoch`. See [`publish_budget`](Self::publish_budget).
     budget_published_ms: AtomicU64,
@@ -292,6 +300,7 @@ impl PoolManager {
             queue_depth_per_tenant: config.queue_depth_per_tenant,
             max_wait: config.query_wait_timeout(),
         };
+        let query_deadline_seconds = config.query_deadline_seconds;
         let mut allocator = Allocator::new(pool_spec, admission)
             .map_err(|e| ProxyError::config(format!("pool capacity: {e}")))?;
 
@@ -332,6 +341,7 @@ impl PoolManager {
             fence,
             metrics,
             next_link_id: AtomicU64::new(1),
+            query_deadline_seconds: AtomicU64::new(query_deadline_seconds),
             budget_published_ms: AtomicU64::new(0),
             budget_epoch: std::time::Instant::now(),
         }))
@@ -399,6 +409,23 @@ impl PoolManager {
     /// clients already waiting on it rather than only for the next arrivals.
     ///
     /// Returns the number of claims accepted; the rest were refused and logged.
+    /// Adopts the pool limits a running replica may change without being rebuilt.
+    ///
+    /// Returns whether anything moved, so a reload can say what it did. The
+    /// value is read at the next checkout rather than mid-statement, which is
+    /// what keeps a limit change from altering a transaction already underway.
+    pub fn apply_limits(&self, config: &PoolConfig) -> bool {
+        let next = config.query_deadline_seconds;
+        self.query_deadline_seconds.swap(next, Ordering::Relaxed) != next
+    }
+
+    /// The statement deadline in force now, or `None` when the pool sets none.
+    #[must_use]
+    pub fn query_deadline(&self) -> Option<Duration> {
+        let seconds = self.query_deadline_seconds.load(Ordering::Relaxed);
+        (seconds > 0).then(|| Duration::from_secs(seconds))
+    }
+
     pub fn apply_tenants(&self, tenants: &[crate::config::TenantConfig]) -> usize {
         let mut inner = self.lock();
         let mut changed = 0;
