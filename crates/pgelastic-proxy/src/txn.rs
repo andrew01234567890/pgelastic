@@ -202,6 +202,14 @@ struct Running<'a> {
     /// Set once the fence has fired on a read-only transaction: the outstanding
     /// statement is allowed to finish and nothing new is admitted.
     draining_fence: bool,
+    /// Set while the client owes the backend a `Sync`.
+    ///
+    /// An extended-query batch ended with `Flush` rather than `Sync` draws no
+    /// `ReadyForQuery`, so `tx_status` still reports whatever the last completed
+    /// batch left and the outstanding queue empties anyway. The link is inside an
+    /// implicit transaction that nothing else here can see, and without this bit
+    /// neither bound would ever fire on it.
+    unsynced_batch: bool,
     /// Held for exactly as long as `checkout` is, so `drainStatus` can say
     /// whether the tenant still has work on its source.
     holding: Option<InFlight>,
@@ -247,6 +255,7 @@ pub async fn run(
         client_streaming: 0,
         witness: TransactionWitness::new(),
         draining_fence: false,
+        unsynced_batch: false,
         holding: None,
         instance_gate: instance_gate_of(&session),
         epochs: epochs_of(&session),
@@ -281,6 +290,13 @@ impl Running<'_> {
         let statement = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(statement);
         let mut statement_armed = false;
+        // The complement of the statement deadline, armed exactly when that one
+        // is not: a client holding an open transaction and running nothing.
+        // Between them they bound both ways a backend can be held, and neither
+        // fires on the state the other governs.
+        let idle = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(idle);
+        let mut idle_armed = false;
         if draining {
             deadline
                 .as_mut()
@@ -306,18 +322,18 @@ impl Running<'_> {
             // different name. Placed at the top of the loop rather than beside any
             // one message because a request reaches the backend down several
             // paths, and one that armed nothing is the hold this exists to bound.
-            match (statement_armed, self.statement_outstanding()) {
-                (false, true) => {
-                    if let Some(limit) = self.manager().query_deadline() {
-                        statement
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + limit);
-                        statement_armed = true;
-                    }
-                }
-                (true, false) => statement_armed = false,
-                _ => {}
-            }
+            arm(
+                &mut statement_armed,
+                statement.as_mut(),
+                self.statement_outstanding(),
+                self.manager().query_deadline(),
+            );
+            arm(
+                &mut idle_armed,
+                idle.as_mut(),
+                self.idle_in_transaction(),
+                self.manager().client_idle_in_transaction(),
+            );
 
             let event = tokio::select! {
                 biased;
@@ -327,6 +343,7 @@ impl Running<'_> {
                 _ = self.epochs.changed() => Event::EpochChanged,
                 () = &mut deadline, if draining => Event::Deadline,
                 () = &mut statement, if statement_armed => Event::StatementDeadline,
+                () = &mut idle, if idle_armed => Event::IdleInTransaction,
                 read = self.session.client.read_buf(self.from_client.read_target()) => {
                     Event::FromClient(read)
                 }
@@ -348,6 +365,10 @@ impl Running<'_> {
                     self.on_statement_deadline().await;
                     return Ok(Ending::StatementTimeout);
                 }
+                Event::IdleInTransaction => {
+                    self.on_idle_in_transaction().await;
+                    return Ok(Ending::IdleInTransaction);
+                }
                 Event::FromClient(read) => {
                     if read? == 0 {
                         return Ok(Ending::PeerClosed);
@@ -368,6 +389,44 @@ impl Running<'_> {
                 }
             }
         }
+    }
+
+    /// Whether the client is holding an open transaction and running nothing.
+    ///
+    /// Read off the last `ReadyForQuery` rather than off "a link is held",
+    /// because a pinned session holds its backend between transactions too, and
+    /// closing one of those would be closing an idle client for being idle.
+    fn idle_in_transaction(&self) -> bool {
+        self.checkout.as_ref().is_some_and(|checkout| {
+            checkout.conn.link.outstanding().is_empty()
+                && (self.unsynced_batch
+                    || checkout
+                        .conn
+                        .link
+                        .tx_status()
+                        .is_some_and(|status| !status.is_releasable()))
+        })
+    }
+
+    /// Closes a client that has held an open transaction without working.
+    ///
+    /// The link is closed rather than rolled back and returned. What the
+    /// transaction was holding - its locks, and the xmin horizon that pins every
+    /// dead tuple in the cluster behind it - is released by the backend going
+    /// away, and a rollback issued to a session the proxy has already given up on
+    /// is one more round trip that can itself hang.
+    ///
+    /// The client is told first. A bare socket close is indistinguishable from a
+    /// network fault, and a driver that cannot tell them apart will retry.
+    async fn on_idle_in_transaction(&mut self) {
+        self.session.metrics.idle_in_transaction_closed();
+        crate::wire_io::send_fatal(
+            self.session.client,
+            "25P03",
+            "terminating connection due to idle-in-transaction timeout",
+        )
+        .await;
+        self.abandon();
     }
 
     /// Whether the held backend owes a response to a request already sent.
@@ -883,6 +942,14 @@ impl Running<'_> {
     }
 
     fn dispatch_from(&mut self, message: &FrontendMessage, relay: Relay, origin: Origin) {
+        // Before the early return: a message that never reached a backend has
+        // opened no batch. Only the client's own messages count - a `Parse` the
+        // pool injects is followed by the client's own `Sync` or by nothing.
+        if origin == Origin::Client
+            && let Some(kind) = pgelastic_pool::RequestKind::from_frontend(message)
+        {
+            self.unsynced_batch = !kind.terminates_batch();
+        }
         let Some(checkout) = self.checkout.as_mut() else {
             return;
         };
@@ -948,6 +1015,10 @@ impl Running<'_> {
                     }
                     if matches!(message, BackendMessage::ReadyForQuery(_)) {
                         saw_ready = true;
+                        // The byte that ends a batch, which is what makes the
+                        // implicit transaction behind an unsynced one visible
+                        // again in `tx_status`.
+                        self.unsynced_batch = false;
                     }
                 }
             }
@@ -1510,6 +1581,7 @@ enum Event {
     Drain,
     Deadline,
     StatementDeadline,
+    IdleInTransaction,
     EpochChanged,
     FromClient(std::io::Result<usize>),
     FromBackend(std::io::Result<usize>),
@@ -1611,6 +1683,29 @@ fn close_statement(name: &pgelastic_pool::StatementName) -> FrontendMessage {
 
 /// Re-emits a frame byte-identically rather than re-encoding the message it
 /// decoded to, so field order and unknown fields survive the relay.
+/// Arms a deadline while a condition holds and disarms it when it stops.
+///
+/// A timer only ever starts on the transition into the state it bounds, so a
+/// state that persists across many loop passes is measured from when it began
+/// rather than restarted by each pass.
+fn arm(
+    armed: &mut bool,
+    timer: std::pin::Pin<&mut tokio::time::Sleep>,
+    condition: bool,
+    limit: Option<Duration>,
+) {
+    match (*armed, condition) {
+        (false, true) => {
+            if let Some(limit) = limit {
+                timer.reset(tokio::time::Instant::now() + limit);
+                *armed = true;
+            }
+        }
+        (true, false) => *armed = false,
+        _ => {}
+    }
+}
+
 fn put_frame(out: &mut BytesMut, frame: &RawFrame) {
     out.put_u8(frame.tag);
     out.put_i32(i32::try_from(frame.body.len() + 4).unwrap_or(i32::MAX));

@@ -309,6 +309,10 @@ const defaultGlobalStatementsLimit = 2048
 // was already written down onto every pool in an estate at once.
 const defaultQueryDeadlineSeconds = 120
 
+// defaultIdleInTransactionSeconds must match the +kubebuilder:default on
+// spec.timeouts.clientIdleInTransaction, and is reached for the same reason as its sibling.
+const defaultIdleInTransactionSeconds = 60
+
 func (c Config) renderRouting(out *strings.Builder, dynamic bool) {
 	out.WriteString("[routing]\n")
 	discriminators := tenantDiscriminators(c.Pool)
@@ -353,6 +357,8 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 	// agree or the pods roll for a change the binary was willing to adopt.
 	if dynamic {
 		writeInt(out, "queryDeadlineSeconds", queryDeadlineSeconds(c.Pool))
+		writeInt(out, "clientIdleInTransactionSeconds",
+			openBoundSeconds(timeouts(c.Pool).ClientIdleInTransaction, defaultIdleInTransactionSeconds))
 	}
 	writeInt(out, "notifyAfterSeconds", int64(queryWaitNotifySeconds(c.Pool)))
 	writeInt(out, "queueDepthPerTenant", int64(queueDepthPerTenant(c.Pool)))
@@ -522,19 +528,22 @@ func seconds(duration *metav1.Duration, fallback int64) int64 {
 	return int64((duration.Duration + time.Second - 1) / time.Second)
 }
 
-// queryDeadlineSeconds renders spec.timeouts.query, which unlike every other timeout has a
-// meaningful zero: it is the only way to ask for no deadline at all, and an operator with a
-// legitimately long statement needs that escape hatch. So an explicit zero is passed through
-// rather than folded into the default the way seconds does.
 func queryDeadlineSeconds(pool *pgelasticv1alpha1.PgElasticPool) int64 {
-	query := timeouts(pool).Query
-	if query == nil {
-		return defaultQueryDeadlineSeconds
+	return openBoundSeconds(timeouts(pool).Query, defaultQueryDeadlineSeconds)
+}
+
+// openBoundSeconds renders a timeout whose zero means "no bound at all" rather than "unset".
+// Both callers bound something an operator may legitimately want unbounded - a long statement,
+// a long-held transaction - so an explicit zero is passed through instead of being folded into
+// the default the way seconds does it.
+func openBoundSeconds(duration *metav1.Duration, fallback int64) int64 {
+	if duration == nil {
+		return fallback
 	}
-	if query.Duration <= 0 {
+	if duration.Duration <= 0 {
 		return 0
 	}
-	return int64((query.Duration + time.Second - 1) / time.Second)
+	return int64((duration.Duration + time.Second - 1) / time.Second)
 }
 
 func poolMode(pooling *pgelasticv1alpha1.PoolingConfig) string {

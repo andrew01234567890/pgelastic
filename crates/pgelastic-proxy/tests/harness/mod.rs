@@ -657,6 +657,37 @@ impl RawClient {
         }
     }
 
+    /// Reads until the message the predicate accepts, panicking if the stream
+    /// ends first.
+    pub async fn read_until(
+        &mut self,
+        accept: impl Fn(&pgelastic_wire::BackendMessage) -> bool,
+    ) -> pgelastic_wire::BackendMessage {
+        loop {
+            let message = self.read().await;
+            if accept(&message) {
+                return message;
+            }
+        }
+    }
+
+    /// Whether the proxy closes this connection within `limit`, whatever it says
+    /// on the way out.
+    ///
+    /// Reads rather than sleeps, because a bound that ends a session is only
+    /// observable as the socket going away: a client with nothing to send would
+    /// otherwise never learn it had happened.
+    pub async fn closed_within(&mut self, limit: std::time::Duration) -> bool {
+        tokio::time::timeout(limit, async {
+            while pgelastic_proxy::wire_io::read_backend_message(&mut self.socket, &mut self.buf)
+                .await
+                .is_ok()
+            {}
+        })
+        .await
+        .is_ok()
+    }
+
     pub async fn simple_query(
         &mut self,
         sql: &str,

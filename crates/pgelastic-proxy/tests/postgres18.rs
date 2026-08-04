@@ -472,6 +472,172 @@ async fn a_client_thinking_between_statements_is_not_charged_the_query_deadline(
     client.simple_query("COMMIT").await.expect("committing");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_idling_inside_a_transaction_is_closed_and_its_backend_released() {
+    // What such a client costs is not CPU. It is the backend it holds, the locks its
+    // transaction took, and the xmin horizon that pins every dead tuple in the cluster
+    // behind it - on a pool whose capacity unit is the backend.
+    let stack =
+        harness::stack_with("[pool]\nmode = \"transaction\"\nclientIdleInTransactionSeconds = 2\n")
+            .await;
+    let client = stack.connect().await;
+
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("opening a transaction");
+    // Idle for longer than the bound in one stretch. Polling the session instead would
+    // reset the timer at every poll and measure nothing.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect_err("a transaction left open past the bound must have been closed");
+
+    // And the backend it was holding is gone rather than parked in the transaction.
+    let (observer, conn) =
+        tokio_postgres::connect(&stack.pg.direct_url("idle_observer"), tokio_postgres::NoTls)
+            .await
+            .expect("an observer connection straight to PostgreSQL");
+    tokio::spawn(conn);
+    let cleared = Instant::now();
+    loop {
+        // Excluding this backend is load-bearing: the observer's own row is active while it
+        // runs this, and counting it would make the loop below never reach zero.
+        let held: i64 = observer
+            .query_one(
+                "SELECT count(*) FROM pg_catalog.pg_stat_activity \
+                 WHERE pid <> pg_backend_pid() AND state = 'idle in transaction'",
+                &[],
+            )
+            .await
+            .expect("counting backends left inside a transaction")
+            .get(0);
+        if held == 0 {
+            break;
+        }
+        assert!(
+            cleared.elapsed() < Duration::from_secs(10),
+            "a backend is still parked inside the transaction the bound closed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+// The bound must not fire on a client that is merely between transactions: outside one it
+// holds no backend, and closing it would be closing an idle client for being idle.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_idling_outside_a_transaction_is_left_alone() {
+    let stack =
+        harness::stack_with("[pool]\nmode = \"transaction\"\nclientIdleInTransactionSeconds = 2\n")
+            .await;
+    let client = stack.connect().await;
+
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("a first statement");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("a client between transactions holds nothing and must survive");
+}
+
+// The case the predicate is written for. A pinned session holds its backend between
+// transactions as well as inside one, so a bound armed on "a link is held" rather than on
+// "the last ReadyForQuery said T" closes it for being idle - which is what every pinned
+// client is, most of the time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pinned_client_idling_outside_a_transaction_is_left_alone() {
+    let stack =
+        harness::stack_with("[pool]\nmode = \"transaction\"\nclientIdleInTransactionSeconds = 2\n")
+            .await;
+    let client = stack.connect().await;
+
+    client
+        .simple_query("LISTEN pinned_channel")
+        .await
+        .expect("LISTEN is session state no reset removes, so it pins the link");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("a pinned client holds its backend by design and must not be closed for it");
+}
+
+// The hole a review found in the first version of these bounds. A batch ended with Flush
+// rather than Sync draws no ReadyForQuery, so the link's transaction status still reports
+// whatever the last completed batch left - and the outstanding queue empties anyway when the
+// rows arrive. PostgreSQL is inside an implicit transaction with a pinned backend_xmin; the
+// statement deadline has disarmed and the idle bound would never arm, so N such clients
+// permanently remove N backends from a fixed budget with no bound and no signal. PostgreSQL's
+// own idle_in_transaction_session_timeout cannot catch it either: it reports the backend as
+// active, not idle in transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_ended_with_flush_instead_of_sync_is_still_bounded() {
+    let stack =
+        harness::stack_with("[pool]\nmode = \"transaction\"\nclientIdleInTransactionSeconds = 2\n")
+            .await;
+    let mut raw = RawClient::connect(stack.localhost(), "tenant", BACKEND_DATABASE).await;
+
+    raw.send(&[
+        FrontendMessage::Parse(Parse {
+            name: Bytes::new(),
+            query: Bytes::from_static(b"SELECT 1"),
+            param_types: vec![],
+        }),
+        FrontendMessage::Bind(Bind {
+            portal: Bytes::new(),
+            statement: Bytes::new(),
+            param_formats: vec![],
+            params: vec![],
+            result_formats: vec![Format::Text],
+        }),
+        FrontendMessage::Execute(Execute {
+            portal: Bytes::new(),
+            max_rows: 0,
+        }),
+        // Flush, not Sync: the rows come back and the batch stays open.
+        FrontendMessage::Flush,
+    ])
+    .await;
+
+    // Drain the CommandComplete, then go silent the way a client that forgot its Sync does.
+    let started = Instant::now();
+    raw.read_until(|message| matches!(message, pgelastic_wire::BackendMessage::CommandComplete(_)))
+        .await;
+    assert!(
+        raw.closed_within(Duration::from_secs(15)).await,
+        "a batch left unsynced held its backend past the bound: {:?}",
+        started.elapsed()
+    );
+}
+
+// arm() claims a persisting state is measured from when it began rather than restarted by
+// each pass of the relay loop, and its (true, true) no-op is what implements that. Every
+// other bound test holds its state with a client that generates no traffic at all, so the
+// loop never iterates during the window and the claim goes untested. Each row here is large
+// enough to overflow PostgreSQL's output buffer on its own, which is what makes it a separate
+// flush - a hundred small rows would be buffered and arrive as one wake-up, testing nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deadline_is_measured_from_when_its_state_began_not_from_the_last_byte() {
+    let stack =
+        harness::stack_with("[pool]\nmode = \"transaction\"\nqueryDeadlineSeconds = 3\n").await;
+    let client = stack.connect().await;
+
+    let started = Instant::now();
+    client
+        .simple_query("SELECT pg_sleep(0.2), repeat('x', 30000) FROM generate_series(1, 100)")
+        .await
+        .expect_err("twenty seconds of streaming rows must not outlive a three-second deadline");
+    assert!(
+        started.elapsed() < Duration::from_secs(12),
+        "the deadline was restarted by the rows arriving under it: {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn a_cancel_request_cancels_a_long_running_query() {
     let stack = stack().await;

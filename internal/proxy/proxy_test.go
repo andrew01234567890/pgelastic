@@ -234,6 +234,42 @@ func TestChangingTheQueryDeadlineDoesNotRollTheFleet(t *testing.T) {
 	}
 }
 
+func TestTheIdleInTransactionBoundReachesTheProxyAndDoesNotRollTheFleet(t *testing.T) {
+	before := testConfig().Render()
+	if !strings.Contains(before.TOML, "clientIdleInTransactionSeconds = 60") {
+		t.Fatalf("an unset spec.timeouts.clientIdleInTransaction rendered something other "+
+			"than its own CRD default:\n%s", before.TOML)
+	}
+
+	config := testConfig()
+	config.Pool.Spec.Timeouts = &pgelasticv1alpha1.PoolTimeouts{
+		ClientIdleInTransaction: &metav1.Duration{Duration: 90 * time.Second},
+	}
+	after := config.Render()
+
+	if !strings.Contains(after.TOML, "clientIdleInTransactionSeconds = 90") {
+		t.Fatalf("the idle-in-transaction bound never reached the proxy:\n%s", after.TOML)
+	}
+	if before.StructuralHash != after.StructuralHash {
+		t.Fatalf("changing the idle-in-transaction bound moved the pod template hash from %q "+
+			"to %q, so an operator cannot change one without dropping every client of every "+
+			"tenant", before.StructuralHash, after.StructuralHash)
+	}
+}
+
+func TestAZeroIdleInTransactionBoundDisablesItRatherThanDefaulting(t *testing.T) {
+	config := testConfig()
+	config.Pool.Spec.Timeouts = &pgelasticv1alpha1.PoolTimeouts{
+		ClientIdleInTransaction: &metav1.Duration{},
+	}
+
+	document := config.Render().TOML
+	if !strings.Contains(document, "clientIdleInTransactionSeconds = 0") {
+		t.Fatalf("an explicit zero bound was folded into the default, so an operator has no "+
+			"way to turn it off:\n%s", document)
+	}
+}
+
 func TestAddingAnInstanceRollsTheFleet(t *testing.T) {
 	before := testConfig().Render()
 
