@@ -36,17 +36,59 @@ async fn rows_on(fleet: &Fleet, pg: &Postgres) -> Vec<i32> {
         .collect()
 }
 
+/// Backend checkouts the proxy has made, which is one per transaction it has
+/// admitted.
+fn checkouts(fleet: &Fleet) -> u64 {
+    fleet
+        .proxy
+        .metrics
+        .render()
+        .lines()
+        .filter(|line| line.starts_with("pgelastic_proxy_checkouts_total{"))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter_map(|value| value.parse::<u64>().ok())
+        .sum()
+}
+
+/// Which ordering a quiesce guarantees, and which it does not.
+///
+/// **Guaranteed:** the transactions the gate is *holding* are released
+/// first-in-first-out. One baton is passed at a time and it is held across the
+/// checkout, so a released client has its backend before the client behind it
+/// is even woken.
+///
+/// **Not guaranteed:** anything about a transaction a client starts *after* its
+/// own release. That one is admitted whenever it arrives, and eight clients'
+/// round trips complete in whatever order the runtime gets to them. Transaction
+/// pooling deliberately offers no place in a queue to a client that is not
+/// currently in it, so asserting that ordering would be asserting a property
+/// nobody implemented — under CI load it inverts adjacent pairs.
+///
+/// Which is why the statement is prepared *before* the quiesce. `tokio-postgres`
+/// has no statement cache, so `execute(&str, ..)` is a Parse/Describe/Sync and
+/// then a separate Bind/Execute/Sync: two transactions, of which the gate would
+/// hold only the first, leaving every row to be written by a second one the gate
+/// never ordered. With the prepare hoisted out, the transaction the gate holds
+/// *is* the INSERT — which is the ordering this test is about, and what the
+/// checkout count below pins down.
 #[tokio::test(flavor = "multi_thread")]
 async fn quiesce_holds_client_sockets_and_resume_completes_the_queue_in_order() {
     // One backend per instance: with a single link in flight at a time the
-    // order the rows land in is the order the gate released the clients, so
-    // "in order" is observed rather than inferred.
+    // order the rows land in is the order the gate released the transactions it
+    // was holding, so "in order" is observed rather than inferred.
     let fleet = Fleet::start_sized(1, 1, "").await;
     create_ledger(&fleet, &fleet.a).await;
 
+    // Both handles outlive the tasks below, so no statement is closed and no
+    // socket dropped while the released transactions are being counted.
     let mut clients = Vec::new();
     for _ in 0..8 {
-        clients.push(fleet.connect_as("alpha").await);
+        let client = Arc::new(fleet.connect_as("alpha").await);
+        let insert = client
+            .prepare("INSERT INTO cutover (client) VALUES ($1)")
+            .await
+            .expect("preparing before the quiesce");
+        clients.push((client, insert));
     }
 
     fleet.control.quiesce("alpha", HOLDER, 30_000).await.ok();
@@ -55,13 +97,12 @@ async fn quiesce_holds_client_sockets_and_resume_completes_the_queue_in_order() 
     assert_eq!(status["drained"], true, "nothing was in flight: {status}");
 
     let mut inflight = Vec::new();
-    for (index, client) in clients.into_iter().enumerate() {
+    for (index, (client, insert)) in clients.iter().enumerate() {
+        let client = Arc::clone(client);
+        let insert = insert.clone();
         inflight.push(tokio::spawn(async move {
             client
-                .execute(
-                    "INSERT INTO cutover (client) VALUES ($1)",
-                    &[&i32::try_from(index).unwrap()],
-                )
+                .execute(&insert, &[&i32::try_from(index).unwrap()])
                 .await
         }));
         until(
@@ -79,6 +120,7 @@ async fn quiesce_holds_client_sockets_and_resume_completes_the_queue_in_order() 
     assert_eq!(status["inFlight"], 0);
     assert_eq!(rows_on(&fleet, &fleet.a).await, Vec::<i32>::new());
 
+    let held = checkouts(&fleet);
     let released = fleet.control.resume("alpha", HOLDER).await.ok();
     assert_eq!(released["released"], 8);
 
@@ -90,6 +132,15 @@ async fn quiesce_holds_client_sockets_and_resume_completes_the_queue_in_order() 
             .unwrap_or_else(|error| panic!("queued client {index} was failed: {error}"));
     }
 
+    // The premise of the assertion that follows, held to rather than assumed:
+    // the eight transactions the resume released are the eight that wrote the
+    // rows. More than eight means a client ran a transaction the gate never
+    // ordered, and the row order below would be a scheduling artefact.
+    assert_eq!(
+        checkouts(&fleet) - held,
+        8,
+        "the released clients ran more transactions than the gate was holding"
+    );
     assert_eq!(
         rows_on(&fleet, &fleet.a).await,
         (0..8).collect::<Vec<i32>>(),

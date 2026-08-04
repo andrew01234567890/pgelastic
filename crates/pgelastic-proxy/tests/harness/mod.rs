@@ -686,8 +686,11 @@ impl Fleet {
     /// As [`start`](Self::start), with an explicit backend budget per instance.
     ///
     /// A budget of one makes the order a queue drains in observable: only one
-    /// transaction can be running, so the order rows land in *is* the order the
-    /// gate released them.
+    /// transaction can be running, so the order queued transactions leave their
+    /// mark in *is* the order the gate released them. It says nothing about the
+    /// order of transactions the gate never held - a caller watching for an
+    /// effect has to make sure the transaction that produces it is the one that
+    /// was queued.
     pub async fn start_sized(a_budget: u32, b_budget: u32, extra: &str) -> Self {
         Self::start_leased(a_budget, b_budget, 15_000, extra).await
     }
