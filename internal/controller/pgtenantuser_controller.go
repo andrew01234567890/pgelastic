@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
@@ -183,6 +184,12 @@ func (r *PgTenantUserReconciler) converge(
 	}
 
 	if _, err := tenantuser.Ensure(ctx, r.SQL, tenantEndpoint(tenant, instanceName), spec); err != nil {
+		// Logged as well as conditioned. A failure that only reaches the status is invisible
+		// in the place anybody debugging actually looks, and a permanent one then presents as
+		// a controller doing nothing at all - which is how a broken catalog query cost two
+		// sessions before anyone saw the error text PostgreSQL had been returning all along.
+		logf.FromContext(ctx).Error(err, "Could not provision the login's role",
+			"role", status.RoleName, "instance", instanceName)
 		r.notReady(status, user.Generation, tenantuser.ReasonProvisioningFailed, err.Error())
 		return ctrl.Result{RequeueAfter: placementRetryInterval}, nil
 	}
