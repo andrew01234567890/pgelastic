@@ -734,6 +734,90 @@ async fn a_pin_refused_before_the_relay_loop_still_closes_its_client() {
     );
 }
 
+// The count ceiling alone leaves a pool stuck at it for as long as its longest-lived client.
+// This bounds how long any one link stays pinned, so the reusable pool recovers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pin_held_longer_than_the_pool_allows_is_closed_and_the_budget_recovers() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\nbackendConnections = 4\nmaxPinnedPercent = 20\n\
+         maxPinDurationSeconds = 2\n",
+    )
+    .await;
+
+    let holder = stack.connect().await;
+    holder
+        .simple_query("LISTEN held_channel")
+        .await
+        .expect("the pin is inside the count ceiling");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    holder
+        .simple_query("SELECT 1")
+        .await
+        .expect_err("a pin held past the bound must have closed its client");
+
+    // And the budget it was holding is free again: the next client can take the pin the
+    // ceiling would otherwise still be refusing.
+    let next = stack.connect().await;
+    next.simple_query("LISTEN next_channel")
+        .await
+        .expect("the pinned budget the expiry released must be available again");
+}
+
+// A pin expiring mid-statement must cancel the backend, not merely close the session. The
+// budget is handed to a queued client before the Terminate is even sent, and a Terminate is
+// only honoured once the backend finishes what it is running - so without the cancel the
+// instance runs one backend over budget for the length of the abandoned statement, and the
+// query deadline that would have stopped it died with the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pin_that_expires_mid_statement_cancels_the_backend_it_gives_up() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\nbackendConnections = 4\nmaxPinnedPercent = 20\n\
+         maxPinDurationSeconds = 3\n",
+    )
+    .await;
+
+    let holder = stack.connect().await;
+    holder
+        .simple_query("LISTEN expiring_channel")
+        .await
+        .expect("the pin is inside the count ceiling");
+    holder
+        .simple_query("SELECT pg_sleep(60)")
+        .await
+        .expect_err("the pin expires under the statement and ends the session");
+
+    let (observer, conn) = tokio_postgres::connect(
+        &stack.pg.direct_url("pin_expiry_observer"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("an observer connection straight to PostgreSQL");
+    tokio::spawn(conn);
+    let cleared = Instant::now();
+    loop {
+        // Excluding this backend is load-bearing: the observer's own row carries this very
+        // statement and would satisfy the pattern it searches for.
+        let running: i64 = observer
+            .query_one(
+                "SELECT count(*) FROM pg_catalog.pg_stat_activity \
+                 WHERE pid <> pg_backend_pid() AND state = 'active' \
+                 AND query LIKE '%pg_sleep(60)%'",
+                &[],
+            )
+            .await
+            .expect("counting backends still running the abandoned statement")
+            .get(0);
+        if running == 0 {
+            break;
+        }
+        assert!(
+            cleared.elapsed() < Duration::from_secs(15),
+            "the pin expiry gave the budget away and left the backend running the statement"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_cancel_request_cancels_a_long_running_query() {
     let stack = stack().await;

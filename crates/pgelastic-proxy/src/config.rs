@@ -251,6 +251,7 @@ impl Config {
         structural.pool.query_deadline_seconds = 0;
         structural.pool.client_idle_in_transaction_seconds = 0;
         structural.pool.max_pinned_percent = 0;
+        structural.pool.max_pin_duration_seconds = 0;
         // An instance's allocatable capacity moves whenever that instance rolls, because the
         // operator withholds it while a member is not serving. Leaving it here meant rolling
         // one instance restarted the whole fleet and dropped every client of every tenant on
@@ -891,6 +892,17 @@ pub struct PoolConfig {
     /// Adopted rather than structural.
     #[serde(default)]
     pub max_pinned_percent: u32,
+    /// How long one client may hold a pinned backend before the proxy closes it.
+    /// Zero is no bound.
+    ///
+    /// The count ceiling above bounds how many links may be pinned at once; this
+    /// bounds how long any one of them stays that way. Without it a pool at its
+    /// ceiling stays there for as long as its longest-lived client, and the
+    /// reusable pool never recovers.
+    ///
+    /// Adopted rather than structural.
+    #[serde(default)]
+    pub max_pin_duration_seconds: u64,
     /// When a queued client is sent a `NoticeResponse` telling it why it is
     /// still waiting.
     #[serde(default = "default_notify_after_seconds")]
@@ -937,6 +949,7 @@ impl Default for PoolConfig {
             query_deadline_seconds: 0,
             client_idle_in_transaction_seconds: 0,
             max_pinned_percent: 0,
+            max_pin_duration_seconds: 0,
             notify_after_seconds: default_notify_after_seconds(),
             queue_depth_per_tenant: default_queue_depth_per_tenant(),
             max_server_statements: default_max_server_statements(),
@@ -1573,6 +1586,17 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(next.pool.max_pinned_percent, 50);
+        assert!(current.is_dynamic_change(&next));
+    }
+
+    #[test]
+    fn changing_the_pin_duration_changes_no_process_either() {
+        let current = Config::from_str(MINIMAL).unwrap();
+        let next = Config::from_str(&format!(
+            "configVersion = \"2\"\n{MINIMAL}\n[pool]\nmaxPinDurationSeconds = 900\n"
+        ))
+        .unwrap();
+        assert_eq!(next.pool.max_pin_duration_seconds, 900);
         assert!(current.is_dynamic_change(&next));
     }
 

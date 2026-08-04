@@ -307,6 +307,40 @@ func TestAZeroPinnedCeilingIsNoCeiling(t *testing.T) {
 	}
 }
 
+func TestThePinDurationReachesTheProxyAndDoesNotRollTheFleet(t *testing.T) {
+	before := testConfig().Render()
+	if !strings.Contains(before.TOML, "maxPinDurationSeconds = 3600") {
+		t.Fatalf("an unset spec.pooling.maxPinDuration rendered something other than its own "+
+			"CRD default:\n%s", before.TOML)
+	}
+
+	config := testConfig()
+	config.Pool.Spec.Pooling = &pgelasticv1alpha1.PoolingConfig{
+		MaxPinDuration: &metav1.Duration{Duration: 15 * time.Minute},
+	}
+	after := config.Render()
+
+	if !strings.Contains(after.TOML, "maxPinDurationSeconds = 900") {
+		t.Fatalf("the pin duration never reached the proxy:\n%s", after.TOML)
+	}
+	if before.StructuralHash != after.StructuralHash {
+		t.Fatalf("changing the pin duration moved the pod template hash from %q to %q",
+			before.StructuralHash, after.StructuralHash)
+	}
+}
+
+func TestAZeroPinDurationIsNoBound(t *testing.T) {
+	config := testConfig()
+	config.Pool.Spec.Pooling = &pgelasticv1alpha1.PoolingConfig{
+		MaxPinDuration: &metav1.Duration{},
+	}
+
+	document := config.Render().TOML
+	if !strings.Contains(document, "maxPinDurationSeconds = 0") {
+		t.Fatalf("an explicit zero pin duration was folded into the default:\n%s", document)
+	}
+}
+
 func TestAddingAnInstanceRollsTheFleet(t *testing.T) {
 	before := testConfig().Render()
 
