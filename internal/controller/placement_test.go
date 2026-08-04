@@ -228,6 +228,13 @@ var _ = Describe("tenant placement", Ordered, func() {
 		first, second := shard("shard-one", "shard_one"), shard("shard-two", "shard_two")
 
 		reconcileNow(reconciler, first)
+		// Anti-affinity is a fact about where the *sibling* already is, and the placer reads
+		// its siblings through the informer cache. Reconciling the second tenant before that
+		// cache has the first one's binding asks the placer to avoid a tenant it cannot see,
+		// and it puts them together perfectly correctly - so the assertion below has to wait
+		// for the precondition rather than assume the write is instantly readable.
+		awaitCached(refetch(first))
+
 		reconcileNow(reconciler, refetch(second))
 
 		firstInstance := refetch(first).Status.Binding.InstanceRef.Name
