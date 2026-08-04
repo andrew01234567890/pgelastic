@@ -259,6 +259,9 @@ pub struct PoolManager {
     /// the pool's mutex per statement would put a contended lock on the hot
     /// path of every query the proxy carries.
     query_deadline_seconds: AtomicU64,
+    /// The idle-in-transaction bound in seconds, zero for none. An atomic for
+    /// the same reason as the deadline above it.
+    client_idle_in_transaction_seconds: AtomicU64,
     /// When the budget gauges were last refreshed, in milliseconds since
     /// `budget_epoch`. See [`publish_budget`](Self::publish_budget).
     budget_published_ms: AtomicU64,
@@ -301,6 +304,7 @@ impl PoolManager {
             max_wait: config.query_wait_timeout(),
         };
         let query_deadline_seconds = config.query_deadline_seconds;
+        let client_idle_in_transaction_seconds = config.client_idle_in_transaction_seconds;
         let mut allocator = Allocator::new(pool_spec, admission)
             .map_err(|e| ProxyError::config(format!("pool capacity: {e}")))?;
 
@@ -342,6 +346,7 @@ impl PoolManager {
             metrics,
             next_link_id: AtomicU64::new(1),
             query_deadline_seconds: AtomicU64::new(query_deadline_seconds),
+            client_idle_in_transaction_seconds: AtomicU64::new(client_idle_in_transaction_seconds),
             budget_published_ms: AtomicU64::new(0),
             budget_epoch: std::time::Instant::now(),
         }))
@@ -415,14 +420,34 @@ impl PoolManager {
     /// value is read at the next checkout rather than mid-statement, which is
     /// what keeps a limit change from altering a transaction already underway.
     pub fn apply_limits(&self, config: &PoolConfig) -> bool {
-        let next = config.query_deadline_seconds;
-        self.query_deadline_seconds.swap(next, Ordering::Relaxed) != next
+        let deadline = config.query_deadline_seconds;
+        let idle = config.client_idle_in_transaction_seconds;
+        // Both swaps run: short-circuiting on the first would leave the second
+        // limit unapplied whenever they change in the same document.
+        let deadline_moved = self
+            .query_deadline_seconds
+            .swap(deadline, Ordering::Relaxed)
+            != deadline;
+        let idle_moved = self
+            .client_idle_in_transaction_seconds
+            .swap(idle, Ordering::Relaxed)
+            != idle;
+        deadline_moved || idle_moved
     }
 
     /// The statement deadline in force now, or `None` when the pool sets none.
     #[must_use]
     pub fn query_deadline(&self) -> Option<Duration> {
         let seconds = self.query_deadline_seconds.load(Ordering::Relaxed);
+        (seconds > 0).then(|| Duration::from_secs(seconds))
+    }
+
+    /// The idle-in-transaction bound in force now, or `None` when there is none.
+    #[must_use]
+    pub fn client_idle_in_transaction(&self) -> Option<Duration> {
+        let seconds = self
+            .client_idle_in_transaction_seconds
+            .load(Ordering::Relaxed);
         (seconds > 0).then(|| Duration::from_secs(seconds))
     }
 

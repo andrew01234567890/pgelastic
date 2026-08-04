@@ -249,6 +249,7 @@ impl Config {
         // and dropping every client of every tenant to do it - which is the mistake the two
         // comments above this one record, twice.
         structural.pool.query_deadline_seconds = 0;
+        structural.pool.client_idle_in_transaction_seconds = 0;
         // An instance's allocatable capacity moves whenever that instance rolls, because the
         // operator withholds it while a member is not serving. Leaving it here meant rolling
         // one instance restarted the whole fleet and dropped every client of every tenant on
@@ -864,6 +865,19 @@ pub struct PoolConfig {
     /// transactions of a session and never inside one.
     #[serde(default)]
     pub query_deadline_seconds: u64,
+    /// How long a client may hold an open transaction without working before the
+    /// proxy closes it. Zero is no bound.
+    ///
+    /// A different quantity from `query_deadline_seconds` and not a substitute
+    /// for it: this one bounds a client that is running nothing, and a statement
+    /// deadline never fires on a session that is running nothing. What such a
+    /// client costs is not CPU - it is the backend, the locks that transaction
+    /// took, and the xmin horizon that pins every dead tuple in the cluster
+    /// behind it.
+    ///
+    /// Adopted rather than structural, for the reason above it.
+    #[serde(default)]
+    pub client_idle_in_transaction_seconds: u64,
     /// When a queued client is sent a `NoticeResponse` telling it why it is
     /// still waiting.
     #[serde(default = "default_notify_after_seconds")]
@@ -908,6 +922,7 @@ impl Default for PoolConfig {
             reset_policy: ResetPolicyConfig::default(),
             query_wait_seconds: default_query_wait_seconds(),
             query_deadline_seconds: 0,
+            client_idle_in_transaction_seconds: 0,
             notify_after_seconds: default_notify_after_seconds(),
             queue_depth_per_tenant: default_queue_depth_per_tenant(),
             max_server_statements: default_max_server_statements(),
@@ -928,6 +943,13 @@ impl PoolConfig {
     #[must_use]
     pub fn query_deadline(&self) -> Option<Duration> {
         (self.query_deadline_seconds > 0).then(|| Duration::from_secs(self.query_deadline_seconds))
+    }
+
+    /// The idle-in-transaction bound, or `None` when the pool sets no bound.
+    #[must_use]
+    pub fn client_idle_in_transaction(&self) -> Option<Duration> {
+        (self.client_idle_in_transaction_seconds > 0)
+            .then(|| Duration::from_secs(self.client_idle_in_transaction_seconds))
     }
 
     pub fn notify_after(&self) -> Duration {
@@ -1509,6 +1531,31 @@ mod tests {
         .unwrap();
         assert_eq!(next.pool.query_deadline_seconds, 30);
         assert!(current.is_dynamic_change(&next));
+    }
+
+    #[test]
+    fn changing_the_idle_in_transaction_bound_changes_no_process_either() {
+        let current = Config::from_str(MINIMAL).unwrap();
+        let next = Config::from_str(&format!(
+            "configVersion = \"2\"\n{MINIMAL}\n[pool]\nclientIdleInTransactionSeconds = 45\n"
+        ))
+        .unwrap();
+        assert_eq!(next.pool.client_idle_in_transaction_seconds, 45);
+        assert_eq!(
+            next.pool.client_idle_in_transaction(),
+            Some(Duration::from_secs(45))
+        );
+        assert!(current.is_dynamic_change(&next));
+    }
+
+    /// Zero is the only way to ask for no bound, so it must not be confused with
+    /// a bound of zero seconds - which would close every transaction the instant
+    /// it opened.
+    #[test]
+    fn an_unset_idle_in_transaction_bound_is_no_bound() {
+        let config = Config::from_str(MINIMAL).unwrap();
+        assert_eq!(config.pool.client_idle_in_transaction_seconds, 0);
+        assert!(config.pool.client_idle_in_transaction().is_none());
     }
 
     /// The neighbouring keys are still structural, and must stay that way: the process is

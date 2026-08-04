@@ -247,6 +247,7 @@ pub struct Metrics {
     cancels_unmatched: AtomicU64,
     cancels_refused: AtomicU64,
     statement_deadlines: [AtomicU64; STATEMENT_DEADLINES.len()],
+    idle_in_transaction_closed: AtomicU64,
     connect_gate: [AtomicU64; 4],
     bytes_to_backend: AtomicU64,
     bytes_to_client: AtomicU64,
@@ -392,6 +393,11 @@ impl Metrics {
 
     pub fn statement_deadline(&self, outcome: StatementDeadline) {
         self.statement_deadlines[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn idle_in_transaction_closed(&self) {
+        self.idle_in_transaction_closed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn connect_gated(&self, outcome: ConnectGateOutcome) {
@@ -931,6 +937,12 @@ impl Metrics {
                     load(&self.statement_deadlines[outcome as usize]),
                 )
             })),
+        );
+        counter(
+            out,
+            "pgelastic_proxy_idle_in_transaction_closed_total",
+            "Clients closed for holding an open transaction without working.",
+            &[("", load(&self.idle_in_transaction_closed))],
         );
     }
 

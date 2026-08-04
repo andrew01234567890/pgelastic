@@ -610,7 +610,10 @@ type PoolTimeouts struct {
 	ClientLogin *metav1.Duration `json:"clientLogin,omitempty"`
 
 	// clientIdleInTransaction closes a client that holds an open transaction without
-	// working, which also holds locks and the xmin horizon.
+	// working, which also holds locks and the xmin horizon. It bounds a transaction that is
+	// running nothing; a transaction whose statement is running is bounded by query.
+	//
+	// Zero disables it, like query and unlike every other timeout here.
 	// +kubebuilder:default="60s"
 	// +optional
 	ClientIdleInTransaction *metav1.Duration `json:"clientIdleInTransaction,omitempty"`

@@ -22,6 +22,11 @@ pub enum Ending {
     Drained,
     /// A drain ran out of time and closed the session mid-work.
     Forced,
+    /// A client held an open transaction without working for longer than the
+    /// pool allows. The link is closed rather than rolled back and returned: what
+    /// the transaction held is released by the backend going away, and a rollback
+    /// issued to a session already given up on is a round trip that can hang.
+    IdleInTransaction,
     /// A statement outran the pool's query deadline. The backend was cancelled
     /// and the link closed rather than returned: a cancel that did not land
     /// leaves a backend still running the statement, and handing that to the
