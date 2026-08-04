@@ -112,10 +112,16 @@ type PgElasticPoolReconciler struct {
 // operator.
 const envProxyImage = "PGELASTIC_PROXY_IMAGE"
 
+// defaultPoolReplicas mirrors the CRD default on spec.instances.replicas. The API server
+// applies that default on every write, so an unset pointer is only reachable for an object
+// built in memory - and answering it with a different number than the API would is how a
+// fixture and a cluster come to disagree about how many machines a pool wants.
+const defaultPoolReplicas = 3
+
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools/finalizers,verbs=update
-// +kubebuilder:rbac:groups=pgelastic.io,resources=pginstances,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=pgelastic.io,resources=pginstances,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenants,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenantusers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenantusers/status,verbs=get;update;patch
@@ -154,6 +160,14 @@ func (r *PgElasticPoolReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	provisioned, err := r.provisionMembers(ctx, pool, view)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	// Reclaiming a member scale-in has emptied is convergence too, and for the same reason:
+	// it changes every number the plan is computed from.
+	if !provisioned {
+		provisioned, err = r.reclaimDrainedMembers(ctx, pool, view)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	if provisioned {
 		// Nothing is published on this pass. Every number a plan carries has just been
@@ -708,7 +722,7 @@ func (r *PgElasticPoolReconciler) expandStorage(
 // unset pointer is a pool whose spec predates the default rather than a pool that wants none.
 func declaredInstances(pool *pgelasticv1alpha1.PgElasticPool) int32 {
 	if pool.Spec.Instances.Replicas == nil {
-		return 1
+		return defaultPoolReplicas
 	}
 	return *pool.Spec.Instances.Replicas
 }
@@ -791,15 +805,20 @@ func (r *PgElasticPoolReconciler) scaleIn(
 		instance.Spec.Drain = &pgelasticv1alpha1.InstanceDrain{
 			Mode: ptr.To(pgelasticv1alpha1.InstanceDrainRequested),
 		}
+		// Marked, because a cordoned and drained member is not on its own a member anybody
+		// wanted deleted: an operator retiring hardware sets exactly the same two fields and
+		// expects the machine to still be there afterwards. The mark says this particular
+		// drain was a scale-in, and it is the only thing the reclaim acts on.
+		if instance.Annotations == nil {
+			instance.Annotations = map[string]string{}
+		}
+		instance.Annotations[ReclaimWhenEmptyAnnotation] = ReclaimWhenEmpty
 		if err := r.Patch(ctx, instance, patch); err != nil {
 			return false, err
 		}
 	}
 
-	current := int32(len(view.instances))
-	if pool.Spec.Instances.Replicas != nil {
-		current = *pool.Spec.Instances.Replicas
-	}
+	current := declaredInstances(pool)
 	if current <= plan.RecommendedInstances {
 		return false, nil
 	}
@@ -978,7 +997,6 @@ func (r *PgElasticPoolReconciler) publish(
 		},
 		Autoscaling: planStatus(pool, plan, applied, r.now()),
 	}
-	status.Phase = poolPhase(view, pool, status.Conditions)
 
 	r.recordPlan(pool, plan)
 	setCondition(&status.Conditions, pool.Generation, pgelasticv1alpha1.ConditionAccepted,
