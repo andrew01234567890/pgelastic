@@ -72,9 +72,9 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 	)
 
 	BeforeAll(func() {
-		Expect(k8sClient.Create(suiteCtx, &corev1.Namespace{
+		Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: provisioningNamespace},
-		})).To(Succeed())
+		}))).To(Succeed())
 
 		elasticClass := &pgelasticv1alpha1.PgElasticClass{
 			ObjectMeta: metav1.ObjectMeta{Name: className},
@@ -104,8 +104,13 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 					Kind:     elasticClassKind,
 					Name:     className,
 				},
-				Capacity:  pgelasticv1alpha1.PoolCapacity{BackendConnections: 50},
-				Instances: pgelasticv1alpha1.PoolInstances{Template: instanceTemplate()},
+				Capacity: pgelasticv1alpha1.PoolCapacity{BackendConnections: 50},
+				Instances: pgelasticv1alpha1.PoolInstances{
+					// Declared, rather than left to the CRD's default of three. This container
+					// stands up one member by hand, and a pool provisions what it declares.
+					Replicas: ptr.To(int32(1)),
+					Template: instanceTemplate(),
+				},
 				Admission: &pgelasticv1alpha1.PoolAdmission{DefaultWorkloadClassName: workloadName},
 			},
 		}
@@ -133,9 +138,11 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 				}
 			}
 			Expect(client.IgnoreNotFound(k8sClient.Delete(suiteCtx, instance))).To(Succeed())
-			Expect(client.IgnoreNotFound(k8sClient.Delete(suiteCtx, &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{Name: provisioningNamespace},
-			}))).To(Succeed())
+			// The namespace is left to releaseNamespaces at the end of the suite. It is the
+			// one namespace with a live instance controller behind it, so it is shared with
+			// the container that proves a pool can make a member - and container order is
+			// randomised, so whichever finished first was tearing the other one's namespace
+			// out from under it.
 			Expect(client.IgnoreNotFound(k8sClient.Delete(suiteCtx, elasticClass))).To(Succeed())
 			Expect(client.IgnoreNotFound(k8sClient.Delete(suiteCtx, workloadClass))).To(Succeed())
 		})
