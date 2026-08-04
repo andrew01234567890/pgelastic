@@ -49,6 +49,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/placement"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
 	"github.com/andrew01234567890/pgelastic/internal/tenantdb"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 )
 
 // placementRetryInterval is how long a tenant waits before its unresolved references or
@@ -752,7 +753,7 @@ func (r *PgTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&pgelasticv1alpha1.PgInstance{}, handler.EnqueueRequestsFromMapFunc(r.tenantsOfInstance)).
 		Watches(&pgelasticv1alpha1.PgWorkloadClass{}, handler.EnqueueRequestsFromMapFunc(r.tenantsOfWorkloadClass)).
 		Named("pgtenant").
-		Complete(r)
+		Complete(tracing.Wrap("PgTenant", r))
 }
 
 func (r *PgTenantReconciler) tenantsOfPool(ctx context.Context, object client.Object) []reconcile.Request {

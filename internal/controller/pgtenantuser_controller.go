@@ -38,6 +38,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
 	"github.com/andrew01234567890/pgelastic/internal/tenantuser"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 )
 
 // PgTenantUserFinalizer holds a login open until the cluster-global role it minted is gone.
@@ -395,7 +396,7 @@ func (r *PgTenantUserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&pgelasticv1alpha1.PgTenantUser{},
 			handler.EnqueueRequestsFromMapFunc(r.siblingsOf)).
 		Named("pgtenantuser").
-		Complete(r)
+		Complete(tracing.Wrap("PgTenantUser", r))
 }
 
 func (r *PgTenantUserReconciler) usersOfTenant(ctx context.Context, object client.Object) []reconcile.Request {

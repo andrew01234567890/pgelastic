@@ -44,6 +44,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/placement"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
 	"github.com/andrew01234567890/pgelastic/internal/proxy"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 )
 
 // poolResyncInterval paces the planner. Placement and autoscaling read trailing windows
@@ -899,7 +900,7 @@ func (r *PgElasticPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&pgelasticv1alpha1.PgInstance{}, handler.EnqueueRequestsFromMapFunc(poolOfInstance)).
 		Watches(&pgelasticv1alpha1.PgTenant{}, handler.EnqueueRequestsFromMapFunc(poolOfTenant)).
 		Named("pgelasticpool").
-		Complete(r)
+		Complete(tracing.Wrap("PgElasticPool", r))
 }
 
 // poolSelector is the label selector the scale subresource resolves replicas through. It

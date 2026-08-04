@@ -47,6 +47,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/metering"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 )
 
 // anySource is pg_hba's spelling of "from anywhere". It is a default rather than a
@@ -1234,7 +1235,7 @@ func (r *PgInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Named("pginstance").
-		Complete(r)
+		Complete(tracing.Wrap("PgInstance", r))
 }
 
 func envOrDefault(name, fallback string) string {

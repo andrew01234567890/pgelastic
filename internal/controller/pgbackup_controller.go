@@ -34,6 +34,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 )
 
 // backupRequeue paces a backup waiting to be taken. It is a floor rather than the
@@ -310,7 +311,7 @@ func (r *PgBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&pgelasticv1alpha1.PgInstance{},
 			handler.EnqueueRequestsFromMapFunc(r.backupsOfInstance)).
 		Named("pgbackup").
-		Complete(r)
+		Complete(tracing.Wrap("PgBackup", r))
 }
 
 func (r *PgBackupReconciler) backupsOfInstance(
