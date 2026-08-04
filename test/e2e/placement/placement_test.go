@@ -352,6 +352,53 @@ var _ = Describe("placing a tenant population across a pool", Ordered, func() {
 			"Recommend mode moved a tenant, which is the one thing it must never do")
 	})
 
+	// A recovered instance is handed the source pool's poolRef and cordoned in the same breath
+	// (pgrestore_controller: "evidence until somebody has looked at it, not capacity"), so a
+	// pool acquires a member nothing may be placed on without anybody asking for one. Its idle
+	// capacity sitting in the denominator makes a pool at its target read as one well under it,
+	// and the reading is what decides how many machines the pool asks for.
+	It("does not measure the pool through a member nothing may be placed on", func() {
+		var before int32
+		Eventually(func(g Gomega) {
+			plan := fetchPool(namespace, poolName).Status.Autoscaling
+			g.Expect(plan).NotTo(BeNil())
+			g.Expect(plan.MeasuredInstances).To(Equal(int32(instanceCount)))
+			g.Expect(plan.ObservedUtilizationPercent).To(BeNumerically(">", 0),
+				"the fixture publishes load on every member, so a zero reading would make the "+
+					"assertion below pass without measuring anything")
+			before = plan.ObservedUtilizationPercent
+		}).Should(Succeed())
+
+		recovered := instances[len(instances)-1]
+		instance := fetchInstance(namespace, recovered)
+		patch := client.MergeFrom(instance.DeepCopy())
+		instance.Spec.Admission = &pgelasticv1alpha1.InstanceAdmission{Schedulable: ptr.To(false)}
+		Expect(k8sClient.Patch(suiteCtx, instance, patch)).To(Succeed())
+
+		instance = fetchInstance(namespace, recovered)
+		instance.Status.Capacity.InUse = 0
+		Expect(k8sClient.Status().Update(suiteCtx, instance)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			plan := fetchPool(namespace, poolName).Status.Autoscaling
+			g.Expect(plan).NotTo(BeNil())
+			g.Expect(plan.MeasuredInstances).To(Equal(int32(instanceCount - 1)))
+			g.Expect(plan.ObservedInstances).To(Equal(int32(instanceCount)),
+				"the member is still a member; only its capacity stopped counting")
+			g.Expect(plan.ObservedUtilizationPercent).To(Equal(before),
+				"an idle member nothing may be placed on moved the pool's utilization")
+		}).Should(Succeed())
+
+		By("restoring the member so the specs below see the pool they were written against")
+		instance = fetchInstance(namespace, recovered)
+		restore := client.MergeFrom(instance.DeepCopy())
+		instance.Spec.Admission = nil
+		Expect(k8sClient.Patch(suiteCtx, instance, restore)).To(Succeed())
+		instance = fetchInstance(namespace, recovered)
+		instance.Status.Capacity.InUse = 4
+		Expect(k8sClient.Status().Update(suiteCtx, instance)).To(Succeed())
+	})
+
 	// Last, because it takes the pool away from every spec above it.
 	//
 	// A tenant inherits its claim on this operator from its pool, so a tenant that outlives

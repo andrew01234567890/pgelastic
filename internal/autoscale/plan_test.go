@@ -419,6 +419,230 @@ func TestUtilizationInsideTheToleranceProposesNothing(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- measurable capacity
+
+// A restored instance is the reachable case: pgrestore_controller gives it the source pool's
+// poolRef and cordons it in the same breath, so a pool acquires unschedulable capacity with
+// no operator action at all.
+func restoredInstance(name string, allocatable int32) InstanceSignal {
+	instance := readyInstance(name, allocatable, 0)
+	instance.Schedulable = false
+	return instance
+}
+
+func TestCapacityNothingMayBePlacedOnIsNotMeasured(t *testing.T) {
+	policy := basePolicy()
+	policy.TargetUtilizationPercent = 70
+
+	signals := baseSignals()
+	signals.Instances = []InstanceSignal{
+		readyInstance(instanceA, 225, 100),
+		readyInstance(instanceB, 225, 100),
+		restoredInstance(instanceC, 225),
+	}
+
+	plan := Recommend(signals, policy)
+	if want := int32(44); plan.ObservedUtilizationPercent != want {
+		t.Errorf("utilization is %d%%, want %d%% — 200 in use over the 450 connections a tenant "+
+			"could actually be placed on", plan.ObservedUtilizationPercent, want)
+	}
+	if action, ok := plan.ActionFor(pgelasticv1alpha1.AutoActionScaleIn); ok {
+		t.Errorf("a pool at 44%% of a 70%% target proposed %s: %s", action.Class, action.Detail)
+	}
+}
+
+func TestAPoolWithNoPlaceableCapacityIsUnmeasuredRatherThanEmpty(t *testing.T) {
+	policy := basePolicy()
+	policy.TargetUtilizationPercent = 70
+	policy.MinInstances = 1
+
+	signals := baseSignals()
+	for i := range signals.Instances {
+		signals.Instances[i].Schedulable = false
+	}
+
+	plan := Recommend(signals, policy)
+	// The count is not the assertion; what the pool does about it is. A pool nothing can be
+	// read through proposes neither growth nor consolidation, because both would be acting on
+	// a reading that was never taken.
+	if action, ok := plan.ActionFor(pgelasticv1alpha1.AutoActionScaleIn); ok {
+		t.Errorf("proposed %s against a pool nothing can be placed on: %s", action.Class, action.Detail)
+	}
+	if action, ok := plan.ActionFor(pgelasticv1alpha1.AutoActionScaleOut); ok {
+		t.Errorf("proposed %s against a pool nothing can be placed on: %s", action.Class, action.Detail)
+	}
+	// Taking no action and saying the pool is idle are the same outcome told two ways, and
+	// only one of them sends an operator to look at why the members are cordoned.
+	if !strings.Contains(plan.Summary, "utilization is unknown") {
+		t.Errorf("the summary reads %q, which does not distinguish an unreadable pool from an idle one",
+			plan.Summary)
+	}
+}
+
+// The count the ratio scales must be the count the ratio measured, or a pool that is one
+// third unschedulable is sized as though the third were carrying its share.
+func TestTheRecommendationIsScaledFromTheMeasuredCount(t *testing.T) {
+	policy := basePolicy()
+	policy.TargetUtilizationPercent = 50
+
+	signals := baseSignals()
+	signals.Instances = []InstanceSignal{
+		readyInstance(instanceA, 100, 100),
+		readyInstance(instanceB, 100, 100),
+		restoredInstance(instanceC, 100),
+	}
+
+	plan := Recommend(signals, policy)
+	// Two measured instances at 100%, halved to a 50% target, needs four that can serve. The
+	// unschedulable member is not one of them and is not added on top of them either.
+	if want := int32(4); plan.RecommendedInstances != want {
+		t.Errorf("recommended %d instances from %d measured at %d%%, want %d",
+			plan.RecommendedInstances, plan.MeasuredInstances, plan.ObservedUtilizationPercent, want)
+	}
+}
+
+// The recommendation must not be a function of the count it is compared against. A member
+// that exists without becoming measurable - one still coming up, one cordoned - would
+// otherwise raise the recommendation by one and so ask for another, for ever.
+func TestTheRecommendationDoesNotChaseTheMembersItAsksFor(t *testing.T) {
+	policy := basePolicy()
+	policy.TargetUtilizationPercent = 40
+	policy.MaxInstances = 32
+
+	signals := baseSignals()
+	for i := range signals.Instances {
+		signals.Instances[i].InUseConnections = 135 // 60% of 225
+	}
+	first := Recommend(signals, policy).RecommendedInstances
+	if first <= signals.InstanceCount() {
+		t.Fatalf("the fixture recommends %d against %d members, so it cannot show a runaway",
+			first, signals.InstanceCount())
+	}
+
+	// The members it asked for arrive and are not serving yet, which is every member for the
+	// minutes between being created and finishing initdb.
+	for len(signals.Instances) < int(first) {
+		signals.Instances = append(signals.Instances, InstanceSignal{
+			Name: fmt.Sprintf("pg-new-%d", len(signals.Instances)), Schedulable: true,
+		})
+	}
+
+	if second := Recommend(signals, policy).RecommendedInstances; second != first {
+		t.Errorf("recommended %d after the %d it asked for appeared unready; a recommendation "+
+			"that grows with the membership walks to maxInstances", second, first)
+	}
+}
+
+// The proposal and whatever applies it have now disagreed about which count "current" means
+// three times, in three different pairs of numbers, and each time the symptom was identical: a
+// class proposed, permitted and selected on every pass that applies nothing, and every class
+// beneath it in ActionOrder never running again.
+//
+// So the plan states the count its recommendation is in, and this asserts that a permitted
+// ScaleOut is one the executor will also find worth applying - across a fixture set that
+// includes every shape that has caused the disagreement so far.
+func TestAPermittedScaleOutIsAlwaysOneItsExecutorWouldApply(t *testing.T) {
+	shapes := map[string]func(Signals) Signals{
+		"all serving":  func(s Signals) Signals { return s },
+		"one cordoned": func(s Signals) Signals { s.Instances[2].Schedulable = false; return s },
+		"two cordoned": func(s Signals) Signals {
+			s.Instances[1].Schedulable = false
+			s.Instances[2].Schedulable = false
+			return s
+		},
+		"one still coming up":    func(s Signals) Signals { s.Instances[2].Ready = false; return s },
+		"cordoned and coming up": func(s Signals) Signals { s.Instances[1].Schedulable = false; s.Instances[2].Ready = false; return s },
+	}
+	loads := []int32{20, 100, 155, 214, 225}
+
+	for name, shape := range shapes {
+		for _, inUse := range loads {
+			signals := baseSignals()
+			for i := range signals.Instances {
+				signals.Instances[i].InUseConnections = inUse
+			}
+			signals = shape(signals)
+
+			plan := Recommend(signals, basePolicy())
+			action, ok := plan.ActionFor(pgelasticv1alpha1.AutoActionScaleOut)
+			if !ok || !action.Permitted {
+				continue
+			}
+			// What the executor asks before it writes anything.
+			if plan.RecommendedInstances <= plan.ServingInstances {
+				t.Errorf("%s at %d in use: ScaleOut is permitted with recommended=%d against "+
+					"serving=%d, so it is selected every pass and applies nothing",
+					name, inUse, plan.RecommendedInstances, plan.ServingInstances)
+			}
+		}
+	}
+}
+
+// A pool whose members are all out of service reads as needing more of them - the floor puts
+// the recommendation above a serving count of zero - so growth has to be refused on the
+// measurement rather than on the arithmetic.
+func TestAPoolWithNothingMeasurableDoesNotProposeGrowth(t *testing.T) {
+	policy := basePolicy()
+	policy.TargetUtilizationPercent = 70
+	policy.MinInstances = 4
+
+	signals := baseSignals()
+	for i := range signals.Instances {
+		signals.Instances[i].Schedulable = false
+	}
+
+	plan := Recommend(signals, policy)
+	if plan.RecommendedInstances <= signals.ServingInstances() {
+		t.Fatalf("the fixture recommends %d against %d serving, so the guard under test is not "+
+			"what stops the proposal", plan.RecommendedInstances, signals.ServingInstances())
+	}
+	if action, ok := plan.ActionFor(pgelasticv1alpha1.AutoActionScaleOut); ok {
+		t.Errorf("proposed %s from a pool nothing could be measured through: %s",
+			action.Class, action.Detail)
+	}
+}
+
+// A pool sitting on its target proposes nothing, and holding a member that is out of service
+// does not change that. The recommendation and the count it is compared against have to be
+// the same unit: expressed in members and compared with servable ones, an on-target pool with
+// one cordoned member proposed raising its own count from three to three - inert, permitted,
+// selected, and starving every class below it, for ever.
+func TestAnOnTargetPoolWithACordonedMemberProposesNothing(t *testing.T) {
+	policy := basePolicy()
+	policy.TargetUtilizationPercent = 70
+	policy.TolerancePercent = 10
+
+	signals := baseSignals()
+	for i := range signals.Instances {
+		signals.Instances[i].InUseConnections = 155 // 68% of 225, inside the band
+	}
+	signals.Instances[2].Schedulable = false
+
+	plan := Recommend(signals, policy)
+	if action, ok := plan.ActionFor(pgelasticv1alpha1.AutoActionScaleOut); ok {
+		t.Errorf("an on-target pool proposed %s: %s", action.Class, action.Detail)
+	}
+}
+
+// The state scale-in leaves behind on the pass after it cordons its victim: the victim stops
+// counting as capacity, so the utilization over what is left rises. Read against the members
+// that remain in service, that is not a pool that needs to grow - and proposing growth here
+// abandons the scale-in half-done, with the victim cordoned, empty and never reclaimed.
+func TestCordoningTheScaleInVictimDoesNotTurnIntoAScaleOut(t *testing.T) {
+	policy := basePolicy()
+	policy.TargetUtilizationPercent = 70
+
+	signals := scaleInSignals()
+	signals.Instances[2].Schedulable = false
+	signals.Instances[2].Tenants = 0
+
+	plan := Recommend(signals, policy)
+	if action, ok := plan.ActionFor(pgelasticv1alpha1.AutoActionScaleOut); ok {
+		t.Errorf("proposed %s on the pass after scale-in cordoned its victim: %s",
+			action.Class, action.Detail)
+	}
+}
+
 // ---------------------------------------------------------------- scale-in
 
 func scaleInSignals() Signals {
