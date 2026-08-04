@@ -430,50 +430,49 @@ async fn a_hold_does_not_save_a_write_the_old_primary_still_owes_an_answer() {
 /// like.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hold_never_decides_a_commit_that_was_forwarded_and_never_answered() {
-    let (fleet, admin) = fleet_with_push().await;
+    // Quorum loss is the member's birth condition: `SyncRepWaitForLSN` reads a shared-memory
+    // word only the checkpointer publishes, so arming by reload races a process no query can
+    // observe, and a commit that loses that race completes instead of stalling. The cluster
+    // default stays `local` so only the transaction that opts in can hang, and the stall
+    // detector's refusal is off because inst-a is degraded before the proxy starts.
+    let fleet = Fleet::start_leased_with_conf(
+        8,
+        8,
+        15_000,
+        "synchronous_standby_names = 'ghost'\nsynchronous_commit = local",
+        "[fence]\npushAddress = \"127.0.0.1:0\"\n\n[stall]\nfailFast = false\n",
+    )
+    .await;
+    let admin = fleet
+        .proxy
+        .running
+        .push_address
+        .expect("the push endpoint must report where it bound")
+        .port();
     create_ledger(&fleet, &fleet.a).await;
-
-    // Quorum loss, which is how the design says a commit hangs in production:
-    // dataDurability Required waiting on a synchronous standby that is not there.
     let dba = fleet
         .observer(&fleet.a, "pgelastic_switchover_quorum")
         .await;
-    dba.simple_query("ALTER SYSTEM SET synchronous_standby_names = 'ghost'")
-        .await
-        .expect("naming an absent standby");
-    dba.simple_query("SELECT pg_reload_conf()")
-        .await
-        .expect("reloading");
 
     let alpha = fleet.connect_as("alpha").await;
-    until(
-        "the backend to load the clause that will stall its commit",
-        Duration::from_secs(10),
-        async || {
-            alpha
-                .simple_query("SHOW synchronous_standby_names")
-                .await
-                .ok()
-                .is_some_and(|messages| {
-                    messages.iter().any(|message| {
-                        matches!(message, tokio_postgres::SimpleQueryMessage::Row(row)
-                            if row.get(0) == Some("ghost"))
-                    })
-                })
-        },
-    )
-    .await;
-
     alpha.simple_query("BEGIN").await.expect("begin");
+    let alpha_pid: i32 = alpha
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("the pid of the backend this transaction is pinned to")
+        .get(0);
+    alpha
+        .simple_query("SET LOCAL synchronous_commit = on")
+        .await
+        .expect("this transaction opting in to synchronous replication");
     alpha
         .simple_query("INSERT INTO ledger (tenant) VALUES ('alpha')")
         .await
         .expect("the write");
     let committer = tokio::spawn(async move { alpha.simple_query("COMMIT").await });
-    // The clause gate above is not enough on its own, and here it is weaker still: it was
-    // asked before BEGIN, so under transaction pooling the link that answered need not be the
-    // link that runs this COMMIT. The wait itself is the precondition, so wait for it.
-    await_stalled_commit(&dba).await;
+    // Ordering, not arming: the quiesce must be asked for while the commit is genuinely in the
+    // wait, and the pid is what makes "genuinely" mean this backend.
+    await_stalled_commit(&dba, alpha_pid).await;
 
     let report = fleet
         .control
