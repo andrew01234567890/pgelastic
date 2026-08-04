@@ -108,10 +108,13 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	// Not Development. That mode is the kubebuilder scaffold's default and it decides three
 	// things at once: console encoding rather than JSON, DebugLevel rather than Info, and a
-	// stacktrace on every Warn. The first is what spec.observability.logFormat has been
-	// promising - and defaulting to Json - since the field was added. BindFlags still exposes
-	// --zap-encoder and --zap-log-level, so a human debugging locally can have console back
-	// by asking for it.
+	// stacktrace on every Warn. None of those is right for a process whose logs are collected
+	// and queried rather than watched by a person.
+	//
+	// This is the operator's own decision and not spec.observability.logFormat's: that field
+	// is pool-scoped and governs the proxy fleet, which the operator is not. BindFlags still
+	// exposes --zap-encoder and --zap-log-level, so a human debugging locally can have console
+	// and Debug back by asking for them.
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()

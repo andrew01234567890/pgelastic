@@ -81,6 +81,20 @@ func TestEveryBinaryLogsInTheSameShape(t *testing.T) {
 }
 
 // valueOf pulls the first double-quoted string from the line carrying a marker.
+// The operator names the variable that carries the log format to the proxy, and the proxy
+// reads it. They are a matched pair across a language boundary, which means a rename on
+// either side compiles, passes both test suites, and silently falls back to the default -
+// the field would go inert again exactly the way it was inert before.
+func TestTheProxyReadsTheVariableTheOperatorSets(t *testing.T) {
+	operator := valueOf(t, read(t, "internal/proxy/names.go"), "EnvLogFormat =")
+	proxy := valueOf(t, read(t, "crates/pgelastic-proxy/src/main.rs"), "LOG_FORMAT_ENV: &str =")
+
+	if operator != proxy {
+		t.Errorf("the operator sets %q and the proxy reads %q, so the pool's logFormat reaches "+
+			"nothing", operator, proxy)
+	}
+}
+
 func valueOf(t *testing.T, source, marker string) string {
 	t.Helper()
 	for line := range strings.SplitSeq(source, "\n") {

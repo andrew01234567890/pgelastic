@@ -336,8 +336,12 @@ func (b Builder) ports() []corev1.ContainerPort {
 	return ports
 }
 
-// env carries the two facts the document cannot: how many runtime workers to start, and
-// which Pod this replica is.
+// env carries the three facts the document cannot: how many runtime workers to start, which
+// Pod this replica is, and what shape to write logs in.
+//
+// The log format is here rather than in the document for a reason that is not about
+// convenience: the subscriber is installed before the document is read, so a format that
+// travelled in the document would arrive after every line it was meant to shape.
 //
 // TOKIO_WORKER_THREADS rather than a count derived from the visible CPUs: a pod that spawns
 // one worker per host core under a CPU limit spends its quota on CFS throttling.
@@ -351,7 +355,7 @@ func (b Builder) env() []corev1.EnvVar {
 	if declared := b.spec().Workers; declared != nil {
 		workers = *declared
 	}
-	return []corev1.EnvVar{
+	env := []corev1.EnvVar{
 		{Name: "TOKIO_WORKER_THREADS", Value: fmt.Sprintf("%d", workers)},
 		{Name: "GOMAXPROCS", Value: fmt.Sprintf("%d", workers)},
 		{
@@ -361,6 +365,13 @@ func (b Builder) env() []corev1.EnvVar {
 			},
 		},
 	}
+	// Omitted entirely for a pool with no observability block, rather than set to the
+	// default. Adding it unconditionally would roll every proxy fleet in the estate - and a
+	// proxy roll drops client sessions - to hand the process a value it already picks.
+	if observability := b.Pool.Spec.Observability; observability != nil && observability.LogFormat != "" {
+		env = append(env, corev1.EnvVar{Name: EnvLogFormat, Value: observability.LogFormat})
+	}
+	return env
 }
 
 // readinessProbe reads admin state over HTTP and never opens a bare TCP connection.

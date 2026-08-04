@@ -105,6 +105,16 @@ const (
 // ContainerName names the proxy container, and is what a template override merges onto.
 const ContainerName = "proxy"
 
+// EnvLogFormat carries spec.observability.logFormat to the proxy.
+//
+// It cannot travel in the configuration document, and that is not an oversight to tidy away
+// later: the subscriber is installed before the document is read, so a format that arrived
+// there would arrive after every line it was supposed to shape.
+//
+// The value is the enum verbatim. The proxy compares it case-insensitively, so "Text" matches
+// without a second spelling that has to be kept in step with the API's.
+const EnvLogFormat = "PGELASTIC_LOG_FORMAT"
+
 // DefaultReplicas matches the spec.proxy.replicas CRD default and is applied to a pool
 // whose fleet was written before the default existed.
 const DefaultReplicas int32 = 3
