@@ -34,6 +34,7 @@ pub async fn connect_socket(
         .await
         .map_err(|_| ProxyError::Timeout(connect_timeout))??;
     socket.set_nodelay(true)?;
+    crate::stream::arm_keepalive(&socket);
 
     let Some(tls) = tls else {
         return Ok(MaybeTls::Plain(socket));

@@ -7,6 +7,41 @@ use std::task::{Context, Poll};
 use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// How long a connection may be silent before the kernel starts probing it.
+///
+/// Both legs of the proxy carry connections that are idle for long stretches by
+/// design - a client between transactions, a pooled backend parked for reuse - so
+/// this is deliberately well above any of them rather than tuned to a round trip.
+const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The gap between probes once one has gone unanswered.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Unanswered probes before the connection is declared dead, giving roughly 90
+/// seconds from the last byte to the socket erroring out.
+const KEEPALIVE_RETRIES: u32 = 3;
+
+/// Asks the kernel to notice a peer that stopped answering.
+///
+/// Without this a peer that vanishes without a FIN - a killed pod, a partitioned
+/// node, a NAT that forgot the flow - leaves the socket open indefinitely on this
+/// side. On the client leg that is a backend held for a client nobody can reach;
+/// on the backend leg it is a checkout that never completes and a pool slot that
+/// never comes back. Neither of the two bounds a session is subject to helps: a
+/// statement deadline needs the client to have started something, and an
+/// idle-in-transaction bound needs a transaction.
+///
+/// Best effort, like `arm_reset` beside it: a socket the peer has already torn
+/// down has nothing to configure, and failing to set an option is not a reason to
+/// refuse a connection that otherwise works.
+pub fn arm_keepalive(socket: &tokio::net::TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    let _ = socket2::SockRef::from(socket).set_tcp_keepalive(&keepalive);
+}
+
 /// A stream that replays already-read bytes before reaching the socket.
 ///
 /// Direct-TLS detection is a one-byte peek, and that byte is the start of the
@@ -190,6 +225,30 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// The option has to be on the socket, not merely requested: a keepalive that
+    /// silently failed to apply leaves exactly the hang it was added to end, and
+    /// nothing else in the proxy would ever say so.
+    #[tokio::test]
+    async fn arming_keepalive_sets_it_on_the_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connecting = tokio::spawn(async move { tokio::net::TcpStream::connect(address).await });
+        let (accepted, _) = listener.accept().await.unwrap();
+        let _client = connecting.await.unwrap().unwrap();
+
+        let socket = socket2::SockRef::from(&accepted);
+        assert!(
+            !socket.keepalive().unwrap(),
+            "a socket must not arrive with keepalive already on, or this proves nothing"
+        );
+
+        arm_keepalive(&accepted);
+        assert!(socket.keepalive().unwrap());
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
+        assert_eq!(socket.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(socket.tcp_keepalive_retries().unwrap(), KEEPALIVE_RETRIES);
+    }
     use super::*;
     use tokio::io::AsyncReadExt;
 

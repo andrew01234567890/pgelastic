@@ -646,6 +646,11 @@ async fn accept_loop(
             continue;
         };
 
+        // Before the permit, so a connection refused for the connection limit is
+        // still one the kernel will notice the death of while its error is
+        // written.
+        crate::stream::arm_keepalive(&socket);
+
         let Ok(permit) = Arc::clone(&proxy.permits).try_acquire_owned() else {
             proxy.metrics.client_rejected(RejectReason::ConnectionLimit);
             tokio::spawn(refuse(socket, ProxyError::ConnectionLimit));
