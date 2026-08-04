@@ -28,20 +28,38 @@ import (
 // records everything it was asked in order, so a test can assert on the order the cleanup
 // ladder ran in as well as on what it returned.
 type fakeSQL struct {
-	mutex     sync.Mutex
-	answers   map[string][]Row
+	mutex   sync.Mutex
+	answers map[string][]Row
+	// scoped answers a fragment differently per endpoint. The unscoped map cannot express
+	// "the source says 19 and the target says 18", which is the only shape in which a
+	// version disagreement exists at all.
+	scoped    map[endpointFragment][]Row
 	failures  map[string]error
 	statement []string
 	endpoints []Endpoint
 }
 
 func newFakeSQL() *fakeSQL {
-	return &fakeSQL{answers: map[string][]Row{}, failures: map[string]error{}}
+	return &fakeSQL{
+		answers:  map[string][]Row{},
+		scoped:   map[endpointFragment][]Row{},
+		failures: map[string]error{},
+	}
 }
 
 func (f *fakeSQL) answer(fragment string, rows ...Row) *fakeSQL {
 	f.answers[fragment] = rows
 	return f
+}
+
+// endpointAnswer scopes one fragment's answer to one endpoint, overriding the unscoped one.
+func (f *fakeSQL) endpointAnswer(at Endpoint, fragment, value string) {
+	f.scoped[endpointFragment{at: at, fragment: fragment}] = []Row{{value}}
+}
+
+type endpointFragment struct {
+	at       Endpoint
+	fragment string
 }
 
 func (f *fakeSQL) scalarAnswer(fragment, value string) *fakeSQL {
@@ -71,6 +89,11 @@ func (f *fakeSQL) Query(_ context.Context, at Endpoint, statement string) ([]Row
 	f.endpoints = append(f.endpoints, at)
 	if err := f.matchFailure(statement); err != nil {
 		return nil, err
+	}
+	for key, rows := range f.scoped {
+		if key.at == at && strings.Contains(statement, key.fragment) {
+			return rows, nil
+		}
 	}
 	best, found := "", false
 	for fragment := range f.answers {

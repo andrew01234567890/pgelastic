@@ -39,7 +39,8 @@ func passingSource() *fakeSQL {
 		scalarAnswer("FROM pg_stat_activity WHERE backend_type", "12").
 		answer(roleEnumerationFragment).
 		answer("CASE WHEN r.rolsuper THEN 'SUPERUSER' END").
-		scalarAnswer("e.grantee = 0 AND e.privilege_type = 'CONNECT'", "0")
+		scalarAnswer("e.grantee = 0 AND e.privilege_type = 'CONNECT'", "0").
+		scalarAnswer(serverVersionQuery, "18")
 }
 
 // A migration must not be a route by which a tenant acquires an attribute it was never
@@ -302,5 +303,52 @@ func TestTheOfflineDumpCarriesStatistics(t *testing.T) {
 
 	if !strings.Contains(command, "--statistics") {
 		t.Errorf("the dump leaves the tenant with no optimizer statistics: %s", command)
+	}
+}
+
+// Both dumps run in the target's container, so the binary is always the target's, and
+// pg_dump refuses outright to read a server newer than itself. Without this check that
+// refusal arrives as a shell exit code inside a retry budget, which spends itself re-running
+// a command that could never have worked.
+func TestAMoveOntoAnOlderMajorIsRefusedHereRatherThanInsidePgDump(t *testing.T) {
+	sql := passingSource().scalarAnswer(serverVersionQuery, "19")
+	sql.endpointAnswer(targetAt.WithDatabase("postgres"), serverVersionQuery, "18")
+
+	check := checkVersionCompatibility(t.Context(), sql, passingInput())
+
+	if check.Passed {
+		t.Fatal("a move from PostgreSQL 19 onto 18 passed preflight")
+	}
+	if !strings.Contains(check.Detail, "refuses to read a server newer than itself") {
+		t.Errorf("the refusal does not say why: %q", check.Detail)
+	}
+}
+
+// The recommended upgrade route is to stand up an instance on the new major and migrate
+// tenants onto it one at a time. Refusing the newer target would refuse exactly that.
+func TestAMoveOntoTheNextMajorIsTheSupportedDirection(t *testing.T) {
+	sql := passingSource().scalarAnswer(serverVersionQuery, "18")
+	sql.endpointAnswer(targetAt.WithDatabase("postgres"), serverVersionQuery, "19")
+
+	check := checkVersionCompatibility(t.Context(), sql, passingInput())
+
+	if !check.Passed {
+		t.Fatalf("a move from 18 onto 19 was refused: %s", check.Detail)
+	}
+}
+
+// One major at a time is the path that gets tested. Two is a combination nobody has run, and
+// it is something an operator drifts into rather than chooses.
+func TestAMultiMajorJumpIsRefused(t *testing.T) {
+	sql := passingSource().scalarAnswer(serverVersionQuery, "18")
+	sql.endpointAnswer(targetAt.WithDatabase("postgres"), serverVersionQuery, "20")
+
+	check := checkVersionCompatibility(t.Context(), sql, passingInput())
+
+	if check.Passed {
+		t.Fatal("a two-major jump passed preflight")
+	}
+	if !strings.Contains(check.Detail, "jump of 2") {
+		t.Errorf("the refusal does not name the size of the jump: %q", check.Detail)
 	}
 }
