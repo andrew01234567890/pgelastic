@@ -37,6 +37,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 )
 
 // restoreRequeue paces a restore that is waiting for its target instance to finish
@@ -628,5 +629,5 @@ func (r *PgRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pgelasticv1alpha1.PgRestore{}).
 		Named("pgrestore").
-		Complete(r)
+		Complete(tracing.Wrap("PgRestore", r))
 }

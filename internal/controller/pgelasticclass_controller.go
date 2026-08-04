@@ -36,6 +36,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 )
 
 // PoolsExistFinalizer keeps a PgElasticClass alive while pools still depend on the
@@ -189,7 +190,7 @@ func (r *PgElasticClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&pgelasticv1alpha1.PgElasticClass{}).
 		Watches(&pgelasticv1alpha1.PgElasticPool{}, handler.EnqueueRequestsFromMapFunc(elasticClassForPool)).
 		Named("pgelasticclass").
-		Complete(r)
+		Complete(tracing.Wrap("PgElasticClass", r))
 }
 
 func elasticClassForPool(_ context.Context, object client.Object) []reconcile.Request {

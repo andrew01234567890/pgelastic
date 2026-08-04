@@ -36,6 +36,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 )
 
 const (
@@ -441,5 +442,5 @@ func (r *PgTenantMigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pgelasticv1alpha1.PgTenantMigration{}).
 		Named("pgtenantmigration").
-		Complete(r)
+		Complete(tracing.Wrap("PgTenantMigration", r))
 }

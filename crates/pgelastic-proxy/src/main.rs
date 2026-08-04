@@ -110,19 +110,31 @@ async fn wait_for_signal() {
 /// Installs the subscriber, in JSON unless a human has asked otherwise.
 ///
 /// The filter is read the same way either way, so `RUST_LOG` keeps working exactly as it did.
+///
+/// Span close records are emitted in both shapes. The default is `FmtSpan::NONE`, which drops
+/// every field a span records - so the admission wait, whose whole content is `outcome` and
+/// `waited_ms` set at the moment it ends, would produce no output at all. Both branches, and
+/// not only the JSON one: a fleet running with `logFormat: Text` would otherwise lose exactly
+/// the record somebody set it to read.
 fn init_logging() {
+    use tracing_subscriber::fmt::format::FmtSpan;
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let human = std::env::var(LOG_FORMAT_ENV).is_ok_and(|value| {
         value.eq_ignore_ascii_case("text") || value.eq_ignore_ascii_case("console")
     });
     if human {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .with_span_events(FmtSpan::CLOSE)
+            .with_env_filter(filter)
+            .init();
     } else {
         tracing_subscriber::fmt()
             .json()
             .flatten_event(true)
             .with_current_span(true)
+            .with_span_events(FmtSpan::CLOSE)
             .with_env_filter(filter)
             .init();
     }

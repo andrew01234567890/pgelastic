@@ -35,6 +35,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 )
 
 // PgWorkloadClassReconciler reconciles a PgWorkloadClass object.
@@ -198,7 +199,7 @@ func (r *PgWorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&pgelasticv1alpha1.PgTenant{}, handler.EnqueueRequestsFromMapFunc(r.classesForTenant)).
 		Watches(&pgelasticv1alpha1.PgElasticPool{}, handler.EnqueueRequestsFromMapFunc(r.classesForPool)).
 		Named("pgworkloadclass").
-		Complete(r)
+		Complete(tracing.Wrap("PgWorkloadClass", r))
 }
 
 func (r *PgWorkloadClassReconciler) classesForTenant(ctx context.Context, object client.Object) []reconcile.Request {

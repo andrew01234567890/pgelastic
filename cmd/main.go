@@ -45,6 +45,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/metering"
 	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/proxy"
+	"github.com/andrew01234567890/pgelastic/internal/tracing"
 	webhookv1alpha1 "github.com/andrew01234567890/pgelastic/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
@@ -71,6 +72,11 @@ func init() {
 	utilruntime.Must(pgelasticv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
+
+// operatorVersion is stamped at build time with -ldflags "-X main.operatorVersion=...". The
+// default is "dev" rather than "unknown": a build nobody stamped is a development build, and
+// saying so is more use in a trace than admitting ignorance.
+var operatorVersion = "dev"
 
 // nolint:gocyclo
 func main() {
@@ -384,9 +390,34 @@ func main() {
 		os.Exit(1)
 	}
 
+	signals := ctrl.SetupSignalHandler()
+
+	// Started before the manager runs, so the first reconcile already has somewhere to send
+	// its spans.
+	//
+	// Nothing here contacts the collector: the gRPC channel connects lazily and reconnects in
+	// the background, so an unreachable collector costs traces - the batch processor drops
+	// them once its queue fills - and never costs the operator. That is the right trade, and
+	// worth stating because the opposite is the tempting one: making startup wait for the
+	// collector would let a collector rollout stop the operator starting.
+	//
+	// With no endpoint configured this is a no-op and costs nothing.
+	stopTracing, err := tracing.Start(signals, operatorVersion)
+	if err != nil {
+		setupLog.Error(err, "Failed to start trace export")
+		os.Exit(1)
+	}
+
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "Failed to run manager")
+	runErr := mgr.Start(signals)
+
+	// Flushed before exit even when the manager failed. The spans describing a crash are the
+	// ones worth having, and they are buffered at exactly the moment they would be dropped.
+	if err := stopTracing(signals); err != nil {
+		setupLog.Error(err, "Failed to flush traces")
+	}
+	if runErr != nil {
+		setupLog.Error(runErr, "Failed to run manager")
 		os.Exit(1)
 	}
 }

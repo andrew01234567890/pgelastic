@@ -612,6 +612,28 @@ impl PoolManager {
 
     /// Waits for the queue to reach this client, emitting the notice threshold
     /// on the way and refusing with `PGE1024` at the deadline.
+    ///
+    /// This is the span that matters most in the proxy, and until now it did not exist. The
+    /// admission-queue wait is the whole point of the capacity model - it is where
+    /// oversubscription is either working or hurting - and from outside it is
+    /// indistinguishable from a slow query: the client simply waits. The counters say how
+    /// many waited and the histogram says how long they waited in aggregate, but neither can
+    /// answer "why was *this* statement slow", which is the question somebody actually has.
+    ///
+    /// `outcome` and `waited_ms` are recorded on the span rather than logged as events, so the
+    /// wait is one record with a duration rather than two lines to correlate. The subscriber
+    /// emits span close records, which is what makes those fields observable at all; the shape
+    /// is the one an OTLP layer will export when the proxy grows one, which it has not yet.
+    #[tracing::instrument(
+        name = "proxy.admission_wait",
+        skip_all,
+        fields(
+            tenant = %request.tenant,
+            blocked_by = %blocked_by.code(),
+            outcome = tracing::field::Empty,
+            waited_ms = tracing::field::Empty,
+        )
+    )]
     async fn await_grant<W: AsyncWrite + Unpin>(
         &self,
         request: &AcquireRequest<'_>,
@@ -641,6 +663,7 @@ impl PoolManager {
                 grant = &mut waiter => {
                     ticket.settled = true;
                     self.metrics.admission_dequeued();
+                    Self::record_wait("granted", started.elapsed());
                     return grant.map_err(|_| Denial::backend("the pool is shutting down"));
                 }
                 () = &mut notice, if !notified => {
@@ -664,10 +687,25 @@ impl PoolManager {
                         waited: started.elapsed(),
                     };
                     self.metrics.admission_denied(reason.code());
+                    Self::record_wait("timed_out", started.elapsed());
                     return Err(Denial::from_reason(&reason));
                 }
             }
         }
+    }
+
+    /// Records how the admission wait ended, on the span the caller is inside.
+    ///
+    /// A span whose `outcome` is unset is a wait that never returned at all: the client hung
+    /// up and the future was dropped. That is a real state and worth being able to see, which
+    /// is why this does not try to be a `Drop` guard that always fires.
+    fn record_wait(outcome: &'static str, waited: std::time::Duration) {
+        let span = tracing::Span::current();
+        span.record("outcome", outcome);
+        span.record(
+            "waited_ms",
+            u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        );
     }
 
     /// Severs every parked link opened under a superseded epoch.
