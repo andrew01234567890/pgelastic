@@ -45,6 +45,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
+	"github.com/andrew01234567890/pgelastic/internal/metering"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
 )
 
@@ -99,6 +100,11 @@ type PgInstanceReconciler struct {
 	// Nil is the headless deployment: no fleet fronts the pool, so there is nobody to hold
 	// and the handover is simply the unheld one.
 	Quiescer InstanceQuiescer
+	// Metering is where each member's pg_stat_database scrape is staged for the pool
+	// controller to fold. It is the same collector the pool and tenant controllers hold, so
+	// the counters a tenant is metered on and the ones its pool is planned from are one
+	// number rather than two independently sampled ones. Nil meters nothing.
+	Metering *metering.Collector
 
 	// ControllerName is this operator's identity. An instance reaches a PgElasticClass
 	// through its pool, and one naming a different controller is left entirely alone.
@@ -326,6 +332,12 @@ func (r *PgInstanceReconciler) finalize(
 		return ctrl.Result{RequeueAfter: drainRecheck}, r.publishDraining(ctx, instance, names)
 	}
 
+	// The staged readings go with the instance. Left behind they describe a server that no
+	// longer exists, and they are held for the life of the process rather than the life of
+	// the object they came from.
+	if r.Metering != nil {
+		r.Metering.ForgetInstance(instance.Namespace, instance.Name)
+	}
 	controllerutil.RemoveFinalizer(instance,
 		pgelasticv1alpha1.PgInstanceDrainTenantsFinalizer)
 	return ctrl.Result{}, r.Update(ctx, instance)

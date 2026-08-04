@@ -266,7 +266,11 @@ func main() {
 		// Without this a rolling restart hands the primary role over with nobody holding the
 		// instance's clients, which is the difference between a latency spike and a dropped
 		// connection for every tenant on it.
-		Quiescer:       fleetRouter,
+		Quiescer: fleetRouter,
+		// The same collector the pool controller holds. This one stages each member's
+		// pg_stat_database scrape; the pool controller folds it into the round it already
+		// runs, so the two cannot disagree about what a tenant did.
+		Metering:       meteringCollector,
 		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "pginstance")

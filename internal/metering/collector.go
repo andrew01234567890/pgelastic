@@ -70,6 +70,10 @@ type Collector struct {
 	// whose tenants have all stopped reporting is not.
 	mu    sync.RWMutex
 	pools map[poolKey]time.Time
+	// readings is where the instance agents' pg_stat_database scrapes wait to be folded.
+	// They arrive on the instance controller's cadence and are folded on the pool
+	// controller's, so something has to hold them across the gap.
+	readings map[ReadingKey]reading
 }
 
 type poolKey struct{ Namespace, Pool string }

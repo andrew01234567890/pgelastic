@@ -354,8 +354,9 @@ func (r *PgElasticPoolReconciler) ledgerOf(
 }
 
 // meter folds this pass's readings into the trailing-window store. The pool's own ledger and
-// each tenant's connection count are what the operator can actually see from here; the
-// pg_stat_database side arrives through the same collector from the instance agents.
+// each tenant's connection count are what the operator can see from here; the
+// pg_stat_database side is staged by the instance controller from the members' own scrapes
+// and picked up by database name on the instance the tenant is bound to.
 func (r *PgElasticPoolReconciler) meter(pool *pgelasticv1alpha1.PgElasticPool, view *poolView) {
 	if r.Metering == nil {
 		return
@@ -376,14 +377,26 @@ func (r *PgElasticPoolReconciler) meter(pool *pgelasticv1alpha1.PgElasticPool, v
 	for i := range view.tenants {
 		entry := &view.tenants[i]
 		present = append(present, meteringKeyOf(entry.tenant))
-		observations = append(observations, metering.TenantObservation{
+		bound := placement.BoundInstanceFor(entry.tenant)
+		observation := metering.TenantObservation{
 			Key:                meteringKeyOf(entry.tenant),
 			Database:           entry.tenant.Spec.DatabaseName,
-			Instance:           placement.BoundInstanceFor(entry.tenant),
+			Instance:           bound,
 			Role:               metering.RolePrimary,
 			BackendConnections: float64(currentConnectionsOf(entry.tenant)),
 			Cold:               isColdTenant(entry, view.policy.HotTenantPercent),
-		})
+		}
+		// Left nil for a tenant with no reading, which is a gap rather than a zero: the
+		// collector counts it as stale, and a zero would fold a counter that has not been
+		// read into the totals as if the tenant had gone quiet.
+		if stats, ok := r.Metering.DatabaseStatsFor(metering.ReadingKey{
+			Namespace: pool.Namespace,
+			Instance:  bound,
+			Database:  entry.tenant.Spec.DatabaseName,
+		}, r.now()); ok {
+			observation.Stats = &stats
+		}
+		observations = append(observations, observation)
 	}
 
 	// A tenant that has been deleted stops being observed but does not stop occupying a ring
