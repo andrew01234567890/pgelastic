@@ -136,6 +136,7 @@ const (
 	GUCMaxPreparedTransactions = "max_prepared_transactions"
 	GUCMaxWALSenders           = "max_wal_senders"
 	GUCMaxWorkerProcesses      = "max_worker_processes"
+	GUCMaxParallelWorkers      = "max_parallel_workers"
 	GUCMaxLocksPerTransaction  = "max_locks_per_transaction"
 	GUCWALLevel                = "wal_level"
 	GUCWALLogHints             = "wal_log_hints"
@@ -175,21 +176,27 @@ var ownedParameters = map[string]Owned{
 	"max_replication_slots":          {Ownership: OwnershipFixed, Context: ContextPostmaster},
 	"max_active_replication_origins": {Ownership: OwnershipFixed, Context: ContextPostmaster},
 	GUCMaxWorkerProcesses:            {Ownership: OwnershipFixed, Context: ContextPostmaster},
-	GUCMaxPreparedTransactions:       {Ownership: OwnershipFixed, Context: ContextPostmaster},
-	GUCMaxLocksPerTransaction:        {Ownership: OwnershipFixed, Context: ContextPostmaster},
-	"hot_standby":                    {Ownership: OwnershipBlocked, Context: ContextPostmaster, Value: valueOn},
-	"hot_standby_feedback":           {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOn},
-	"sync_replication_slots":         {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOn},
-	"synchronized_standby_slots":     {Ownership: OwnershipFixed, Context: ContextSighup},
-	GUCSynchronousStandbyNames:       {Ownership: OwnershipFixed, Context: ContextSighup},
-	GUCSynchronousCommit:             {Ownership: OwnershipFixed, Context: ContextUser},
-	"primary_conninfo":               {Ownership: OwnershipFixed, Context: ContextSighup},
-	"primary_slot_name":              {Ownership: OwnershipFixed, Context: ContextSighup},
-	"restore_command":                {Ownership: OwnershipFixed, Context: ContextSighup},
-	"recovery_target_time":           {Ownership: OwnershipFixed, Context: ContextPostmaster},
-	"recovery_target_lsn":            {Ownership: OwnershipFixed, Context: ContextPostmaster},
-	"recovery_target_name":           {Ownership: OwnershipFixed, Context: ContextPostmaster},
-	"recovery_target_action":         {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	// The first Tuned parameter, and the level's whole point: the operator computes a value
+	// from the instance's own CPU and the tenant may replace it. Over-setting it costs the
+	// tenant that chose it a share of one bounded pool and cannot take the postmaster down,
+	// it denominates no capacity the product sells, and it is not one of EnforcedParameters -
+	// which are the three tests a parameter has to pass to be Tuned rather than Fixed.
+	GUCMaxParallelWorkers:        {Ownership: OwnershipTuned, Context: ContextUser},
+	GUCMaxPreparedTransactions:   {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	GUCMaxLocksPerTransaction:    {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"hot_standby":                {Ownership: OwnershipBlocked, Context: ContextPostmaster, Value: valueOn},
+	"hot_standby_feedback":       {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOn},
+	"sync_replication_slots":     {Ownership: OwnershipBlocked, Context: ContextSighup, Value: valueOn},
+	"synchronized_standby_slots": {Ownership: OwnershipFixed, Context: ContextSighup},
+	GUCSynchronousStandbyNames:   {Ownership: OwnershipFixed, Context: ContextSighup},
+	GUCSynchronousCommit:         {Ownership: OwnershipFixed, Context: ContextUser},
+	"primary_conninfo":           {Ownership: OwnershipFixed, Context: ContextSighup},
+	"primary_slot_name":          {Ownership: OwnershipFixed, Context: ContextSighup},
+	"restore_command":            {Ownership: OwnershipFixed, Context: ContextSighup},
+	"recovery_target_time":       {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"recovery_target_lsn":        {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"recovery_target_name":       {Ownership: OwnershipFixed, Context: ContextPostmaster},
+	"recovery_target_action":     {Ownership: OwnershipFixed, Context: ContextPostmaster},
 
 	// WAL retention, derived from the WAL volume: losing a slot costs a bounded replica
 	// rebuild, losing the primary costs every tenant on the instance their guarantee.
@@ -387,4 +394,62 @@ func BlockedDefaults() map[string]string {
 		}
 	}
 	return values
+}
+
+// logicalReplicationWorkers is the slot budget the ONLINE migration path needs, and the
+// reason max_worker_processes cannot simply be a literal.
+//
+// bgworker.c keeps ONE global pool, shared by parallel query, parallel maintenance and
+// logical replication. So a max_worker_processes that does not account for the apply and
+// tablesync workers a migration starts is a migration that cannot start - it fails on a
+// resource nobody can see from the migration's own configuration.
+const logicalReplicationWorkers = 4
+
+// backgroundWorkerReserve is what the instance itself runs that is neither parallel query nor
+// logical replication: the autovacuum launcher, the logical replication launcher and room for
+// the extensions a tenant may load.
+const backgroundWorkerReserve = 8
+
+// minWorkerProcesses is the literal this tree used before anything derived it, kept as a
+// floor so no instance shape can end up with fewer workers than the tree has always had.
+const minWorkerProcesses = 16
+
+// WorkerProcesses is max_worker_processes: the envelope every other worker count sits inside.
+//
+// Fixed rather than Tuned, and the reason is the pool it governs. A user who lowered it below
+// what the parallel and logical-replication settings already promise would not get a smaller
+// instance; they would get migrations that cannot start and parallel plans that silently run
+// serially, with nothing saying why.
+func WorkerProcesses(parallelWorkers int32) int32 {
+	return workerProcesses(parallelWorkers)
+}
+
+func workerProcesses(parallelWorkers int32) int32 {
+	return max(minWorkerProcesses,
+		parallelWorkers+logicalReplicationWorkers+backgroundWorkerReserve)
+}
+
+// minParallelWorkers keeps a small instance able to run a parallel plan at all. Below two
+// the setting stops meaning "fewer workers" and starts meaning "no parallelism", which is a
+// different decision and not one the operator should make on a tenant's behalf.
+const minParallelWorkers = 2
+
+// parallelWorkers is max_parallel_workers, in workers, from a CPU allocation in millicores.
+//
+// One worker per core, which is where pgtune, timescaledb-tune and CNPG all land for a
+// dedicated server. It is bounded above by the Fixed max_worker_processes that is derived
+// from it, so a Tuned override cannot escape the envelope the operator sized.
+func parallelWorkers(declared int32) int32 {
+	if declared <= 0 {
+		return minParallelWorkers
+	}
+	return max(minParallelWorkers, declared)
+}
+
+// ParallelWorkersForCPU turns a CPU allocation in millicores into a worker count.
+func ParallelWorkersForCPU(millis int64) int32 {
+	if millis <= 0 {
+		return minParallelWorkers
+	}
+	return parallelWorkers(int32(millis / 1000))
 }

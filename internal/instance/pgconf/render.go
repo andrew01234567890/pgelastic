@@ -92,6 +92,10 @@ type InstanceConfig struct {
 	// a number invented from nothing.
 	SharedBuffers      string
 	EffectiveCacheSize string
+	// ParallelWorkers is max_parallel_workers, derived from the instance's CPU allocation.
+	// Zero renders the worker counts a tree with no CPU input rendered, which is what every
+	// instance got while spec.resources was read by nothing.
+	ParallelWorkers int32
 	// PrimaryEpoch is the fence token bound into the postmaster.
 	PrimaryEpoch int64
 	// UserParameters are the tenant-settable parameters that survived UserParameters.
@@ -124,7 +128,8 @@ func RenderCustomConf(config InstanceConfig) []Setting {
 		GUCMaxWALSenders:                 strconv.Itoa(int(config.Capacity.WALSenders)),
 		"max_replication_slots":          strconv.Itoa(int(config.Capacity.ReplicationSlots)),
 		"max_active_replication_origins": strconv.Itoa(int(config.ActiveReplicationOrigins)),
-		GUCMaxWorkerProcesses:            "16",
+		GUCMaxWorkerProcesses:            strconv.Itoa(int(workerProcesses(config.ParallelWorkers))),
+		GUCMaxParallelWorkers:            strconv.Itoa(int(parallelWorkers(config.ParallelWorkers))),
 		GUCMaxPreparedTransactions:       "0",
 		GUCMaxLocksPerTransaction:        "64",
 		"autovacuum_worker_slots":        strconv.Itoa(int(config.AutovacuumWorkerSlots)),

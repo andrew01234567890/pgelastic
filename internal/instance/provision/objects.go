@@ -200,6 +200,7 @@ func (b Builder) AgentConfig() AgentConfig {
 		ActiveReplicationOrigins: 64,
 		SharedBuffers:            sharedBuffersFor(spec.Resources, b.SizingClass),
 		EffectiveCacheSize:       effectiveCacheSizeFor(spec.Resources, b.SizingClass),
+		ParallelWorkers:          pgconf.ParallelWorkersForCPU(instanceCPUMillis(spec.Resources, b.SizingClass)),
 		// The epoch is bound into the postmaster as a custom GUC so the proxy can read it
 		// off any backend connection with a plain SHOW, where it cannot drift from the
 		// running postmaster the way a value fetched from the API server can.
@@ -768,6 +769,25 @@ func instanceMemory(resources *corev1.ResourceRequirements, class pgconf.SizingC
 		declared = class.RatedMemoryBytes
 	}
 	return max(declared-nonPostgresReserve, minSharedBuffers)
+}
+
+// instanceCPUMillis is how much CPU the postmaster may plan around, and where the figure came
+// from. The precedence is the one instanceMemory uses, for the same reason: limits, then
+// requests, then the class rating.
+//
+// The milestone this belongs to is called "auto-configure PostgreSQL from CPU and memory" and
+// CPU was read nowhere at all - max_worker_processes was the literal 16 whether the class sold
+// one core or thirty-two.
+func instanceCPUMillis(resources *corev1.ResourceRequirements, class pgconf.SizingClass) int64 {
+	if resources != nil {
+		if cpu, ok := resources.Limits[corev1.ResourceCPU]; ok {
+			return cpu.MilliValue()
+		}
+		if cpu, ok := resources.Requests[corev1.ResourceCPU]; ok {
+			return cpu.MilliValue()
+		}
+	}
+	return class.RatedCPUMillis
 }
 
 // sharedBuffersFor is a quarter of what is left after the reserve, floored and capped.

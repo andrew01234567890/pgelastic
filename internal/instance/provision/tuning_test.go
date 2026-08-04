@@ -18,6 +18,7 @@ package provision
 
 import (
 	"slices"
+	"strconv"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -119,5 +120,77 @@ func TestAnOwnedParameterIsDroppedAndNamed(t *testing.T) {
 	}
 	if _, kept := pgconf.UserParameters(builder.Instance.Spec.Parameters); len(kept) != 1 {
 		t.Errorf("the tenant's own parameter did not survive alongside the refusal")
+	}
+}
+
+// The milestone is called "auto-configure PostgreSQL from CPU and memory" and CPU was read
+// nowhere: max_worker_processes was the literal 16 whether the class sold one core or
+// thirty-two, and max_parallel_workers was not rendered at all.
+func TestTheWorkerCountsFollowTheInstancesCPU(t *testing.T) {
+	rendered := func(t *testing.T, resources *corev1.ResourceRequirements, class string) map[string]string {
+		t.Helper()
+		builder := Builder{
+			Instance:    &pgelasticv1alpha1.PgInstance{Spec: pgelasticv1alpha1.PgInstanceSpec{Resources: resources}},
+			SizingClass: classNamed(t, class),
+		}
+		settings := map[string]string{}
+		for _, setting := range pgconf.RenderCustomConf(builder.AgentConfig().Postgres) {
+			settings[setting.Name] = setting.Value
+		}
+		return settings
+	}
+
+	// Eight cores asked for, eight parallel workers, and an envelope with room for them plus
+	// the logical replication workers a migration needs.
+	eight := rendered(t, &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
+	}, "dev-1")
+	if got := eight[pgconf.GUCMaxParallelWorkers]; got != "8" {
+		t.Errorf("%s = %q for an 8-core instance, want 8", pgconf.GUCMaxParallelWorkers, got)
+	}
+	if got := eight[pgconf.GUCMaxWorkerProcesses]; got != "20" {
+		t.Errorf("%s = %q, want 20 (8 parallel + 4 logical replication + 8 reserve)",
+			pgconf.GUCMaxWorkerProcesses, got)
+	}
+
+	// A small instance keeps enough workers to run a parallel plan at all, and never fewer
+	// background workers than the tree has always had.
+	small := rendered(t, &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+	}, "dev-1")
+	if got := small[pgconf.GUCMaxParallelWorkers]; got != "2" {
+		t.Errorf("%s = %q for half a core, want the floor of 2", pgconf.GUCMaxParallelWorkers, got)
+	}
+	if got := small[pgconf.GUCMaxWorkerProcesses]; got != "16" {
+		t.Errorf("%s = %q, want the floor of 16", pgconf.GUCMaxWorkerProcesses, got)
+	}
+
+	// The envelope always has room for what it promises, whatever the shape.
+	for _, cpu := range []string{"250m", "1", "4", "16", "64"} {
+		settings := rendered(t, &corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu)},
+		}, "dev-1")
+		parallel, _ := strconv.Atoi(settings[pgconf.GUCMaxParallelWorkers])
+		processes, _ := strconv.Atoi(settings[pgconf.GUCMaxWorkerProcesses])
+		if processes < parallel+4 {
+			t.Errorf("at %s CPU, %s=%d leaves no room for %s=%d plus the logical replication "+
+				"workers a migration starts", cpu, pgconf.GUCMaxWorkerProcesses, processes,
+				pgconf.GUCMaxParallelWorkers, parallel)
+		}
+	}
+}
+
+// The level exists so a computed value is a default rather than a decision, and it had no
+// members at all - which made it a level that could not be wrong because nothing used it.
+func TestSomethingIsActuallyTuned(t *testing.T) {
+	if pgconf.Classify(pgconf.GUCMaxParallelWorkers).Ownership != pgconf.OwnershipTuned {
+		t.Errorf("%s is %s, not Tuned", pgconf.GUCMaxParallelWorkers,
+			pgconf.Classify(pgconf.GUCMaxParallelWorkers).Ownership)
+	}
+	if pgconf.IsPinned(pgconf.GUCMaxParallelWorkers) {
+		t.Error("a Tuned parameter is pinned, so a user value would be refused and the level is a no-op")
+	}
+	if !pgconf.IsOwned(pgconf.GUCMaxParallelWorkers) {
+		t.Error("a Tuned parameter is not owned, so the operator computes no default for it")
 	}
 }
