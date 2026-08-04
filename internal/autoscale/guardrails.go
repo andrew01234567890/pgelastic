@@ -38,6 +38,7 @@ const (
 	ReasonDwellTime            = "DwellTimeNotElapsed"
 	ReasonInsufficientEvidence = "InsufficientEvidence"
 	ReasonAtInstanceBound      = "AtInstanceBound"
+	ReasonScaleOutUnrealised   = "ScaleOutUnrealised"
 	ReasonHumanGated           = "HumanGated"
 	ReasonPoolPaused           = "PoolPaused"
 	ReasonScheduleInvalid      = "ScheduleInvalid"
@@ -175,6 +176,17 @@ func (g Guard) perClass(class pgelasticv1alpha1.AutoAction) verdict {
 func (g Guard) scaleOut() verdict {
 	if g.Signals.InstanceCount() >= g.Policy.MaxInstances {
 		return refuse(ReasonAtInstanceBound, "the pool is already at maxInstances %d", g.Policy.MaxInstances)
+	}
+	// The proposal is made against the members the pool has and the execution against the
+	// number it declares, so once the two diverge the same scale-out is proposed for ever and
+	// applies nothing. It is not a stuck action on its own: ScaleOut sits above Rebalance and
+	// ScaleIn, and at most one class executes per pass, so a scale-out that is permanently
+	// permitted and permanently inert is every class below it never running again.
+	if declared := g.Signals.DeclaredInstances; declared > g.Signals.InstanceCount() {
+		return refuse(ReasonScaleOutUnrealised,
+			"the pool declares %d members and has %d; adding to a count that has not been made up yet "+
+				"would widen the gap rather than the pool",
+			declared, g.Signals.InstanceCount())
 	}
 	if elapsed, ok := since(g.Signals.Now, g.Signals.LastScaleUpAt); ok && elapsed < g.Policy.ScaleUpStabilization {
 		return refuse(ReasonStabilizing, "scaled up %s ago, inside the %s scale-up window",

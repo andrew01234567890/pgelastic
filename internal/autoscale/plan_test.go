@@ -643,6 +643,89 @@ func TestCordoningTheScaleInVictimDoesNotTurnIntoAScaleOut(t *testing.T) {
 	}
 }
 
+// ------------------------------------------------- a scale-out that never landed
+
+// An over-target pool whose tenants sit unevenly, so ScaleOut and Rebalance are both
+// proposed and the order between them decides which one ever runs.
+func crowdedAndSkewedSignals() Signals {
+	signals := baseSignals()
+	for i := range signals.Instances {
+		signals.Instances[i].InUseConnections = 220
+	}
+	signals.Tenants = tenantsAcross([]string{instanceA}, 6, 40)
+	signals.DeclaredInstances = int32(len(signals.Instances))
+	return signals
+}
+
+func TestAScaleOutIsRefusedWhileTheLastOneIsUnrealised(t *testing.T) {
+	policy := basePolicy()
+	signals := crowdedAndSkewedSignals()
+	// The pool has already asked for a fourth member and has three. Nothing provisions one,
+	// so this is where a pool that has ever scaled out permanently sits.
+	signals.DeclaredInstances = 4
+
+	plan := Recommend(signals, policy)
+	action := actionOf(t, plan, pgelasticv1alpha1.AutoActionScaleOut)
+	if action.Permitted {
+		t.Fatalf("permitted a fourth scale-out while the third is unrealised: %s", action.Detail)
+	}
+	if action.Reason != ReasonScaleOutUnrealised {
+		t.Errorf("refused with %q, want %q", action.Reason, ReasonScaleOutUnrealised)
+	}
+	if !strings.Contains(action.Message, "4") || !strings.Contains(action.Message, "3") {
+		t.Errorf("the refusal reads %q and names neither count", action.Message)
+	}
+}
+
+// The starvation this exists to stop: ScaleOut sits above Rebalance and ScaleIn in
+// ActionOrder, and Selected takes the earliest proposed-and-permitted class. A ScaleOut that
+// is permitted for ever and applies nothing is therefore not one stuck action, it is every
+// action below it never running again.
+func TestAnUnrealisedScaleOutDoesNotStarveTheClassesBelowIt(t *testing.T) {
+	policy := basePolicy()
+	signals := crowdedAndSkewedSignals()
+	signals.DeclaredInstances = 4
+
+	plan := Recommend(signals, policy)
+	selected, ok := plan.Selected()
+	if !ok {
+		t.Fatalf("nothing was selected; the plan proposes %v", classesOf(plan))
+	}
+	if selected.Class == pgelasticv1alpha1.AutoActionScaleOut {
+		t.Fatal("selected the ScaleOut that cannot be applied, so nothing below it will ever run")
+	}
+	if selected.Class != pgelasticv1alpha1.AutoActionRebalance {
+		t.Errorf("selected %s, want Rebalance: it is the earliest class that can actually act", selected.Class)
+	}
+}
+
+func TestAScaleOutIsPermittedOnceThePoolHasTheMembersItDeclares(t *testing.T) {
+	policy := basePolicy()
+	signals := crowdedAndSkewedSignals()
+
+	plan := Recommend(signals, policy)
+	action := actionOf(t, plan, pgelasticv1alpha1.AutoActionScaleOut)
+	if !action.Permitted {
+		t.Errorf("refused a scale-out on a pool holding every member it declares: %s / %s",
+			action.Reason, action.Message)
+	}
+}
+
+// A pool holding more members than it declares has not asked for anything it has not got, so
+// the gate above it must not fire. Adoption makes this reachable.
+func TestAPoolHoldingMoreMembersThanItDeclaresMayStillScaleOut(t *testing.T) {
+	policy := basePolicy()
+	signals := crowdedAndSkewedSignals()
+	signals.DeclaredInstances = 1
+
+	plan := Recommend(signals, policy)
+	action := actionOf(t, plan, pgelasticv1alpha1.AutoActionScaleOut)
+	if !action.Permitted {
+		t.Errorf("refused a scale-out on a pool with more members than it declares: %s / %s",
+			action.Reason, action.Message)
+	}
+}
+
 // ---------------------------------------------------------------- scale-in
 
 func scaleInSignals() Signals {

@@ -97,6 +97,11 @@ type Signals struct {
 
 	Instances []InstanceSignal
 	Tenants   []TenantSignal
+	// DeclaredInstances is the member count the pool's spec asks for, which is a different
+	// fact from how many members it has. The two are the same only once something has made
+	// the difference up, and scale-out is the thing that widens the gap - so a scale-out that
+	// has not been realised must be visible here or it is proposed again for ever.
+	DeclaredInstances int32
 
 	// MetricsSeen and MetricsAge drive the stale-metric fallback.
 	MetricsSeen bool
