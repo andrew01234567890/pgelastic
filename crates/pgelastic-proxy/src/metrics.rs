@@ -86,6 +86,46 @@ impl ConnectGateOutcome {
     }
 }
 
+/// What a fired statement deadline managed to do to the backend it fired on.
+///
+/// Only `Cancelled` means the statement was actually stopped. The other three
+/// are all cases where the session ended and the backend was left running, which
+/// is the failure this metric exists to make visible rather than plausible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementDeadline {
+    /// The `CancelRequest` reached the backend on its own key.
+    Cancelled,
+    /// The deadline fired with no backend held, so there was nothing to cancel.
+    NothingHeld,
+    /// The held link carries no `BackendKeyData`, so no cancel can be addressed
+    /// to it at all.
+    NoCancelKey,
+    /// The cancel connection failed.
+    Undeliverable,
+    /// The cancel did not complete inside its own bound.
+    TimedOut,
+}
+
+const STATEMENT_DEADLINES: [StatementDeadline; 5] = [
+    StatementDeadline::Cancelled,
+    StatementDeadline::NothingHeld,
+    StatementDeadline::NoCancelKey,
+    StatementDeadline::Undeliverable,
+    StatementDeadline::TimedOut,
+];
+
+impl StatementDeadline {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::NothingHeld => "nothing_held",
+            Self::NoCancelKey => "no_cancel_key",
+            Self::Undeliverable => "undeliverable",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
 /// Every code in the capacity taxonomy, so the exposition carries all six even
 /// when nothing has been refused.
 const ERROR_CODES: [pgelastic_capacity::ErrorCode; 6] = pgelastic_capacity::ErrorCode::ALL;
@@ -206,6 +246,7 @@ pub struct Metrics {
     cancels_matched: AtomicU64,
     cancels_unmatched: AtomicU64,
     cancels_refused: AtomicU64,
+    statement_deadlines: [AtomicU64; STATEMENT_DEADLINES.len()],
     connect_gate: [AtomicU64; 4],
     bytes_to_backend: AtomicU64,
     bytes_to_client: AtomicU64,
@@ -347,6 +388,10 @@ impl Metrics {
     /// A cancel that resolved to a live session but could not draw credit.
     pub fn cancel_refused(&self) {
         self.cancels_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn statement_deadline(&self, outcome: StatementDeadline) {
+        self.statement_deadlines[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn connect_gated(&self, outcome: ConnectGateOutcome) {
@@ -668,16 +713,7 @@ impl Metrics {
                 ),
             ],
         );
-        counter(
-            &mut out,
-            "pgelastic_proxy_cancel_requests_total",
-            "CancelRequests received, by whether the key resolved and drew credit.",
-            &[
-                ("outcome=\"matched\"", load(&self.cancels_matched)),
-                ("outcome=\"unmatched\"", load(&self.cancels_unmatched)),
-                ("outcome=\"refused\"", load(&self.cancels_refused)),
-            ],
-        );
+        self.render_cancellation(&mut out);
         counter(
             &mut out,
             "pgelastic_proxy_relayed_bytes_total",
@@ -871,6 +907,33 @@ impl Metrics {
     }
 
     /// The pooling half of the exposition.
+    /// The two ways a running statement gets stopped: a client asked, or it
+    /// outran the pool's deadline.
+    fn render_cancellation(&self, out: &mut String) {
+        let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        counter(
+            out,
+            "pgelastic_proxy_cancel_requests_total",
+            "CancelRequests received, by whether the key resolved and drew credit.",
+            &[
+                ("outcome=\"matched\"", load(&self.cancels_matched)),
+                ("outcome=\"unmatched\"", load(&self.cancels_unmatched)),
+                ("outcome=\"refused\"", load(&self.cancels_refused)),
+            ],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_statement_deadlines_total",
+            "Statement deadlines that fired, by what reached the backend. Only cancelled stopped it.",
+            &labelled(&STATEMENT_DEADLINES.map(|outcome| {
+                (
+                    format!("outcome=\"{}\"", outcome.label()),
+                    load(&self.statement_deadlines[outcome as usize]),
+                )
+            })),
+        );
+    }
+
     fn render_pooling(&self, out: &mut String) {
         let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
         gauge(

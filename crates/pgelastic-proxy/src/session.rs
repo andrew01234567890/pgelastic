@@ -22,6 +22,11 @@ pub enum Ending {
     Drained,
     /// A drain ran out of time and closed the session mid-work.
     Forced,
+    /// A statement outran the pool's query deadline. The backend was cancelled
+    /// and the link closed rather than returned: a cancel that did not land
+    /// leaves a backend still running the statement, and handing that to the
+    /// next client is worse than losing the link.
+    StatementTimeout,
 }
 
 /// Tracks whether the session is at a boundary a drain may close on.
