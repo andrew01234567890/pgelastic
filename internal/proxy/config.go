@@ -303,6 +303,12 @@ const defaultPreparedStatementsLimit = 200
 // Rust DEFAULT_GLOBAL_STATEMENTS it renders into.
 const defaultGlobalStatementsLimit = 2048
 
+// defaultQueryDeadlineSeconds must match the +kubebuilder:default on spec.timeouts.query. It is
+// reached only for an object that never went through the API server's defaulting, because every
+// stored pool already carries the field — which is also why wiring this rendered a deadline that
+// was already written down onto every pool in an estate at once.
+const defaultQueryDeadlineSeconds = 120
+
 func (c Config) renderRouting(out *strings.Builder, dynamic bool) {
 	out.WriteString("[routing]\n")
 	discriminators := tenantDiscriminators(c.Pool)
@@ -340,6 +346,14 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 	writeInt(out, "maxClientConnections", int64(maxClientConnections(c.Pool)))
 	writeString(out, "resetPolicy", resetPolicy(pooling))
 	writeInt(out, "queryWaitSeconds", seconds(timeouts(c.Pool).Checkout, 30))
+	// Written only into the full document. The proxy adopts this one at a checkout boundary,
+	// so leaving it in the structural half would mean an operator could not change a statement
+	// deadline without rolling the whole fleet and dropping every client of every tenant to do
+	// it. The Rust side clears the same field in Config::structural, and the two halves have to
+	// agree or the pods roll for a change the binary was willing to adopt.
+	if dynamic {
+		writeInt(out, "queryDeadlineSeconds", queryDeadlineSeconds(c.Pool))
+	}
 	writeInt(out, "notifyAfterSeconds", int64(queryWaitNotifySeconds(c.Pool)))
 	writeInt(out, "queueDepthPerTenant", int64(queueDepthPerTenant(c.Pool)))
 	writeInt(out, "maxServerStatements", int64(preparedStatementsLimit(pooling)))
@@ -506,6 +520,21 @@ func seconds(duration *metav1.Duration, fallback int64) int64 {
 		return fallback
 	}
 	return int64((duration.Duration + time.Second - 1) / time.Second)
+}
+
+// queryDeadlineSeconds renders spec.timeouts.query, which unlike every other timeout has a
+// meaningful zero: it is the only way to ask for no deadline at all, and an operator with a
+// legitimately long statement needs that escape hatch. So an explicit zero is passed through
+// rather than folded into the default the way seconds does.
+func queryDeadlineSeconds(pool *pgelasticv1alpha1.PgElasticPool) int64 {
+	query := timeouts(pool).Query
+	if query == nil {
+		return defaultQueryDeadlineSeconds
+	}
+	if query.Duration <= 0 {
+		return 0
+	}
+	return int64((query.Duration + time.Second - 1) / time.Second)
 }
 
 func poolMode(pooling *pgelasticv1alpha1.PoolingConfig) string {

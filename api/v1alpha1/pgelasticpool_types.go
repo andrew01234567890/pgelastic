@@ -595,7 +595,11 @@ type PoolTimeouts struct {
 
 	// query bounds a single statement, enforced by the proxy with a CancelRequest and then a
 	// close. This is the authoritative deadline; the equivalent GUCs are advisory because a
-	// client can SET them back.
+	// client can SET them back. It bounds a statement and not a transaction: a client sitting
+	// idle between two statements is bounded by clientIdleInTransaction instead.
+	//
+	// Zero disables it, which is the only way to allow a statement to run unbounded. Every
+	// other timeout here treats zero as "unset" and falls back to its default.
 	// +kubebuilder:default="120s"
 	// +optional
 	Query *metav1.Duration `json:"query,omitempty"`

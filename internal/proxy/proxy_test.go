@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -171,6 +172,65 @@ func TestMovingATenantToAnotherInstanceDoesNotRollTheFleet(t *testing.T) {
 	}
 	if !strings.Contains(after.TOML, `"orders" = "pg-a"`) {
 		t.Fatalf("the routing table does not carry the move:\n%s", after.TOML)
+	}
+}
+
+func TestTheQueryDeadlineReachesTheProxy(t *testing.T) {
+	config := testConfig()
+	config.Pool.Spec.Timeouts = &pgelasticv1alpha1.PoolTimeouts{
+		Query: &metav1.Duration{Duration: 45 * time.Second},
+	}
+
+	document := config.Render().TOML
+	if !strings.Contains(document, "queryDeadlineSeconds = 45") {
+		t.Fatalf("spec.timeouts.query is documented as the authoritative deadline and the "+
+			"proxy never sees it:\n%s", document)
+	}
+}
+
+// A pool that never went through the API server's defaulting still gets the deadline the CRD
+// promises, because the proxy's own default is no deadline at all.
+func TestAPoolWithNoTimeoutsStillGetsTheDefaultedDeadline(t *testing.T) {
+	document := testConfig().Render().TOML
+	if !strings.Contains(document, "queryDeadlineSeconds = 120") {
+		t.Fatalf("an unset spec.timeouts.query rendered something other than its own CRD "+
+			"default:\n%s", document)
+	}
+}
+
+// The only timeout with a meaningful zero. Every other one folds zero into its default,
+// because a zero connect timeout is a mistake; a zero query deadline is the only way an
+// operator with a legitimately long statement can ask to be left alone.
+func TestAZeroQueryDeadlineDisablesItRatherThanDefaulting(t *testing.T) {
+	config := testConfig()
+	config.Pool.Spec.Timeouts = &pgelasticv1alpha1.PoolTimeouts{Query: &metav1.Duration{}}
+
+	document := config.Render().TOML
+	if !strings.Contains(document, "queryDeadlineSeconds = 0") {
+		t.Fatalf("an explicit zero deadline was folded into the default, so an operator has "+
+			"no way to turn the deadline off:\n%s", document)
+	}
+}
+
+// The whole point of the field being in the adoptable half. The Rust side clears it in
+// Config::structural; if this side leaves it in the pod template the two disagree and a
+// timeout change rolls the fleet the binary was willing to adopt it without.
+func TestChangingTheQueryDeadlineDoesNotRollTheFleet(t *testing.T) {
+	before := testConfig().Render()
+
+	config := testConfig()
+	config.Pool.Spec.Timeouts = &pgelasticv1alpha1.PoolTimeouts{
+		Query: &metav1.Duration{Duration: 30 * time.Second},
+	}
+	after := config.Render()
+
+	if before.TOML == after.TOML {
+		t.Fatal("the deadline change never reached the document at all")
+	}
+	if before.StructuralHash != after.StructuralHash {
+		t.Fatalf("changing a statement deadline moved the pod template hash from %q to %q, so "+
+			"an operator cannot change one without dropping every client of every tenant",
+			before.StructuralHash, after.StructuralHash)
 	}
 }
 
