@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
@@ -34,6 +35,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/autoscale"
 	"github.com/andrew01234567890/pgelastic/internal/metering"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/tenantdb/tenantdbtest"
 )
 
@@ -731,5 +733,122 @@ var _ = Describe("auto mode", Ordered, func() {
 			Expect(action.Permitted).To(BeFalse())
 			Expect(action.Reason).To(Equal(autoscale.ReasonRolloutInProgress))
 		}
+	})
+})
+
+var _ = Describe("a migration refused at the gate", Ordered, func() {
+	const (
+		namespace = "pool-refused"
+		poolName  = "refused-pool"
+		className = "refused-class"
+		workload  = "refused-standard"
+	)
+
+	var (
+		reconciler *PgElasticPoolReconciler
+		pool       *pgelasticv1alpha1.PgElasticPool
+		tenants    []*pgelasticv1alpha1.PgTenant
+	)
+
+	BeforeAll(func() {
+		ensureNamespace(namespace)
+		elasticClass := makeElasticClass(className, defaultControllerName)
+		pool = makePool(namespace, poolName, className, 400)
+		pool.Spec.Instances.Replicas = ptrTo(int32(2))
+		pool.Spec.Admission = &pgelasticv1alpha1.PoolAdmission{DefaultWorkloadClassName: workload}
+		pool.Spec.Rebalancing = &pgelasticv1alpha1.PoolRebalancing{Enabled: ptrTo(true)}
+		pool.Spec.Autoscaling = &pgelasticv1alpha1.PoolAutoscaling{
+			Mode:         pgelasticv1alpha1.AutoscalingAuto,
+			MinInstances: ptrTo(int32(1)),
+			MaxInstances: ptrTo(int32(8)),
+			AutoActions:  []pgelasticv1alpha1.AutoAction{pgelasticv1alpha1.AutoActionRebalance},
+		}
+		class := makeWorkloadClass(workload, 2, 40)
+
+		Expect(k8sClient.Create(ctx, elasticClass)).To(Succeed())
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+		Expect(k8sClient.Create(ctx, class)).To(Succeed())
+
+		roomy := makeReadyInstance(namespace, "rf-a", poolName, 30, 0)
+		crowded := makeReadyInstance(namespace, "rf-b", poolName, 225, 10)
+		for i := range 2 {
+			tenant := makeTenant(namespace, fmt.Sprintf("rf-t%d", i), poolName, fmt.Sprintf("rf_t%d", i))
+			Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
+			bindTenant(tenant, "rf-b")
+			tenants = append(tenants, tenant)
+		}
+
+		DeferCleanup(func() {
+			for _, tenant := range tenants {
+				deleteAndAwait(tenant)
+			}
+			deleteAndAwait(roomy, crowded, pool, elasticClass, class)
+		})
+		awaitCached(elasticClass, pool, class, roomy, crowded)
+		for _, tenant := range tenants {
+			awaitCached(tenant)
+		}
+	})
+
+	BeforeEach(func() {
+		collector := metering.NewCollector(metering.Options{}, nil)
+		for _, tenant := range tenants {
+			key := metering.Key{Namespace: namespace, Pool: poolName, Tenant: tenant.Name}
+			for i := range 60 {
+				collector.Store.Observe(key, metering.Sample{BackendConnections: 5},
+					placementClock.Add(-time.Duration(60-i)*time.Minute))
+			}
+		}
+		reconciler = &PgElasticPoolReconciler{
+			Client:   cachedClient,
+			Scheme:   cachedClient.Scheme(),
+			Recorder: events.NewFakeRecorder(64),
+			Metering: collector,
+			Now:      func() time.Time { return placementClock },
+		}
+	})
+
+	// A refusal that stops other work is a much bigger refusal than the one that was written.
+	//
+	// A migration refused at preflight never settles - deliberately, so the reason stays on
+	// the object - but it holds no slot, no subscription and no backend. Counting it against
+	// maxConcurrentMigrations, whose default is 1, let one unmovable tenant stall every
+	// rebalance, evacuation and scale-in in the pool for ever. And the refusals this stack
+	// adds cannot be waited out: a materialized view refuses an ONLINE move by the shape of
+	// the tenant's own schema.
+	It("does not spend the migration budget while it sits at the gate", func() {
+		refused := &pgelasticv1alpha1.PgTenantMigration{
+			ObjectMeta: metav1.ObjectMeta{Name: "rf-refused", Namespace: namespace},
+			Spec: pgelasticv1alpha1.PgTenantMigrationSpec{
+				TenantRef:         corev1.LocalObjectReference{Name: tenants[0].Name},
+				TargetInstanceRef: corev1.LocalObjectReference{Name: "rf-a"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, refused)).To(Succeed())
+		DeferCleanup(func() { deleteAndAwait(refused) })
+
+		refused.Status.Phase = pgelasticv1alpha1.TenantMigrationPhasePreflight
+		meta.SetStatusCondition(&refused.Status.Conditions, metav1.Condition{
+			Type:    migration.ConditionPreflightPassed,
+			Status:  metav1.ConditionFalse,
+			Reason:  "Unpublishable",
+			Message: "the tenant owns a materialized view, which logical replication cannot carry",
+		})
+		Expect(k8sClient.Status().Update(ctx, refused)).To(Succeed())
+		awaitCached(refused)
+
+		reconcileNow(reconciler, refetch(pool))
+
+		migrations := &pgelasticv1alpha1.PgTenantMigrationList{}
+		Expect(k8sClient.List(ctx, migrations, client.InNamespace(namespace))).To(Succeed())
+		emitted := 0
+		for i := range migrations.Items {
+			if migrations.Items[i].Name != refused.Name {
+				emitted++
+			}
+		}
+		Expect(emitted).To(Equal(1),
+			"the pool made no move while one migration sat at the gate; a refusal that is "+
+				"holding no slot, no subscription and no backend must not spend the budget")
 	})
 })

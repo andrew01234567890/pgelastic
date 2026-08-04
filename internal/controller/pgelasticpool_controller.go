@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,6 +41,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/autoscale"
 	"github.com/andrew01234567890/pgelastic/internal/metering"
+	migrationpkg "github.com/andrew01234567890/pgelastic/internal/migration"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
 	"github.com/andrew01234567890/pgelastic/internal/placement"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
@@ -530,7 +532,7 @@ func (r *PgElasticPoolReconciler) migrationSignals(
 	windowStart := signals.Now.Add(-migrationRateWindow)
 	for i := range migrations.Items {
 		migration := &migrations.Items[i]
-		if migrationSettled(migration) {
+		if migrationSettled(migration) || preflightRefused(migration) {
 			if migration.CreationTimestamp.After(windowStart) {
 				signals.MigrationsStartedInWindow++
 			}
@@ -951,6 +953,23 @@ func migrationSettled(migration *pgelasticv1alpha1.PgTenantMigration) bool {
 	default:
 		return false
 	}
+}
+
+// preflightRefused is a migration parked at the gate rather than one in flight.
+//
+// It is not settled, and deliberately so: the object stays, with the reason on it, until
+// somebody acts on it. But it is holding no replication slot, no subscription and no backend,
+// so counting it against maxConcurrentMigrations is counting a resource nobody is using.
+//
+// That distinction became load-bearing the moment a refusal existed that no amount of waiting
+// can clear. A materialized view or an unlogged table refuses an ONLINE move by the shape of
+// the tenant's own schema, and there is no waiver - so one such object would sit at the gate
+// and consume a budget whose default is 1, permanently stalling every rebalance, every
+// evacuation and every scale-in in the pool. A refusal that stops other work is a much bigger
+// refusal than the one that was written.
+func preflightRefused(object *pgelasticv1alpha1.PgTenantMigration) bool {
+	return object.Status.Phase == pgelasticv1alpha1.TenantMigrationPhasePreflight &&
+		meta.IsStatusConditionFalse(object.Status.Conditions, migrationpkg.ConditionPreflightPassed)
 }
 
 func cordoned(instance *pgelasticv1alpha1.PgInstance) bool {
