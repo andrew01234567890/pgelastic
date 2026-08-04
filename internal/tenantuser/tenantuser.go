@@ -128,10 +128,16 @@ func (s State) Settled(spec Spec) bool {
 //
 // An absent role answers -1 for rolcanlogin, which is what separates "not created yet" from
 // "created NOLOGIN".
+//
+// CONNECT is asked by OID and not by name, and that is the difference between an observation
+// and an error. has_database_privilege(name, ...) raises 42704 for a role that does not exist
+// - which is the state this query exists to report - so the name form makes the first
+// observation of every login fail, Ensure return before CREATE ROLE, and the login retry for
+// ever. Joining pg_roles instead means an absent role contributes no row and coalesce answers.
 const observeQuery = `SELECT coalesce((SELECT r.rolcanlogin::int::text FROM pg_roles r WHERE r.rolname = %[1]s), '-1'),
  coalesce((SELECT (a.rolpassword = %[2]s)::int::text FROM pg_authid a WHERE a.rolname = %[1]s), '0'),
- coalesce((SELECT has_database_privilege(%[1]s, %[3]s, 'CONNECT')::int::text
-   FROM pg_database d WHERE d.datname = %[3]s), '0'),
+ coalesce((SELECT has_database_privilege(r.oid, d.oid, 'CONNECT')::int::text
+   FROM pg_roles r, pg_database d WHERE r.rolname = %[1]s AND d.datname = %[3]s), '0'),
  coalesce((SELECT string_agg(g.rolname, ',' ORDER BY g.rolname) FROM pg_auth_members m
    JOIN pg_roles g ON g.oid = m.roleid JOIN pg_roles v ON v.oid = m.member
    WHERE v.rolname = %[1]s AND g.rolname = ANY (%[4]s)), '')`
