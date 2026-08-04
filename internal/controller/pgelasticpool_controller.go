@@ -471,6 +471,7 @@ func (r *PgElasticPoolReconciler) signalsOf(
 		instance := &view.instances[i]
 		signal := autoscale.InstanceSignal{
 			Name:        instance.Name,
+			Major:       placement.MajorOf(instance),
 			Ready:       instance.Status.Phase == pgelasticv1alpha1.InstancePhaseReady,
 			Schedulable: placement.InstanceFrom(instance).Schedulable,
 			Progressing: instanceProgressing(instance),

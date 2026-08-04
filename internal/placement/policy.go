@@ -17,6 +17,8 @@ limitations under the License.
 package placement
 
 import (
+	"strconv"
+	"strings"
 	"time"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
@@ -119,6 +121,7 @@ func InstanceFrom(instance *pgelasticv1alpha1.PgInstance) Instance {
 	target := Instance{
 		Name:        instance.Name,
 		Schedulable: true,
+		Major:       MajorOf(instance),
 		Ready:       instance.Status.Phase == pgelasticv1alpha1.InstancePhaseReady,
 	}
 	if admission := instance.Spec.Admission; admission != nil {
@@ -140,4 +143,20 @@ func InstanceFrom(instance *pgelasticv1alpha1.PgInstance) Instance {
 		target.Capacity.StorageBytes = storage.Allocated.Value()
 	}
 	return target
+}
+
+// MajorOf reads an instance's PostgreSQL major from its spec.
+//
+// Zero for anything unreadable, and the callers treat zero as "do not refuse on this axis"
+// rather than as a version - an instance whose major nobody can determine should not become
+// unplaceable because of it.
+func MajorOf(instance *pgelasticv1alpha1.PgInstance) int {
+	if instance.Spec.PostgresVersion == nil {
+		return 0
+	}
+	major, err := strconv.Atoi(strings.TrimSpace(*instance.Spec.PostgresVersion))
+	if err != nil || major <= 0 {
+		return 0
+	}
+	return major
 }

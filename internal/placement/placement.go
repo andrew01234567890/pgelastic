@@ -46,8 +46,11 @@ var ErrOverCommitted = errors.New("pool is over-committed: the sum of guaranteed
 // Refusal reasons. Each names the constraint that blocked the placement, because "no
 // instance available" is the answer that makes an operator open a support ticket.
 const (
-	ReasonNoCapacity          = "NoCapacity"
-	ReasonAntiAffinity        = "AntiAffinityConflict"
+	ReasonNoCapacity   = "NoCapacity"
+	ReasonAntiAffinity = "AntiAffinityConflict"
+	// ReasonVersionUnsupported is a destination whose PostgreSQL major the migration cannot
+	// reach from where the tenant currently is.
+	ReasonVersionUnsupported  = "VersionUnsupported"
 	ReasonPinnedUnavailable   = "PinnedInstanceUnavailable"
 	ReasonNoInstances         = "NoSchedulableInstance"
 	ReasonInstanceUnavailable = "InstanceUnavailable"
@@ -116,6 +119,9 @@ type Tenant struct {
 	// GuaranteedOnly marks a tenant that has never been metered, so its observed demand is
 	// an absence rather than a zero.
 	GuaranteedOnly bool
+	// BoundMajor is the PostgreSQL major the tenant currently sits on. Zero means it sits
+	// nowhere yet, which is what makes a first admission unconstrained by any of this.
+	BoundMajor int
 }
 
 // Instance is one placement target.
@@ -130,6 +136,9 @@ type Instance struct {
 	// Schedulable is false for a cordoned or draining instance. It may still host the
 	// tenants already on it; it takes no new ones.
 	Schedulable bool
+	// Major is the PostgreSQL major this instance runs. Zero means unknown, which is treated
+	// as "do not refuse on this axis" rather than as a version.
+	Major int
 	// Ready is false while the instance cannot serve tenant traffic. Its headroom must not
 	// be counted as available: an instance re-cloning a replica has capacity on paper only.
 	Ready bool
@@ -260,6 +269,29 @@ func (b *bin) fits(tenant Tenant) (bool, string, string) {
 	}
 	if !b.instance.Schedulable {
 		return false, ReasonInstanceUnavailable, "is cordoned"
+	}
+	// A move has to be one the migration can actually perform. Both of this tree's dumps run
+	// in the *target's* container, so pg_dump cannot read a server newer than itself: a move
+	// to an older major is refused at preflight, permanently and by construction. A packer
+	// blind to the major proposes exactly those moves, and each one becomes a migration that
+	// is refused for ever - so this refuses them where they are proposed rather than where
+	// they are carried out.
+	//
+	// One major forward is allowed and is the whole point: the recommended upgrade route is
+	// an instance on the new major with tenants migrated onto it one at a time. Two is
+	// refused because one at a time is the path that gets tested, and a tenant with no
+	// binding carries no floor at all.
+	if tenant.BoundMajor > 0 && b.instance.Major > 0 {
+		if b.instance.Major < tenant.BoundMajor {
+			return false, ReasonVersionUnsupported, fmt.Sprintf(
+				"runs PostgreSQL %d and the tenant is on %d; a dump runs in the target and "+
+					"cannot read a newer server", b.instance.Major, tenant.BoundMajor)
+		}
+		if b.instance.Major > tenant.BoundMajor+1 {
+			return false, ReasonVersionUnsupported, fmt.Sprintf(
+				"runs PostgreSQL %d and the tenant is on %d; majors are crossed one at a time",
+				b.instance.Major, tenant.BoundMajor)
+		}
 	}
 	for key, value := range tenant.AntiAffinity {
 		if values, ok := b.labels[key]; ok {
