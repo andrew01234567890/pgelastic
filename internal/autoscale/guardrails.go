@@ -38,6 +38,7 @@ const (
 	ReasonDwellTime            = "DwellTimeNotElapsed"
 	ReasonInsufficientEvidence = "InsufficientEvidence"
 	ReasonAtInstanceBound      = "AtInstanceBound"
+	ReasonScaleOutUnrealised   = "ScaleOutUnrealised"
 	ReasonHumanGated           = "HumanGated"
 	ReasonPoolPaused           = "PoolPaused"
 	ReasonScheduleInvalid      = "ScheduleInvalid"
@@ -175,6 +176,28 @@ func (g Guard) perClass(class pgelasticv1alpha1.AutoAction) verdict {
 func (g Guard) scaleOut() verdict {
 	if g.Signals.InstanceCount() >= g.Policy.MaxInstances {
 		return refuse(ReasonAtInstanceBound, "the pool is already at maxInstances %d", g.Policy.MaxInstances)
+	}
+	// A pool is only entitled to ask for another member once the last one it asked for is
+	// carrying load. Until then the shortfall the recommendation is measuring is a member
+	// already on its way, and asking again widens the gap rather than the pool.
+	//
+	// Both halves matter, because a member is missing in two different ways and the pool
+	// passes through them in order: declared and not yet created, then created and not yet
+	// serving. Guarding only the first leaves the same defect one step further along - the
+	// recommendation counts members that can serve, the execution counts members that exist,
+	// and a scale-out that is permanently proposed and permanently inert is not one stuck
+	// action but every class below it in ActionOrder never running again.
+	if declared := g.Signals.DeclaredInstances; declared > g.Signals.InstanceCount() {
+		return refuse(ReasonScaleOutUnrealised,
+			"the pool declares %d members and has %d; the last one it asked for has not been made yet",
+			declared, g.Signals.InstanceCount())
+	}
+	// Not-Ready rather than not-measurable: a cordoned member is up, and a pool draining one
+	// is exactly a pool that may need a replacement for it.
+	if pending := g.Signals.InstanceCount() - g.Signals.ReadyInstances(); pending > 0 {
+		return refuse(ReasonScaleOutUnrealised,
+			"%d of the pool's %d members have not come up yet; another one would not have either",
+			pending, g.Signals.InstanceCount())
 	}
 	if elapsed, ok := since(g.Signals.Now, g.Signals.LastScaleUpAt); ok && elapsed < g.Policy.ScaleUpStabilization {
 		return refuse(ReasonStabilizing, "scaled up %s ago, inside the %s scale-up window",

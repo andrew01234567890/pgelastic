@@ -97,6 +97,11 @@ type Signals struct {
 
 	Instances []InstanceSignal
 	Tenants   []TenantSignal
+	// DeclaredInstances is the member count the pool's spec asks for, which is a different
+	// fact from how many members it has. The two are the same only once something has made
+	// the difference up, and scale-out is the thing that widens the gap - so a scale-out that
+	// has not been realised must be visible here or it is proposed again for ever.
+	DeclaredInstances int32
 
 	// MetricsSeen and MetricsAge drive the stale-metric fallback.
 	MetricsSeen bool
@@ -146,6 +151,19 @@ func (s Signals) ServingInstances() int32 {
 		serving++
 	}
 	return serving
+}
+
+// ReadyInstances is how many of them have come up. It is deliberately not the measurable
+// count: a cordoned member is up, and the difference between "not up yet" and "up but not
+// taking new work" is the difference between waiting and replacing.
+func (s Signals) ReadyInstances() int32 {
+	ready := int32(0)
+	for _, instance := range s.Instances {
+		if instance.Ready {
+			ready++
+		}
+	}
+	return ready
 }
 
 // Action is one proposed change class.

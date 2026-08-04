@@ -101,7 +101,7 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 			Spec: pgelasticv1alpha1.PgElasticPoolSpec{
 				ClassRef: pgelasticv1alpha1.ClassReference{
 					APIGroup: pgelasticv1alpha1.SchemeGroupVersion.Group,
-					Kind:     "PgElasticClass",
+					Kind:     elasticClassKind,
 					Name:     className,
 				},
 				Capacity:  pgelasticv1alpha1.PoolCapacity{BackendConnections: 50},

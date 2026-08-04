@@ -54,6 +54,10 @@ const (
 	maxSkewTenants = 3
 	// shardLabelKey is the anti-affinity key the correlated tenants declare.
 	shardLabelKey = "saas.example.com/customer-shard"
+	// elasticClassKind and memberClass are what every fixture in this suite names when it
+	// points a pool at its class and stamps a member's shape.
+	elasticClassKind = "PgElasticClass"
+	memberClass      = "gp-8"
 )
 
 var _ = Describe("placing a tenant population across a pool", Ordered, func() {
@@ -98,14 +102,14 @@ var _ = Describe("placing a tenant population across a pool", Ordered, func() {
 			Spec: pgelasticv1alpha1.PgElasticPoolSpec{
 				ClassRef: pgelasticv1alpha1.ClassReference{
 					APIGroup: pgelasticv1alpha1.SchemeGroupVersion.Group,
-					Kind:     "PgElasticClass",
+					Kind:     elasticClassKind,
 					Name:     className,
 				},
 				Capacity: pgelasticv1alpha1.PoolCapacity{BackendConnections: 240},
 				Instances: pgelasticv1alpha1.PoolInstances{
 					Replicas: ptr.To(int32(instanceCount)),
 					Template: pgelasticv1alpha1.PgInstanceTemplate{
-						Class: "gp-8",
+						Class: memberClass,
 						Storage: pgelasticv1alpha1.InstanceStorage{
 							Size:      resource.MustParse("100Gi"),
 							WALVolume: pgelasticv1alpha1.WALVolume{Size: resource.MustParse("20Gi")},
@@ -442,7 +446,7 @@ func createReadyInstance(namespace, name, pool string, allocatable int32) {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: pgelasticv1alpha1.PgInstanceSpec{
 			PoolRef: corev1.LocalObjectReference{Name: pool},
-			Class:   "gp-8",
+			Class:   memberClass,
 			Storage: pgelasticv1alpha1.InstanceStorage{
 				Size:      resource.MustParse("100Gi"),
 				WALVolume: pgelasticv1alpha1.WALVolume{Size: resource.MustParse("20Gi")},
