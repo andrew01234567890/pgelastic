@@ -714,7 +714,23 @@ impl Fleet {
         default_lease_ms: u64,
         extra: &str,
     ) -> Self {
-        let (a, b) = tokio::join!(start_postgres(), start_postgres());
+        Self::start_leased_with_conf(a_budget, b_budget, default_lease_ms, "", extra).await
+    }
+
+    /// As [`start_leased`](Self::start_leased), with `a_conf` appended to the
+    /// first member's `postgresql.conf`.
+    ///
+    /// A postmaster setting a test needs from birth rather than by reload:
+    /// `synchronous_standby_names`, whose effect on commits is published by the
+    /// checkpointer and so cannot be waited for from a client connection.
+    pub async fn start_leased_with_conf(
+        a_budget: u32,
+        b_budget: u32,
+        default_lease_ms: u64,
+        a_conf: &str,
+        extra: &str,
+    ) -> Self {
+        let (a, b) = tokio::join!(start_postgres_with(a_conf), start_postgres());
         let pki = ControlPki::generate();
         let source = format!(
             "[listen]\n\
@@ -1042,28 +1058,30 @@ pub async fn until(
     }
 }
 
-/// Waits until a commit is actually parked in the synchronous-replication wait.
+/// Waits until backend `pid` is actually parked in the synchronous-replication wait.
 ///
-/// A test that needs a commit to hang cannot gate on `SHOW synchronous_standby_names`. That
-/// only proves the *client backend* has processed the SIGHUP. `SyncRepWaitForLSN` consults
-/// `WalSndCtl->sync_standbys_defined`, a shared-memory flag the **checkpointer** publishes
-/// when it processes the same signal, and the two processes handle it independently. Under
-/// CPU contention - eight postgres containers on one CI runner - the checkpointer lags, the
-/// backend reads the clause back, and the commit sails through without waiting at all.
+/// Ordering only. This orders whatever comes next - an epoch push, a quiesce - after the
+/// commit has reached the wait, and it **cannot cause the wait**: a commit that took the fast
+/// exit has already completed, so no amount of waiting will make it park. The caller owes the
+/// precondition, and it is not `SHOW synchronous_standby_names`. `SyncRepWaitForLSN` consults
+/// `WalSndCtl->sync_standbys_status`, a shared-memory word the **checkpointer** publishes;
+/// arming with `ALTER SYSTEM` + `pg_reload_conf` races a process no query can observe. Name
+/// the absent standby in `postgresql.conf` before the postmaster starts instead, and the
+/// question does not arise: either the checkpointer has published the word, or it has not yet
+/// initialised it and the backend falls back to the clause it loaded itself.
 ///
-/// So this waits for the wait, which is the only unambiguous evidence that the commit is
-/// stalled. Each test owns its own container, so the count cannot pick up another test's
-/// backend.
-pub async fn await_stalled_commit(observer: &tokio_postgres::Client) {
+/// Keyed by pid, because once such a clause is live any commit that opts in parks, and the
+/// only evidence worth having is that *this* backend did.
+pub async fn await_stalled_commit(observer: &tokio_postgres::Client, pid: i32) {
     until(
-        "a commit to park in the synchronous-replication wait",
+        "the commit to park in the synchronous-replication wait",
         std::time::Duration::from_secs(30),
         async || {
             observer
                 .query_one(
                     "SELECT count(*) FROM pg_catalog.pg_stat_activity \
-                     WHERE wait_event_type = 'IPC' AND wait_event = 'SyncRep'",
-                    &[],
+                     WHERE pid = $1 AND wait_event_type = 'IPC' AND wait_event = 'SyncRep'",
+                    &[&pid],
                 )
                 .await
                 .expect("looking for a stalled commit")

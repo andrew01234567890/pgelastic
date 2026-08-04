@@ -494,16 +494,37 @@ async fn an_uncommitted_write_transaction_is_reset_and_leaves_nothing_behind() {
 /// a synchronous standby that is not there.
 #[tokio::test]
 async fn a_commit_whose_outcome_was_never_observed_is_reported_unknown_and_logged() {
-    let pg = postgres_at_epoch(1).await;
+    // Quorum is lost from the postmaster's first breath rather than by a reload the test then
+    // hopes has landed. `SyncRepWaitForLSN` does not consult the committing backend's
+    // `synchronous_standby_names`; it consults `WalSndCtl->sync_standbys_status`, which only
+    // the checkpointer publishes. Arming by `ALTER SYSTEM` + `pg_reload_conf` therefore races
+    // a process the test cannot observe, and a commit that loses that race completes instead
+    // of parking -- unstallable after the fact, whatever the test then waits for. A clause the
+    // postmaster loaded at start-up has no such window: either the checkpointer has published
+    // the flag, or it has not yet initialised it and the backend falls back to its own copy of
+    // the GUC, which says `ghost` either way. The cluster default stays `local` so that only
+    // the one transaction that opts in can stall -- the setup DDL, autovacuum and the proxy's
+    // own links must not.
+    let pg = harness::start_postgres_with(
+        "pgelastic.primary_epoch = '1'\n\
+         synchronous_standby_names = 'ghost'\n\
+         synchronous_commit = local",
+    )
+    .await;
     let dir = tempfile::TempDir::new().expect("a temp dir");
     let log_path = dir.path().join("in-doubt.jsonl");
 
+    // The instance is write-degraded before the proxy is even started, so the stall detector
+    // confirms it within half a second and would refuse every checkout with 57P03 -- including
+    // the ones this test needs. What the detector does with that verdict is stall.rs's
+    // subject; here it is the environment, so the refusal is off and the probe still runs.
     let proxy = harness::start_proxy(&harness::config_for(
         &pg,
         &format!(
             "{LEASE}\n[fence]\npushAddress = \"127.0.0.1:0\"\n\
              inDoubtLog = \"{log}\"\n\n\
-             [pool]\nmode = \"transaction\"\nbackendConnections = 4\n",
+             [pool]\nmode = \"transaction\"\nbackendConnections = 4\n\n\
+             [stall]\nfailFast = false\n",
             log = log_path.display()
         ),
     ))
@@ -515,29 +536,29 @@ async fn a_commit_whose_outcome_was_never_observed_is_reported_unknown_and_logge
         .await
         .expect("creating the table");
 
-    // Quorum loss, exactly as the design describes it: commits stall rather
-    // than silently degrading to asynchronous.
-    let admin_client = connect_direct(&pg, "pgelastic_quorum").await;
-    admin_client
-        .simple_query("ALTER SYSTEM SET synchronous_standby_names = 'ghost'")
-        .await
-        .expect("naming an absent standby");
-    admin_client
-        .simple_query("SELECT pg_reload_conf()")
-        .await
-        .expect("reloading");
+    let observer = connect_direct(&pg, "pgelastic_observer").await;
 
     let client = connect(&proxy, "acme").await;
 
     client.simple_query("BEGIN").await.expect("begin");
 
-    // Checked inside the transaction rather than before it. Outside one, transaction pooling
-    // is free to put each statement on a different backend link, so seeing the clause loaded
-    // says only that *some* link has it -- and the link that goes on to run the COMMIT may be
-    // one that has not processed the SIGHUP yet, whose commit then does not stall and the test
-    // fails having proved nothing. Inside BEGIN the session is pinned to one link, and it is
-    // the link whose commit must hang.
-    await_quorum_clause(&client, "ghost").await;
+    // Inside the transaction, so it is the link the COMMIT will run on. `BEGIN` has pinned the
+    // session to one backend; outside a transaction, pooling is free to answer each statement
+    // on a different one.
+    let committer_pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("the pid of the backend this transaction is pinned to")
+        .get(0);
+
+    // `dataDurability: Required`, asked for by the one transaction that must hang. It is
+    // `PGC_USERSET`, so this backend applies it itself when the statement returns: no signal,
+    // no second process, nothing to wait for. `SET LOCAL` rather than `SET` because the
+    // tripwire exempts it from tainting the link.
+    client
+        .simple_query("SET LOCAL synchronous_commit = on")
+        .await
+        .expect("this transaction opting in to synchronous replication");
 
     client
         .simple_query("INSERT INTO fence_commits VALUES (1)")
@@ -545,7 +566,7 @@ async fn a_commit_whose_outcome_was_never_observed_is_reported_unknown_and_logge
         .expect("the insert");
 
     let committer = tokio::spawn(async move { client.simple_query("COMMIT").await });
-    await_stalled_commit(&admin_client).await;
+    await_stalled_commit(&observer, committer_pid).await;
     push(proxy.push_port(), 5).await;
 
     let error = committer
@@ -588,9 +609,10 @@ async fn a_commit_whose_outcome_was_never_observed_is_reported_unknown_and_logge
         record.key.epoch, 1,
         "keyed by the epoch the commit went out on"
     );
-    assert!(
-        record.key.backend_pid.is_some(),
-        "keyed by the backend pid: {:?}",
+    assert_eq!(
+        record.key.backend_pid,
+        Some(committer_pid),
+        "keyed by the pid of the backend PostgreSQL actually had parked: {:?}",
         record.key
     );
     assert!(
@@ -771,31 +793,4 @@ fn reported(error: &tokio_postgres::Error) -> String {
         || error.to_string(),
         |db| format!("{} {}", db.code().code(), db.message()),
     )
-}
-
-/// Waits until the backend serving `client` reports `expected` as its loaded quorum clause.
-///
-/// `synchronous_standby_names` is `PGC_SIGHUP`, so `pg_reload_conf` returns long before a backend
-/// has picked the new value up. A test that assumes otherwise passes on a fast machine and
-/// fails on a loaded one, because the commit it wanted to stall simply completes first.
-async fn await_quorum_clause(client: &tokio_postgres::Client, expected: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let rows = client
-            .simple_query("SHOW synchronous_standby_names")
-            .await
-            .expect("reading the loaded quorum clause");
-        let loaded = rows.iter().any(|message| {
-            matches!(message, tokio_postgres::SimpleQueryMessage::Row(row)
-                if row.get(0) == Some(expected))
-        });
-        if loaded {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the backend never loaded {expected}, so a commit could not stall"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
