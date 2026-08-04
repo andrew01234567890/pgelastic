@@ -270,6 +270,16 @@ func (r *PgInstanceReconciler) ensureSupportingObjects(
 		return err
 	}
 
+	// Said out loud. The webhook refuses these at admission, so anything here belongs to an
+	// object admitted before the parameter became owned - a real state, and one that used to
+	// pass in silence: the value is in the manifest, absent from the postmaster, and nothing
+	// anywhere said the two disagreed.
+	if dropped := builder.DroppedParameters(); len(dropped) > 0 {
+		logf.FromContext(ctx).Info(
+			"Ignoring parameters the operator owns; they are in the object and not in the configuration",
+			"parameters", dropped)
+	}
+
 	configMap, err := builder.ConfigMap(builder.AgentConfig())
 	if err != nil {
 		return err
