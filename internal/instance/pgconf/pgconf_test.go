@@ -258,6 +258,24 @@ func TestRenderHBADeniesByDefault(t *testing.T) {
 	}
 }
 
+// pg_hba matches the first record that fits, so this ordering is the whole of whether the
+// metrics scrape can authenticate at all. The agent's OS identity is postgres; below "local
+// all all peer" a socket connection asking for pgelastic_ops is checked against the peer
+// identity postgres and refused, leaving the bootstrap superuser as the only reachable role.
+func TestTheOpsRoleReachesTheSocketAboveThePeerCatchAll(t *testing.T) {
+	// No sources at all: the record is a local one, so it must not depend on any CIDR
+	// having been configured.
+	rendered := RenderHBA(HBAConfig{OpsRole: "pgelastic_ops"})
+	ops := strings.Index(rendered, "local all pgelastic_ops scram-sha-256")
+	catchAll := strings.Index(rendered, "local all all peer")
+	if ops < 0 {
+		t.Fatalf("pg_hba = %q, want a local record for the ops role", rendered)
+	}
+	if catchAll < 0 || ops > catchAll {
+		t.Errorf("pg_hba = %q, want the ops record above the peer catch-all", rendered)
+	}
+}
+
 func TestIncludeDirectivesOrderOverrideLast(t *testing.T) {
 	custom := strings.Index(IncludeDirectives, CustomConfFile)
 	override := strings.Index(IncludeDirectives, OverrideConfFile)
