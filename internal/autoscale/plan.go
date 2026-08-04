@@ -129,6 +129,25 @@ type Signals struct {
 // InstanceCount is how many instances the pool has.
 func (s Signals) InstanceCount() int32 { return int32(len(s.Instances)) }
 
+// ServingInstances is how many members are serving or on their way to it: everything except
+// the ones deliberately taken out of service.
+//
+// It is the unit the recommendation is expressed in and the count it is compared against, and
+// those two have to be the same thing. A member still coming up counts, because it is about
+// to carry load and asking for another in the meantime asks twice for the same capacity. A
+// cordoned member does not, because it is on its way out - a scale-in victim mid-drain, or an
+// instance recovered from a backup that nobody has looked at yet.
+func (s Signals) ServingInstances() int32 {
+	serving := int32(0)
+	for _, instance := range s.Instances {
+		if instance.Ready && !instance.Schedulable {
+			continue
+		}
+		serving++
+	}
+	return serving
+}
+
 // Action is one proposed change class.
 type Action struct {
 	Class     pgelasticv1alpha1.AutoAction
@@ -201,6 +220,15 @@ type Plan struct {
 	// published rather than derived because zero of it is the difference between a pool with
 	// nothing on it and a pool nothing can be seen through, and those want opposite actions.
 	MeasuredInstances int32
+	// ServingInstances is how many members are serving or on their way to it, which is the
+	// unit RecommendedInstances is expressed in.
+	//
+	// It is on the plan so that whoever executes an action compares against the same count the
+	// proposal did. A recommendation about serving members held up against the whole
+	// membership is a class that is proposed, permitted and selected on every pass and applies
+	// nothing - and since at most one class executes per pass and this one sits above
+	// Rebalance and ScaleIn, that is every class beneath it never running again.
+	ServingInstances int32
 	// MigrationsPermitted is the disruption budget alone - concurrency cap, rate cap and
 	// migration windows - with no opinion about whether any particular move is worth making.
 	// It is what an evacuation asks, because a drain has already been decided by an operator
@@ -277,6 +305,7 @@ func Recommend(signals Signals, policy Policy) Plan {
 		ComputedAt:               signals.Now,
 		Mode:                     policy.Mode,
 		ObservedInstances:        signals.InstanceCount(),
+		ServingInstances:         signals.ServingInstances(),
 		TargetUtilizationPercent: policy.TargetUtilizationPercent,
 	}
 	inUse, allocatable := int64(0), int64(0)
@@ -331,7 +360,10 @@ func Recommend(signals Signals, policy Policy) Plan {
 // or recovering - and scaling a measurement by a count it did not cover sizes the pool as
 // though the members nothing may be placed on were carrying their share.
 func recommendedInstances(plan Plan, signals Signals, policy Policy) int32 {
-	current := signals.InstanceCount()
+	// Serving members, not every member, because that is the count this answer is compared
+	// against. Returning one and comparing it with the other is how a pool holding a cordoned
+	// member came to propose raising its own count from three to three, for ever.
+	current := signals.ServingInstances()
 	// No measurable capacity means the pool cannot be seen through, which is not the same
 	// fact as the pool being empty and does not want the same answer. A ratio taken from
 	// nothing reads as idle, and an idle verdict here would consolidate a fleet whose load is
@@ -346,11 +378,13 @@ func recommendedInstances(plan Plan, signals Signals, policy Policy) int32 {
 	if deviation <= policy.TolerancePercent {
 		return clamp(current, policy.MinInstances, policy.MaxInstances)
 	}
+	// The answer is in members that can serve, and the members that cannot are not added back
+	// on top of it. Adding them back would make the recommendation a function of the member
+	// count it is being compared against, so every member that appeared without becoming
+	// measurable - a provisioning one, a cordoned one - would raise the recommendation by one
+	// and ask for another. That does not converge; it walks to maxInstances.
 	desired := (int64(plan.MeasuredInstances)*int64(plan.ObservedUtilizationPercent) +
 		int64(policy.TargetUtilizationPercent) - 1) / int64(policy.TargetUtilizationPercent)
-	// A member that carries no load still occupies a slot in the count scale-out and scale-in
-	// compare against, so the answer is expressed in members rather than in servable ones.
-	desired += int64(current - plan.MeasuredInstances)
 	return clamp(int32(desired), policy.MinInstances, policy.MaxInstances)
 }
 
@@ -514,12 +548,20 @@ func actions(signals Signals, policy Policy, guard Guard, plan Plan) []Action {
 		}
 	}
 
-	if plan.RecommendedInstances > plan.ObservedInstances {
+	// Both counts are the members the utilization was read from, because that is what the
+	// recommendation is expressed in. Comparing a recommendation about serving members
+	// against the whole membership proposes growth or consolidation on the strength of
+	// members the reading never covered. A pool nothing could be read from proposes neither:
+	// it is unmeasured rather than empty, and the summary says so.
+	if plan.MeasuredInstances > 0 && plan.RecommendedInstances > plan.ServingInstances {
 		proposals = append(proposals, Action{
 			Class:  pgelasticv1alpha1.AutoActionScaleOut,
 			Target: signals.Pool,
-			Detail: fmt.Sprintf("raise instances.replicas from %d to %d; the pool is at %d%% of a %d%% target",
-				plan.ObservedInstances, plan.RecommendedInstances,
+			// The counts named are the ones actually compared. Reporting the membership beside
+			// a recommendation about serving members is how "raise instances.replicas from 3
+			// to 3" came to be written in a status field an operator reads during an incident.
+			Detail: fmt.Sprintf("%d of the pool's %d members are serving and it needs %d; it is at %d%% of a %d%% target",
+				plan.ServingInstances, plan.ObservedInstances, plan.RecommendedInstances,
 				plan.ObservedUtilizationPercent, policy.TargetUtilizationPercent),
 		})
 	}
@@ -534,12 +576,14 @@ func actions(signals Signals, policy Policy, guard Guard, plan Plan) []Action {
 		})
 	}
 
-	if plan.ConsolidationTarget != "" && plan.RecommendedInstances < plan.ObservedInstances {
+	// No measurable guard here: with nothing measurable the recommendation is at least the
+	// serving count, so the comparison below is already false.
+	if plan.ConsolidationTarget != "" && plan.RecommendedInstances < plan.ServingInstances {
 		proposals = append(proposals, Action{
 			Class:  pgelasticv1alpha1.AutoActionScaleIn,
 			Target: plan.ConsolidationTarget,
-			Detail: fmt.Sprintf("evacuate and reclaim %s, taking the pool from %d instances to %d",
-				plan.ConsolidationTarget, plan.ObservedInstances, plan.RecommendedInstances),
+			Detail: fmt.Sprintf("evacuate and reclaim %s, taking the pool from %d serving members to %d",
+				plan.ConsolidationTarget, plan.ServingInstances, plan.RecommendedInstances),
 		})
 	}
 
