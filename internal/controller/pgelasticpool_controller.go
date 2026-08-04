@@ -143,10 +143,12 @@ func (r *PgElasticPoolReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return result, err
 	}
 	if !pool.DeletionTimestamp.IsZero() {
-		if r.Metering != nil {
-			r.Metering.ForgetPool(pool.Namespace, pool.Name)
-		}
-		return ctrl.Result{}, nil
+		return r.finalizePool(ctx, pool)
+	}
+	// Before anything is provisioned, so there is never a member the pool made and no record
+	// that deleting the pool would take it.
+	if err := r.holdPoolForMembers(ctx, pool); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	view, err := r.observe(ctx, pool)
@@ -1061,6 +1063,7 @@ func (r *PgElasticPoolReconciler) event(
 const (
 	actionPlan          = "Plan"
 	actionRefuse        = "Refuse"
+	actionHold          = "Hold"
 	actionExecute       = "Execute"
 	actionEmitMigration = "EmitMigration"
 )
