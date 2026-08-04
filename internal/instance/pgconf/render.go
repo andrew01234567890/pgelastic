@@ -159,7 +159,12 @@ func RenderCustomConf(config InstanceConfig) []Setting {
 		settings["effective_cache_size"] = config.EffectiveCacheSize
 	}
 	for name, value := range config.UserParameters {
-		if IsOwned(name) || !RenderableParameter(name, value) {
+		// IsPinned rather than IsOwned, so a Tuned parameter the user set survives to here
+		// and overwrites the computed value written earlier in this same map. This stays a
+		// real check rather than a formality: it is the second, independent pass the package
+		// doc promises, so that an object admitted under an older classification cannot
+		// poison a pod that reads it later.
+		if IsPinned(name) || !RenderableParameter(name, value) {
 			continue
 		}
 		settings[name] = value
