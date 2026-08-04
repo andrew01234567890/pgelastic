@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -187,6 +188,7 @@ func (b Builder) AgentConfig() AgentConfig {
 	spec := b.Instance.Spec
 	userParameters, _ := pgconf.UserParameters(spec.Parameters)
 	initdb := pgconf.InstanceConfig{
+		Major:                    majorOf(spec.PostgresVersion),
 		Capacity:                 b.Capacity,
 		SocketDirectory:          SocketDir,
 		Port:                     PostgresPort,
@@ -827,4 +829,22 @@ func StorageQuantity(size resource.Quantity) *resource.Quantity {
 func (b Builder) DroppedParameters() []string {
 	_, dropped := pgconf.UserParameters(b.Instance.Spec.Parameters)
 	return dropped
+}
+
+// majorOf reads spec.postgresVersion as a number.
+//
+// An absent or unreadable value is the tree's own default rather than zero: the field is
+// optional and defaulted by the CRD, so an object stored before it had a default reaches this
+// with nothing set, and rendering that as major 0 would silently pick every "before 19" branch
+// for a cluster nobody has said anything about. The enum is what refuses a version the tree
+// does not know; this only has to turn the ones it admits into a number.
+func majorOf(version *string) int {
+	if version == nil {
+		return pgconf.DefaultMajor
+	}
+	major, err := strconv.Atoi(strings.TrimSpace(*version))
+	if err != nil || major <= 0 {
+		return pgconf.DefaultMajor
+	}
+	return major
 }

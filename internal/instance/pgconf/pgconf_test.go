@@ -394,3 +394,33 @@ func TestATunedParametersUserValueSurvivesIntoTheRenderedConfiguration(t *testin
 		t.Errorf("the user's value was dropped: kept=%v dropped=%v", kept, dropped)
 	}
 }
+
+// PostgreSQL 19 doubled max_locks_per_transaction's default to 128, and said in its own release
+// note that settings "must now be doubled to match their capacity in previous releases". The
+// lock table is max_locks_per_transaction x (max_connections + max_prepared_transactions), so
+// carrying 18's literal onto a 19 postmaster halves the lock capacity of every instance - and
+// the first symptom is "out of shared memory" on a tenant doing nothing unusual.
+func TestTheLockTableKeepsItsCapacityAcrossAMajor(t *testing.T) {
+	for _, testCase := range []struct {
+		major int
+		want  string
+	}{
+		{major: 0, want: "64"},
+		{major: 18, want: "64"},
+		{major: 19, want: "128"},
+		{major: 20, want: "128"},
+	} {
+		settings := RenderCustomConf(InstanceConfig{Major: testCase.major})
+
+		var rendered string
+		for _, setting := range settings {
+			if setting.Name == GUCMaxLocksPerTransaction {
+				rendered = setting.Value
+			}
+		}
+		if rendered != testCase.want {
+			t.Errorf("major %d renders %s = %q, want %q",
+				testCase.major, GUCMaxLocksPerTransaction, rendered, testCase.want)
+		}
+	}
+}

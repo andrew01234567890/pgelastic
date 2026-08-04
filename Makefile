@@ -2,7 +2,10 @@
 IMG ?= controller:latest
 # INSTANCE_IMG carries the instance manager; PG_IMG carries PostgreSQL 18 and pgBackRest.
 INSTANCE_IMG ?= pgelastic/instance:latest
-PG_IMG ?= pgelastic/postgres:18
+# The PostgreSQL major everything is built and tested against. One place, so a second major
+# is a variable rather than an edit in four files.
+PG_MAJOR ?= 18
+PG_IMG ?= pgelastic/postgres:$(PG_MAJOR)
 # PROXY_IMG carries the inline proxy fleet.
 PROXY_IMG ?= pgelastic/proxy:latest
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
@@ -506,7 +509,7 @@ docker-build-instance: ## Build the instance manager image.
 
 .PHONY: docker-build-postgres
 docker-build-postgres: ## Build the pgelastic PostgreSQL 18 image.
-	$(CONTAINER_TOOL) build -f Dockerfile.postgres -t $(PG_IMG) .
+	$(CONTAINER_TOOL) build -f Dockerfile.postgres --build-arg PG_MAJOR=$(PG_MAJOR) -t $(PG_IMG) .
 
 # The proxy is the only component on the client's data path, so its image carries the binary
 # and nothing that could be executed instead of it.

@@ -1,13 +1,19 @@
 # The pgelastic PostgreSQL image.
 #
-# PostgreSQL 18 only: there is no major-version upgrade path in v1, and pinning the major
-# version is what lets the design omit wal_log_hints (PG18 turns data checksums on by
-# default) and rely on io_method = worker being the default.
+# The major is an argument rather than a literal, because supporting a second one is a build
+# rather than a code change: every e2e suite already takes its image from an environment
+# variable, and the tree renders the parameters the major needs. It stays pinned per image -
+# there is no in-place major upgrade, and the answer to "make this a 19" is an instance that
+# already is one, with tenants migrated onto it.
+#
+# Pinning the major is still what lets the design omit wal_log_hints (18 turns data checksums
+# on by default) and rely on io_method = worker being the default; both hold from 18 onwards.
 #
 # The instance manager is deliberately NOT in this image. It arrives at runtime from an
 # init container that does nothing but cp, so upgrading the agent does not mean rebuilding
 # and re-certifying the database image.
-FROM postgres:18
+ARG PG_MAJOR=18
+FROM postgres:${PG_MAJOR}
 
 # pgBackRest does WAL archiving and physical backup. Writing that natively is a large
 # correctness surface - multipart uploads, retry idempotency, partial-object detection,

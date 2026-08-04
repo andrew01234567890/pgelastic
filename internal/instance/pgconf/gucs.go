@@ -453,3 +453,27 @@ func ParallelWorkersForCPU(millis int64) int32 {
 	}
 	return parallelWorkers(int32(millis / 1000))
 }
+
+// DefaultMajor is the PostgreSQL major a configuration is rendered for when the caller names
+// none. It is what every caller meant before the tree could express more than one.
+const DefaultMajor = 18
+
+// maxLocksPerTransaction is the one operator-computed value that changes with the major.
+//
+// PostgreSQL 19 doubled the default from 64 to 128, and its release note is explicit that
+// settings "must now be doubled to match their capacity in previous releases" - the lock
+// table is sized as max_locks_per_transaction x (max_connections + max_prepared_transactions),
+// and 19 changed what one unit buys. Rendering 18's literal on a 19 postmaster would
+// therefore halve the lock capacity of every instance, silently, and the first symptom would
+// be "out of shared memory" on a tenant doing nothing unusual.
+//
+// It is also an EnforcedParameters member, so a standby that came up on the smaller value
+// would raise it to the primary's anyway - which means a mixed-major pair would disagree
+// about the number and only the primary's would take effect. One more reason the value has
+// to follow the major rather than the tree.
+func maxLocksPerTransaction(major int) string {
+	if major >= 19 {
+		return "128"
+	}
+	return "64"
+}
