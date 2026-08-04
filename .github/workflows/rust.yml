@@ -56,6 +56,19 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features
 
+      # Every integration test here starts a real PostgreSQL and refuses to skip without one,
+      # and testcontainers pulls inside the test with a deadline it does not retry. Pulling
+      # first, with retries, keeps a slow registry from reddening a build about the proxy.
+      - name: Pull the PostgreSQL image the harness uses
+        run: |
+          for attempt in 1 2 3; do
+            docker pull postgres:18 && exit 0
+            echo "pull attempt $attempt failed; retrying"
+            sleep $((attempt * 10))
+          done
+          echo "could not pull postgres:18 after three attempts"
+          exit 1
+
       - name: test
         run: cargo test --workspace --all-features
 
