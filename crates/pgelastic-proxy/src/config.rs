@@ -243,6 +243,12 @@ impl Config {
         // a tunable, so changing it invalidates every credential derived under the old value,
         // which is a different process rather than a document a running one can adopt.
         structural.auth.users.clear();
+        // The pool's limits are adopted by a running replica at a checkout boundary, so two
+        // documents that differ only in them describe the same process. Leaving them here
+        // would mean an operator could not change a timeout without rolling the whole fleet
+        // and dropping every client of every tenant to do it - which is the mistake the two
+        // comments above this one record, twice.
+        structural.pool.query_deadline_seconds = 0;
         // An instance's allocatable capacity moves whenever that instance rolls, because the
         // operator withholds it while a member is not serving. Leaving it here meant rolling
         // one instance restarted the whole fleet and dropped every client of every tenant on
@@ -848,6 +854,16 @@ pub struct PoolConfig {
     /// with `PGE1024`.
     #[serde(default = "default_query_wait_seconds")]
     pub query_wait_seconds: u64,
+    /// How long one statement may run before the proxy cancels it and closes
+    /// the link. Zero is no deadline.
+    ///
+    /// Adopted rather than structural: it is in the half [`Config::structural`]
+    /// clears, so an operator may change it without rolling the fleet and
+    /// dropping every client of every tenant to do it. A running replica picks
+    /// it up at the next checkout, which is why it changes between two
+    /// transactions of a session and never inside one.
+    #[serde(default)]
+    pub query_deadline_seconds: u64,
     /// When a queued client is sent a `NoticeResponse` telling it why it is
     /// still waiting.
     #[serde(default = "default_notify_after_seconds")]
@@ -891,6 +907,7 @@ impl Default for PoolConfig {
             max_client_connections: default_pool_max_client_connections(),
             reset_policy: ResetPolicyConfig::default(),
             query_wait_seconds: default_query_wait_seconds(),
+            query_deadline_seconds: 0,
             notify_after_seconds: default_notify_after_seconds(),
             queue_depth_per_tenant: default_queue_depth_per_tenant(),
             max_server_statements: default_max_server_statements(),
@@ -905,6 +922,12 @@ impl Default for PoolConfig {
 impl PoolConfig {
     pub fn query_wait_timeout(&self) -> Duration {
         Duration::from_secs(self.query_wait_seconds)
+    }
+
+    /// The statement deadline, or `None` when the pool sets no bound.
+    #[must_use]
+    pub fn query_deadline(&self) -> Option<Duration> {
+        (self.query_deadline_seconds > 0).then(|| Duration::from_secs(self.query_deadline_seconds))
     }
 
     pub fn notify_after(&self) -> Duration {
@@ -1472,6 +1495,32 @@ mod tests {
         ))
         .unwrap();
         assert!(current.is_dynamic_change(&next));
+    }
+
+    /// Every `[pool]` key was structural, so changing a timeout rolled the whole fleet and
+    /// dropped every client of every tenant to do it. The limits a running replica reads at a
+    /// checkout are the ones it can be told about instead.
+    #[test]
+    fn changing_a_pool_limit_changes_the_document_without_changing_the_process() {
+        let current = Config::from_str(MINIMAL).unwrap();
+        let next = Config::from_str(&format!(
+            "configVersion = \"2\"\n{MINIMAL}\n[pool]\nqueryDeadlineSeconds = 30\n"
+        ))
+        .unwrap();
+        assert_eq!(next.pool.query_deadline_seconds, 30);
+        assert!(current.is_dynamic_change(&next));
+    }
+
+    /// The neighbouring keys are still structural, and must stay that way: the process is
+    /// built from them.
+    #[test]
+    fn changing_the_pool_budget_is_still_a_different_process() {
+        let current = Config::from_str(MINIMAL).unwrap();
+        let next = Config::from_str(&format!(
+            "configVersion = \"2\"\n{MINIMAL}\n[pool]\nbackendConnections = 77\n"
+        ))
+        .unwrap();
+        assert!(!current.is_dynamic_change(&next));
     }
 
     #[test]

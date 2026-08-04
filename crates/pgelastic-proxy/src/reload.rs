@@ -109,6 +109,7 @@ impl Reloader {
         let mut claims = 0;
         for instance in fleet.instances() {
             claims += instance.pools.apply_tenants(&next.pool.tenants);
+            instance.pools.apply_limits(&next.pool);
         }
         fleet.publish_budget_now();
         // The logins and the per-tenant backend identities. A failure here leaves the previous
