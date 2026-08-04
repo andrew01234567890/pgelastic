@@ -1236,10 +1236,26 @@ type PoolObservability struct {
 	// +optional
 	LogFormat string `json:"logFormat,omitempty"`
 
-	// perTenantMetrics labels pool metrics by tenant. Counters stay monotonic per tenant
+	// perTenantMetrics publishes the pg_stat_database counters broken down by tenant, as
+	// pgelastic_metering_tenant_database_stats_total. Counters stay monotonic per tenant
 	// independent of pool object lifetime, so freeing an idle pool does not read as a
 	// counter reset downstream.
-	// +kubebuilder:default=true
+	//
+	// It is the database counters and nothing else. The rest of the pool's exposition -
+	// allocatable connections, the tenant population, the pool's staleness - are facts about
+	// the pool with no per-tenant reading to give, so labelling them by tenant would multiply
+	// the series count without adding a number anybody could read.
+	//
+	// Off by default, and the default is the whole of the decision. It costs 16 series per
+	// tenant, so at the design point of ~200 tenants a pool goes from 32 series to 3,232, and
+	// a Prometheus that falls over is worse than one that cannot break a number down. The
+	// per-tenant figures are published where an operator looks for them anyway - on the
+	// tenant's own CR - so this buys aggregation and alerting across tenants rather than
+	// visibility of them, and it should be turned on deliberately by somebody who has counted
+	// their tenants.
+	//
+	// Turning it off releases the series turning it on created, on the pool's next pass.
+	// +kubebuilder:default=false
 	// +optional
 	PerTenantMetrics *bool `json:"perTenantMetrics,omitempty"`
 

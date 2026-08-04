@@ -29,6 +29,7 @@ import (
 const (
 	labelNamespace = "namespace"
 	labelInstance  = "instance"
+	labelKind      = "kind"
 )
 
 // Failover metrics. Each named veto is a label value rather than a metric of its own, so an

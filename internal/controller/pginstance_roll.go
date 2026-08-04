@@ -488,7 +488,8 @@ func (r *PgInstanceReconciler) rankTargets(
 	targets []rollTarget,
 ) {
 	replayed := map[string]ha.LSN{}
-	for _, member := range r.observeMembers(ctx, client.ObjectKeyFromObject(instance), pods) {
+	members, _ := r.observeMembers(ctx, client.ObjectKeyFromObject(instance), pods)
+	for _, member := range members {
 		replayed[member.Name] = member.ReplayLSN
 	}
 	primary := instance.Status.CurrentPrimary

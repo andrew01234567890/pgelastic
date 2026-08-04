@@ -94,6 +94,9 @@ func MemberReportOf(member string, state ProbeState) provision.MemberReport {
 		ReplayLagSeconds:        state.ReplayLag.Seconds(),
 		WALReceiverActive:       observation.WALReceiverActive,
 		WALVolumeFull:           state.WALVolumeFull,
+		DataUsedBytes:           state.DataUsedBytes,
+		WALUsedBytes:            state.WALUsedBytes,
+		ClientBackends:          state.ClientBackends,
 		Rejoining:               string(state.Rejoin),
 		SynchronousStandbyNames: observation.SyncStandbyNames,
 		NumSync:                 observation.NumSync,
@@ -101,6 +104,7 @@ func MemberReportOf(member string, state ProbeState) provision.MemberReport {
 		StreamingMembers:        observation.SyncStandbys,
 		PrimaryEpoch:            observation.PrimaryEpoch,
 		Archive:                 archiveReport(observation.Archive),
+		Databases:               state.Databases,
 	}
 }
 

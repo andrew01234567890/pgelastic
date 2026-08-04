@@ -80,7 +80,11 @@ type observationCache struct {
 }
 
 type observationRound struct {
-	members  []ha.Member
+	members []ha.Member
+	// reports are the members' own answers, kept whole rather than reduced to the fields the
+	// failover decision reads. The metering scrape rides them, and re-polling for it would
+	// double the number of times each member is asked to describe itself.
+	reports  []provision.MemberReport
 	observed time.Time
 }
 
@@ -95,8 +99,11 @@ func (r *PgInstanceReconciler) reconcileFailover(
 	instance *pgelasticv1alpha1.PgInstance,
 	pods []corev1.Pod,
 ) ha.Decision {
+	members, reports := r.observeMembers(ctx, client.ObjectKeyFromObject(instance), pods)
+	r.meterDatabases(instance, reports)
+
 	observation := ha.Observation{
-		Members:           r.observeMembers(ctx, client.ObjectKeyFromObject(instance), pods),
+		Members:           members,
 		CurrentPrimary:    instance.Status.CurrentPrimary,
 		TargetPrimary:     instance.Status.TargetPrimary,
 		Evidence:          ha.EvidenceFrom(instance.Status.QuorumEvidence),
@@ -157,17 +164,17 @@ func (r *PgInstanceReconciler) observeMembers(
 	ctx context.Context,
 	instance types.NamespacedName,
 	pods []corev1.Pod,
-) []ha.Member {
+) ([]ha.Member, []provision.MemberReport) {
 	r.observations.mutex.Lock()
 	defer r.observations.mutex.Unlock()
 
 	round, cached := r.observations.entries[instance]
 	if r.ProbeTTL > 0 && cached && time.Since(round.observed) < r.ProbeTTL &&
 		sameMembers(round.members, pods) {
-		return round.members
+		return round.members, round.reports
 	}
 
-	members := r.pollMembers(ctx, pods)
+	members, reports := r.pollMembers(ctx, pods)
 	now := time.Now()
 	if r.observations.entries == nil {
 		r.observations.entries = map[types.NamespacedName]observationRound{}
@@ -179,8 +186,10 @@ func (r *PgInstanceReconciler) observeMembers(
 			delete(r.observations.entries, key)
 		}
 	}
-	r.observations.entries[instance] = observationRound{members: members, observed: now}
-	return members
+	r.observations.entries[instance] = observationRound{
+		members: members, reports: reports, observed: now,
+	}
+	return members, reports
 }
 
 // sameMembers reports whether a cached round describes exactly the Pods being reconciled
@@ -198,12 +207,16 @@ func sameMembers(members []ha.Member, pods []corev1.Pod) bool {
 	return true
 }
 
-func (r *PgInstanceReconciler) pollMembers(ctx context.Context, pods []corev1.Pod) []ha.Member {
+func (r *PgInstanceReconciler) pollMembers(
+	ctx context.Context,
+	pods []corev1.Pod,
+) ([]ha.Member, []provision.MemberReport) {
 	prober := r.Prober
 	if prober == nil {
 		prober = httpMemberProber{}
 	}
 	members := make([]ha.Member, 0, len(pods))
+	reports := make([]provision.MemberReport, 0, len(pods))
 	for i := range pods {
 		pod := &pods[i]
 		member := ha.Member{Name: pod.Name, PodReady: podReady(pod)}
@@ -217,11 +230,12 @@ func (r *PgInstanceReconciler) pollMembers(ctx context.Context, pods []corev1.Po
 				member.InRecovery = report.InRecovery
 				member.WALReceiverActive = report.WALReceiverActive
 				member.WALVolumeFull = report.WALVolumeFull
+				reports = append(reports, report)
 			}
 		}
 		members = append(members, member)
 	}
-	return members
+	return members, reports
 }
 
 // stripRoleLabel takes a member out of the read-write Service's selector.

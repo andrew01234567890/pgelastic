@@ -39,13 +39,29 @@ type Accumulator struct {
 	mu      sync.Mutex
 	totals  map[TotalKey]map[Stat]int64
 	cursors map[cursorKey]*cursor
+	// observing records that this process has read this counter source before, and it
+	// deliberately outlives the cursors. The three cases it separates look identical from a
+	// missing cursor alone: a database recreated under a new OID and a pool object that was
+	// freed are both new sources whose whole value has genuinely accrued since, while an
+	// operator that has only just started observing is looking at a counter as old as the
+	// postmaster and has accrued none of it.
+	observing map[observerKey]bool
+}
+
+// observerKey is one counter source without its OID: the thing that stays the same when a
+// database is dropped and recreated underneath it.
+type observerKey struct {
+	Key      Key
+	Instance string
+	Role     Role
 }
 
 // NewAccumulator returns an empty accumulator.
 func NewAccumulator() *Accumulator {
 	return &Accumulator{
-		totals:  map[TotalKey]map[Stat]int64{},
-		cursors: map[cursorKey]*cursor{},
+		totals:    map[TotalKey]map[Stat]int64{},
+		cursors:   map[cursorKey]*cursor{},
+		observing: map[observerKey]bool{},
 	}
 }
 
@@ -84,10 +100,21 @@ func (a *Accumulator) Observe(key TotalKey, instance string, stats DatabaseStats
 	defer a.mu.Unlock()
 
 	source := cursorKey{Key: key.Key, Instance: instance, Role: key.Role, OID: stats.DatabaseOID}
+	observer := observerKey{Key: key.Key, Instance: instance, Role: key.Role}
+	// The first reading this process ever takes of a source is a baseline, not an accrual.
+	// Everything after it - a new OID, a freed pool object - is a genuinely new counter
+	// sequence whose value really did accrue since it appeared.
+	firstEver := !a.observing[observer]
+	a.observing[observer] = true
+
 	entry := a.cursors[source]
 	if entry == nil {
 		entry = &cursor{}
 		a.cursors[source] = entry
+	}
+	if firstEver {
+		entry.baseline(stats)
+		return a.addLocked(key, nil)
 	}
 	return a.addLocked(key, entry.delta(stats))
 }
@@ -130,6 +157,11 @@ func (a *Accumulator) Forget(key TotalKey) {
 	for source := range a.cursors {
 		if source.Key == key.Key && source.Role == key.Role {
 			delete(a.cursors, source)
+		}
+	}
+	for observer := range a.observing {
+		if observer.Key == key.Key && observer.Role == key.Role {
+			delete(a.observing, observer)
 		}
 	}
 }

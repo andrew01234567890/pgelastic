@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgtool"
+	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 )
 
 // ProbeResult is one probe's answer plus the reason behind it. The reason is carried into
@@ -63,6 +64,20 @@ type ProbeState struct {
 	// WALVolumeFull is measured from the filesystem rather than from PostgreSQL, so it is
 	// still answerable when the postmaster is not.
 	WALVolumeFull bool
+	// DataUsedBytes and WALUsedBytes are the two volumes' usage from the same measurement.
+	// Zero means the agent could not stat the path, which is distinguishable from an empty
+	// volume only because an initialised one is never actually zero.
+	DataUsedBytes int64
+	WALUsedBytes  int64
+	// ClientBackends is the postmaster's own count of client connections. Absent rather
+	// than zero when the postmaster cannot be reached: an instance nobody can ask is not an
+	// instance with no clients.
+	ClientBackends int32
+	// Databases is the last pg_stat_database scrape. It is held here rather than read on the
+	// status request for the same reason Observation is: a probe that opened its own
+	// connection would consume a backend slot on an instance that is already short of them,
+	// and would do so exactly when it is shortest.
+	Databases []provision.DatabaseReport
 }
 
 // StartupProbe answers whether the postmaster has got far enough to be waited on.

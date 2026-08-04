@@ -71,6 +71,12 @@ type MemberObservation struct {
 	// that the answer survives a postmaster that has already stopped - which is precisely
 	// the state a candidate is in when the veto has to be evaluated.
 	WALVolumeFull bool
+	// DataUsedBytes and WALUsedBytes are what the two volumes are using, from the same
+	// measurement that decides WALVolumeFull. Carried rather than dropped because
+	// status.storage.used has no other producer, and the autoscaler cannot expand a volume
+	// whose usage it cannot see.
+	DataUsedBytes int64
+	WALUsedBytes  int64
 	// SyncStandbys and StreamingStandbys come from pg_stat_replication and describe what is
 	// happening right now.
 	SyncStandbys      []string
@@ -85,7 +91,10 @@ type MemberObservation struct {
 	ConfigSHA256     string
 	PendingRestart   bool
 	MaxConnections   int32
-	PrimaryEpoch     int64
+	// ClientBackends is how many client connections the postmaster is holding right now,
+	// counted as PostgreSQL counts them rather than as the proxy believes it opened them.
+	ClientBackends int32
+	PrimaryEpoch   int64
 	// Archive is this member's view of its own WAL archiving.
 	Archive ArchiveObservation
 }
@@ -203,6 +212,8 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		       COALESCE(current_setting('pgelastic.config_sha256', true), ''),
 		       EXISTS (SELECT 1 FROM pg_settings WHERE pending_restart),
 		       current_setting('max_connections')::int,
+		       (SELECT count(*) FROM pg_stat_activity
+		         WHERE backend_type = 'client backend')::int,
 		       current_setting('synchronous_standby_names'),
 		       COALESCE(current_setting('pgelastic.primary_epoch', true), '0')::bigint,
 		       COALESCE((SELECT last_archived_wal FROM pg_stat_archiver), ''),
@@ -222,6 +233,7 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		&observation.ConfigSHA256,
 		&observation.PendingRestart,
 		&observation.MaxConnections,
+		&observation.ClientBackends,
 		&observation.SyncStandbyNames,
 		&observation.PrimaryEpoch,
 		&observation.Archive.LastArchivedWAL,
@@ -336,7 +348,7 @@ func BootstrapRoles(ctx context.Context, conn *pgx.Conn, replicationPassword, op
 	//
 	// template1 is included because a database created from it inherits its ACL, so leaving it
 	// open would hand the same opening to every database made afterwards.
-	for _, database := range []string{"postgres", "template1"} {
+	for _, database := range []string{maintenanceDatabase, templateDatabase} {
 		statements = append(statements,
 			fmt.Sprintf(`REVOKE CONNECT ON DATABASE %s FROM PUBLIC`, database),
 			fmt.Sprintf(`GRANT CONNECT ON DATABASE %s TO %s, %s, %s`,

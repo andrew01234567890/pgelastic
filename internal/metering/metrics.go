@@ -28,6 +28,9 @@ const (
 	labelRole      = "role"
 	labelStatistic = "statistic"
 	labelState     = "state"
+	// labelTenant appears on exactly one metric, and only when the pool has asked for it.
+	// Every other metric in this file is unlabelled by tenant on purpose.
+	labelTenant = "tenant"
 )
 
 // ConnectionStatistic and TenantState are closed label-value sets. Every value listed here
@@ -90,21 +93,36 @@ const SeriesPerPool = len(Stats)*len(Roles) + // database_stats_total
 	1 + // stale
 	1 // tenant_series
 
+// SeriesPerTenant is what one tenant adds on top of SeriesPerPool when the pool has turned
+// spec.observability.perTenantMetrics on, and it is the whole price of that field: at the
+// design point of ~200 tenants a pool goes from 32 series to 3,232.
+//
+// It is only the database counters that gain a tenant label. The rest of this file is
+// pool-level facts - allocatable connections, the tenant population, the pool's staleness -
+// which have no per-tenant reading to give, so labelling them by tenant would multiply the
+// series count without adding a number anybody could read.
+const SeriesPerTenant = len(Stats) * len(Roles)
+
 // Metrics is the bounded exposition of everything this package meters.
 //
 // Every metric here is labelled by namespace and pool and by a closed enum, and by nothing
-// else. There is deliberately no tenant, database, query or relation label anywhere: at the
-// design point of ~200 tenants per pool a single per-tenant label would turn this file's 32
-// series into 6,400, and the per-tenant numbers are already published where an operator
-// actually looks for them, on the tenant's own CR.
+// else. There is deliberately no database, query or relation label anywhere, and no tenant
+// label on any metric a pool has not explicitly asked for one on: at the design point of ~200
+// tenants per pool a per-tenant label costs a hundredfold, and the per-tenant numbers are
+// already published where an operator actually looks for them, on the tenant's own CR.
+//
+// tenantDatabaseStats is the single exception, and it is inert unless the pool sets
+// spec.observability.perTenantMetrics. Nothing else in this struct gains a tenant label under
+// that field, because nothing else in this struct has a per-tenant reading to give.
 type Metrics struct {
-	databaseStats *prometheus.CounterVec
-	poolConns     *prometheus.GaugeVec
-	tenantConns   *prometheus.GaugeVec
-	tenants       *prometheus.GaugeVec
-	samples       *prometheus.CounterVec
-	stale         *prometheus.GaugeVec
-	tenantSeries  *prometheus.GaugeVec
+	databaseStats       *prometheus.CounterVec
+	tenantDatabaseStats *prometheus.CounterVec
+	poolConns           *prometheus.GaugeVec
+	tenantConns         *prometheus.GaugeVec
+	tenants             *prometheus.GaugeVec
+	samples             *prometheus.CounterVec
+	stale               *prometheus.GaugeVec
+	tenantSeries        *prometheus.GaugeVec
 }
 
 // NewMetrics builds the metric vectors and registers them. Taking a Registerer rather than
@@ -118,6 +136,13 @@ func NewMetrics(registerer prometheus.Registerer) (*Metrics, error) {
 				"Monotonic per tenant, database and role, so freeing an idle pool object " +
 				"does not read as a counter reset.",
 		}, []string{labelNamespace, labelPool, labelStat, labelRole}),
+
+		tenantDatabaseStats: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgelastic_metering_tenant_database_stats_total",
+			Help: "The same pg_stat_database counters broken down by tenant. Emitted only " +
+				"for pools that set spec.observability.perTenantMetrics, because it costs " +
+				"16 series per tenant rather than 16 per pool.",
+		}, []string{labelNamespace, labelPool, labelTenant, labelStat, labelRole}),
 
 		poolConns: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "pgelastic_metering_pool_connections",
@@ -163,7 +188,8 @@ func NewMetrics(registerer prometheus.Registerer) (*Metrics, error) {
 
 func (m *Metrics) collectors() []prometheus.Collector {
 	return []prometheus.Collector{
-		m.databaseStats, m.poolConns, m.tenantConns, m.tenants, m.samples, m.stale, m.tenantSeries,
+		m.databaseStats, m.tenantDatabaseStats, m.poolConns, m.tenantConns, m.tenants,
+		m.samples, m.stale, m.tenantSeries,
 	}
 }
 
@@ -193,12 +219,62 @@ func (m *Metrics) RegisterPool(namespace, pool string) {
 	m.tenantSeries.WithLabelValues(namespace, pool)
 }
 
+// RegisterTenant materialises the per-tenant counters for one tenant, for the same reason
+// RegisterPool materialises the pool's: a series that springs into existence the first time a
+// tenant deadlocks cannot be alerted on, because absent and zero are different to every query
+// language. It is called only while the pool has perTenantMetrics on.
+func (m *Metrics) RegisterTenant(namespace, pool, tenant string) {
+	for _, stat := range Stats {
+		for _, role := range Roles {
+			m.tenantDatabaseStats.WithLabelValues(
+				namespace, pool, tenant, string(stat), string(role))
+		}
+	}
+}
+
+// AddTenantDatabaseStats adds one already-differenced, non-negative delta under the tenant's
+// own label.
+func (m *Metrics) AddTenantDatabaseStats(
+	namespace, pool, tenant string,
+	role Role,
+	deltas map[Stat]int64,
+) {
+	for stat, delta := range deltas {
+		if delta <= 0 {
+			continue
+		}
+		m.tenantDatabaseStats.
+			WithLabelValues(namespace, pool, tenant, string(stat), string(role)).
+			Add(float64(delta))
+	}
+}
+
+// ForgetTenant releases one tenant's per-tenant series, for a tenant that has left the pool.
+func (m *Metrics) ForgetTenant(namespace, pool, tenant string) {
+	m.tenantDatabaseStats.DeletePartialMatch(prometheus.Labels{
+		labelNamespace: namespace, labelPool: pool, labelTenant: tenant,
+	})
+}
+
+// ForgetTenantStats releases every per-tenant series a pool holds.
+//
+// It is what makes the field reversible. Turning perTenantMetrics off would otherwise leave
+// the series that were already created behind for the life of the process - so the setting
+// would take effect on the way up and not on the way down, which is the direction somebody
+// flips it in when their Prometheus is falling over.
+func (m *Metrics) ForgetTenantStats(namespace, pool string) {
+	m.tenantDatabaseStats.DeletePartialMatch(prometheus.Labels{
+		labelNamespace: namespace, labelPool: pool,
+	})
+}
+
 // ForgetPool removes every series for a pool that no longer exists. It is the only path by
 // which a counter here goes away, and it fires on the pool being deleted rather than on any
 // tenant of it going idle.
 func (m *Metrics) ForgetPool(namespace, pool string) {
 	labels := prometheus.Labels{labelNamespace: namespace, labelPool: pool}
 	m.databaseStats.DeletePartialMatch(labels)
+	m.tenantDatabaseStats.DeletePartialMatch(labels)
 	m.poolConns.DeletePartialMatch(labels)
 	m.tenantConns.DeletePartialMatch(labels)
 	m.tenants.DeletePartialMatch(labels)

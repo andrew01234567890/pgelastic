@@ -750,6 +750,29 @@ type InstanceMemberStatus struct {
 	// +optional
 	WALVolumeFull bool `json:"walVolumeFull,omitempty"`
 
+	// dataUsedBytes and walUsedBytes are the two volumes' usage as this member measured
+	// them, from the same statfs that decides walVolumeFull.
+	//
+	// Per member rather than per instance because that is where they can be measured: only
+	// the agent is inside the volume. The instance's own status.storage.used is the primary's
+	// figure, because a standby's is a replica of the same data and averaging them would
+	// describe no real filesystem.
+	// +optional
+	DataUsedBytes int64 `json:"dataUsedBytes,omitempty"`
+	// +optional
+	WALUsedBytes int64 `json:"walUsedBytes,omitempty"`
+
+	// clientBackends is how many client connections this member is holding, as the
+	// postmaster counts them.
+	//
+	// Counted from pg_stat_activity rather than from the proxy's own book-keeping, because
+	// the two disagree in exactly the case that matters: a link the proxy believes it holds
+	// but the postmaster has already terminated is not capacity in use, and the whole point
+	// of this figure is to be the observed number rather than the intended one.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ClientBackends int32 `json:"clientBackends,omitempty"`
+
 	// rejoining names the path this member is taking back onto the primary's history after
 	// its own diverged: "rewinding" for pg_rewind, "recloning" for the pg_basebackup
 	// fallback. It is empty the rest of the time.

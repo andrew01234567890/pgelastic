@@ -99,6 +99,10 @@ func (r *PgRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	// Captured before publish, which is called mid-pass on the tenant path and overwrites
+	// restore.Status with what this pass decided.
+	previousPhase := restore.Status.Phase
+
 	status := restore.Status.DeepCopy()
 	status.ObservedGeneration = restore.Generation
 	status.TargetInstance = restoreTargetInstance(restore)
@@ -116,6 +120,8 @@ func (r *PgRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err := r.publish(ctx, restore, status); err != nil {
 		return ctrl.Result{}, err
 	}
+	recordRestorePhase(restore.Namespace, restore.Name, previousPhase, status,
+		restore.Spec.SourceInstanceRef.Name, time.Now())
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 

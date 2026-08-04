@@ -848,6 +848,29 @@ spec:
                         still in progress.
                       maxLength: 64
                       type: string
+                    clientBackends:
+                      description: |-
+                        clientBackends is how many client connections this member is holding, as the
+                        postmaster counts them.
+
+                        Counted from pg_stat_activity rather than from the proxy's own book-keeping, because
+                        the two disagree in exactly the case that matters: a link the proxy believes it holds
+                        but the postmaster has already terminated is not capacity in use, and the whole point
+                        of this figure is to be the observed number rather than the intended one.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    dataUsedBytes:
+                      description: |-
+                        dataUsedBytes and walUsedBytes are the two volumes' usage as this member measured
+                        them, from the same statfs that decides walVolumeFull.
+
+                        Per member rather than per instance because that is where they can be measured: only
+                        the agent is inside the volume. The instance's own status.storage.used is the primary's
+                        figure, because a standby's is a replica of the same data and averaging them would
+                        describe no real filesystem.
+                      format: int64
+                      type: integer
                     healthy:
                       description: |-
                         healthy reports whether the member's status endpoint answered and its postmaster is
@@ -918,6 +941,9 @@ spec:
                         candidate must have had an active receiver when the failure was detected, and every
                         member must have its receiver down before promotion may proceed.
                       type: boolean
+                    walUsedBytes:
+                      format: int64
+                      type: integer
                     walVolumeFull:
                       description: |-
                         walVolumeFull refuses this member as a promotion candidate outright. A primary whose

@@ -77,6 +77,17 @@ func podIPOf(member string) string {
 	return "10.244.0." + serial
 }
 
+// observedMembers is observeMembers when only the failover half of its answer is under test.
+func observedMembers(
+	reconciler *PgInstanceReconciler,
+	ctx context.Context,
+	instance types.NamespacedName,
+	pods []corev1.Pod,
+) []ha.Member {
+	members, _ := reconciler.observeMembers(ctx, instance, pods)
+	return members
+}
+
 func standbyReport(member string, timeline int32, lsn string) provision.MemberReport {
 	return provision.MemberReport{
 		Member:            member,
@@ -594,11 +605,11 @@ var _ = Describe("The member observation cache", func() {
 		alpha := types.NamespacedName{Namespace: cacheNamespace, Name: "alpha"}
 		beta := types.NamespacedName{Namespace: cacheNamespace, Name: "beta"}
 
-		observed := reconciler.observeMembers(ctx, alpha, podsOf(cacheNamespace, "alpha-1"))
+		observed := observedMembers(reconciler, ctx, alpha, podsOf(cacheNamespace, "alpha-1"))
 		Expect(observed).To(HaveLen(1))
 		Expect(observed[0].Name).To(Equal("alpha-1"))
 
-		observed = reconciler.observeMembers(ctx, beta, podsOf(cacheNamespace, "beta-1"))
+		observed = observedMembers(reconciler, ctx, beta, podsOf(cacheNamespace, "beta-1"))
 		Expect(observed).To(HaveLen(1))
 		Expect(observed[0].Name).To(Equal("beta-1"),
 			"beta's failover decision was handed alpha's members")
@@ -611,10 +622,10 @@ var _ = Describe("The member observation cache", func() {
 		left := types.NamespacedName{Namespace: "left", Name: "shared"}
 		right := types.NamespacedName{Namespace: "right", Name: "shared"}
 
-		Expect(reconciler.observeMembers(ctx, left, podsOf("left", "shared-1"))).To(HaveLen(1))
+		Expect(observedMembers(reconciler, ctx, left, podsOf("left", "shared-1"))).To(HaveLen(1))
 
 		prober.silence("shared-1")
-		observed := reconciler.observeMembers(ctx, right, podsOf("right", "shared-1"))
+		observed := observedMembers(reconciler, ctx, right, podsOf("right", "shared-1"))
 		Expect(observed).To(HaveLen(1))
 		Expect(observed[0].StatusReachable).To(BeFalse(),
 			"the right-hand instance was answered from the left-hand namespace's cache")
@@ -625,10 +636,10 @@ var _ = Describe("The member observation cache", func() {
 		prober.set("gamma-2", standbyReport("gamma-2", 1, "0/1000000"))
 
 		gamma := types.NamespacedName{Namespace: cacheNamespace, Name: "gamma"}
-		Expect(reconciler.observeMembers(ctx, gamma, podsOf(cacheNamespace, "gamma-1"))).To(
+		Expect(observedMembers(reconciler, ctx, gamma, podsOf(cacheNamespace, "gamma-1"))).To(
 			HaveLen(1))
 
-		observed := reconciler.observeMembers(ctx, gamma, podsOf(cacheNamespace, "gamma-2"))
+		observed := observedMembers(reconciler, ctx, gamma, podsOf(cacheNamespace, "gamma-2"))
 		Expect(observed).To(HaveLen(1))
 		Expect(observed[0].Name).To(Equal("gamma-2"))
 		Expect(observed[0].StatusReachable).To(BeTrue())
@@ -638,10 +649,10 @@ var _ = Describe("The member observation cache", func() {
 		prober.set("delta-1", primaryReport("delta-1", 4, "0/4000000"))
 		delta := types.NamespacedName{Namespace: cacheNamespace, Name: "delta"}
 
-		Expect(reconciler.observeMembers(ctx, delta, podsOf(cacheNamespace, "delta-1"))).To(HaveLen(1))
+		Expect(observedMembers(reconciler, ctx, delta, podsOf(cacheNamespace, "delta-1"))).To(HaveLen(1))
 		prober.silence("delta-1")
 
-		observed := reconciler.observeMembers(ctx, delta, podsOf(cacheNamespace, "delta-1"))
+		observed := observedMembers(reconciler, ctx, delta, podsOf(cacheNamespace, "delta-1"))
 		Expect(observed[0].StatusReachable).To(BeTrue(),
 			"the TTL is what keeps three agents' status writes from re-polling every member")
 	})

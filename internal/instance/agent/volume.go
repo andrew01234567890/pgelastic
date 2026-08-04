@@ -43,6 +43,18 @@ type VolumeUsage struct {
 	FreeBytes  int64
 }
 
+// UsedBytes is what the filesystem is holding, from the unprivileged figures.
+//
+// Total minus *available* rather than minus free, so the answer matches the budget Full() is
+// judged against: the blocks a filesystem reserves for root are not room PostgreSQL can use,
+// so counting them as free would report a volume as emptier than PostgreSQL can treat it.
+func (u VolumeUsage) UsedBytes() int64 {
+	if u.TotalBytes <= 0 {
+		return 0
+	}
+	return u.TotalBytes - u.FreeBytes
+}
+
 // Full reports whether the volume has too little room left to promote onto.
 func (u VolumeUsage) Full() bool {
 	if u.TotalBytes <= 0 {

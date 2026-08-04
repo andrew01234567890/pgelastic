@@ -31,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -44,6 +45,7 @@ import (
 	"github.com/andrew01234567890/pgelastic/internal/index"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
+	"github.com/andrew01234567890/pgelastic/internal/metering"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
 )
 
@@ -98,6 +100,11 @@ type PgInstanceReconciler struct {
 	// Nil is the headless deployment: no fleet fronts the pool, so there is nobody to hold
 	// and the handover is simply the unheld one.
 	Quiescer InstanceQuiescer
+	// Metering is where each member's pg_stat_database scrape is staged for the pool
+	// controller to fold. It is the same collector the pool and tenant controllers hold, so
+	// the counters a tenant is metered on and the ones its pool is planned from are one
+	// number rather than two independently sampled ones. Nil meters nothing.
+	Metering *metering.Collector
 
 	// ControllerName is this operator's identity. An instance reaches a PgElasticClass
 	// through its pool, and one naming a different controller is left entirely alone.
@@ -325,6 +332,12 @@ func (r *PgInstanceReconciler) finalize(
 		return ctrl.Result{RequeueAfter: drainRecheck}, r.publishDraining(ctx, instance, names)
 	}
 
+	// The staged readings go with the instance. Left behind they describe a server that no
+	// longer exists, and they are held for the life of the process rather than the life of
+	// the object they came from.
+	if r.Metering != nil {
+		r.Metering.ForgetInstance(instance.Namespace, instance.Name)
+	}
 	controllerutil.RemoveFinalizer(instance,
 		pgelasticv1alpha1.PgInstanceDrainTenantsFinalizer)
 	return ctrl.Result{}, r.Update(ctx, instance)
@@ -664,6 +677,49 @@ func (r *PgInstanceReconciler) applyPrimaryLabel(
 	return nil
 }
 
+// storageStatus is what the volumes are actually holding, taken from the primary's own report.
+//
+// The primary rather than an aggregate: a standby's volume holds a replica of the same data, so
+// summing them would count it twice and averaging them would describe no filesystem that
+// exists. Absent until a member has reported, because a zero would read as an empty volume and
+// the autoscaler treats "no usage" and "no measurement" differently - StorageExpand requires a
+// figure above zero precisely so that it cannot act on an instance it has never heard from.
+// inUseOf is how many connections the instance is currently carrying.
+//
+// The primary's count, for the same reason storage takes the primary's bytes: allocatable is
+// derived once from the sizing class and describes what one member sells, so comparing it
+// against a sum across three members would be comparing a three-member number to a
+// one-member budget and would read as saturation at a third of it.
+//
+// The cost of that choice, stated rather than hidden: a connection a reader is holding on a
+// standby is not counted here. Nothing in the tree routes tenant reads to standbys today, so
+// the figure is currently exact; the day something does, this is the line that has to change
+// and allocatable has to change with it.
+func inUseOf(instance *pgelasticv1alpha1.PgInstance) int32 {
+	for _, member := range instance.Status.Instances {
+		if member.Name == instance.Status.CurrentPrimary {
+			return member.ClientBackends
+		}
+	}
+	return 0
+}
+
+func storageStatus(instance *pgelasticv1alpha1.PgInstance) map[string]any {
+	storage := map[string]any{"allocated": instance.Spec.Storage.Size.String()}
+	for _, member := range instance.Status.Instances {
+		if member.Name != instance.Status.CurrentPrimary {
+			continue
+		}
+		if member.DataUsedBytes > 0 {
+			storage["used"] = resource.NewQuantity(member.DataUsedBytes, resource.BinarySI).String()
+		}
+		if member.WALUsedBytes > 0 {
+			storage["walUsed"] = resource.NewQuantity(member.WALUsedBytes, resource.BinarySI).String()
+		}
+	}
+	return storage
+}
+
 // publishStatus applies the fields the operator owns.
 //
 // It is a server-side apply under the operator's own field manager, and it deliberately
@@ -690,10 +746,9 @@ func (r *PgInstanceReconciler) publishStatus(
 			"reservedForAdmin": int64(capacity.SuperuserReserved + capacity.Reserved),
 			"replicationSlots": int64(capacity.ReplicationSlots),
 			"allocatable":      int64(allocatableOf(instance, capacity, roll, decision)),
+			"inUse":            int64(inUseOf(instance)),
 		},
-		"storage": map[string]any{
-			"allocated": instance.Spec.Storage.Size.String(),
-		},
+		"storage":   storageStatus(instance),
 		"instances": syncSetEntries(instance),
 		fieldConditions: append(conditionsFor(instance, groups, pods, decision, builder.Replicas()),
 			rollCondition(instance, roll)),
