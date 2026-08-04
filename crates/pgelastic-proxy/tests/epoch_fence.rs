@@ -13,7 +13,7 @@ mod harness;
 
 use std::time::{Duration, Instant};
 
-use harness::{BACKEND_DATABASE, Postgres, ProxyUnderTest, Switch};
+use harness::{BACKEND_DATABASE, Postgres, ProxyUnderTest, Switch, await_stalled_commit};
 
 /// A short lease, so the tests exercise the same derivation the production
 /// 15s/10s/2s does without spending fifteen seconds proving it. The fence
@@ -545,7 +545,7 @@ async fn a_commit_whose_outcome_was_never_observed_is_reported_unknown_and_logge
         .expect("the insert");
 
     let committer = tokio::spawn(async move { client.simple_query("COMMIT").await });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    await_stalled_commit(&admin_client).await;
     push(proxy.push_port(), 5).await;
 
     let error = committer

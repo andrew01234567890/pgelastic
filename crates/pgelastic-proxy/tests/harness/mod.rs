@@ -1028,3 +1028,35 @@ pub async fn until(
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
+
+/// Waits until a commit is actually parked in the synchronous-replication wait.
+///
+/// A test that needs a commit to hang cannot gate on `SHOW synchronous_standby_names`. That
+/// only proves the *client backend* has processed the SIGHUP. `SyncRepWaitForLSN` consults
+/// `WalSndCtl->sync_standbys_defined`, a shared-memory flag the **checkpointer** publishes
+/// when it processes the same signal, and the two processes handle it independently. Under
+/// CPU contention - eight postgres containers on one CI runner - the checkpointer lags, the
+/// backend reads the clause back, and the commit sails through without waiting at all.
+///
+/// So this waits for the wait, which is the only unambiguous evidence that the commit is
+/// stalled. Each test owns its own container, so the count cannot pick up another test's
+/// backend.
+pub async fn await_stalled_commit(observer: &tokio_postgres::Client) {
+    until(
+        "a commit to park in the synchronous-replication wait",
+        std::time::Duration::from_secs(30),
+        async || {
+            observer
+                .query_one(
+                    "SELECT count(*) FROM pg_catalog.pg_stat_activity \
+                     WHERE wait_event_type = 'IPC' AND wait_event = 'SyncRep'",
+                    &[],
+                )
+                .await
+                .expect("looking for a stalled commit")
+                .get::<_, i64>(0)
+                > 0
+        },
+    )
+    .await;
+}
