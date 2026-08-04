@@ -46,6 +46,10 @@ pub struct Proxy {
     /// The startup-parameter policy, built once from the document this process
     /// was started with. `pool_key` runs on every binding and this is a map.
     fingerprint: pgelastic_pool::FingerprintPolicy,
+    /// The parameters this process's variable caches follow. Shared rather than
+    /// rebuilt per connection, and per process rather than `'static`, because two
+    /// proxies in one test binary follow two different sets.
+    tracked: Arc<crate::vars::Tracked>,
     pub acceptor: Option<TlsAcceptor>,
     dynamic: ArcSwap<Dynamic>,
     pub kdf: KdfPool,
@@ -85,11 +89,13 @@ impl Proxy {
 
         let permits = Arc::new(Semaphore::new(config.listen.max_client_connections.max(1)));
         let kdf = KdfPool::new(config.auth.kdf_concurrency);
-        let fleet = Fleet::build(&config, &metrics)?;
+        let tracked = Arc::new(config.tracked_parameters()?);
+        let fleet = Fleet::build(&config, &tracked, &metrics)?;
         metrics.in_doubt(fleet.default_instance().fence.fence.in_doubt().len());
 
         Ok(Arc::new(Self {
             fingerprint: config.fingerprint_policy(),
+            tracked,
             dynamic: ArcSwap::from_pointee(Dynamic {
                 tenants: config.pool.tenants.clone(),
                 users: config.auth.users.clone(),
@@ -110,6 +116,11 @@ impl Proxy {
     /// The startup-parameter policy every pool key is built under.
     pub fn fingerprint_policy(&self) -> &pgelastic_pool::FingerprintPolicy {
         &self.fingerprint
+    }
+
+    /// The parameters this process's variable caches follow.
+    pub fn tracked(&self) -> &Arc<crate::vars::Tracked> {
+        &self.tracked
     }
 
     /// Everything the client leg needs to authenticate a peer, as last published.
@@ -1094,7 +1105,7 @@ async fn multiplexed(
         parameters?
     };
 
-    let mut client_vars = crate::vars::VariableCache::new();
+    let mut client_vars = crate::vars::VariableCache::with_tracked(Arc::clone(proxy.tracked()));
     for message in parameters.iter() {
         if let BackendMessage::ParameterStatus(status) = message {
             client_vars.observe(&status.name, &status.value);

@@ -385,6 +385,7 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 	// next, so both halves carry it and changing one rolls the fleet.
 	writeString(out, "startupParameterPolicy", startupParameterPolicy(pooling))
 	writeStrings(out, "ignoreStartupParameters", ignoreStartupParameters(pooling))
+	writeStrings(out, "trackExtraParameters", trackExtraParameters(pooling))
 	out.WriteString("\n")
 
 	if !dynamic {
@@ -620,6 +621,20 @@ func ignoreStartupParameters(pooling *pgelasticv1alpha1.PoolingConfig) []string 
 		return []string{"extra_float_digits", "options"}
 	}
 	return pooling.IgnoreStartupParameters
+}
+
+// trackExtraParameters renders spec.pooling.trackExtraParameters. There is no CRD default: the
+// proxy's built-in set is the default, and an empty list means it.
+//
+// The proxy refuses any entry that is not a plain GUC identifier, because each becomes the
+// unquoted name side of a SET it writes. Rendered as given rather than filtered here: a name the
+// proxy will not accept is one an operator has to be told about, not one the renderer should
+// quietly drop.
+func trackExtraParameters(pooling *pgelasticv1alpha1.PoolingConfig) []string {
+	if pooling == nil {
+		return nil
+	}
+	return pooling.TrackExtraParameters
 }
 
 func poolMode(pooling *pgelasticv1alpha1.PoolingConfig) string {

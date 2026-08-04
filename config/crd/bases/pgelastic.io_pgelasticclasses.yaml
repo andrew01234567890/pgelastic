@@ -590,8 +590,12 @@ spec:
                           trackExtraParameters are GUC_REPORT parameters added to the variable cache beyond
                           the built-in set, so a difference between client and backend is corrected rather
                           than silently inherited from the previous client.
+                          Each name becomes the unquoted name side of a `SET` the proxy writes, so it must be a
+                          plain GUC identifier. The proxy refuses anything else at start-up; refusing it here
+                          means a mistake is a rejected apply rather than a rollout that crash-loops one pod.
                         items:
                           maxLength: 63
+                          pattern: ^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$
                           type: string
                         maxItems: 32
                         type: array

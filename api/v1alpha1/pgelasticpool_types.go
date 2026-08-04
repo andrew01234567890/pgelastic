@@ -539,6 +539,10 @@ type PoolingConfig struct {
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:items:MaxLength=63
+	// Each name becomes the unquoted name side of a `SET` the proxy writes, so it must be a
+	// plain GUC identifier. The proxy refuses anything else at start-up; refusing it here
+	// means a mistake is a rejected apply rather than a rollout that crash-loops one pod.
+	// +kubebuilder:validation:items:Pattern=`^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$`
 	// +optional
 	TrackExtraParameters []string `json:"trackExtraParameters,omitempty"`
 
