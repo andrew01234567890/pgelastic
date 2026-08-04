@@ -411,15 +411,29 @@ func (r *PgElasticPoolReconciler) meter(pool *pgelasticv1alpha1.PgElasticPool, v
 	defer r.Metering.Store.Prune(r.now())
 
 	r.Metering.Observe(metering.PoolObservation{
-		Namespace:      pool.Namespace,
-		Pool:           pool.Name,
-		InUse:          inUse,
-		Reserved:       view.ledger.Reserved,
-		Allocatable:    view.ledger.Allocatable,
-		CommittedBurst: view.ledger.CommittedBurst,
-		Bound:          view.boundCount,
-		Pending:        view.pendingCount,
+		Namespace:        pool.Namespace,
+		Pool:             pool.Name,
+		InUse:            inUse,
+		Reserved:         view.ledger.Reserved,
+		Allocatable:      view.ledger.Allocatable,
+		CommittedBurst:   view.ledger.CommittedBurst,
+		Bound:            view.boundCount,
+		Pending:          view.pendingCount,
+		PerTenantMetrics: perTenantMetrics(pool),
 	}, observations, r.now())
+}
+
+// perTenantMetrics reads spec.observability.perTenantMetrics, which is the only switch that
+// lets a tenant label out of the metering package.
+//
+// Absent is off. The field has a false default in the API, so an object that went through the
+// API server carries one either way; the fallback is for an object built in memory, and it
+// falls the way that cannot multiply a pool's series by its tenant count without anybody
+// having asked.
+func perTenantMetrics(pool *pgelasticv1alpha1.PgElasticPool) bool {
+	observability := pool.Spec.Observability
+	return observability != nil && observability.PerTenantMetrics != nil &&
+		*observability.PerTenantMetrics
 }
 
 // signalsOf assembles the planner's inputs, including the three facts that can only be read

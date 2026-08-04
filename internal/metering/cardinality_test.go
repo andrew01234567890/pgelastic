@@ -18,6 +18,7 @@ package metering
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -63,8 +64,21 @@ func labelNames(t *testing.T, registry *prometheus.Registry) []string {
 	return names
 }
 
-// meterTenants runs one full round of observations for a pool of the given size.
+// meterTenants runs one full round of observations for a pool of the given size, with the
+// per-tenant label switched off - which is what every pool that has not asked for it gets.
 func meterTenants(t *testing.T, collector *Collector, namespace, pool string, tenants int) {
+	t.Helper()
+	meterTenantsLabelled(t, collector, namespace, pool, tenants, false)
+}
+
+// meterTenantsLabelled is the same round with spec.observability.perTenantMetrics either way.
+func meterTenantsLabelled(
+	t *testing.T,
+	collector *Collector,
+	namespace, pool string,
+	tenants int,
+	perTenant bool,
+) {
 	t.Helper()
 	observations := make([]TenantObservation, 0, tenants)
 	for i := range tenants {
@@ -91,29 +105,34 @@ func meterTenants(t *testing.T, collector *Collector, namespace, pool string, te
 		})
 	}
 	collector.Observe(PoolObservation{
-		Namespace:   namespace,
-		Pool:        pool,
-		InUse:       int32(tenants),
-		Allocatable: 675,
-		Bound:       int32(tenants),
+		Namespace:        namespace,
+		Pool:             pool,
+		InUse:            int32(tenants),
+		Allocatable:      675,
+		Bound:            int32(tenants),
+		PerTenantMetrics: perTenant,
 	}, observations, epoch)
 }
 
-// This is the hard requirement of M8 stated as a test: the exported series count is a
-// property of the pool, not of the tenant population. Two hundred tenants must cost exactly
-// what one tenant costs.
-func TestExportedSeriesDoNotScaleWithTenantCount(t *testing.T) {
-	measure := func(tenants int) (int, []string) {
-		registry := prometheus.NewRegistry()
-		metrics, err := NewMetrics(registry)
-		if err != nil {
-			t.Fatalf("registering metrics: %v", err)
-		}
-		metrics.RegisterPool("saas-prod", "saas-pool")
-		collector := &Collector{Store: NewStore(Options{}), Accumulator: NewAccumulator(), Metrics: metrics}
-		meterTenants(t, collector, "saas-prod", "saas-pool", tenants)
-		return gatheredSeries(t, registry), labelNames(t, registry)
+// measurePool runs one pool's round at a given size and reports what the registry then holds.
+func measurePool(t *testing.T, tenants int, perTenant bool) (int, []string) {
+	t.Helper()
+	registry := prometheus.NewRegistry()
+	metrics, err := NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("registering metrics: %v", err)
 	}
+	metrics.RegisterPool("saas-prod", "saas-pool")
+	collector := &Collector{Store: NewStore(Options{}), Accumulator: NewAccumulator(), Metrics: metrics}
+	meterTenantsLabelled(t, collector, "saas-prod", "saas-pool", tenants, perTenant)
+	return gatheredSeries(t, registry), labelNames(t, registry)
+}
+
+// This is the hard requirement of M8 stated as a test: with perTenantMetrics off - which is
+// every pool that has not asked - the exported series count is a property of the pool, not of
+// the tenant population. Two hundred tenants must cost exactly what one tenant costs.
+func TestExportedSeriesDoNotScaleWithTenantCount(t *testing.T) {
+	measure := func(tenants int) (int, []string) { return measurePool(t, tenants, false) }
 
 	one, oneLabels := measure(1)
 	many, manyLabels := measure(200)
@@ -133,6 +152,116 @@ func TestExportedSeriesDoNotScaleWithTenantCount(t *testing.T) {
 		case "tenant", "database", "dbid", "datname", "query", "queryid", "relation", "user", "usename":
 			t.Errorf("label %q is per-tenant or finer and would multiply every series by the tenant count", name)
 		}
+	}
+}
+
+// The other half of the same requirement, and the half that was missing: a field declared in
+// the API has to do what it says, and what it costs has to be a number rather than a shrug.
+//
+// Asserting only the bounded case lets both a gate that does nothing and a gate that labels
+// everything pass. So the price is written down: SeriesPerTenant on top of SeriesPerPool, and
+// the tenant label on exactly one metric family.
+func TestPerTenantMetricsCostsExactlyWhatItSaysItCosts(t *testing.T) {
+	const tenants = 200
+
+	bounded, boundedLabels := measurePool(t, tenants, false)
+	labelled, labelledLabels := measurePool(t, tenants, true)
+
+	if bounded != SeriesPerPool {
+		t.Errorf("the gate off emits %d series for %d tenants, want the documented bound of %d",
+			bounded, tenants, SeriesPerPool)
+	}
+	if want := SeriesPerPool + tenants*SeriesPerTenant; labelled != want {
+		t.Errorf("the gate on emits %d series for %d tenants, want %d - SeriesPerTenant is "+
+			"either wrong or the label is on metrics it was never meant to reach",
+			labelled, tenants, want)
+	}
+	if slices.Contains(boundedLabels, labelTenant) {
+		t.Errorf("a tenant label is emitted with the gate off; labels = %v", boundedLabels)
+	}
+	if !slices.Contains(labelledLabels, labelTenant) {
+		t.Errorf("no tenant label is emitted with the gate on, so the field is still inert; "+
+			"labels = %v", labelledLabels)
+	}
+}
+
+// The tenant label reaches the database counters and nothing else. Everything else in the
+// exposition is a fact about the pool with no per-tenant reading to give, so a tenant label on
+// it would be cost with no number behind it.
+func TestOnlyTheDatabaseCountersGainATenantLabel(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("registering metrics: %v", err)
+	}
+	metrics.RegisterPool("saas-prod", "saas-pool")
+	collector := &Collector{Store: NewStore(Options{}), Accumulator: NewAccumulator(), Metrics: metrics}
+	meterTenantsLabelled(t, collector, "saas-prod", "saas-pool", 3, true)
+
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gathering the registry: %v", err)
+	}
+	for _, family := range families {
+		for _, metric := range family.GetMetric() {
+			for _, pair := range metric.GetLabel() {
+				if pair.GetName() != labelTenant {
+					continue
+				}
+				if family.GetName() != "pgelastic_metering_tenant_database_stats_total" {
+					t.Errorf("%s carries a tenant label", family.GetName())
+				}
+			}
+		}
+	}
+}
+
+// Turning the field off has to release what turning it on created. Otherwise it works on the
+// way up and not on the way down, which is the direction somebody flips it in when their
+// Prometheus is already struggling.
+func TestTurningPerTenantMetricsOffReleasesItsSeries(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("registering metrics: %v", err)
+	}
+	metrics.RegisterPool("saas-prod", "saas-pool")
+	collector := &Collector{Store: NewStore(Options{}), Accumulator: NewAccumulator(), Metrics: metrics}
+
+	meterTenantsLabelled(t, collector, "saas-prod", "saas-pool", 50, true)
+	if got, want := gatheredSeries(t, registry), SeriesPerPool+50*SeriesPerTenant; got != want {
+		t.Fatalf("the gate on holds %d series, want %d", got, want)
+	}
+
+	meterTenantsLabelled(t, collector, "saas-prod", "saas-pool", 50, false)
+	if got := gatheredSeries(t, registry); got != SeriesPerPool {
+		t.Errorf("the pool holds %d series after the gate was turned off, want %d: the series "+
+			"it created outlive the setting that created them", got, SeriesPerPool)
+	}
+}
+
+// A tenant that has left the pool must take its per-tenant series with it, or held
+// cardinality is bounded by the tenants that ever existed rather than the ones that do.
+func TestADepartedTenantTakesItsPerTenantSeriesWithIt(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("registering metrics: %v", err)
+	}
+	metrics.RegisterPool("saas-prod", "saas-pool")
+	collector := &Collector{Store: NewStore(Options{}), Accumulator: NewAccumulator(), Metrics: metrics}
+	meterTenantsLabelled(t, collector, "saas-prod", "saas-pool", 10, true)
+
+	survivors := make([]Key, 0, 4)
+	for i := range 4 {
+		survivors = append(survivors, Key{
+			Namespace: "saas-prod", Pool: testPool, Tenant: fmt.Sprintf("tenant-%03d", i),
+		})
+	}
+	collector.ForgetDeparted("saas-prod", "saas-pool", survivors)
+
+	if got, want := gatheredSeries(t, registry), SeriesPerPool+4*SeriesPerTenant; got != want {
+		t.Errorf("the pool holds %d series after six of ten tenants left, want %d", got, want)
 	}
 }
 

@@ -33,6 +33,12 @@ type PoolObservation struct {
 
 	Bound   int32
 	Pending int32
+
+	// PerTenantMetrics is spec.observability.perTenantMetrics, and it is the only thing that
+	// lets a tenant label out of this package. It rides the pool's own round because it is a
+	// property of the pool: a tenant cannot ask to be labelled, and the cost is paid by the
+	// pool that holds it.
+	PerTenantMetrics bool
 }
 
 // TenantObservation is one round of readings for one tenant.
@@ -69,7 +75,7 @@ type Collector struct {
 	// its newest tenant sample was taken: a pool with no tenants is measurable and a pool
 	// whose tenants have all stopped reporting is not.
 	mu    sync.RWMutex
-	pools map[poolKey]time.Time
+	pools map[poolKey]poolRound
 	// readings is where the instance agents' pg_stat_database scrapes wait to be folded.
 	// They arrive on the instance controller's cadence and are folded on the pool
 	// controller's, so something has to hold them across the gap.
@@ -77,6 +83,15 @@ type Collector struct {
 }
 
 type poolKey struct{ Namespace, Pool string }
+
+// poolRound is what the collector remembers about a pool between rounds: when it was last
+// read, and whether it was labelling by tenant at the time. The second is kept so that
+// turning perTenantMetrics off can release the series turning it on created, rather than
+// leaving them behind until the process restarts.
+type poolRound struct {
+	observedAt time.Time
+	perTenant  bool
+}
 
 // NewCollector wires a collector over a fresh store and accumulator. Metrics may be nil,
 // which is what a unit test that only cares about the recommenders wants.
@@ -90,12 +105,21 @@ func NewCollector(options Options, metrics *Metrics) *Collector {
 
 // Observe records one round.
 func (c *Collector) Observe(pool PoolObservation, tenants []TenantObservation, at time.Time) {
+	key := poolKey{pool.Namespace, pool.Pool}
 	c.mu.Lock()
 	if c.pools == nil {
-		c.pools = map[poolKey]time.Time{}
+		c.pools = map[poolKey]poolRound{}
 	}
-	c.pools[poolKey{pool.Namespace, pool.Pool}] = at
+	labelledLastRound := c.pools[key].perTenant
+	c.pools[key] = poolRound{observedAt: at, perTenant: pool.PerTenantMetrics}
 	c.mu.Unlock()
+
+	// Flipping the field off has to release what flipping it on created, or the setting works
+	// on the way up and not on the way down - which is the direction it is flipped in by
+	// somebody whose Prometheus is already struggling.
+	if c.Metrics != nil && labelledLastRound && !pool.PerTenantMetrics {
+		c.Metrics.ForgetTenantStats(pool.Namespace, pool.Pool)
+	}
 
 	var p95Sum, p95Max, peakSum, peakMax float64
 	cold, stale := 0, 0
@@ -103,6 +127,9 @@ func (c *Collector) Observe(pool PoolObservation, tenants []TenantObservation, a
 	for _, tenant := range tenants {
 		if tenant.PoolObjectFreed {
 			c.Accumulator.PoolObjectFreed(TotalKey{Key: tenant.Key, Database: tenant.Database, Role: tenant.Role})
+		}
+		if c.Metrics != nil && pool.PerTenantMetrics {
+			c.Metrics.RegisterTenant(pool.Namespace, pool.Pool, tenant.Key.Tenant)
 		}
 
 		sample := Sample{BackendConnections: tenant.BackendConnections}
@@ -114,6 +141,10 @@ func (c *Collector) Observe(pool PoolObservation, tenants []TenantObservation, a
 			applied := c.Accumulator.Observe(total, tenant.Instance, *tenant.Stats)
 			if c.Metrics != nil {
 				c.Metrics.AddDatabaseStats(pool.Namespace, pool.Pool, tenant.Role, applied)
+				if pool.PerTenantMetrics {
+					c.Metrics.AddTenantDatabaseStats(pool.Namespace, pool.Pool,
+						tenant.Key.Tenant, tenant.Role, applied)
+				}
 			}
 		} else {
 			stale++
@@ -176,13 +207,13 @@ func (c *Collector) seriesFor(namespace, pool string) int {
 // current round is folded in; afterwards every age is zero by construction.
 func (c *Collector) Age(namespace, pool string, now time.Time) (time.Duration, bool) {
 	c.mu.RLock()
-	observedAt, observed := c.pools[poolKey{namespace, pool}]
+	round, observed := c.pools[poolKey{namespace, pool}]
 	c.mu.RUnlock()
 
 	age := time.Duration(0)
 	seen := false
 	if observed {
-		age = now.Sub(observedAt)
+		age = now.Sub(round.observedAt)
 		seen = true
 	}
 	for _, key := range c.Store.Keys() {
@@ -238,6 +269,9 @@ func (c *Collector) ForgetDeparted(namespace, pool string, present []Key) {
 		}
 		if _, ok := live[key]; !ok {
 			c.Store.Forget(key)
+			if c.Metrics != nil {
+				c.Metrics.ForgetTenant(namespace, pool, key.Tenant)
+			}
 		}
 	}
 }
@@ -247,5 +281,8 @@ func (c *Collector) Forget(key Key, database string) {
 	c.Store.Forget(key)
 	for _, role := range Roles {
 		c.Accumulator.Forget(TotalKey{Key: key, Database: database, Role: role})
+	}
+	if c.Metrics != nil {
+		c.Metrics.ForgetTenant(key.Namespace, key.Pool, key.Tenant)
 	}
 }
