@@ -126,6 +126,9 @@ func (r *PgElasticPoolReconciler) reconcileProxy(
 			return nil, err
 		}
 	}
+	// Before the document is written, because the comparison is against the one the fleet is
+	// running now.
+	r.warnNewlyEnforcedTimeouts(ctx, pool, builder.Document.TOML)
 	if err := r.applyProxyObjects(ctx, pool, builder); err != nil {
 		return nil, err
 	}
