@@ -56,7 +56,10 @@ func newScriptedSQL() *scriptedSQL {
 	sql := &scriptedSQL{answers: map[string][]migration.Row{}}
 	maps.Copy(sql.answers, map[string][]migration.Row{
 		// Preflight answers for a source that may be moved.
-		"AND c.relreplident = 'd'":                  {},
+		"AND c.relreplident = 'd'": {},
+		// No matview and no unlogged table: both are unpublishable, so an online move of
+		// one is refused before anything is provisioned.
+		"c.relpersistence = 'u'":                    {},
 		"FROM pg_prepared_xacts":                    {},
 		"FROM pg_largeobject_metadata":              {{"0"}},
 		"SELECT extname FROM pg_extension":          {{"plpgsql"}},

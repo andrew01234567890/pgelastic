@@ -31,10 +31,11 @@ const (
 	bob          = "bob"
 	carol        = "carol"
 	temporary    = "TEMPORARY"
+	liveInstance = "pg-live"
 )
 
 func heldTarget() Endpoint {
-	return Endpoint{Namespace: "tenants", Instance: "pg-live", Database: heldDatabase}
+	return Endpoint{Namespace: "tenants", Instance: liveInstance, Database: heldDatabase}
 }
 
 func tenantRoles(names ...string) []RoleSpec {

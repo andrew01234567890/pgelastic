@@ -256,3 +256,51 @@ func (s splitSQL) Exec(ctx context.Context, at Endpoint, statement string) error
 func (s splitSQL) Query(ctx context.Context, at Endpoint, statement string) ([]Row, error) {
 	return s.pick(at).Query(ctx, at, statement)
 }
+
+// Logical replication carries neither an unlogged table nor a materialized view, and nothing
+// downstream notices: the verifier's relation inventory excludes relkind 'm' entirely and
+// nothing reads relispopulated, so an unlogged table surfaces only as a row-count mismatch at
+// cutover and a matview surfaces as the tenant's first query failing. Refusing at preflight is
+// what turns two silent data losses into one legible sentence.
+func TestPreflightRefusesRelationsLogicalReplicationCannotCarry(t *testing.T) {
+	sql := newFakeSQL().answer("relpersistence", Row{"public.report (materialized view)"})
+
+	check := checkPublishableRelations(context.Background(), sql, publishableSource())
+
+	if check.Passed {
+		t.Fatal("a source holding a materialized view was admitted to the online path")
+	}
+	for _, want := range []string{"materialized view", "Offline", "has not been populated"} {
+		if !strings.Contains(check.Detail, want) {
+			t.Errorf("the refusal does not mention %q: %s", want, check.Detail)
+		}
+	}
+}
+
+func TestPreflightAdmitsASourceOfOrdinaryTables(t *testing.T) {
+	sql := newFakeSQL().answer("relpersistence")
+
+	check := checkPublishableRelations(context.Background(), sql, publishableSource())
+
+	if !check.Passed {
+		t.Fatalf("an ordinary source was refused: %s", check.Detail)
+	}
+}
+
+// pg_dump defaults to --no-statistics, so without the flag every migrated tenant lands with an
+// empty pg_statistic and the planner guesses - immediately after a cutover sold on a
+// sub-second pause.
+func publishableSource() Endpoint {
+	return Endpoint{Namespace: "tenants", Instance: liveInstance, Database: tenantDatabase}
+}
+
+func TestTheOfflineDumpCarriesStatistics(t *testing.T) {
+	command := offlineDumpCommand(Plan{
+		DumpDir:        "/scratch/dump",
+		SourceConnInfo: "host=/tmp dbname=acme",
+	}, DefaultDumpJobs)
+
+	if !strings.Contains(command, "--statistics") {
+		t.Errorf("the dump leaves the tenant with no optimizer statistics: %s", command)
+	}
+}
