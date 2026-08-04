@@ -138,3 +138,22 @@ func sameInstant(a, b *time.Time) bool {
 		return a.Equal(*b)
 	}
 }
+
+// baseline records a reading without accruing any of it.
+//
+// It is what the very first observation of a source does. A counter read for the first time
+// is as old as the postmaster that has been incrementing it, and none of that accrued while
+// anybody here was watching; adding it would put the server's whole lifetime into the total
+// on every operator restart and every leader election, and the dashboard's rate() over that
+// counter would draw a spike that never happened.
+//
+// Deliberately not the same as a reset. A source that restarted its count, a database
+// recreated under a new OID and a pool object that was freed have all genuinely accrued their
+// whole value since they appeared - which is why the accumulator, not the cursor, is what
+// tells the two situations apart.
+func (c *cursor) baseline(next DatabaseStats) {
+	c.counters = make(map[Stat]int64, len(next.Counters))
+	maps.Copy(c.counters, next.Counters)
+	c.statsReset = next.StatsReset
+	c.seen = true
+}

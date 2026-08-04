@@ -140,9 +140,11 @@ type DatabaseScraper struct {
 	// exercised as one thing rather than only where they meet.
 	Open func(context.Context) (*pgx.Conn, error)
 
-	mutex    sync.Mutex
-	cached   []provision.DatabaseReport
-	cachedAt time.Time
+	mutex  sync.Mutex
+	cached []provision.DatabaseReport
+	// attemptedAt paces attempts rather than successes, so a failing scrape is retried at
+	// the TTL instead of on every tick.
+	attemptedAt time.Time
 }
 
 // Scrape returns the current readings, running the batch only if the cached ones have aged
@@ -155,9 +157,16 @@ func (s *DatabaseScraper) Scrape(ctx context.Context) ([]provision.DatabaseRepor
 	if s.Password == "" && s.Open == nil {
 		return nil, false, nil
 	}
-	if !s.cachedAt.IsZero() && time.Since(s.cachedAt) < s.ttl() {
+	// The TTL paces attempts, not successes. Bounding only the success path leaves the
+	// failure path unbounded, and the failure path is the one that piles up: a wrong
+	// password, a pg_hba that has not rolled yet, a postmaster refusing connections - each
+	// would re-dial on every observe tick, which is every two seconds at rest and every 250
+	// milliseconds through a handover. A scrape that cannot connect must not become a
+	// connection storm against a server that is already struggling.
+	if !s.attemptedAt.IsZero() && time.Since(s.attemptedAt) < s.ttl() {
 		return s.cached, false, nil
 	}
+	s.attemptedAt = time.Now()
 
 	scrapeCtx, cancel := context.WithTimeout(ctx, s.timeout())
 	defer cancel()
@@ -166,7 +175,7 @@ func (s *DatabaseScraper) Scrape(ctx context.Context) ([]provision.DatabaseRepor
 	if err != nil {
 		return s.cached, false, err
 	}
-	s.cached, s.cachedAt = reports, time.Now()
+	s.cached = reports
 	return reports, true, nil
 }
 

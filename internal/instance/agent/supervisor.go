@@ -154,6 +154,13 @@ type Supervisor struct {
 	// cadence and nothing else: it makes the loop look sooner, never act differently.
 	roleChanging bool
 
+	// scrapeMutex guards the metrics scrape's own state, and is separate from the state
+	// mutex above because the scrape runs off the observe tick and must never be able to
+	// hold up a pass that ends in renewing the primary's lease.
+	scrapeMutex   sync.Mutex
+	scrapeRunning bool
+	lastDatabases []provision.DatabaseReport
+
 	// leaseUnverifiedSince records when renewals started failing to reach the API server.
 	// It is reported rather than acted on: failing to verify the lease is not losing it.
 	leaseUnverifiedSince time.Time
@@ -515,16 +522,50 @@ func (s *Supervisor) archiveObservation(observation ArchiveObservation) ArchiveO
 // refuses autoscaling for the pool - a heavier consequence than one round of counters being a
 // few seconds old, and the wrong response to a query that timed out once.
 func (s *Supervisor) scrapeDatabases(ctx context.Context) []provision.DatabaseReport {
+	s.scrapeMutex.Lock()
+	running, last := s.scrapeRunning, s.lastDatabases
+	if !running {
+		s.scrapeRunning = true
+	}
+	s.scrapeMutex.Unlock()
+
+	if !running {
+		go s.scrapeDatabasesNow(context.WithoutCancel(ctx))
+	}
+	return last
+}
+
+// scrapeDatabasesNow performs the scrape and stores what it read.
+//
+// It runs off the observe tick, and that is a correctness requirement rather than a
+// performance one. observe() calls reconcileRole last, and reconcileRole is what renews the
+// primary's lease; localReadTimeout is its own constant precisely so the observe budget does
+// not track the tick cadence. A scrape on the tick added a second independent budget in front
+// of that call - one equal to the whole steady-state interval and eight times the handover
+// interval - so a PostgreSQL slow to answer a metrics query could cost a primary its lease
+// and trigger a failover nobody asked for. Metrics must never be able to do that.
+//
+// One at a time: a scrape still running when the next tick arrives is left alone and the tick
+// serves the previous reading, so a slow server produces a stale number rather than a queue of
+// connections.
+func (s *Supervisor) scrapeDatabasesNow(ctx context.Context) {
+	defer func() {
+		s.scrapeMutex.Lock()
+		s.scrapeRunning = false
+		s.scrapeMutex.Unlock()
+	}()
+
 	reports, fresh, err := s.databases.Scrape(ctx)
 	if err != nil {
 		logf.FromContext(ctx).V(1).Info("could not read pg_stat_database",
 			"error", err, "servingLastReading", len(reports) > 0)
-		return reports
-	}
-	if fresh {
+	} else if fresh {
 		logf.FromContext(ctx).V(1).Info("read pg_stat_database", "databases", len(reports))
 	}
-	return reports
+
+	s.scrapeMutex.Lock()
+	s.lastDatabases = reports
+	s.scrapeMutex.Unlock()
 }
 
 // observe re-reads the postmaster, converges the replication configuration, and

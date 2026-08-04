@@ -133,6 +133,28 @@ type MemberReport struct {
 	Databases []DatabaseReport `json:"databases,omitempty"`
 }
 
+// MaxDatabasesPerReport is the most tenant databases one member can be carrying, and matches
+// the Maximum on maxTenantsPerInstance in ElasticClassDensity. It is duplicated here rather
+// than derived because a CRD validation marker is not readable from Go; a hygiene test keeps
+// the two from drifting.
+const MaxDatabasesPerReport = 5000
+
+// reportSizeLimit bounds a member's report so a broken or hostile agent cannot make the
+// operator read forever.
+//
+// It is not an arbitrary round number. The report carries one DatabaseReport per tenant
+// database, each about 330 bytes of JSON with a name at PostgreSQL's 63-byte identifier limit
+// and counters at full width, so a member at MaxDatabasesPerReport is already past 1.6 MB -
+// and the previous 1 MiB limit truncated it. That failure was not confined to metrics:
+// FetchMemberReport returns the decode error, the caller records no member at all, and the
+// instance's own view of that member becomes "unreachable, timeline 0" - which is a failover
+// input. A limit that silently reclassifies the largest instances as unhealthy is worse than
+// no limit.
+//
+// 8 MiB is MaxDatabasesPerReport with room for the fields the report will grow. The test
+// beside this constant is what keeps that claim true.
+const reportSizeLimit = 8 << 20
+
 // DatabaseReport is one tenant database's row of pg_stat_database, as the member that holds
 // it reports it.
 //
@@ -228,7 +250,7 @@ func FetchMemberReport(ctx context.Context, endpoint string) (MemberReport, erro
 	}
 
 	var report MemberReport
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&report); err != nil {
+	if err := json.NewDecoder(io.LimitReader(response.Body, reportSizeLimit)).Decode(&report); err != nil {
 		return MemberReport{}, err
 	}
 	return report, nil

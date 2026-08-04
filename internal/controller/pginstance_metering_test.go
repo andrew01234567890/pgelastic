@@ -155,8 +155,11 @@ func TestAStagedReadingIsDifferencedIntoThePoolsTotals(t *testing.T) {
 		reportOf(testMember, provision.DatabaseReport{Name: database, OID: 16385, XactCommit: 100}),
 	})
 	fold(at)
-	if got := collector.Accumulator.Total(key, metering.StatXactCommit); got != 100 {
-		t.Fatalf("xact_commit total = %d after the first reading, want 100", got)
+	// The first reading is a baseline. That 100 accrued on the postmaster before this
+	// process was watching, and counting it would put the server's lifetime into the total
+	// on every operator restart.
+	if got := collector.Accumulator.Total(key, metering.StatXactCommit); got != 0 {
+		t.Fatalf("xact_commit total = %d after the first reading, want 0", got)
 	}
 
 	later := at.Add(time.Minute)
@@ -165,8 +168,8 @@ func TestAStagedReadingIsDifferencedIntoThePoolsTotals(t *testing.T) {
 		reportOf(testMember, provision.DatabaseReport{Name: database, OID: 16385, XactCommit: 130}),
 	})
 	fold(later)
-	if got := collector.Accumulator.Total(key, metering.StatXactCommit); got != 130 {
-		t.Errorf("xact_commit total = %d after a second cumulative reading of 130, want 130: "+
+	if got := collector.Accumulator.Total(key, metering.StatXactCommit); got != 30 {
+		t.Errorf("xact_commit total = %d after a second cumulative reading of 130, want 30: "+
 			"the readings are being added rather than differenced", got)
 	}
 }
