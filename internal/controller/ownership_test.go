@@ -275,4 +275,48 @@ var _ = Describe("ownership of the object graph", Ordered, func() {
 			Expect(theirs.Of(ctx, foreign)).To(Equal(ownership.Foreign))
 		})
 	})
+
+	// A login resolves through the tenant it belongs to. Without a case of its own it fell to
+	// the default arm, which answers Foreign *and* an error - so every reconcile of one would
+	// have failed on its first line, before any of the rest of this kind could be reached.
+	Context("a login belonging to a tenant of a claimed pool", func() {
+		It("resolves through its tenant to the pool's class", func() {
+			tenant := makeTenant(namespace, "ownership-login-host", ownedPool, "ownership_login")
+			Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
+			DeferCleanup(func() { deleteAndAwait(tenant) })
+			awaitCached(tenant)
+
+			resolver := ownership.Resolver{Reader: cachedClient}
+			login := &pgelasticv1alpha1.PgTenantUser{
+				ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "own-login"},
+				Spec: pgelasticv1alpha1.PgTenantUserSpec{
+					TenantRef: corev1.LocalObjectReference{Name: tenant.Name},
+					UserName:  "app",
+				},
+			}
+
+			verdict, err := resolver.Of(ctx, login)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(verdict).To(Equal(ownership.Mine))
+		})
+
+		// A tenant that has gone is a state of the cluster, not a fault. Answering Foreign
+		// would let whichever operator asked next adopt a login it never provisioned.
+		It("reports a login whose tenant has gone as unresolved rather than foreign", func() {
+			resolver := ownership.Resolver{Reader: cachedClient}
+			login := &pgelasticv1alpha1.PgTenantUser{
+				ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "orphan-login"},
+				Spec: pgelasticv1alpha1.PgTenantUserSpec{
+					TenantRef: corev1.LocalObjectReference{Name: "a-tenant-that-never-existed"},
+					UserName:  "app",
+				},
+			}
+
+			verdict, err := resolver.Of(ctx, login)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(verdict).To(Equal(ownership.Unresolved))
+		})
+	})
 })

@@ -113,6 +113,8 @@ func (r Resolver) Of(ctx context.Context, object client.Object) (Verdict, error)
 		return r.ofPoolNamed(ctx, typed.Namespace, typed.Spec.PoolRef.Name)
 	case *pgelasticv1alpha1.PgTenantMigration:
 		return r.ofMigration(ctx, typed)
+	case *pgelasticv1alpha1.PgTenantUser:
+		return r.ofTenantNamed(ctx, typed.Namespace, typed.Spec.TenantRef.Name)
 	case *pgelasticv1alpha1.PgRestore:
 		return r.ofInstanceNamed(ctx, typed.Namespace, typed.Spec.SourceInstanceRef.Name)
 	case *pgelasticv1alpha1.PgBackup:
@@ -175,11 +177,20 @@ func (r Resolver) ofMigration(
 	ctx context.Context,
 	object *pgelasticv1alpha1.PgTenantMigration,
 ) (Verdict, error) {
-	if object.Spec.TenantRef.Name == "" {
+	return r.ofTenantNamed(ctx, object.Namespace, object.Spec.TenantRef.Name)
+}
+
+// ofTenantNamed resolves an object that belongs to a tenant rather than directly to a pool.
+//
+// A tenant that has gone is Unresolved rather than Foreign, for the reason the type's doc
+// gives: a dangling reference is a state of the cluster, not a fault of this operator, and
+// adopting an object whose referent has vanished is how two operators end up both acting on it.
+func (r Resolver) ofTenantNamed(ctx context.Context, namespace, name string) (Verdict, error) {
+	if name == "" {
 		return Foreign, nil
 	}
 	tenant := &pgelasticv1alpha1.PgTenant{}
-	key := types.NamespacedName{Namespace: object.Namespace, Name: object.Spec.TenantRef.Name}
+	key := types.NamespacedName{Namespace: namespace, Name: name}
 	if err := r.Reader.Get(ctx, key, tenant); err != nil {
 		if apierrors.IsNotFound(err) {
 			return Unresolved, nil

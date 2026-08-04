@@ -459,7 +459,29 @@ func (r *PgElasticPoolReconciler) proxyUsers(
 	if err != nil {
 		return nil, err
 	}
-	return append(users, contained...), nil
+
+	// A contained login may not shadow its own tenant's owner. spec.userName is a tenant
+	// operator's to choose, so a login can be named after the owner it sits beside, and both
+	// would render here under one (name, tenant). The proxy would then have two entries to
+	// pick between for one session.
+	//
+	// The owner entry is the one kept, and the direction is not arbitrary: dropping the owner
+	// would take the tenant offline, while dropping the login leaves it with the mock
+	// verifier and refused at authentication - visible, and confined to the login that
+	// caused it. The webhook refuses the collision at admission; this is the backstop for the
+	// two objects admitted concurrently that no webhook can see.
+	type identity struct{ name, tenant string }
+	owners := make(map[identity]bool, len(users))
+	for _, user := range users {
+		owners[identity{user.Name, user.Tenant}] = true
+	}
+	for _, login := range contained {
+		if owners[identity{login.Name, login.Tenant}] {
+			continue
+		}
+		users = append(users, login)
+	}
+	return users, nil
 }
 
 // containedUsers collects the PgTenantUser logins for the pool's tenants.
@@ -493,6 +515,13 @@ func (r *PgElasticPoolReconciler) containedUsers(
 		if !ours || login.Spec.CredentialsSecretRef == nil {
 			continue
 		}
+		// A group role authenticates nobody. Omitted rather than rendered-and-refused,
+		// because an omitted login gets the mock verifier and fails an exchange identically
+		// to a name that was never configured - which is the anti-enumeration property the
+		// handshake already gives, reused rather than reimplemented.
+		if login.Spec.Login != nil && !*login.Spec.Login {
+			continue
+		}
 		secret := &corev1.Secret{}
 		key := client.ObjectKey{Namespace: pool.Namespace, Name: login.Spec.CredentialsSecretRef.Name}
 		if err := r.Get(ctx, key, secret); err != nil {
@@ -505,11 +534,22 @@ func (r *PgElasticPoolReconciler) containedUsers(
 		if password == "" {
 			continue
 		}
-		users = append(users, proxy.User{
+		rendered := proxy.User{
 			Name:     login.Spec.UserName,
 			Tenant:   database,
 			Password: password,
-		})
+		}
+		// The login's own backend identity, when the reconciler has provisioned one. Rendered
+		// only once both the role and its credential exist, so that a proxy refusing a login
+		// means exactly "not provisioned yet" rather than "provisioned badly".
+		if credential, ok := r.userBackendCredentialFor(ctx, login); ok {
+			rendered.BackendRole = credential.Role
+			rendered.BackendSaltedPassword = credential.SaltedPassword
+			rendered.BackendSalt = credential.Salt
+			rendered.BackendIterations = credential.Iterations
+			rendered.BackendCredentialGeneration = credential.Generation
+		}
+		users = append(users, rendered)
 	}
 	return users, nil
 }

@@ -241,6 +241,160 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 		Expect(fmt.Sprintf("%d", *binding.DatabaseOID)).To(Equal(oid))
 	})
 
+	// A PgTenantUser's whole promise is that it is a *contained* identity: its own role, its
+	// own credential, reaching its own tenant and nothing else. Every spec below asks
+	// PostgreSQL rather than the CR, because the CR said all of this was true for the whole
+	// time the roles did not exist.
+	Context("a tenant's own logins", func() {
+		var appLogin, groupLogin *pgelasticv1alpha1.PgTenantUser
+
+		appRole := func() string {
+			return migration.TenantUserRoleName(provisioningNamespace, reclaimedName, "e2e-app")
+		}
+		groupRole := func() string {
+			return migration.TenantUserRoleName(provisioningNamespace, reclaimedName, "e2e-group")
+		}
+
+		It("creates a role for a login, named after its identity and not the name it sends", func() {
+			Expect(k8sClient.Create(suiteCtx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "e2e-app-password", Namespace: provisioningNamespace,
+				},
+				StringData: map[string]string{"password": "hunter2"},
+			})).To(Succeed())
+
+			appLogin = &pgelasticv1alpha1.PgTenantUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "e2e-app", Namespace: provisioningNamespace,
+				},
+				Spec: pgelasticv1alpha1.PgTenantUserSpec{
+					TenantRef:            corev1.LocalObjectReference{Name: reclaimedName},
+					UserName:             "app",
+					CredentialsSecretRef: &corev1.LocalObjectReference{Name: "e2e-app-password"},
+					ConnectionLimit:      ptr.To(int32(5)),
+				},
+			}
+			Expect(k8sClient.Create(suiteCtx, appLogin)).To(Succeed())
+
+			Eventually(func() (string, error) {
+				return psql(primary, "postgres", countRole(appRole()))
+			}).Should(Equal("1"), "the login's role never reached pg_roles")
+
+			// Published so that a role seen in pg_stat_activity can be traced back to the
+			// object, which is needed most when that object is not Ready.
+			Eventually(func() string {
+				user := &pgelasticv1alpha1.PgTenantUser{}
+				if err := k8sClient.Get(suiteCtx, client.ObjectKeyFromObject(appLogin), user); err != nil {
+					return ""
+				}
+				return user.Status.RoleName
+			}).Should(Equal(appRole()))
+		})
+
+		// The kind has no field for any privilege beyond membership, so this is the whole of
+		// what a fresh login may do. Everything else is the tenant's own DBA's to grant.
+		It("gives a login CONNECT on its tenant's database and nothing else", func() {
+			Expect(psql(primary, "postgres", fmt.Sprintf(
+				`SELECT has_database_privilege('%s','%s','CONNECT')::int`, appRole(), reclaimedDB))).
+				To(Equal("1"), "the login cannot reach its own tenant")
+
+			Expect(psql(primary, "postgres", fmt.Sprintf(
+				`SELECT has_database_privilege('%s','%s','TEMPORARY')::int`, appRole(), reclaimedDB))).
+				To(Equal("0"), "the login may write temporary objects it never asked for")
+
+			// The containment claim, asked of PostgreSQL: a login cannot reach a neighbour.
+			Expect(psql(primary, "postgres", fmt.Sprintf(
+				`SELECT has_database_privilege('%s','%s','CONNECT')::int`, appRole(), retainedDB))).
+				To(Equal("0"), "a login reached another tenant's database")
+		})
+
+		// connectionLimit is the proxy's ledger or it is nothing. Mirroring it onto the role
+		// would make every backend the fleet opens count against rolconnlimit, so N replicas
+		// each entitled to 5 would breach a cap of 5 by a factor of N.
+		It("leaves a login's role uncapped even when connectionLimit is set", func() {
+			Expect(psql(primary, "postgres", fmt.Sprintf(
+				`SELECT rolconnlimit FROM pg_roles WHERE rolname = '%s'`, appRole()))).
+				To(Equal("-1"))
+		})
+
+		It("creates a login that may not log in as a role that cannot", func() {
+			groupLogin = &pgelasticv1alpha1.PgTenantUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "e2e-group", Namespace: provisioningNamespace,
+				},
+				Spec: pgelasticv1alpha1.PgTenantUserSpec{
+					TenantRef: corev1.LocalObjectReference{Name: reclaimedName},
+					UserName:  "reporting",
+					Login:     ptr.To(false),
+				},
+			}
+			Expect(k8sClient.Create(suiteCtx, groupLogin)).To(Succeed())
+
+			Eventually(func() (string, error) {
+				return psql(primary, "postgres", fmt.Sprintf(
+					`SELECT rolcanlogin::int FROM pg_roles WHERE rolname = '%s'`, groupRole()))
+			}).Should(Equal("0"), "a group role may open a session")
+		})
+
+		// Granting is the half an additive implementation gets right by accident; revoking is
+		// the half it gets wrong, so both are asserted.
+		It("grants a membership the spec asks for, and revokes one it stops asking for", func() {
+			Eventually(func() error {
+				user := &pgelasticv1alpha1.PgTenantUser{}
+				if err := k8sClient.Get(suiteCtx, client.ObjectKeyFromObject(appLogin), user); err != nil {
+					return err
+				}
+				user.Spec.MemberOf = []string{"reporting"}
+				return k8sClient.Update(suiteCtx, user)
+			}).Should(Succeed())
+
+			Eventually(func() (string, error) {
+				return psql(primary, "postgres", fmt.Sprintf(
+					`SELECT pg_has_role('%s','%s','MEMBER')::int`, appRole(), groupRole()))
+			}).Should(Equal("1"), "the membership was never granted")
+
+			Eventually(func() error {
+				user := &pgelasticv1alpha1.PgTenantUser{}
+				if err := k8sClient.Get(suiteCtx, client.ObjectKeyFromObject(appLogin), user); err != nil {
+					return err
+				}
+				user.Spec.MemberOf = nil
+				return k8sClient.Update(suiteCtx, user)
+			}).Should(Succeed())
+
+			Eventually(func() (string, error) {
+				return psql(primary, "postgres", fmt.Sprintf(
+					`SELECT pg_has_role('%s','%s','MEMBER')::int`, appRole(), groupRole()))
+			}).Should(Equal("0"), "the membership survived being removed from the spec")
+		})
+
+		// DROP ROLE fails while a role owns anything, and nothing stops a tenant's owner
+		// granting a login CREATE. The objects go to the tenant's owner, which already
+		// controls the database - so the table must survive the login that made it.
+		It("drops a login's role and rehomes what it owned onto the tenant", func() {
+			owner := migration.BackendRoleName(provisioningNamespace, reclaimedName)
+			_, err := psql(primary, reclaimedDB, fmt.Sprintf(
+				`CREATE TABLE e2e_owned(); ALTER TABLE e2e_owned OWNER TO "%s"`, appRole()))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Delete(suiteCtx, appLogin)).To(Succeed())
+			Eventually(func() (string, error) {
+				return psql(primary, "postgres", countRole(appRole()))
+			}).Should(Equal("0"), "the login's role outlived the object")
+
+			Expect(psql(primary, reclaimedDB,
+				`SELECT tableowner FROM pg_tables WHERE tablename = 'e2e_owned'`)).
+				To(Equal(owner), "what the login owned was destroyed rather than rehomed")
+		})
+
+		It("drops a group role too", func() {
+			Expect(k8sClient.Delete(suiteCtx, groupLogin)).To(Succeed())
+			Eventually(func() (string, error) {
+				return psql(primary, "postgres", countRole(groupRole()))
+			}).Should(Equal("0"))
+		})
+	})
+
 	It("keeps the database of a Retain tenant, which is the default", func() {
 		Expect(k8sClient.Delete(suiteCtx, retained)).To(Succeed())
 		Eventually(func() bool { return tenantGone(retainedName) }).Should(BeTrue())

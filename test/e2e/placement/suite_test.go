@@ -169,6 +169,17 @@ var _ = BeforeSuite(func() {
 		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
+	// Registered because this suite asserts on the roles it creates. Without it the tenant
+	// user specs assert that a role reaches pg_roles while nothing is running the controller
+	// that puts it there - a suite that cannot pass on any code, which is the shape the
+	// backup suite shipped in four times before anybody ran it.
+	Expect((&controller.PgTenantUserReconciler{
+		Client:         manager.GetClient(),
+		Scheme:         manager.GetScheme(),
+		SQL:            tenantSQL,
+		ControllerName: suiteControllerName,
+	}).SetupWithManager(manager)).To(Succeed())
+
 	Expect((&controller.PgElasticPoolReconciler{
 		Client:         manager.GetClient(),
 		Scheme:         manager.GetScheme(),
@@ -208,6 +219,11 @@ func startInstanceManager(config *rest.Config) {
 		},
 	})
 	Expect(err).NotTo(HaveOccurred())
+	// Its own manager, so its own cache, so its own indexes. Without this the PgInstance
+	// reconciler errors on every pass with "Index with name field:status.binding.instanceRef.
+	// name does not exist" - 38 times in one run of this suite - and those errors are noise
+	// that a real failure then hides in.
+	Expect(index.Setup(suiteCtx, instanceManager.GetFieldIndexer())).To(Succeed())
 
 	Expect((&controller.PgInstanceReconciler{
 		Client:        instanceManager.GetClient(),

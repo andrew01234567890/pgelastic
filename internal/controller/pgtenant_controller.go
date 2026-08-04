@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
@@ -364,6 +365,8 @@ func (r *PgTenantReconciler) provision(
 	spec.Verifier = credential.Verifier
 	state, err := tenantdb.Ensure(ctx, r.SQL, tenantEndpoint(tenant, host.Name), spec)
 	if err != nil {
+		logf.FromContext(ctx).Error(err, "Could not provision the tenant's database",
+			"database", spec.Database, "instance", host.Name)
 		r.notServing(status, tenant.Generation, tenantdb.ReasonProvisioningFailed, err.Error())
 		return nil
 	}
