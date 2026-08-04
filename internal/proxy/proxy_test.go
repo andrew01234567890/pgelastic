@@ -784,3 +784,36 @@ func hasPort(ports []corev1.ContainerPort, name string, number int32) bool {
 	}
 	return false
 }
+
+// spec.observability.logFormat is an enum defaulted to Json that read by nothing at all -
+// which is the defect the JSON-logging milestone exists to remove, and it survived that
+// milestone. The proxy has always read PGELASTIC_LOG_FORMAT; nothing ever set it, so a pool
+// asking for Text was ignored in silence.
+func TestTheLogFormatThePoolAsksForReachesTheProxy(t *testing.T) {
+	envOf := func(t *testing.T, pool *pgelasticv1alpha1.PgElasticPool) map[string]string {
+		t.Helper()
+		deployment, err := Builder{Pool: pool, Image: testImage}.Deployment()
+		if err != nil {
+			t.Fatal(err)
+		}
+		declared := map[string]string{}
+		for _, env := range deployment.Spec.Template.Spec.Containers[0].Env {
+			declared[env.Name] = env.Value
+		}
+		return declared
+	}
+
+	asked := testPool()
+	asked.Spec.Observability = &pgelasticv1alpha1.PoolObservability{LogFormat: "Text"}
+	if got := envOf(t, asked)[EnvLogFormat]; got != "Text" {
+		t.Errorf("%s = %q, want %q: the pool asked for text and the proxy was never told",
+			EnvLogFormat, got, "Text")
+	}
+
+	// Absent rather than defaulted, because setting it would roll every proxy fleet in the
+	// estate - dropping client sessions - to hand the process the value it already picks.
+	if _, set := envOf(t, testPool())[EnvLogFormat]; set {
+		t.Errorf("%s is set for a pool with no observability block, which rolls the fleet for "+
+			"a value the proxy chooses anyway", EnvLogFormat)
+	}
+}

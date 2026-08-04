@@ -61,14 +61,14 @@ const (
 	// LogDir holds the FIFO the logging collector writes into.
 	LogDir = "/var/log/postgresql"
 	// LogFileName is the log_filename PostgreSQL is given. It has to end in ".log":
-	// with log_destination = csvlog, PostgreSQL replaces a ".log" suffix with ".csv" and
-	// otherwise *appends* ".csv", so naming the file after the FIFO directly produces a
-	// "postgresql.csv.csv" regular file beside an untouched FIFO - an emptyDir quietly
+	// PostgreSQL replaces a ".log" suffix with the destination's own extension and
+	// otherwise *appends* it, so naming the file after the FIFO directly produces a
+	// "postgresql.json.json" regular file beside an untouched FIFO - an emptyDir quietly
 	// filling up with logs nobody is reading.
 	LogFileName = "postgresql.log"
 	// LogFIFOName is what the logging collector actually writes, and the FIFO the agent
 	// creates and drains to the container's stdout before any postmaster exists.
-	LogFIFOName = "postgresql.csv"
+	LogFIFOName = "postgresql.json"
 )
 
 // Backup paths. The generated pgBackRest configuration carries the repository credentials,
