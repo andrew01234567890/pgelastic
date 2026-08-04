@@ -584,6 +584,9 @@ func bindTenant(tenant *pgelasticv1alpha1.PgTenant, instance string) {
 
 var _ = Describe("auto mode", Ordered, func() {
 	const (
+		// crowded is the instance the plan wants to move tenants off, and the one the drain
+		// spec below asks to be evacuated.
+		crowded   = "rb-b"
 		namespace = "pool-auto"
 		poolName  = "auto-pool"
 		className = "auto-class"
@@ -619,12 +622,12 @@ var _ = Describe("auto mode", Ordered, func() {
 		// A small instance next to a large, nearly empty one: best-fit packs the tenants onto
 		// the small one and leaves the large one to be reclaimed.
 		small := makeReadyInstance(namespace, "rb-a", poolName, 30, 0)
-		large := makeReadyInstance(namespace, "rb-b", poolName, 225, 10)
+		large := makeReadyInstance(namespace, crowded, poolName, 225, 10)
 
 		for i := range 4 {
 			tenant := makeTenant(namespace, fmt.Sprintf("rb-t%d", i), poolName, fmt.Sprintf("rb_t%d", i))
 			Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
-			bindTenant(tenant, "rb-b")
+			bindTenant(tenant, crowded)
 			tenants = append(tenants, tenant)
 		}
 
@@ -683,10 +686,42 @@ var _ = Describe("auto mode", Ordered, func() {
 		plan := refetch(pool).Status.Autoscaling
 		Expect(plan.Moves).NotTo(BeEmpty())
 		for _, move := range plan.Moves {
-			Expect(move.From).To(Equal("rb-b"))
+			Expect(move.From).To(Equal(crowded))
 			Expect(move.To).To(Equal("rb-a"))
 			Expect(move.Eligible).To(BeTrue(), "blocked by %s", move.BlockedBy)
 		}
+	})
+
+	// A drain and the autoscaler spend the same migration budget, and both read the count
+	// the pass started with. Without the drain telling the executor what it already did, one
+	// reconcile emits two migrations against a cap of one - and both off the same source,
+	// which is the pair the per-source guard exists to prevent. This fixture is the one that
+	// can show it: rebalancing is enabled here and the plan really does carry an eligible
+	// move, so both paths have something to spend.
+	It("spends the pool's migration budget once, not once per path", func() {
+		instance := &pgelasticv1alpha1.PgInstance{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: crowded}, instance)).To(Succeed())
+		patch := client.MergeFrom(instance.DeepCopy())
+		instance.Spec.Drain = &pgelasticv1alpha1.InstanceDrain{
+			Mode: ptr.To(pgelasticv1alpha1.InstanceDrainRequested),
+		}
+		Expect(k8sClient.Patch(ctx, instance, patch)).To(Succeed())
+		awaitCached(instance)
+		DeferCleanup(func() {
+			live := &pgelasticv1alpha1.PgInstance{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: crowded}, live)).To(Succeed())
+			back := client.MergeFrom(live.DeepCopy())
+			live.Spec.Drain = nil
+			Expect(k8sClient.Patch(ctx, live, back)).To(Succeed())
+			awaitCached(live)
+		})
+
+		reconcileNow(reconciler, refetch(pool))
+
+		migrations := &pgelasticv1alpha1.PgTenantMigrationList{}
+		Expect(k8sClient.List(ctx, migrations, client.InNamespace(namespace))).To(Succeed())
+		Expect(migrations.Items).To(HaveLen(1),
+			"the drain and the rebalancer both spent the same budget in one pass")
 	})
 
 	It("does not start a second move while the first is in flight", func() {
@@ -706,7 +741,7 @@ var _ = Describe("auto mode", Ordered, func() {
 
 	It("takes no action at all while an instance is rolling out", func() {
 		instance := &pgelasticv1alpha1.PgInstance{}
-		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "rb-b"}, instance)).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: crowded}, instance)).To(Succeed())
 		instance.Status.Conditions = []metav1.Condition{{
 			Type:               pgelasticv1alpha1.ConditionProgressing,
 			Status:             metav1.ConditionTrue,
@@ -850,5 +885,139 @@ var _ = Describe("a migration refused at the gate", Ordered, func() {
 		Expect(emitted).To(Equal(1),
 			"the pool made no move while one migration sat at the gate; a refusal that is "+
 				"holding no slot, no subscription and no backend must not spend the budget")
+	})
+})
+
+var _ = Describe("draining an instance", Ordered, func() {
+	const (
+		namespace = "pool-drain"
+		poolName  = "drain-pool"
+		className = "drain-class"
+		workload  = "drain-standard"
+	)
+
+	var (
+		reconciler *PgElasticPoolReconciler
+		pool       *pgelasticv1alpha1.PgElasticPool
+		draining   *pgelasticv1alpha1.PgInstance
+		tenants    []*pgelasticv1alpha1.PgTenant
+	)
+
+	BeforeAll(func() {
+		ensureNamespace(namespace)
+		elasticClass := makeElasticClass(className, defaultControllerName)
+		pool = makePool(namespace, poolName, className, 400)
+		pool.Spec.Instances.Replicas = ptr.To(int32(2))
+		pool.Spec.Admission = &pgelasticv1alpha1.PoolAdmission{DefaultWorkloadClassName: workload}
+		class := makeWorkloadClass(workload, 2, 40)
+
+		Expect(k8sClient.Create(ctx, elasticClass)).To(Succeed())
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+		Expect(k8sClient.Create(ctx, class)).To(Succeed())
+
+		target := makeReadyInstance(namespace, "dr-a", poolName, 225, 0)
+		draining = makeReadyInstance(namespace, "dr-b", poolName, 225, 10)
+
+		for i := range 3 {
+			tenant := makeTenant(namespace, fmt.Sprintf("dr-t%d", i), poolName, fmt.Sprintf("dr_t%d", i))
+			Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
+			bindTenant(tenant, "dr-b")
+			tenants = append(tenants, tenant)
+		}
+
+		DeferCleanup(func() {
+			for _, tenant := range tenants {
+				deleteAndAwait(tenant)
+			}
+			deleteAndAwait(target, draining, pool, elasticClass, class)
+		})
+		awaitCached(elasticClass, pool, class, target, draining)
+		for _, tenant := range tenants {
+			awaitCached(tenant)
+		}
+	})
+
+	BeforeEach(func() {
+		collector := metering.NewCollector(metering.Options{}, nil)
+		for _, tenant := range tenants {
+			key := metering.Key{Namespace: namespace, Pool: poolName, Tenant: tenant.Name}
+			for i := range 60 {
+				collector.Store.Observe(key, metering.Sample{BackendConnections: 5},
+					placementClock.Add(-time.Duration(60-i)*time.Minute))
+			}
+		}
+		reconciler = &PgElasticPoolReconciler{
+			Client:   cachedClient,
+			Scheme:   cachedClient.Scheme(),
+			Recorder: events.NewFakeRecorder(64),
+			Metering: collector,
+			Now:      func() time.Time { return placementClock },
+		}
+	})
+
+	AfterEach(func() {
+		migrations := &pgelasticv1alpha1.PgTenantMigrationList{}
+		Expect(k8sClient.List(ctx, migrations, client.InNamespace(namespace))).To(Succeed())
+		for i := range migrations.Items {
+			deleteAndAwait(&migrations.Items[i])
+		}
+	})
+
+	// The half that already worked, asserted so the spec below is evidence rather than a
+	// coincidence: this pool is in Recommend mode with no auto actions, so nothing else in
+	// the planner may emit a migration.
+	It("moves nothing while no instance is draining", func() {
+		reconcilePool(reconciler, pool)
+
+		migrations := &pgelasticv1alpha1.PgTenantMigrationList{}
+		Expect(k8sClient.List(ctx, migrations, client.InNamespace(namespace))).To(Succeed())
+		Expect(migrations.Items).To(BeEmpty())
+	})
+
+	// The half that did not exist. `mode: Requested` documents itself as cordoning the
+	// instance *and* emitting a PgTenantMigration per bound tenant; only the cordon was ever
+	// implemented, so a drained instance kept every tenant it had, for ever, silently.
+	// The override has to travel on the object. The migration's own preflight defaults
+	// requireColdTenant to true and then reads the same coldness verdict the pool overruled,
+	// so a bare spec emits a migration guaranteed to be refused - an override that looks
+	// applied and does nothing.
+	It("tells the migration it may move a tenant that is not cold", func() {
+		instance := refetch(draining)
+		patch := client.MergeFrom(instance.DeepCopy())
+		instance.Spec.Drain = &pgelasticv1alpha1.InstanceDrain{
+			Mode: ptr.To(pgelasticv1alpha1.InstanceDrainRequested),
+		}
+		Expect(k8sClient.Patch(ctx, instance, patch)).To(Succeed())
+		awaitCached(instance)
+
+		reconcilePool(reconciler, pool)
+
+		migrations := &pgelasticv1alpha1.PgTenantMigrationList{}
+		Expect(k8sClient.List(ctx, migrations, client.InNamespace(namespace))).To(Succeed())
+		Expect(migrations.Items).NotTo(BeEmpty())
+		preflight := migrations.Items[0].Spec.Preflight
+		Expect(preflight).NotTo(BeNil(), "the drain emitted a bare spec")
+		Expect(preflight.RequireColdTenant).NotTo(BeNil())
+		Expect(*preflight.RequireColdTenant).To(BeFalse())
+	})
+
+	It("evacuates a draining instance even in Recommend mode", func() {
+		instance := refetch(draining)
+		patch := client.MergeFrom(instance.DeepCopy())
+		instance.Spec.Drain = &pgelasticv1alpha1.InstanceDrain{
+			Mode: ptr.To(pgelasticv1alpha1.InstanceDrainRequested),
+		}
+		Expect(k8sClient.Patch(ctx, instance, patch)).To(Succeed())
+		awaitCached(instance)
+
+		reconcilePool(reconciler, pool)
+
+		migrations := &pgelasticv1alpha1.PgTenantMigrationList{}
+		Expect(k8sClient.List(ctx, migrations, client.InNamespace(namespace))).To(Succeed())
+		Expect(migrations.Items).To(HaveLen(1),
+			"a drain moves one tenant per pass, like every other move: emitting the whole "+
+				"instance at once would decode every tenant off one source simultaneously")
+		Expect(migrations.Items[0].Spec.TargetInstanceRef.Name).To(Equal("dr-a"))
+		Expect(migrations.Items[0].Spec.TenantRef.Name).To(HavePrefix("dr-t"))
 	})
 })
