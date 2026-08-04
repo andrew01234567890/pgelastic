@@ -612,6 +612,26 @@ impl PoolManager {
 
     /// Waits for the queue to reach this client, emitting the notice threshold
     /// on the way and refusing with `PGE1024` at the deadline.
+    ///
+    /// This is the span that matters most in the proxy, and until now it did not exist. The
+    /// admission-queue wait is the whole point of the capacity model - it is where
+    /// oversubscription is either working or hurting - and from outside it is
+    /// indistinguishable from a slow query: the client simply waits. The counters say how
+    /// many waited and the histogram says how long they waited in aggregate, but neither can
+    /// answer "why was *this* statement slow", which is the question somebody actually has.
+    ///
+    /// `outcome` and `waited_ms` are recorded on the span rather than logged, so a trace shows
+    /// the wait as a span with a duration next to the work it delayed.
+    #[tracing::instrument(
+        name = "proxy.admission_wait",
+        skip_all,
+        fields(
+            tenant = %request.tenant,
+            blocked_by = %blocked_by.code(),
+            outcome = tracing::field::Empty,
+            waited_ms = tracing::field::Empty,
+        )
+    )]
     async fn await_grant<W: AsyncWrite + Unpin>(
         &self,
         request: &AcquireRequest<'_>,
@@ -641,6 +661,9 @@ impl PoolManager {
                 grant = &mut waiter => {
                     ticket.settled = true;
                     self.metrics.admission_dequeued();
+                    let span = tracing::Span::current();
+                    span.record("outcome", "granted");
+                    span.record("waited_ms", u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
                     return grant.map_err(|_| Denial::backend("the pool is shutting down"));
                 }
                 () = &mut notice, if !notified => {
@@ -664,6 +687,9 @@ impl PoolManager {
                         waited: started.elapsed(),
                     };
                     self.metrics.admission_denied(reason.code());
+                    let span = tracing::Span::current();
+                    span.record("outcome", "timed_out");
+                    span.record("waited_ms", u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
                     return Err(Denial::from_reason(&reason));
                 }
             }
