@@ -88,6 +88,7 @@ impl Binding {
         let backend = Arc::new(proxy.backend_for(&instance, tenant_name, login)?);
         let key = crate::pool::pool_key(
             &proxy.config,
+            proxy.fingerprint_policy(),
             &backend,
             startup,
             tenant_name,

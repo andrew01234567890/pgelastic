@@ -1430,14 +1430,15 @@ impl PoolManager {
 /// ladder can undo them.
 pub async fn pool_key(
     config: &crate::config::Config,
+    policy: &pgelastic_pool::FingerprintPolicy,
     backend: &crate::config::BackendConfig,
     startup: &StartupMessage,
     tenant: &str,
     credential_generation: u64,
 ) -> Result<PoolKey> {
     use pgelastic_pool::{
-        BackendTarget, CredentialGeneration, DatabaseName, FingerprintPolicy, PoolKeySpec,
-        ReplicationKind, RoleName, StartupFingerprint, TenantId, TlsPosture,
+        BackendTarget, CredentialGeneration, DatabaseName, PoolKeySpec, ReplicationKind, RoleName,
+        StartupFingerprint, TenantId, TlsPosture,
     };
 
     let text =
@@ -1454,7 +1455,7 @@ pub async fn pool_key(
             (!name.starts_with("_pq_."))
                 .then(|| (name, String::from_utf8_lossy(value).into_owned()))
         }),
-        &FingerprintPolicy::default(),
+        policy,
     )
     .map_err(|e| ProxyError::client(e.to_string()))?;
 

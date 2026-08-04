@@ -42,7 +42,7 @@ pub use gate::{CheckInBlock, can_check_in};
 pub use key::{
     BackendTarget, CredentialGeneration, DatabaseName, FingerprintPolicy, PoolKey, PoolKeySpec,
     PoolMode, ReplicationKind, RoleName, StartupFingerprint, StartupParamPolicy, TenantId,
-    TlsPosture,
+    TlsPosture, expand_startup_options,
 };
 pub use outstanding::{
     Disposition, OutstandingError, OutstandingQueue, Reaction, Relay, RequestKind,
