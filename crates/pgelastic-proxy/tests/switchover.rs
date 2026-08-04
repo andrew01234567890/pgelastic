@@ -18,7 +18,7 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::{Fleet, Postgres, until};
+use harness::{Fleet, Postgres, await_stalled_commit, until};
 
 const SWITCHOVER: &str = "pgelastic-switchover";
 const MIGRATION: &str = "pgelastic-migration";
@@ -470,6 +470,10 @@ async fn a_hold_never_decides_a_commit_that_was_forwarded_and_never_answered() {
         .await
         .expect("the write");
     let committer = tokio::spawn(async move { alpha.simple_query("COMMIT").await });
+    // The clause gate above is not enough on its own, and here it is weaker still: it was
+    // asked before BEGIN, so under transaction pooling the link that answered need not be the
+    // link that runs this COMMIT. The wait itself is the precondition, so wait for it.
+    await_stalled_commit(&dba).await;
 
     let report = fleet
         .control
