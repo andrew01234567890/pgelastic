@@ -1526,8 +1526,15 @@ type AutoscalingPlan struct {
 	// +optional
 	RecommendedInstances int32 `json:"recommendedInstances,omitempty"`
 
-	// observedUtilizationPercent is connections in use over allocatable, across the ready
-	// instances.
+	// measuredInstances is how many of them the utilization was read from. It is lower than
+	// observedInstances whenever a member is cordoned, draining or recovering, and zero of it
+	// means the pool's load could not be read at all rather than that there was none.
+	// +optional
+	MeasuredInstances int32 `json:"measuredInstances,omitempty"`
+
+	// observedUtilizationPercent is connections in use over allocatable, across the instances
+	// a tenant could actually be placed on. Capacity nothing may be scheduled onto is left out
+	// of both halves of the ratio, so a cordoned member neither flatters nor deflates it.
 	// +optional
 	ObservedUtilizationPercent int32 `json:"observedUtilizationPercent,omitempty"`
 

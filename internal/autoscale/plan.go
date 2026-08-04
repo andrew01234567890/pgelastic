@@ -43,6 +43,12 @@ type InstanceSignal struct {
 	StorageUsedBytes       int64
 }
 
+// Measurable is whether this instance's capacity is capacity the pool may actually spend. A
+// cordoned, draining or recovering member still publishes an allocatable figure and still
+// serves whatever it already holds, but nothing new may be placed on it - so counting it
+// dilutes the utilization that decides how many members the pool needs.
+func (i InstanceSignal) Measurable() bool { return i.Ready && i.Schedulable }
+
 // UtilizationPercent is connections in use over allocatable. An instance with no published
 // allocatable capacity reports zero rather than dividing by it.
 func (i InstanceSignal) UtilizationPercent() int32 {
@@ -191,6 +197,10 @@ type Plan struct {
 	RecommendedInstances       int32
 	ObservedUtilizationPercent int32
 	TargetUtilizationPercent   int32
+	// MeasuredInstances is how many members the utilization was actually read from. It is
+	// published rather than derived because zero of it is the difference between a pool with
+	// nothing on it and a pool nothing can be seen through, and those want opposite actions.
+	MeasuredInstances int32
 	// MigrationsPermitted is the disruption budget alone - concurrency cap, rate cap and
 	// migration windows - with no opinion about whether any particular move is worth making.
 	// It is what an evacuation asks, because a drain has already been decided by an operator
@@ -271,9 +281,10 @@ func Recommend(signals Signals, policy Policy) Plan {
 	}
 	inUse, allocatable := int64(0), int64(0)
 	for _, instance := range signals.Instances {
-		if !instance.Ready {
+		if !instance.Measurable() {
 			continue
 		}
+		plan.MeasuredInstances++
 		inUse += int64(instance.InUseConnections)
 		allocatable += int64(instance.AllocatableConnections)
 	}
@@ -281,7 +292,7 @@ func Recommend(signals Signals, policy Policy) Plan {
 		plan.ObservedUtilizationPercent = int32(inUse * 100 / allocatable)
 	}
 
-	plan.RecommendedInstances = recommendedInstances(plan.ObservedUtilizationPercent, signals, policy)
+	plan.RecommendedInstances = recommendedInstances(plan, signals, policy)
 	packing := repack(signals, policy)
 	plan.InstanceTargets = instanceTargets(signals, policy, packing)
 	plan.ConsolidationTarget = consolidationTarget(plan.InstanceTargets, policy)
@@ -314,20 +325,32 @@ func Recommend(signals Signals, policy Policy) Plan {
 
 // recommendedInstances is the HPA ratio, with the same dead band: a utilization within
 // tolerance of the target changes nothing at all.
-func recommendedInstances(observed int32, signals Signals, policy Policy) int32 {
+//
+// The ratio is scaled from the count the utilization was measured over rather than from the
+// pool's whole membership, because the two disagree the moment a member is cordoned, draining
+// or recovering - and scaling a measurement by a count it did not cover sizes the pool as
+// though the members nothing may be placed on were carrying their share.
+func recommendedInstances(plan Plan, signals Signals, policy Policy) int32 {
 	current := signals.InstanceCount()
-	if current == 0 || policy.TargetUtilizationPercent <= 0 {
+	// No measurable capacity means the pool cannot be seen through, which is not the same
+	// fact as the pool being empty and does not want the same answer. A ratio taken from
+	// nothing reads as idle, and an idle verdict here would consolidate a fleet whose load is
+	// merely invisible.
+	if plan.MeasuredInstances == 0 || policy.TargetUtilizationPercent <= 0 {
 		return max(current, policy.MinInstances)
 	}
-	deviation := observed - policy.TargetUtilizationPercent
+	deviation := plan.ObservedUtilizationPercent - policy.TargetUtilizationPercent
 	if deviation < 0 {
 		deviation = -deviation
 	}
 	if deviation <= policy.TolerancePercent {
 		return clamp(current, policy.MinInstances, policy.MaxInstances)
 	}
-	desired := (int64(current)*int64(observed) + int64(policy.TargetUtilizationPercent) - 1) /
-		int64(policy.TargetUtilizationPercent)
+	desired := (int64(plan.MeasuredInstances)*int64(plan.ObservedUtilizationPercent) +
+		int64(policy.TargetUtilizationPercent) - 1) / int64(policy.TargetUtilizationPercent)
+	// A member that carries no load still occupies a slot in the count scale-out and scale-in
+	// compare against, so the answer is expressed in members rather than in servable ones.
+	desired += int64(current - plan.MeasuredInstances)
 	return clamp(int32(desired), policy.MinInstances, policy.MaxInstances)
 }
 
@@ -559,6 +582,13 @@ func packedUtilization(target InstanceTarget) int32 {
 func summarise(plan Plan) string {
 	if plan.MetricsStale {
 		return "metrics are stale; no action will be taken"
+	}
+	// Without this the same pass reports "0% of a 70% target; nothing to change", which reads
+	// as an idle pool rather than as an unreadable one.
+	if plan.MeasuredInstances == 0 && plan.ObservedInstances > 0 {
+		return fmt.Sprintf(
+			"nothing may be placed on any of the pool's %d instances; utilization is unknown and no action will be taken",
+			plan.ObservedInstances)
 	}
 	if len(plan.Actions) == 0 {
 		return fmt.Sprintf("%d instances at %d%% of a %d%% target; nothing to change",

@@ -238,6 +238,7 @@ func planStatus(
 		ComputedAt:                 &metav1.Time{Time: plan.ComputedAt},
 		MetricsStale:               plan.MetricsStale,
 		ObservedInstances:          plan.ObservedInstances,
+		MeasuredInstances:          plan.MeasuredInstances,
 		RecommendedInstances:       plan.RecommendedInstances,
 		ObservedUtilizationPercent: plan.ObservedUtilizationPercent,
 		TargetUtilizationPercent:   plan.TargetUtilizationPercent,

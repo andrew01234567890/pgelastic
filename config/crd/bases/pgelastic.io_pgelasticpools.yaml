@@ -10468,6 +10468,13 @@ spec:
                     description: computedAt is when the plan was last recomputed.
                     format: date-time
                     type: string
+                  measuredInstances:
+                    description: |-
+                      measuredInstances is how many of them the utilization was read from. It is lower than
+                      observedInstances whenever a member is cordoned, draining or recovering, and zero of it
+                      means the pool's load could not be read at all rather than that there was none.
+                    format: int32
+                    type: integer
                   metricsStale:
                     description: |-
                       metricsStale reports that the readings the plan was computed from are older than the
@@ -10535,8 +10542,9 @@ spec:
                     type: integer
                   observedUtilizationPercent:
                     description: |-
-                      observedUtilizationPercent is connections in use over allocatable, across the ready
-                      instances.
+                      observedUtilizationPercent is connections in use over allocatable, across the instances
+                      a tenant could actually be placed on. Capacity nothing may be scheduled onto is left out
+                      of both halves of the ratio, so a cordoned member neither flatters nor deflates it.
                     format: int32
                     type: integer
                   perInstance:

@@ -419,6 +419,86 @@ func TestUtilizationInsideTheToleranceProposesNothing(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- measurable capacity
+
+// A restored instance is the reachable case: pgrestore_controller gives it the source pool's
+// poolRef and cordons it in the same breath, so a pool acquires unschedulable capacity with
+// no operator action at all.
+func restoredInstance(name string, allocatable int32) InstanceSignal {
+	instance := readyInstance(name, allocatable, 0)
+	instance.Schedulable = false
+	return instance
+}
+
+func TestCapacityNothingMayBePlacedOnIsNotMeasured(t *testing.T) {
+	policy := basePolicy()
+	policy.TargetUtilizationPercent = 70
+
+	signals := baseSignals()
+	signals.Instances = []InstanceSignal{
+		readyInstance(instanceA, 225, 100),
+		readyInstance(instanceB, 225, 100),
+		restoredInstance(instanceC, 225),
+	}
+
+	plan := Recommend(signals, policy)
+	if want := int32(44); plan.ObservedUtilizationPercent != want {
+		t.Errorf("utilization is %d%%, want %d%% — 200 in use over the 450 connections a tenant "+
+			"could actually be placed on", plan.ObservedUtilizationPercent, want)
+	}
+	if action, ok := plan.ActionFor(pgelasticv1alpha1.AutoActionScaleIn); ok {
+		t.Errorf("a pool at 44%% of a 70%% target proposed %s: %s", action.Class, action.Detail)
+	}
+}
+
+func TestAPoolWithNoPlaceableCapacityIsUnmeasuredRatherThanEmpty(t *testing.T) {
+	policy := basePolicy()
+	policy.TargetUtilizationPercent = 70
+	policy.MinInstances = 1
+
+	signals := baseSignals()
+	for i := range signals.Instances {
+		signals.Instances[i].Schedulable = false
+	}
+
+	plan := Recommend(signals, policy)
+	if plan.RecommendedInstances != plan.ObservedInstances {
+		t.Errorf("recommended %d of %d instances with none of the pool's capacity visible; "+
+			"unmeasured is not empty", plan.RecommendedInstances, plan.ObservedInstances)
+	}
+	if action, ok := plan.ActionFor(pgelasticv1alpha1.AutoActionScaleIn); ok {
+		t.Errorf("proposed %s against a pool nothing can be placed on: %s", action.Class, action.Detail)
+	}
+	// Taking no action and saying the pool is idle are the same outcome told two ways, and
+	// only one of them sends an operator to look at why the members are cordoned.
+	if !strings.Contains(plan.Summary, "utilization is unknown") {
+		t.Errorf("the summary reads %q, which does not distinguish an unreadable pool from an idle one",
+			plan.Summary)
+	}
+}
+
+// The count the ratio scales must be the count the ratio measured, or a pool that is one
+// third unschedulable is sized as though the third were carrying its share.
+func TestTheRecommendationIsScaledFromTheMeasuredCount(t *testing.T) {
+	policy := basePolicy()
+	policy.TargetUtilizationPercent = 50
+
+	signals := baseSignals()
+	signals.Instances = []InstanceSignal{
+		readyInstance(instanceA, 100, 100),
+		readyInstance(instanceB, 100, 100),
+		restoredInstance(instanceC, 100),
+	}
+
+	plan := Recommend(signals, policy)
+	// Two measured instances at 100%, halved to a 50% target, needs four - and the
+	// unschedulable member is still a member, so the pool wants five.
+	if want := int32(5); plan.RecommendedInstances != want {
+		t.Errorf("recommended %d instances from %d measured at %d%%, want %d",
+			plan.RecommendedInstances, plan.MeasuredInstances, plan.ObservedUtilizationPercent, want)
+	}
+}
+
 // ---------------------------------------------------------------- scale-in
 
 func scaleInSignals() Signals {
