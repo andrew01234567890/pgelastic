@@ -353,6 +353,126 @@ async fn a_notice_and_an_error_response_relay_with_their_fields_intact() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_statement_that_outruns_the_pool_deadline_is_cancelled_and_its_link_closed() {
+    // A backend is the scarce thing in this design and it is handed round between
+    // transactions. Before this, one client could hold one for as long as PostgreSQL would
+    // run its statement, and `spec.timeouts.query` - documented as "the authoritative
+    // deadline" - was read by nothing.
+    let stack =
+        harness::stack_with("[pool]\nmode = \"transaction\"\nqueryDeadlineSeconds = 2\n").await;
+    let client = stack.connect().await;
+
+    let started = Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.simple_query("SELECT pg_sleep(30)"),
+    )
+    .await
+    .expect("a statement past the deadline must not run to completion")
+    .expect_err("a statement past the deadline must fail");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the deadline did not end the statement: {error}"
+    );
+    // Told why, rather than left to infer it from a closed socket. A bare close is what a
+    // network fault looks like, and a driver that cannot tell the two apart will retry the
+    // statement the deadline just stopped.
+    assert_eq!(
+        error.code().map(tokio_postgres::error::SqlState::code),
+        Some("57014"),
+        "the client was not told why its statement ended: {error}"
+    );
+
+    // The backend is not left running the statement on a link somebody else might get.
+    let (observer, conn) = tokio_postgres::connect(
+        &stack.pg.direct_url("deadline_observer"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("an observer connection straight to PostgreSQL");
+    tokio::spawn(conn);
+    // The cancel is delivered on its own socket and PostgreSQL acts on it when the backend
+    // next checks for interrupts, so this is a race the observer has to wait out rather than
+    // an instant the deadline can guarantee.
+    let cleared = Instant::now();
+    loop {
+        let sleeping: i64 = observer
+            .query_one(
+                // Excluding this backend is load-bearing, not defensive: the
+                // observer's own row carries this very statement as its `query`,
+                // and the pattern it searches for is a substring of itself. Without
+                // the exclusion the count never reaches zero and the assertion below
+                // fires whatever the deadline did.
+                "SELECT count(*) FROM pg_catalog.pg_stat_activity \
+                 WHERE pid <> pg_backend_pid() AND state = 'active' \
+                 AND query LIKE '%pg_sleep(30)%'",
+                &[],
+            )
+            .await
+            .expect("counting backends still running the statement")
+            .get(0);
+        if sleeping == 0 {
+            break;
+        }
+        assert!(
+            cleared.elapsed() < Duration::from_secs(10),
+            "a backend is still running the statement the deadline cancelled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_pool_deadline_is_measured_per_statement_and_not_per_session() {
+    // Four seconds of work in three statements against a three-second deadline. A
+    // deadline armed once and never disarmed kills the second one, and a session
+    // that survives all three is the only evidence the timer resets at each
+    // ReadyForQuery rather than merely at the first.
+    let stack =
+        harness::stack_with("[pool]\nmode = \"transaction\"\nqueryDeadlineSeconds = 3\n").await;
+    let client = stack.connect().await;
+
+    let started = Instant::now();
+    for statement in 1..=3 {
+        client
+            .simple_query("SELECT pg_sleep(1.4)")
+            .await
+            .unwrap_or_else(|error| {
+                panic!("statement {statement} is inside the deadline and must survive: {error}")
+            });
+    }
+    assert!(
+        started.elapsed() > Duration::from_secs(3),
+        "the session must have outlived the deadline for this to prove anything"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_thinking_between_statements_is_not_charged_the_query_deadline() {
+    // `spec.timeouts.query` bounds how long one statement may run, not how long a
+    // transaction may stay open. A client holds its backend for the whole of an
+    // explicit transaction, so a deadline armed on "a link is held" rather than on
+    // "a statement is outstanding" ends a session that is running nothing - and
+    // reports it as a query timeout. Bounding the idle transaction itself is a
+    // separate limit with a separate name.
+    let stack =
+        harness::stack_with("[pool]\nmode = \"transaction\"\nqueryDeadlineSeconds = 2\n").await;
+    let client = stack.connect().await;
+
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("opening a transaction");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("a client that spent longer thinking than one statement may run must survive");
+    client.simple_query("COMMIT").await.expect("committing");
+}
+
+#[tokio::test]
 async fn a_cancel_request_cancels_a_long_running_query() {
     let stack = stack().await;
     let client = stack.connect().await;

@@ -41,7 +41,7 @@ use tracing::{debug, warn};
 use crate::cancel::{CancelRoute, CancelTarget};
 use crate::epoch::{Epoch, FenceAction, TransactionWitness};
 use crate::error::{ProxyError, Result};
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, StatementDeadline};
 use crate::pool::{AcquireRequest, Checkout, Connector, Denial, PoolManager};
 use crate::quiesce::{InFlight, TenantGate};
 use crate::relay::{FrameRelay, Relayed};
@@ -259,6 +259,9 @@ pub async fn run(
     ending
 }
 
+/// How long the deadline's own cancel may take before it is abandoned.
+const CANCEL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Running<'_> {
     async fn drive(
         &mut self,
@@ -268,6 +271,16 @@ impl Running<'_> {
         let mut draining = *shutdown.borrow_and_update();
         let deadline = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(deadline);
+        // The statement deadline, armed while a request is outstanding on the
+        // backend and disarmed by its ReadyForQuery.
+        //
+        // A branch of this select! rather than a timeout() around the loop, for
+        // the reason the drain deadline beside it is one: an outer timeout drops
+        // the future mid-write_all and truncates a frame on the wire, and a
+        // truncated frame is not a cancelled statement, it is a corrupt session.
+        let statement = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(statement);
+        let mut statement_armed = false;
         if draining {
             deadline
                 .as_mut()
@@ -286,6 +299,26 @@ impl Running<'_> {
                 return Ok(Ending::Drained);
             }
 
+            // Armed on what the backend owes, not on what the client holds. A
+            // client inside an explicit transaction keeps its backend while it
+            // thinks, and a deadline counting that would end a session running
+            // nothing and report it as a query timeout - a different limit with a
+            // different name. Placed at the top of the loop rather than beside any
+            // one message because a request reaches the backend down several
+            // paths, and one that armed nothing is the hold this exists to bound.
+            match (statement_armed, self.statement_outstanding()) {
+                (false, true) => {
+                    if let Some(limit) = self.manager().query_deadline() {
+                        statement
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + limit);
+                        statement_armed = true;
+                    }
+                }
+                (true, false) => statement_armed = false,
+                _ => {}
+            }
+
             let event = tokio::select! {
                 biased;
                 _ = shutdown.changed(), if !draining => Event::Drain,
@@ -293,6 +326,7 @@ impl Running<'_> {
                 // reach the policy before another client byte is forwarded.
                 _ = self.epochs.changed() => Event::EpochChanged,
                 () = &mut deadline, if draining => Event::Deadline,
+                () = &mut statement, if statement_armed => Event::StatementDeadline,
                 read = self.session.client.read_buf(self.from_client.read_target()) => {
                     Event::FromClient(read)
                 }
@@ -310,6 +344,10 @@ impl Running<'_> {
                         .reset(tokio::time::Instant::now() + force_after);
                 }
                 Event::Deadline => return Ok(Ending::Forced),
+                Event::StatementDeadline => {
+                    self.on_statement_deadline().await;
+                    return Ok(Ending::StatementTimeout);
+                }
                 Event::FromClient(read) => {
                     if read? == 0 {
                         return Ok(Ending::PeerClosed);
@@ -329,6 +367,91 @@ impl Running<'_> {
                     self.pump_backend().await?;
                 }
             }
+        }
+    }
+
+    /// Whether the held backend owes a response to a request already sent.
+    ///
+    /// The same queue the release gate reads, so the deadline and the release
+    /// cannot disagree about whether a statement is running.
+    fn statement_outstanding(&self) -> bool {
+        self.checkout
+            .as_ref()
+            .is_some_and(|checkout| !checkout.conn.link.outstanding().is_empty())
+    }
+
+    /// Cancels the statement that outran the pool's deadline.
+    ///
+    /// The cancel is sent on a fresh socket to the backend's own key, which is
+    /// the only way `PostgreSQL` accepts one, and it is bounded: an unbounded
+    /// cancel against a backend that completes the TCP handshake and then goes
+    /// silent - what an overloaded or mid-migration instance looks like - would
+    /// hold this session open on the deadline that was supposed to end it.
+    ///
+    /// The link is not returned to the pool afterwards, whether or not the cancel
+    /// landed. A cancel that did not land leaves a backend still running the
+    /// statement, and handing that to the next client is worse than losing a link.
+    ///
+    /// Every way this can fail to reach the backend is counted rather than
+    /// swallowed. An enforcement path that reports success when it enforced
+    /// nothing is indistinguishable from one that works, and this one has three
+    /// separate ways to arrive there.
+    ///
+    /// The client is told, with the code `PostgreSQL` uses for its own
+    /// `statement_timeout`. The backend's error never reaches it - the link is
+    /// abandoned rather than pumped - so without this the client sees only its
+    /// socket close, which is what a network fault looks like and what a driver
+    /// will retry.
+    async fn on_statement_deadline(&mut self) {
+        let outcome = self.cancel_overrunning_statement().await;
+        self.session.metrics.statement_deadline(outcome);
+        if outcome != StatementDeadline::Cancelled {
+            tracing::warn!(
+                outcome = outcome.label(),
+                "a statement deadline fired without reaching its backend"
+            );
+        }
+        crate::wire_io::send_fatal(
+            self.session.client,
+            "57014",
+            "canceling statement due to the pool's query deadline",
+        )
+        .await;
+        self.abandon();
+    }
+
+    async fn cancel_overrunning_statement(&mut self) -> StatementDeadline {
+        let Some(checkout) = self.checkout.as_ref() else {
+            return StatementDeadline::NothingHeld;
+        };
+        if checkout.conn.key_data.is_none() {
+            // `deliver` treats a missing key as nothing to do and returns Ok, so
+            // without this the deadline would report a cancel it never sent.
+            return StatementDeadline::NoCancelKey;
+        }
+        let target = crate::cancel::CancelTarget {
+            address: checkout.conn.address.clone(),
+            key_data: checkout.conn.key_data.clone(),
+            instance: self.manager().instance().clone(),
+            client: Some(self.session.binding.client),
+        };
+        // The instance's own TLS and connect timeout, exactly as the client-facing
+        // cancel path uses. Passing None for the connector makes every cancel fail
+        // on a TLS backend leg.
+        let instance = &self.session.binding.instance;
+        let limit = CANCEL_DELIVERY_TIMEOUT.min(instance.backend.connect_timeout());
+        match tokio::time::timeout(
+            CANCEL_DELIVERY_TIMEOUT,
+            crate::cancel::deliver(&target, instance.tls.as_ref(), limit),
+        )
+        .await
+        {
+            Ok(Ok(())) => StatementDeadline::Cancelled,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "the statement deadline's cancel could not be delivered");
+                StatementDeadline::Undeliverable
+            }
+            Err(_) => StatementDeadline::TimedOut,
         }
     }
 
@@ -1386,6 +1509,7 @@ impl Running<'_> {
 enum Event {
     Drain,
     Deadline,
+    StatementDeadline,
     EpochChanged,
     FromClient(std::io::Result<usize>),
     FromBackend(std::io::Result<usize>),
