@@ -18,7 +18,6 @@ limitations under the License.
 package hygiene
 
 import (
-	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -46,16 +45,13 @@ func preflightRecipe(t *testing.T) string {
 // ending at the first line that is neither indented nor blank.
 func makefileRecipe(t *testing.T, target string) string {
 	t.Helper()
-	raw, err := os.ReadFile("../../Makefile")
-	if err != nil {
-		t.Fatalf("reading the Makefile: %v", err)
-	}
+	raw := read(t, "Makefile")
 
-	start := strings.Index(string(raw), "\n"+target+":")
+	start := strings.Index(raw, "\n"+target+":")
 	if start < 0 {
 		t.Fatalf("the Makefile has no %s target", target)
 	}
-	rest := string(raw)[start+1:]
+	rest := raw[start+1:]
 	var recipe []string
 	for line := range strings.SplitSeq(rest, "\n") {
 		if strings.HasPrefix(line, target+":") {
@@ -100,13 +96,10 @@ func TestPreflightRunsWhatCiRuns(t *testing.T) {
 // stays where it was, and the gap is only discovered by a red build. Reading the workflow
 // rather than a second hand-maintained list is the point -- a list would drift the same way.
 func TestNoCargoStepInCiIsMissingFromPreflight(t *testing.T) {
-	raw, err := os.ReadFile("../../.github/workflows/rust.yml")
-	if err != nil {
-		t.Fatalf("reading the Rust workflow: %v", err)
-	}
+	raw := read(t, ".github/workflows/rust.yml")
 
 	// `run: cargo ...`, single line, which is how every step in that workflow is written.
-	steps := regexp.MustCompile(`(?m)^\s*run:\s*(cargo\s+[^\n]+?)\s*$`).FindAllStringSubmatch(string(raw), -1)
+	steps := regexp.MustCompile(`(?m)^\s*run:\s*(cargo\s+[^\n]+?)\s*$`).FindAllStringSubmatch(raw, -1)
 	if len(steps) == 0 {
 		t.Fatal("found no cargo steps in the Rust workflow, so this test is not checking anything")
 	}

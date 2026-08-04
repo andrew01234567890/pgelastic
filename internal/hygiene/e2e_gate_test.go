@@ -17,7 +17,6 @@ limitations under the License.
 package hygiene
 
 import (
-	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -93,14 +92,11 @@ func TestTheBackupSuiteIsOnTheMergeGate(t *testing.T) {
 
 func e2eTargets(t *testing.T) []string {
 	t.Helper()
-	raw, err := os.ReadFile("../../Makefile")
-	if err != nil {
-		t.Fatalf("reading the Makefile: %v", err)
-	}
+	raw := read(t, "Makefile")
 	pattern := regexp.MustCompile(`(?m)^(test-e2e-[a-z0-9-]+):`)
 
 	var targets []string
-	for _, match := range pattern.FindAllStringSubmatch(string(raw), -1) {
+	for _, match := range pattern.FindAllStringSubmatch(raw, -1) {
 		if !slices.Contains(targets, match[1]) {
 			targets = append(targets, match[1])
 		}
@@ -111,10 +107,7 @@ func e2eTargets(t *testing.T) []string {
 // targetsOnTheMergeGate is every e2e target reachable from a job that runs on a pull request.
 func targetsOnTheMergeGate(t *testing.T) map[string]bool {
 	t.Helper()
-	raw, err := os.ReadFile("../../.github/workflows/test-e2e.yml")
-	if err != nil {
-		t.Fatalf("reading the e2e workflow: %v", err)
-	}
+	raw := read(t, ".github/workflows/test-e2e.yml")
 
 	var workflow struct {
 		// A bare `on:` is read as the boolean true by every YAML 1.1 parser, so the triggers
@@ -131,7 +124,7 @@ func targetsOnTheMergeGate(t *testing.T) map[string]bool {
 			} `json:"steps"`
 		} `json:"jobs"`
 	}
-	if err := yaml.Unmarshal(raw, &workflow); err != nil {
+	if err := yaml.Unmarshal([]byte(raw), &workflow); err != nil {
 		t.Fatalf("parsing the e2e workflow: %v", err)
 	}
 	triggers := workflow.On
