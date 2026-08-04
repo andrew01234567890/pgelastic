@@ -1021,7 +1021,12 @@ async fn relay(
         // so the deadline that ends a checkout does not run here and this arm is
         // reachable only if that ever changes. Either way the backend is finished
         // with, which is what `PeerClosed` already means.
-        Ok(Ending::PeerClosed | Ending::StatementTimeout | Ending::IdleInTransaction) => {
+        Ok(
+            Ending::PeerClosed
+            | Ending::StatementTimeout
+            | Ending::IdleInTransaction
+            | Ending::PinCeiling,
+        ) => {
             session::terminate_backend(&mut link.stream).await;
             Ok(())
         }
@@ -1131,7 +1136,12 @@ async fn multiplexed(
             session::close_for_drain(&mut session.stream, forced).await;
             Ok(())
         }
-        Ok(Ending::PeerClosed | Ending::StatementTimeout | Ending::IdleInTransaction) => Ok(()),
+        Ok(
+            Ending::PeerClosed
+            | Ending::StatementTimeout
+            | Ending::IdleInTransaction
+            | Ending::PinCeiling,
+        ) => Ok(()),
         Err(error) => Err(error),
     }
 }

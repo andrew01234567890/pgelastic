@@ -22,6 +22,10 @@ pub enum Ending {
     Drained,
     /// A drain ran out of time and closed the session mid-work.
     Forced,
+    /// A tripwire asked to pin a link the pool had no pinned budget left for. The
+    /// link is closed rather than pinned or shared: it carries state no reset
+    /// removes, which is what asked for the pin in the first place.
+    PinCeiling,
     /// A client held an open transaction without working for longer than the
     /// pool allows. The link is closed rather than rolled back and returned: what
     /// the transaction held is released by the backend going away, and a rollback

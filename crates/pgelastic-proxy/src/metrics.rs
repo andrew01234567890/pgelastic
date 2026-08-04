@@ -248,6 +248,7 @@ pub struct Metrics {
     cancels_refused: AtomicU64,
     statement_deadlines: [AtomicU64; STATEMENT_DEADLINES.len()],
     idle_in_transaction_closed: AtomicU64,
+    pins_refused: AtomicU64,
     connect_gate: [AtomicU64; 4],
     bytes_to_backend: AtomicU64,
     bytes_to_client: AtomicU64,
@@ -393,6 +394,15 @@ impl Metrics {
 
     pub fn statement_deadline(&self, outcome: StatementDeadline) {
         self.statement_deadlines[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pin the pinned-share ceiling refused, which closed a client.
+    ///
+    /// Unlabelled by reason on purpose: the reason says which tripwire fired, and
+    /// the thing an operator has to act on here is the ceiling being reached at
+    /// all. `pgelastic_proxy_pins_total` already carries the breakdown.
+    pub fn pin_refused(&self) {
+        self.pins_refused.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn idle_in_transaction_closed(&self) {
@@ -943,6 +953,12 @@ impl Metrics {
             "pgelastic_proxy_idle_in_transaction_closed_total",
             "Clients closed for holding an open transaction without working.",
             &[("", load(&self.idle_in_transaction_closed))],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_pins_refused_total",
+            "Pins refused because the pool was at its pinned share of the budget.",
+            &[("", load(&self.pins_refused))],
         );
     }
 

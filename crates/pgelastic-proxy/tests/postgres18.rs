@@ -638,6 +638,102 @@ async fn a_deadline_is_measured_from_when_its_state_began_not_from_the_last_byte
     );
 }
 
+// A pinned link is out of the elastic pool for as long as its client lives, so without a
+// ceiling one application that opens a LISTEN per connection reduces the reusable pool to
+// nothing and every other client of the tenant sees PGE1024 against a budget that looks
+// unspent. The refused client is closed rather than left on a shared link: the state that
+// asked for the pin is state no reset removes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pin_past_the_pool_ceiling_closes_its_client_instead_of_sharing_the_link() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\nbackendConnections = 4\nmaxPinnedPercent = 20\n",
+    )
+    .await;
+
+    // A ceiling of 20% over four backends is one link, rounded up.
+    let pinned = stack.connect().await;
+    pinned
+        .simple_query("LISTEN first_channel")
+        .await
+        .expect("the first pin is inside the ceiling");
+    pinned
+        .simple_query("SELECT 1")
+        .await
+        .expect("and the client that took it keeps its session");
+
+    let refused = stack.connect().await;
+    let error = refused
+        .simple_query("LISTEN second_channel")
+        .await
+        .expect_err("a second pin is past the ceiling and must not be granted");
+    assert_eq!(
+        error.code().map(tokio_postgres::error::SqlState::code),
+        Some("53300"),
+        "the refused client was not told why its session ended: {error}"
+    );
+
+    // The client that holds the one pinned link is unharmed by the refusal.
+    pinned
+        .simple_query("SELECT 2")
+        .await
+        .expect("refusing somebody else's pin must not disturb the pinned client");
+}
+
+// The hole a review found in the first version of the pin ceiling, and the worst kind: a
+// refusal was recorded but read in exactly one place, so a pin refused by the pump that runs
+// BEFORE the relay loop - over whatever the client pipelined behind its startup packet - was
+// dropped. The link was then not marked pinned, LISTEN leaves no taint, and the release gate
+// parked it in the shared pool with the registration live. The next client on that pool key
+// would have received this one's NOTIFY payloads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pin_refused_before_the_relay_loop_still_closes_its_client() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\nbackendConnections = 4\nmaxPinnedPercent = 20\n",
+    )
+    .await;
+
+    let holder = stack.connect().await;
+    holder
+        .simple_query("LISTEN taken_channel")
+        .await
+        .expect("the first pin takes the only slot the ceiling allows");
+
+    // The Query travels in the same write as the startup packet, so it is pumped once before
+    // the relay loop begins. A connect-then-send client cannot reach that path.
+    let mut pipelined = RawClient::connect_pipelining(
+        stack.localhost(),
+        "tenant",
+        BACKEND_DATABASE,
+        "LISTEN leaked_channel",
+    )
+    .await;
+    assert!(
+        pipelined.closed_within(Duration::from_secs(15)).await,
+        "a client whose pin was refused before the loop was left running on a link that \
+         cannot be pinned"
+    );
+
+    // And the link it used is not in the pool carrying its registration. A fresh client on the
+    // same pool key must see no notifications for the channel it never listened to.
+    let observer = stack.connect().await;
+    observer
+        .simple_query("NOTIFY leaked_channel, 'payload'")
+        .await
+        .expect("notifying a channel nobody in this pool should be listening on");
+    let listeners: i64 = observer
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_listening_channels() AS c(name)",
+            &[],
+        )
+        .await
+        .expect("counting this session's own listening channels")
+        .get(0);
+    assert_eq!(
+        listeners, 0,
+        "a link carrying the refused client's LISTEN was handed to the next client"
+    );
+}
+
 #[tokio::test]
 async fn a_cancel_request_cancels_a_long_running_query() {
     let stack = stack().await;

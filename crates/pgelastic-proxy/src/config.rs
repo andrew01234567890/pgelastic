@@ -250,6 +250,7 @@ impl Config {
         // comments above this one record, twice.
         structural.pool.query_deadline_seconds = 0;
         structural.pool.client_idle_in_transaction_seconds = 0;
+        structural.pool.max_pinned_percent = 0;
         // An instance's allocatable capacity moves whenever that instance rolls, because the
         // operator withholds it while a member is not serving. Leaving it here meant rolling
         // one instance restarted the whole fleet and dropped every client of every tenant on
@@ -878,6 +879,18 @@ pub struct PoolConfig {
     /// Adopted rather than structural, for the reason above it.
     #[serde(default)]
     pub client_idle_in_transaction_seconds: u64,
+    /// The most of a pool's backend budget that may be held by pinned links, as a
+    /// percentage. Zero is no ceiling.
+    ///
+    /// A pinned link is out of the elastic pool for as long as its client lives,
+    /// so it lowers the ceiling every other client of the tenant shares. Without
+    /// a bound, one application that opens a `LISTEN` per connection reduces the
+    /// reusable pool to nothing and every other client sees `PGE1024` against a
+    /// budget that looks unspent.
+    ///
+    /// Adopted rather than structural.
+    #[serde(default)]
+    pub max_pinned_percent: u32,
     /// When a queued client is sent a `NoticeResponse` telling it why it is
     /// still waiting.
     #[serde(default = "default_notify_after_seconds")]
@@ -923,6 +936,7 @@ impl Default for PoolConfig {
             query_wait_seconds: default_query_wait_seconds(),
             query_deadline_seconds: 0,
             client_idle_in_transaction_seconds: 0,
+            max_pinned_percent: 0,
             notify_after_seconds: default_notify_after_seconds(),
             queue_depth_per_tenant: default_queue_depth_per_tenant(),
             max_server_statements: default_max_server_statements(),
@@ -1551,6 +1565,17 @@ mod tests {
     /// Zero is the only way to ask for no bound, so it must not be confused with
     /// a bound of zero seconds - which would close every transaction the instant
     /// it opened.
+    #[test]
+    fn changing_the_pinned_ceiling_changes_no_process_either() {
+        let current = Config::from_str(MINIMAL).unwrap();
+        let next = Config::from_str(&format!(
+            "configVersion = \"2\"\n{MINIMAL}\n[pool]\nmaxPinnedPercent = 50\n"
+        ))
+        .unwrap();
+        assert_eq!(next.pool.max_pinned_percent, 50);
+        assert!(current.is_dynamic_change(&next));
+    }
+
     #[test]
     fn an_unset_idle_in_transaction_bound_is_no_bound() {
         let config = Config::from_str(MINIMAL).unwrap();

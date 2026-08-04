@@ -210,6 +210,9 @@ struct Running<'a> {
     /// implicit transaction that nothing else here can see, and without this bit
     /// neither bound would ever fire on it.
     unsynced_batch: bool,
+    /// Set when a tripwire asked to pin a link the pool had no pinned budget for.
+    /// The link cannot be pinned and must not be shared, so the session ends.
+    pin_refused: Option<PinReason>,
     /// Held for exactly as long as `checkout` is, so `drainStatus` can say
     /// whether the tenant still has work on its source.
     holding: Option<InFlight>,
@@ -256,6 +259,7 @@ pub async fn run(
         witness: TransactionWitness::new(),
         draining_fence: false,
         unsynced_batch: false,
+        pin_refused: None,
         holding: None,
         instance_gate: instance_gate_of(&session),
         epochs: epochs_of(&session),
@@ -311,6 +315,16 @@ impl Running<'_> {
         }
 
         loop {
+            // First, before the drain boundary and before any deadline is armed.
+            // `pin()` records the refusal rather than ending the session where it
+            // is noticed, because that is inside the client pump, mid-message.
+            // The check lives here rather than beside a pump so that every pump -
+            // including the one before this loop, over whatever the client
+            // pipelined behind its startup packet - is covered by construction.
+            if let Some(reason) = self.pin_refused {
+                self.on_pin_refused(reason).await;
+                return Ok(Ending::PinCeiling);
+            }
             if draining && self.at_drain_boundary() {
                 return Ok(Ending::Drained);
             }
@@ -391,6 +405,25 @@ impl Running<'_> {
         }
     }
 
+    /// Ends a session whose link could not be pinned.
+    ///
+    /// The link is closed, not returned. It carries state no reset removes - that
+    /// is what asked for the pin - so handing it to the next client would give one
+    /// tenant's `LISTEN`, cursor or advisory lock to somebody else. Losing one
+    /// client is the cheaper of the two.
+    async fn on_pin_refused(&mut self, reason: PinReason) {
+        self.cancel_anything_outstanding().await;
+        crate::wire_io::send_fatal(
+            self.session.client,
+            "53300",
+            &format!(
+                "this pool is at its limit for connections pinned by session state ({reason})"
+            ),
+        )
+        .await;
+        self.abandon();
+    }
+
     /// Whether the client is holding an open transaction and running nothing.
     ///
     /// Read off the last `ReadyForQuery` rather than off "a link is held",
@@ -427,6 +460,25 @@ impl Running<'_> {
         )
         .await;
         self.abandon();
+    }
+
+    /// Cancels whatever the backend is still running before the link is closed.
+    ///
+    /// `abandon` decrements the ledger and hands the freed slot to a queued client
+    /// *before* the `Terminate` reaches the backend - and a `Terminate` is only
+    /// honoured once the backend finishes what it is running, which pool.rs says
+    /// about the same message. Without this the instance runs one backend over
+    /// budget for as long as the abandoned statement takes, and the statement
+    /// deadline that would have stopped it died with the session.
+    ///
+    /// A no-op when nothing is outstanding, which is every idle-in-transaction
+    /// expiry and most pin expiries.
+    async fn cancel_anything_outstanding(&mut self) {
+        if !self.statement_outstanding() {
+            return;
+        }
+        let outcome = self.cancel_overrunning_statement().await;
+        self.session.metrics.statement_deadline(outcome);
     }
 
     /// Whether the held backend owes a response to a request already sent.
@@ -1459,14 +1511,29 @@ impl Running<'_> {
 
     /// Records unscrubbable state and takes the link out of the elastic budget.
     fn pin(&mut self, reason: PinReason) {
-        let Some(checkout) = self.checkout.as_mut() else {
+        let Some(checkout) = self.checkout.as_ref() else {
             return;
         };
         if checkout.conn.link.pin().is_some() {
             return;
         }
-        checkout.conn.link.set_pin(reason);
-        self.manager().record_pin(reason);
+        if let crate::pool::PinOutcome::Refused { pinned, ceiling } =
+            self.manager().record_pin(reason)
+        {
+            // Recorded rather than acted on here: this runs inside the client
+            // pump, mid-message, and the session has to end at the top of the
+            // loop where nothing is half-written to either side.
+            warn!(
+                %reason, pinned, ceiling,
+                "the pool is at its pinned ceiling, so this link is closed rather than pinned"
+            );
+            self.session.metrics.pin_refused();
+            self.pin_refused = Some(reason);
+            return;
+        }
+        if let Some(checkout) = self.checkout.as_mut() {
+            checkout.conn.link.set_pin(reason);
+        }
         self.session.metrics.pinned(reason);
         self.manager().publish_budget();
         debug!(%reason, "a tripwire pinned this client to its backend");

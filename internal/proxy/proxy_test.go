@@ -270,6 +270,43 @@ func TestAZeroIdleInTransactionBoundDisablesItRatherThanDefaulting(t *testing.T)
 	}
 }
 
+func TestThePinnedCeilingReachesTheProxyAndDoesNotRollTheFleet(t *testing.T) {
+	before := testConfig().Render()
+	if !strings.Contains(before.TOML, "maxPinnedPercent = 20") {
+		t.Fatalf("an unset spec.pooling.maxPinnedFractionPercent rendered something other "+
+			"than its own CRD default:\n%s", before.TOML)
+	}
+
+	config := testConfig()
+	config.Pool.Spec.Pooling = &pgelasticv1alpha1.PoolingConfig{
+		MaxPinnedFractionPercent: ptr.To(int32(50)),
+	}
+	after := config.Render()
+
+	if !strings.Contains(after.TOML, "maxPinnedPercent = 50") {
+		t.Fatalf("the pinned ceiling never reached the proxy:\n%s", after.TOML)
+	}
+	if before.StructuralHash != after.StructuralHash {
+		t.Fatalf("changing the pinned ceiling moved the pod template hash from %q to %q, so "+
+			"an operator cannot change one without dropping every client of every tenant",
+			before.StructuralHash, after.StructuralHash)
+	}
+}
+
+// A pool that would rather run out of reusable connections than refuse a LISTEN says so with
+// zero, which the field's own Minimum=0 offers.
+func TestAZeroPinnedCeilingIsNoCeiling(t *testing.T) {
+	config := testConfig()
+	config.Pool.Spec.Pooling = &pgelasticv1alpha1.PoolingConfig{
+		MaxPinnedFractionPercent: ptr.To(int32(0)),
+	}
+
+	document := config.Render().TOML
+	if !strings.Contains(document, "maxPinnedPercent = 0") {
+		t.Fatalf("an explicit zero ceiling was folded into the default:\n%s", document)
+	}
+}
+
 func TestAddingAnInstanceRollsTheFleet(t *testing.T) {
 	before := testConfig().Render()
 
