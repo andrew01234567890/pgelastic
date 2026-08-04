@@ -169,6 +169,17 @@ var _ = BeforeSuite(func() {
 		ControllerName: suiteControllerName,
 	}).SetupWithManager(manager)).To(Succeed())
 
+	// Registered because this suite asserts on the roles it creates. Without it the tenant
+	// user specs assert that a role reaches pg_roles while nothing is running the controller
+	// that puts it there - a suite that cannot pass on any code, which is the shape the
+	// backup suite shipped in four times before anybody ran it.
+	Expect((&controller.PgTenantUserReconciler{
+		Client:         manager.GetClient(),
+		Scheme:         manager.GetScheme(),
+		SQL:            tenantSQL,
+		ControllerName: suiteControllerName,
+	}).SetupWithManager(manager)).To(Succeed())
+
 	Expect((&controller.PgElasticPoolReconciler{
 		Client:         manager.GetClient(),
 		Scheme:         manager.GetScheme(),
