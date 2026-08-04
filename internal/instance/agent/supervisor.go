@@ -185,6 +185,9 @@ type Supervisor struct {
 	strandedSince time.Time
 	// rejoinPrimary is the member a queued rejoin must take this one back onto.
 	rejoinPrimary string
+	// databases reads pg_stat_database for the tenants this member holds, on a cadence of
+	// its own rather than the observe tick's.
+	databases *DatabaseScraper
 }
 
 // NewSupervisor builds the agent.
@@ -201,6 +204,11 @@ func NewSupervisor(options Options) *Supervisor {
 		state:        ProbeState{Role: RoleUnknown},
 		restartedFor: map[string]bool{},
 		session:      NewSession(),
+		databases: &DatabaseScraper{
+			SocketDir: options.SocketDir,
+			Port:      provision.PostgresPort,
+			Password:  options.OpsPassword,
+		},
 	}
 }
 
@@ -499,6 +507,26 @@ func (s *Supervisor) archiveObservation(observation ArchiveObservation) ArchiveO
 	return observation
 }
 
+// scrapeDatabases reads pg_stat_database for the tenants on this member, at most once per
+// the scraper's TTL however often the observe tick runs.
+//
+// A failure returns whatever the last successful scrape held rather than nothing. Losing the
+// readings would move every tenant on this member into the operator's stale count, which
+// refuses autoscaling for the pool - a heavier consequence than one round of counters being a
+// few seconds old, and the wrong response to a query that timed out once.
+func (s *Supervisor) scrapeDatabases(ctx context.Context) []provision.DatabaseReport {
+	reports, fresh, err := s.databases.Scrape(ctx)
+	if err != nil {
+		logf.FromContext(ctx).V(1).Info("could not read pg_stat_database",
+			"error", err, "servingLastReading", len(reports) > 0)
+		return reports
+	}
+	if fresh {
+		logf.FromContext(ctx).V(1).Info("read pg_stat_database", "databases", len(reports))
+	}
+	return reports
+}
+
 // observe re-reads the postmaster, converges the replication configuration, and
 // republishes this member's status.
 func (s *Supervisor) observe(ctx context.Context) {
@@ -549,12 +577,14 @@ func (s *Supervisor) observe(ctx context.Context) {
 		observation.DataUsedBytes = dataUsage.UsedBytes()
 	}
 	observation.Archive = s.archiveObservation(observation.Archive)
+	databases := s.scrapeDatabases(ctx)
 	s.update(func(state *ProbeState) {
 		state.ClientBackends = observation.ClientBackends
 		state.Role = observation.Role
 		state.ReplayLag = observation.ReplayLag
 		state.Observation = observation
 		state.Observed = true
+		state.Databases = databases
 	})
 
 	var contract *Contract

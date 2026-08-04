@@ -348,7 +348,7 @@ func BootstrapRoles(ctx context.Context, conn *pgx.Conn, replicationPassword, op
 	//
 	// template1 is included because a database created from it inherits its ACL, so leaving it
 	// open would hand the same opening to every database made afterwards.
-	for _, database := range []string{"postgres", "template1"} {
+	for _, database := range []string{maintenanceDatabase, templateDatabase} {
 		statements = append(statements,
 			fmt.Sprintf(`REVOKE CONNECT ON DATABASE %s FROM PUBLIC`, database),
 			fmt.Sprintf(`GRANT CONNECT ON DATABASE %s TO %s, %s, %s`,

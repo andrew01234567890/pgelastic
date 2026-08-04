@@ -104,6 +104,7 @@ func MemberReportOf(member string, state ProbeState) provision.MemberReport {
 		StreamingMembers:        observation.SyncStandbys,
 		PrimaryEpoch:            observation.PrimaryEpoch,
 		Archive:                 archiveReport(observation.Archive),
+		Databases:               state.Databases,
 	}
 }
 

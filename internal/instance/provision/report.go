@@ -119,6 +119,61 @@ type MemberReport struct {
 	// instance's WAL rate onto the API server, and the answer the operator needs is the
 	// current state rather than the log of transitions.
 	Archive *ArchiveReport `json:"archive,omitempty"`
+
+	// Databases is pg_stat_database for every tenant database on this member.
+	//
+	// It rides here for the same reason Archive does, and the reason is sharper: these are
+	// per-transaction counters on ~200 databases per instance, so a channel that wrote them
+	// to the API server would put the fleet's transaction rate onto etcd. The operator
+	// already polls this endpoint, and a poll that times out is evidence in a way that a
+	// stale record on the CR is not.
+	//
+	// Absent rather than empty when the scrape could not run. The two are different facts:
+	// no databases means the member holds no tenants, while no reading means nobody knows.
+	Databases []DatabaseReport `json:"databases,omitempty"`
+}
+
+// DatabaseReport is one tenant database's row of pg_stat_database, as the member that holds
+// it reports it.
+//
+// The counters are named fields rather than a map keyed by the metering package's Stat, so
+// that the wire format cannot be changed by renaming a Prometheus label value, and so that an
+// agent built from an older commit is missing a field rather than silently carrying a key
+// nothing reads.
+//
+// There is no relation count here, and its absence is a limit of PostgreSQL rather than an
+// oversight. pg_class is a per-database catalog, so counting a tenant's relations means one
+// connection to each of the ~200 databases per scrape, which is the cost the single batch
+// exists to avoid. pg_shdepend is shared and tempting - it records an ownership row per
+// relation and can be filtered by dbid from anywhere - and it is wrong: indexes carry no
+// ownership entry, so a trivial schema of two tables, two primary keys, one index, a sequence,
+// a view and a materialized view counts 5 there against 8 in pg_class. Undercounting by every
+// index on a dimension that bounds instance density is worse than not reporting it.
+type DatabaseReport struct {
+	// Name is the database name, which is what a tenant is joined to it by.
+	Name string `json:"name"`
+	// OID disambiguates a database that was dropped and recreated under the same name: its
+	// counters start again from zero, and differencing across the two would be nonsense.
+	OID int64 `json:"oid"`
+	// NumBackends is a level, not a counter, and so is never differenced.
+	NumBackends int32 `json:"numBackends"`
+
+	XactCommit   int64 `json:"xactCommit"`
+	XactRollback int64 `json:"xactRollback"`
+	BlksRead     int64 `json:"blksRead"`
+	BlksHit      int64 `json:"blksHit"`
+	TupReturned  int64 `json:"tupReturned"`
+	TupFetched   int64 `json:"tupFetched"`
+	// TupModified is tup_inserted + tup_updated + tup_deleted, which pg_stat_database
+	// reports separately and no capacity decision reads separately.
+	TupModified int64 `json:"tupModified"`
+	Deadlocks   int64 `json:"deadlocks"`
+
+	// StatsReset is pg_stat_database.stats_reset. A change in it is a reset even when every
+	// counter happens to have gone up, because the new values count from a different origin.
+	StatsReset *metav1.Time `json:"statsReset,omitempty"`
+	// SizeBytes is pg_database_size.
+	SizeBytes int64 `json:"sizeBytes"`
 }
 
 // ArchiveReport is one member's view of its own WAL archiving.
