@@ -91,19 +91,26 @@ func (r *PgTenantUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	status := pgelasticv1alpha1.PgTenantUserStatus{
 		ObservedGeneration: user.Generation,
 		RoleName:           user.Status.RoleName,
-		Conditions:         user.Status.Conditions,
+		// Cloned, not aliased. meta.SetStatusCondition mutates the slice it is given in
+		// place, so sharing the backing array with user.Status.Conditions means publish's
+		// DeepEqual compares the new conditions against themselves and finds no change - and
+		// a pass whose only work was a condition, a reason or a message is dropped entirely
+		// whenever the phase and the observed generation happen to match.
+		Conditions: slices.Clone(user.Status.Conditions),
 	}
 	// Published as soon as the object resolves, before the role exists. It is derived rather
 	// than observed, and what it is for - getting from a role in pg_stat_activity back to the
 	// object - is needed most when that object is Failed.
 	status.RoleName = migration.TenantUserRoleName(user.Namespace, user.Spec.TenantRef.Name, user.Name)
 
-	result, err := r.converge(ctx, user, &status)
-	if err != nil {
+	if err := r.converge(ctx, user, &status); err != nil {
 		return ctrl.Result{}, err
 	}
 	status.Phase = userPhase(status.Conditions)
-	return result, r.publish(ctx, user, status)
+	// One requeue interval for every outcome, stated once. Every path through converge that
+	// is not an error wants the same thing - look again in a while - and returning it from
+	// each of them made seven copies of one decision and hid that they were all the same.
+	return ctrl.Result{RequeueAfter: placementRetryInterval}, r.publish(ctx, user, status)
 }
 
 // converge resolves where the login lives and makes its role match.
@@ -115,16 +122,16 @@ func (r *PgTenantUserReconciler) converge(
 	ctx context.Context,
 	user *pgelasticv1alpha1.PgTenantUser,
 	status *pgelasticv1alpha1.PgTenantUserStatus,
-) (ctrl.Result, error) {
+) error {
 	tenant := &pgelasticv1alpha1.PgTenant{}
 	key := types.NamespacedName{Namespace: user.Namespace, Name: user.Spec.TenantRef.Name}
 	if err := r.Get(ctx, key, tenant); err != nil {
 		if !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, err
+			return err
 		}
 		r.pending(status, user.Generation, pgelasticv1alpha1.ReasonPending,
 			fmt.Sprintf("PgTenant %q does not exist", user.Spec.TenantRef.Name))
-		return ctrl.Result{RequeueAfter: placementRetryInterval}, nil
+		return nil
 	}
 	setCondition(&status.Conditions, user.Generation, pgelasticv1alpha1.ConditionAccepted,
 		metav1.ConditionTrue, pgelasticv1alpha1.ReasonAccepted,
@@ -133,30 +140,30 @@ func (r *PgTenantUserReconciler) converge(
 	if tenant.Status.Binding == nil || tenant.Status.Binding.InstanceRef == nil {
 		r.notReady(status, user.Generation, pgelasticv1alpha1.ReasonPending,
 			fmt.Sprintf("PgTenant %q is not bound to an instance yet", tenant.Name))
-		return ctrl.Result{RequeueAfter: placementRetryInterval}, nil
+		return nil
 	}
 	instanceName := tenant.Status.Binding.InstanceRef.Name
 
 	if r.SQL == nil {
 		r.notReady(status, user.Generation, tenantuser.ReasonProvisioningFailed,
 			"no PostgreSQL transport is configured, so this login's role cannot be created")
-		return ctrl.Result{RequeueAfter: placementRetryInterval}, nil
+		return nil
 	}
 
 	members, owned, missing, err := r.memberRoles(ctx, user, tenant)
 	if err != nil {
-		return ctrl.Result{}, err
+		return err
 	}
 	if missing != "" {
 		// Never created here: a role minted by another object's reconcile carries no
 		// finalizer of its own and nothing would ever drop it.
 		r.notReady(status, user.Generation, pgelasticv1alpha1.ReasonPending, fmt.Sprintf(
 			"waiting for the login %q named in memberOf to be provisioned", missing))
-		return ctrl.Result{RequeueAfter: placementRetryInterval}, nil
+		return nil
 	}
 
 	if err := r.hold(ctx, user); err != nil {
-		return ctrl.Result{}, err
+		return err
 	}
 
 	spec := tenantuser.Spec{
@@ -166,21 +173,16 @@ func (r *PgTenantUserReconciler) converge(
 		MemberOf: members,
 		Owned:    owned,
 	}
-	if spec.Login {
-		if user.Spec.CredentialsSecretRef == nil {
-			// Provisioned anyway. Another login's memberOf may name this one, and a role
-			// that does not exist cannot be granted.
-			r.notReady(status, user.Generation, ReasonNoCredentials,
-				"this login has no credentials Secret, so the proxy has nothing to "+
-					"challenge a client with")
-		} else {
-			credential, err := r.ensureUserBackendCredential(
-				ctx, user, status.RoleName, scramIterationsOfPool(ctx, r.Client, tenant))
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			spec.Verifier = credential.Verifier
+	// Provisioned even without a credential. Another login's memberOf may name this one, and
+	// a role that does not exist cannot be granted.
+	credentialled := spec.Login && user.Spec.CredentialsSecretRef != nil
+	if credentialled {
+		credential, err := r.ensureUserBackendCredential(
+			ctx, user, status.RoleName, scramIterationsOfPool(ctx, r.Client, tenant))
+		if err != nil {
+			return err
 		}
+		spec.Verifier = credential.Verifier
 	}
 
 	if _, err := tenantuser.Ensure(ctx, r.SQL, tenantEndpoint(tenant, instanceName), spec); err != nil {
@@ -191,19 +193,27 @@ func (r *PgTenantUserReconciler) converge(
 		logf.FromContext(ctx).Error(err, "Could not provision the login's role",
 			"role", status.RoleName, "instance", instanceName)
 		r.notReady(status, user.Generation, tenantuser.ReasonProvisioningFailed, err.Error())
-		return ctrl.Result{RequeueAfter: placementRetryInterval}, nil
+		return nil
 	}
 
-	if meta := findCondition(status.Conditions, pgelasticv1alpha1.ConditionReady); meta != nil &&
-		meta.Reason == ReasonNoCredentials {
-		return ctrl.Result{RequeueAfter: placementRetryInterval}, nil
+	// Decided from this pass's own facts, never read back out of the condition list. The
+	// conditions are seeded from the previous reconcile, so peeking at them meant that once a
+	// login had been seen without a credentialsSecretRef it reported NoCredentials for ever -
+	// after the Secret was added the role existed, the backend credential existed and clients
+	// authenticated, while the object still said Ready=False with a message that was no
+	// longer true.
+	if spec.Login && !credentialled {
+		r.notReady(status, user.Generation, ReasonNoCredentials,
+			"this login has no credentials Secret, so the proxy has nothing to challenge a "+
+				"client with")
+		return nil
 	}
 	setCondition(&status.Conditions, user.Generation, pgelasticv1alpha1.ConditionReady,
 		metav1.ConditionTrue, pgelasticv1alpha1.ReasonReady, fmt.Sprintf(
 			"role %q is serving on PgInstance %q: it holds CONNECT on database %q and nothing "+
 				"else, so grant the rest by connecting as the tenant",
 			status.RoleName, instanceName, tenant.Spec.DatabaseName))
-	return ctrl.Result{RequeueAfter: placementRetryInterval}, nil
+	return nil
 }
 
 // memberRoles resolves spec.memberOf to the roles it names, and reports the fence.
@@ -274,13 +284,14 @@ func (r *PgTenantUserReconciler) reclaim(ctx context.Context, user *pgelasticv1a
 	if tenant.Status.Binding == nil || tenant.Status.Binding.InstanceRef == nil {
 		return nil
 	}
+	// Derived rather than read back from status. Reconcile writes that field as exactly this
+	// call over three immutable inputs, so the two can never disagree - and `hold` adds the
+	// finalizer before the first status is ever published, which is the window where reading
+	// status would have found nothing and the error message would have named an empty role.
+	role := migration.TenantUserRoleName(user.Namespace, user.Spec.TenantRef.Name, user.Name)
 	if r.SQL == nil {
 		return fmt.Errorf("no PostgreSQL transport is configured, so role %q cannot be dropped",
-			user.Status.RoleName)
-	}
-	role := user.Status.RoleName
-	if role == "" {
-		role = migration.TenantUserRoleName(user.Namespace, user.Spec.TenantRef.Name, user.Name)
+			role)
 	}
 	return tenantuser.Drop(ctx,
 		r.SQL,

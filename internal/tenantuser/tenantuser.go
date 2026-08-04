@@ -51,8 +51,6 @@ type Endpoint = migration.Endpoint
 // Condition reasons this package produces, spelled here rather than in the shared vocabulary
 // because they describe this package's steps - exactly as tenantdb and migration spell theirs.
 const (
-	// ReasonProvisioning means the role is not there yet and nothing has failed.
-	ReasonProvisioning = "Provisioning"
 	// ReasonProvisioningFailed means PostgreSQL refused a step, and the message says which.
 	ReasonProvisioningFailed = "ProvisioningFailed"
 	// ReasonReclaimFailed means the role could not be dropped, so the finalizer stays on.
