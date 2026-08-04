@@ -347,6 +347,18 @@ fn apply(
 /// to a GUC, so they are preserved verbatim under the reserved `options` name
 /// rather than dropped — dropping them would merge two sessions that the
 /// backend will treat differently.
+/// Splits an `options` startup value into the settings it carries.
+///
+/// Public because the fingerprint is not the only thing that has to see inside
+/// `options`: a `TimeZone` a client asked for arrives here rather than as a
+/// startup key of its own, and the proxy's variable cache has to know about it
+/// or the client silently runs under whatever the pool's first client asked for.
+/// Whatever cannot be attributed to a setting is returned under the literal name
+/// `options`, so nothing is dropped.
+pub fn expand_startup_options(raw: &str) -> Vec<(String, String)> {
+    expand_options(raw)
+}
+
 fn expand_options(raw: &str) -> Vec<(String, String)> {
     let tokens = split_options(raw);
     let mut settings = Vec::new();

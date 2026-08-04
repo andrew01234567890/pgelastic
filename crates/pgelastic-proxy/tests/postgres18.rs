@@ -818,6 +818,133 @@ async fn a_pin_that_expires_mid_statement_cancels_the_backend_it_gives_up() {
     }
 }
 
+// application_name is in the variable cache's TRACKED set, so a client landing on a link that
+// carries somebody else's has its own re-SET before its first message. Keying on it therefore
+// buys nothing and costs everything: every distinct application name mints its own pool, and
+// the key map grows without bound. Asserted on churn rather than on concurrency - a test that
+// counted peak concurrent backends would pass against the bug, because the fragmentation shows
+// up as links opened, not as links held at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_application_names_share_one_backend_when_the_policy_ignores_them() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\nignoreStartupParameters = [\"application_name\"]\n",
+    )
+    .await;
+
+    // Sequential, not concurrent: two clients at once need two backends whatever the key says.
+    let first = stack
+        .connect_with(&format!("{} application_name=alpha", stack.url()))
+        .await;
+    let alpha: i32 = first
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("the first client's backend")
+        .get(0);
+    drop(first);
+    // The link is released at ReadyForQuery, but the session task that parks it is a separate
+    // task, so the second connection has to lose that race rather than assume it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let second = stack
+        .connect_with(&format!("{} application_name=beta", stack.url()))
+        .await;
+    let beta: i32 = second
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("the second client's backend")
+        .get(0);
+
+    assert_eq!(
+        alpha, beta,
+        "two application names minted two pools, so every distinct one costs a backend"
+    );
+
+    // The half an adversarial review of this layer found missing, and the reason it was
+    // missing is that the assertion above passes in exactly the run where this one fails.
+    // Sharing a link is the *cost* side of ignoring a parameter; this is the safety side.
+    let seen: String = second
+        .query_one("SELECT current_setting('application_name')", &[])
+        .await
+        .expect("what the second client is actually running as")
+        .get(0);
+    assert_eq!(
+        seen, "beta",
+        "the second client inherited the first one's application_name from the pool's cached \
+         greeting and nothing ever corrected it"
+    );
+}
+
+// The sharper instance of the same defect. A client that inherits another's TimeZone gets a
+// different answer from every now(), current_date and date_trunc it runs, silently, for its
+// whole session - and TimeZone is in TRACKED, so it is a parameter an operator is allowed to
+// keep out of the pool key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_sharing_a_link_runs_under_its_own_timezone_not_the_pools() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\nignoreStartupParameters = [\"TimeZone\"]\n",
+    )
+    .await;
+
+    let first = stack
+        .connect_with(&format!("{} options='-c timezone=Asia/Tokyo'", stack.url()))
+        .await;
+    let tokyo: String = first
+        .query_one("SHOW TimeZone", &[])
+        .await
+        .expect("the first client's zone")
+        .get(0);
+    assert_eq!(tokyo, "Asia/Tokyo");
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let second = stack
+        .connect_with(&format!("{} options='-c timezone=UTC'", stack.url()))
+        .await;
+    let utc: String = second
+        .query_one("SHOW TimeZone", &[])
+        .await
+        .expect("the second client's zone")
+        .get(0);
+    assert_eq!(
+        utc, "UTC",
+        "the second client asked for UTC and is running in the first client's timezone, so \
+         every timestamp it computes is wrong"
+    );
+}
+
+// The other half of the same policy: a parameter the cache does not track stays in the key,
+// so a client never inherits another's session-start value for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untracked_parameter_still_separates_two_clients() {
+    let stack = harness::stack_with("[pool]\nmode = \"transaction\"\n").await;
+
+    let first = stack
+        .connect_with(&format!("{} options='-c search_path=alpha'", stack.url()))
+        .await;
+    let alpha: i32 = first
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("the first client's backend")
+        .get(0);
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let second = stack
+        .connect_with(&format!("{} options='-c search_path=beta'", stack.url()))
+        .await;
+    let beta: i32 = second
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("the second client's backend")
+        .get(0);
+
+    assert_ne!(
+        alpha, beta,
+        "a client was handed a link opened with another client's search_path, which no reset \
+         restores"
+    );
+}
+
 #[tokio::test]
 async fn a_cancel_request_cancels_a_long_running_query() {
     let stack = stack().await;

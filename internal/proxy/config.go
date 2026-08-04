@@ -379,6 +379,12 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 	// would make proxy memory a function of how much distinct SQL the applications contain.
 	writeInt(out, "maxGlobalStatements", int64(globalStatementsLimit(pooling)))
 	writeInt(out, "serverLifetimeSeconds", serverLifetimeSeconds(pooling))
+	// Structural, unlike the four bounds below: these decide what a pool *key* is, and a key is
+	// what makes one link reusable by another client. A running replica cannot adopt a change to
+	// that without the links it already holds meaning something different from the ones it opens
+	// next, so both halves carry it and changing one rolls the fleet.
+	writeString(out, "startupParameterPolicy", startupParameterPolicy(pooling))
+	writeStrings(out, "ignoreStartupParameters", ignoreStartupParameters(pooling))
 	out.WriteString("\n")
 
 	if !dynamic {
@@ -471,6 +477,14 @@ func writeString(out *strings.Builder, key, value string) {
 	out.WriteString(" = ")
 	out.WriteString(tomlString(value))
 	out.WriteByte('\n')
+}
+
+func writeStrings(out *strings.Builder, key string, values []string) {
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		quoted = append(quoted, tomlString(value))
+	}
+	fmt.Fprintf(out, "%s = [%s]\n", key, strings.Join(quoted, ", "))
 }
 
 func writeInt(out *strings.Builder, key string, value int64) {
@@ -572,6 +586,40 @@ func maxPinDuration(pooling *pgelasticv1alpha1.PoolingConfig) *metav1.Duration {
 		return nil
 	}
 	return pooling.MaxPinDuration
+}
+
+// startupParameterPolicy renders spec.pooling.startupParameterPolicy as the proxy spells it.
+// The two vocabularies are deliberately not shared: the CRD's is Kubernetes-facing and the
+// proxy's is a serde enum, and a rename on either side must be a compile error here rather than
+// a document the proxy silently refuses.
+func startupParameterPolicy(pooling *pgelasticv1alpha1.PoolingConfig) string {
+	policy := pgelasticv1alpha1.StartupParameterPoolKey
+	if pooling != nil && pooling.StartupParameterPolicy != "" {
+		policy = pooling.StartupParameterPolicy
+	}
+	switch policy {
+	case pgelasticv1alpha1.StartupParameterReject:
+		return "reject"
+	case pgelasticv1alpha1.StartupParameterIgnore:
+		return "ignore"
+	case pgelasticv1alpha1.StartupParameterPoolKey:
+		return "poolKey"
+	default:
+		return "poolKey"
+	}
+}
+
+// ignoreStartupParameters renders spec.pooling.ignoreStartupParameters.
+//
+// A nil list is the CRD's own default rather than an empty one: an empty list would key every
+// pool on extra_float_digits, which every libpq-derived driver sends and nothing depends on.
+// The proxy refuses any entry its variable cache does not track, so a list that would hand one
+// client another's search_path is rejected there rather than rendered and hoped for.
+func ignoreStartupParameters(pooling *pgelasticv1alpha1.PoolingConfig) []string {
+	if pooling == nil || pooling.IgnoreStartupParameters == nil {
+		return []string{"extra_float_digits", "options"}
+	}
+	return pooling.IgnoreStartupParameters
 }
 
 func poolMode(pooling *pgelasticv1alpha1.PoolingConfig) string {

@@ -23,6 +23,33 @@ use serde::Deserialize;
 
 use crate::error::{ProxyError, Result};
 
+/// What the proxy does with a startup parameter it has no specific policy for.
+///
+/// Named to match `spec.pooling.startupParameterPolicy`, which is what the
+/// operator renders this from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StartupParameterPolicy {
+    /// Refuse the connection rather than serve it under a different setting.
+    Reject,
+    /// Drop the parameter; the client silently gets the server default.
+    Ignore,
+    /// Carry the parameter into the pool key, so a client only ever shares a link
+    /// with another client that asked for the same thing.
+    #[default]
+    PoolKey,
+}
+
+impl From<StartupParameterPolicy> for pgelastic_pool::StartupParamPolicy {
+    fn from(policy: StartupParameterPolicy) -> Self {
+        match policy {
+            StartupParameterPolicy::Reject => Self::Reject,
+            StartupParameterPolicy::Ignore => Self::Ignore,
+            StartupParameterPolicy::PoolKey => Self::PoolKey,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
@@ -144,12 +171,69 @@ impl Config {
                  somebody else's budget",
             ));
         }
+        self.validate_ignored_startup_parameters()?;
         if self.stall.interval_ms == 0 || self.stall.confirmations == 0 {
             return Err(ProxyError::config(
                 "stall.intervalMs and stall.confirmations must both be non-zero",
             ));
         }
         Ok(())
+    }
+
+    /// Refuses an ignore list that would hand one client another's session state.
+    ///
+    /// A startup parameter is part of a link's identity rather than of its state:
+    /// `RESET ALL` restores a GUC to its session-*start* value, so nothing the
+    /// reset ladder does can undo one. Taking a parameter out of the pool key
+    /// therefore lets a client be handed a link that was opened with somebody
+    /// else's value, permanently - unless the variable cache tracks it, in which
+    /// case it is diffed and re-`SET` at every checkout and the client's own value
+    /// arrives before its first message.
+    ///
+    /// Refused here rather than at the connection that would be mis-served,
+    /// because by then it is one client's `search_path` on another client's link
+    /// and nothing reports it.
+    fn validate_ignored_startup_parameters(&self) -> Result<()> {
+        for name in &self.pool.ignore_startup_parameters {
+            if crate::vars::is_tracked(name)
+                || IGNORABLE_UNTRACKED
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            return Err(ProxyError::config(format!(
+                "pool.ignoreStartupParameters names {name:?}, which the variable cache does \
+                 not track: a startup parameter kept out of the pool key is one a client can \
+                 be handed another client's value of, for the life of the link, with no reset \
+                 that restores it"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The startup-parameter policy this process was built with.
+    ///
+    /// Built once rather than per connection: it is a map, and `pool_key` runs on
+    /// every binding.
+    #[must_use]
+    pub fn fingerprint_policy(&self) -> pgelastic_pool::FingerprintPolicy {
+        let mut policy =
+            pgelastic_pool::FingerprintPolicy::new(self.pool.startup_parameter_policy.into());
+        for name in &self.pool.ignore_startup_parameters {
+            // `options` is skipped rather than overridden. It is expanded into the
+            // settings it carries and each of those is judged on its own - but
+            // whatever the expansion could not attribute to a GUC is re-emitted
+            // under the literal name `options`, so an Ignore override on that name
+            // drops the residual from the fingerprint and two clients passing
+            // different unparseable option strings share a link. The entry is in
+            // the list because the operator's CRD defaults it there.
+            if name.eq_ignore_ascii_case("options") {
+                continue;
+            }
+            policy = policy.with_override(name, pgelastic_pool::StartupParamPolicy::Ignore);
+        }
+        policy
     }
 
     /// Refuses a control listener nobody has to authenticate to.
@@ -903,6 +987,27 @@ pub struct PoolConfig {
     /// Adopted rather than structural.
     #[serde(default)]
     pub max_pin_duration_seconds: u64,
+    /// What to do with a startup parameter that has no policy of its own,
+    /// including one nested inside `options`.
+    ///
+    /// Structural rather than adoptable, unlike the bounds above it. This decides
+    /// what a pool *key* is, and a key is what makes one link reusable by another
+    /// client - so a running replica cannot adopt a change to it without the links
+    /// it already holds meaning something different from the ones it opens next.
+    #[serde(default)]
+    pub startup_parameter_policy: StartupParameterPolicy,
+    /// Startup parameters kept out of the pool key.
+    ///
+    /// Refused at start-up unless the variable cache tracks the parameter, which
+    /// is the only thing that makes ignoring one safe: `RESET ALL` restores a GUC
+    /// to its *session-start* value, so a startup parameter is part of a link's
+    /// identity rather than of its state and no reset ladder can undo it. A
+    /// tracked parameter is diffed and re-`SET` at every checkout, so a client
+    /// landing on somebody else's value has it corrected before its first
+    /// message. An untracked one - `search_path` above all - would silently be
+    /// somebody else's for the life of the link.
+    #[serde(default = "default_ignore_startup_parameters")]
+    pub ignore_startup_parameters: Vec<String>,
     /// When a queued client is sent a `NoticeResponse` telling it why it is
     /// still waiting.
     #[serde(default = "default_notify_after_seconds")]
@@ -950,6 +1055,8 @@ impl Default for PoolConfig {
             client_idle_in_transaction_seconds: 0,
             max_pinned_percent: 0,
             max_pin_duration_seconds: 0,
+            startup_parameter_policy: StartupParameterPolicy::default(),
+            ignore_startup_parameters: default_ignore_startup_parameters(),
             notify_after_seconds: default_notify_after_seconds(),
             queue_depth_per_tenant: default_queue_depth_per_tenant(),
             max_server_statements: default_max_server_statements(),
@@ -1164,6 +1271,20 @@ fn default_backend_connections() -> u32 {
 fn default_query_wait_seconds() -> u64 {
     120
 }
+/// The two the operator's CRD defaults this to, and the only two that may be
+/// ignored without the variable cache backing them.
+///
+/// `options` is not a parameter so much as a container: it is expanded into the
+/// settings it carries and each of those is judged on its own, so ignoring the
+/// literal key changes nothing about what reaches the fingerprint. It is in the
+/// list because the operator renders it there, and refusing it would refuse every
+/// pool that took the CRD default.
+fn default_ignore_startup_parameters() -> Vec<String> {
+    vec!["extra_float_digits".to_owned(), "options".to_owned()]
+}
+
+/// Parameters that may be ignored despite the variable cache not tracking them.
+const IGNORABLE_UNTRACKED: [&str; 2] = ["extra_float_digits", "options"];
 fn default_notify_after_seconds() -> u64 {
     5
 }
@@ -1598,6 +1719,117 @@ mod tests {
         .unwrap();
         assert_eq!(next.pool.max_pin_duration_seconds, 900);
         assert!(current.is_dynamic_change(&next));
+    }
+
+    /// The whole point of the field. `application_name` is in `TRACKED`, so a
+    /// client that lands on a link carrying somebody else's has its own re-`SET`
+    /// before its first message - which is what makes taking it out of the pool
+    /// key safe, and what stops every distinct application name minting a pool.
+    #[test]
+    fn a_tracked_parameter_may_be_kept_out_of_the_pool_key() {
+        let config = Config::from_str(&format!(
+            "{MINIMAL}\n[pool]\nignoreStartupParameters = [\"application_name\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.fingerprint_policy().policy_for("application_name"),
+            pgelastic_pool::StartupParamPolicy::Ignore
+        );
+    }
+
+    /// The trap the field invites. `RESET ALL` restores a GUC to its
+    /// session-start value, so a startup parameter is identity rather than state
+    /// and nothing in the reset ladder undoes one. `search_path` is not tracked,
+    /// so a client handed a link opened with somebody else's would keep it for
+    /// the life of the link - and would be reading another tenant's schema first.
+    #[test]
+    fn an_untracked_parameter_may_not_be_kept_out_of_the_pool_key() {
+        let error = Config::from_str(&format!(
+            "{MINIMAL}\n[pool]\nignoreStartupParameters = [\"search_path\"]\n"
+        ))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("search_path"),
+            "the refusal must name the parameter: {error}"
+        );
+    }
+
+    /// Refused at start-up, not at the connection it would mis-serve. By then it
+    /// is one client's schema on another client's link and nothing reports it.
+    #[test]
+    fn the_ignore_list_is_refused_before_the_listener_binds() {
+        for name in [
+            "search_path",
+            "TimeZoneAbbreviations",
+            "default_transaction_isolation",
+        ] {
+            assert!(
+                Config::from_str(&format!(
+                    "{MINIMAL}\n[pool]\nignoreStartupParameters = [\"{name}\"]\n"
+                ))
+                .is_err(),
+                "{name} is not tracked and must not be ignorable"
+            );
+        }
+    }
+
+    /// The two the operator's CRD defaults the list to. A proxy that refused its
+    /// own default would refuse every pool.
+    #[test]
+    fn the_crd_default_ignore_list_is_accepted() {
+        let config = Config::from_str(MINIMAL).unwrap();
+        assert_eq!(
+            config.pool.ignore_startup_parameters,
+            vec!["extra_float_digits".to_owned(), "options".to_owned()]
+        );
+        assert_eq!(
+            config.fingerprint_policy().policy_for("extra_float_digits"),
+            pgelastic_pool::StartupParamPolicy::Ignore
+        );
+    }
+
+    /// `options` is expanded and each setting inside it judged on its own - but
+    /// whatever the expansion cannot attribute to a setting is re-emitted under
+    /// the literal name `options`, so an Ignore override on that name drops the
+    /// residual and two clients passing different unparseable option strings
+    /// share a link. The entry stays in the list because the CRD defaults it
+    /// there; it just must not become an override.
+    #[test]
+    fn ignoring_options_does_not_drop_what_the_expansion_could_not_attribute() {
+        let config = Config::from_str(MINIMAL).unwrap();
+        assert!(
+            config
+                .pool
+                .ignore_startup_parameters
+                .iter()
+                .any(|name| name == "options"),
+            "the CRD default must still carry it"
+        );
+        assert_eq!(
+            config.fingerprint_policy().policy_for("options"),
+            pgelastic_pool::StartupParamPolicy::PoolKey,
+            "the residual must stay in the pool key"
+        );
+    }
+
+    /// A parameter with no entry of its own follows the default, and the default
+    /// is now the document's rather than the one compiled into the crate.
+    #[test]
+    fn the_default_policy_comes_from_the_document() {
+        let config = Config::from_str(&format!(
+            "{MINIMAL}\n[pool]\nstartupParameterPolicy = \"reject\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.fingerprint_policy().policy_for("search_path"),
+            pgelastic_pool::StartupParamPolicy::Reject
+        );
+
+        let default = Config::from_str(MINIMAL).unwrap();
+        assert_eq!(
+            default.fingerprint_policy().policy_for("search_path"),
+            pgelastic_pool::StartupParamPolicy::PoolKey
+        );
     }
 
     #[test]

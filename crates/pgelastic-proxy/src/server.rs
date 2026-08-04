@@ -43,6 +43,9 @@ struct Dynamic {
 /// Everything a connection task needs, shared by `Arc`.
 pub struct Proxy {
     pub config: Config,
+    /// The startup-parameter policy, built once from the document this process
+    /// was started with. `pool_key` runs on every binding and this is a map.
+    fingerprint: pgelastic_pool::FingerprintPolicy,
     pub acceptor: Option<TlsAcceptor>,
     dynamic: ArcSwap<Dynamic>,
     pub kdf: KdfPool,
@@ -86,6 +89,7 @@ impl Proxy {
         metrics.in_doubt(fleet.default_instance().fence.fence.in_doubt().len());
 
         Ok(Arc::new(Self {
+            fingerprint: config.fingerprint_policy(),
             dynamic: ArcSwap::from_pointee(Dynamic {
                 tenants: config.pool.tenants.clone(),
                 users: config.auth.users.clone(),
@@ -101,6 +105,11 @@ impl Proxy {
             quiesce: QuiesceRegistry::new(),
             permits,
         }))
+    }
+
+    /// The startup-parameter policy every pool key is built under.
+    pub fn fingerprint_policy(&self) -> &pgelastic_pool::FingerprintPolicy {
+        &self.fingerprint
     }
 
     /// Everything the client leg needs to authenticate a peer, as last published.
@@ -758,6 +767,7 @@ async fn serve(
     let instance = proxy.fleet.route(&tenant);
     let key = match crate::pool::pool_key(
         &proxy.config,
+        proxy.fingerprint_policy(),
         &proxy.backend_for(&instance, &tenant, &role)?,
         &session.startup,
         &tenant,
@@ -1090,6 +1100,34 @@ async fn multiplexed(
             client_vars.observe(&status.name, &status.value);
         }
     }
+    // Then whatever this client actually asked for, which wins.
+    //
+    // The greeting above is somebody else's: it is cached from the first link
+    // ever opened under this pool key, and a key that ignores a parameter is a
+    // key two clients with different values of it share. Seeding the cache from
+    // the greeting alone makes the checkout diff compare the first client's
+    // values against a link carrying the first client's values - equal, so
+    // nothing is ever corrected, and the second client silently runs under the
+    // first one's `TimeZone` for its whole session.
+    //
+    // `observe` drops anything the cache does not track, so this reaches exactly
+    // the parameters a checkout can put right.
+    for (name, value) in &session.startup.parameters {
+        // `options` is not a parameter but a container, and it is how a client
+        // actually sends most of these: libpq has no startup key for `TimeZone`,
+        // so it arrives as `-c timezone=...` inside here. Expanded with the same
+        // function the fingerprint uses, so the cache and the pool key cannot
+        // disagree about what the client asked for.
+        if name.eq_ignore_ascii_case(b"options") {
+            for (inner, inner_value) in
+                pgelastic_pool::expand_startup_options(&String::from_utf8_lossy(value))
+            {
+                client_vars.observe(inner.as_bytes(), inner_value.as_bytes());
+            }
+            continue;
+        }
+        client_vars.observe(name, value);
+    }
 
     let token = CancelToken::mint(proxy.config.routing.cancel_routing_id)?;
     let route = CancelRoute::new();
@@ -1098,7 +1136,24 @@ async fn multiplexed(
     let mut greeting = vec![BackendMessage::Authentication(
         pgelastic_wire::Authentication::Ok,
     )];
-    greeting.extend(parameters.iter().cloned());
+    // Reported as this client asked for it rather than as the pool's first client
+    // did. The checkout that follows will `SET` the difference onto whichever link
+    // it lands on, so telling the client the cached value here would be telling it
+    // something that is about to stop being true.
+    greeting.extend(parameters.iter().map(|message| match message {
+        BackendMessage::ParameterStatus(status) => {
+            match client_vars.get(&String::from_utf8_lossy(&status.name)) {
+                Some(wanted) if wanted.as_bytes() != status.value => {
+                    BackendMessage::ParameterStatus(pgelastic_wire::ParameterStatus {
+                        name: status.name.clone(),
+                        value: bytes::Bytes::copy_from_slice(wanted.as_bytes()),
+                    })
+                }
+                _ => message.clone(),
+            }
+        }
+        other => other.clone(),
+    }));
     greeting.push(BackendMessage::BackendKeyData(token.key_data()?));
     greeting.push(BackendMessage::ReadyForQuery(TransactionStatus::Idle));
     crate::wire_io::write_backend(&mut session.stream, &greeting).await?;

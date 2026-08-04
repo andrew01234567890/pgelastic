@@ -341,6 +341,54 @@ func TestAZeroPinDurationIsNoBound(t *testing.T) {
 	}
 }
 
+// The pool key was built with a hardcoded policy, so all three CRD fields that claim to drive
+// it were inert - and application_name, which every driver sends and which the variable cache
+// already restores, minted a pool per distinct value.
+func TestTheStartupParameterPolicyReachesTheProxy(t *testing.T) {
+	document := testConfig().Render().TOML
+	if !strings.Contains(document, `startupParameterPolicy = "poolKey"`) {
+		t.Fatalf("an unset spec.pooling.startupParameterPolicy rendered something other than "+
+			"its own CRD default:\n%s", document)
+	}
+	if !strings.Contains(document,
+		`ignoreStartupParameters = ["extra_float_digits", "options"]`) {
+		t.Fatalf("an unset spec.pooling.ignoreStartupParameters rendered something other than "+
+			"its own CRD default:\n%s", document)
+	}
+
+	config := testConfig()
+	config.Pool.Spec.Pooling = &pgelasticv1alpha1.PoolingConfig{
+		StartupParameterPolicy:  pgelasticv1alpha1.StartupParameterReject,
+		IgnoreStartupParameters: []string{"extra_float_digits", "application_name"},
+	}
+	document = config.Render().TOML
+	if !strings.Contains(document, `startupParameterPolicy = "reject"`) {
+		t.Fatalf("the policy never reached the proxy:\n%s", document)
+	}
+	if !strings.Contains(document,
+		`ignoreStartupParameters = ["extra_float_digits", "application_name"]`) {
+		t.Fatalf("the ignore list never reached the proxy:\n%s", document)
+	}
+}
+
+// A key is what makes one link reusable by another client, so a replica cannot adopt a change
+// to what one is: the links it already holds would mean something different from the ones it
+// opens next. This is the one M9 field that must stay structural.
+func TestChangingTheStartupParameterPolicyRollsTheFleet(t *testing.T) {
+	before := testConfig().Render()
+
+	config := testConfig()
+	config.Pool.Spec.Pooling = &pgelasticv1alpha1.PoolingConfig{
+		IgnoreStartupParameters: []string{"application_name"},
+	}
+	after := config.Render()
+
+	if before.StructuralHash == after.StructuralHash {
+		t.Fatal("changing what a pool key is left the pod template unchanged, so replicas " +
+			"would hold links keyed one way and open links keyed another")
+	}
+}
+
 func TestAddingAnInstanceRollsTheFleet(t *testing.T) {
 	before := testConfig().Render()
 
