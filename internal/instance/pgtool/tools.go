@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -244,6 +245,24 @@ func (t Toolchain) IsReady(ctx context.Context, socketDir string, port int32) Pi
 func DataDirectoryInitialised(dataDir string) bool {
 	_, err := os.Stat(filepath.Join(dataDir, "global", "pg_control"))
 	return err == nil
+}
+
+// DataDirectoryMajor is the PostgreSQL major a data directory was created by, read from
+// PG_VERSION - the file initdb writes and every postmaster refuses to start without.
+//
+// Zero when there is no data directory yet or the file cannot be read as a number, because
+// "not initialised" and "initialised by 19" are different answers and only one of them is a
+// disagreement worth refusing over.
+func DataDirectoryMajor(dataDir string) int {
+	raw, err := os.ReadFile(filepath.Join(dataDir, "PG_VERSION"))
+	if err != nil {
+		return 0
+	}
+	major, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || major <= 0 {
+		return 0
+	}
+	return major
 }
 
 // Rewind rewinds a diverged data directory back to its common ancestor with the source.
