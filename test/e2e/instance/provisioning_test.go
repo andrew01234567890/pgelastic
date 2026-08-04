@@ -354,61 +354,61 @@ var _ = Describe("Provisioning a three-node PostgreSQL 18 instance", Ordered, fu
 			Expect(strings.TrimSpace(string(output))).To(Equal(provision.WALDir))
 		}
 	})
-})
 
-// The authentication the metrics scrape depends on, proven where it actually happens.
-//
-// The scrape must not be the bootstrap superuser - CloudNativePG's exporter was, for the
-// project's whole life, until a low-privilege user chained to superuser through it. So the
-// agent reads pg_stat_database as pgelastic_ops, which holds pg_monitor and nothing else.
-//
-// Reaching that role at all takes one ordered pg_hba record. The agent runs as OS user
-// postgres and the generated file says `local all all peer`, so over the socket the agent can
-// only ever *be* postgres unless a scram record for the ops role sits above that catch-all.
-// A unit test on the rendered file cannot prove the ordering works, because ordering is
-// something the postmaster does; the container tests cannot prove it either, because they
-// connect over TCP. This is the only place the production shape exists: the real file, the
-// real postmaster, the real socket, and the real OS user.
-var _ = It("admits the scrape identity on the socket, and no more than it", func() {
-	member := provision.MemberName(instanceName, 1)
+	// The authentication the metrics scrape depends on, proven where it actually happens.
+	//
+	// The scrape must not be the bootstrap superuser - CloudNativePG's exporter was, for the
+	// project's whole life, until a low-privilege user chained to superuser through it. So the
+	// agent reads pg_stat_database as pgelastic_ops, which holds pg_monitor and nothing else.
+	//
+	// Reaching that role at all takes one ordered pg_hba record. The agent runs as OS user
+	// postgres and the generated file says `local all all peer`, so over the socket the agent can
+	// only ever *be* postgres unless a scram record for the ops role sits above that catch-all.
+	// A unit test on the rendered file cannot prove the ordering works, because ordering is
+	// something the postmaster does; the container tests cannot prove it either, because they
+	// connect over TCP. This is the only place the production shape exists: the real file, the
+	// real postmaster, the real socket, and the real OS user.
+	It("admits the scrape identity on the socket, and no more than it", func() {
+		member := provision.MemberName(instanceName, 1)
 
-	secret := &corev1.Secret{}
-	Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
-		Namespace: e2eNamespace,
-		Name:      provision.CredentialsSecretName(instanceName),
-	}, secret)).To(Succeed())
-	password := string(secret.Data[provision.SecretKeyOpsPassword])
-	Expect(password).NotTo(BeEmpty(), "the instance published no ops password")
+		secret := &corev1.Secret{}
+		Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
+			Namespace: e2eNamespace,
+			Name:      provision.CredentialsSecretName(instanceName),
+		}, secret)).To(Succeed())
+		password := string(secret.Data[provision.SecretKeyOpsPassword])
+		Expect(password).NotTo(BeEmpty(), "the instance published no ops password")
 
-	asOps := func(query string) (string, error) {
-		command := kubectlCommand("exec", "-n", e2eNamespace, member, "-c", "postgres", "--",
-			"env", "PGPASSWORD="+password,
-			"psql", "-h", provision.SocketDir, "-U", provision.OpsRole,
-			"-d", "postgres", "-tAqc", query)
-		output, err := command.CombinedOutput()
-		return strings.TrimSpace(string(output)), err
-	}
+		asOps := func(query string) (string, error) {
+			command := kubectlCommand("exec", "-n", e2eNamespace, member, "-c", "postgres", "--",
+				"env", "PGPASSWORD="+password,
+				"psql", "-h", provision.SocketDir, "-U", provision.OpsRole,
+				"-d", "postgres", "-tAqc", query)
+			output, err := command.CombinedOutput()
+			return strings.TrimSpace(string(output)), err
+		}
 
-	// The record itself. Without it the postmaster falls through to `local all all peer`,
-	// the OS user is postgres, the role is not, and this is a FATAL rather than a row.
-	answer, err := asOps("SELECT current_user")
-	Expect(err).NotTo(HaveOccurred(), "pgelastic_ops could not reach the socket: %s", answer)
-	Expect(answer).To(Equal(provision.OpsRole))
+		// The record itself. Without it the postmaster falls through to `local all all peer`,
+		// the OS user is postgres, the role is not, and this is a FATAL rather than a row.
+		answer, err := asOps("SELECT current_user")
+		Expect(err).NotTo(HaveOccurred(), "pgelastic_ops could not reach the socket: %s", answer)
+		Expect(answer).To(Equal(provision.OpsRole))
 
-	// And what the scrape is for: the counters are readable through pg_monitor, without any
-	// privilege on the databases being counted.
-	counters, err := asOps(
-		"SELECT count(*) FROM pg_catalog.pg_stat_database WHERE datname IS NOT NULL")
-	Expect(err).NotTo(HaveOccurred(), "the scrape identity cannot read pg_stat_database: %s", counters)
-	Expect(counters).NotTo(Equal("0"))
+		// And what the scrape is for: the counters are readable through pg_monitor, without any
+		// privilege on the databases being counted.
+		counters, err := asOps(
+			"SELECT count(*) FROM pg_catalog.pg_stat_database WHERE datname IS NOT NULL")
+		Expect(err).NotTo(HaveOccurred(), "the scrape identity cannot read pg_stat_database: %s", counters)
+		Expect(counters).NotTo(Equal("0"))
 
-	// Least privilege is the whole point of using this role rather than the superuser, so it
-	// is asserted rather than assumed: a scrape identity that turned out to be a superuser
-	// would pass every test above and none of the reasoning behind them.
-	attributes, err := asOps(
-		"SELECT rolsuper::int::text || rolcreatedb::int::text || rolcreaterole::int::text " +
-			"|| rolbypassrls::int::text FROM pg_catalog.pg_roles WHERE rolname = current_user")
-	Expect(err).NotTo(HaveOccurred(), "%s", attributes)
-	Expect(attributes).To(Equal("0000"),
-		"the scrape identity carries a privileged attribute: superuser/createdb/createrole/bypassrls")
+		// Least privilege is the whole point of using this role rather than the superuser, so it
+		// is asserted rather than assumed: a scrape identity that turned out to be a superuser
+		// would pass every test above and none of the reasoning behind them.
+		attributes, err := asOps(
+			"SELECT rolsuper::int::text || rolcreatedb::int::text || rolcreaterole::int::text " +
+				"|| rolbypassrls::int::text FROM pg_catalog.pg_roles WHERE rolname = current_user")
+		Expect(err).NotTo(HaveOccurred(), "%s", attributes)
+		Expect(attributes).To(Equal("0000"),
+			"the scrape identity carries a privileged attribute: superuser/createdb/createrole/bypassrls")
+	})
 })
