@@ -253,22 +253,26 @@ func (g Guard) scaleIn() verdict {
 // It is separate from the class-level budget because the eviction and the destination are
 // decided as one plan, and a plan whose evictions are individually forbidden is not a plan
 // that can be partially executed.
-func (g Guard) MoveEligible(tenant TenantSignal, source InstanceSignal) (bool, string) {
+func (g Guard) MoveEligible(tenant TenantSignal, source InstanceSignal) (bool, Blocker, string) {
 	if !tenant.MigrationAllowed {
-		return false, "the tenant's workload class does not permit automatic migration"
+		return false, BlockedByWorkloadClass,
+			"the tenant's workload class does not permit automatic migration"
 	}
 	if g.Policy.RebalanceColdOnly && !tenant.Cold {
-		return false, fmt.Sprintf("the tenant is hot: moving it would consume exactly the capacity "+
-			"the move is meant to relieve (threshold %d%%)", g.Policy.HotTenantPercent)
+		return false, BlockedByHeat, fmt.Sprintf(
+			"the tenant is hot: moving it would consume exactly the capacity "+
+				"the move is meant to relieve (threshold %d%%)", g.Policy.HotTenantPercent)
 	}
 	if source.UtilizationPercent() > g.Policy.ForbidMoveAboveSourcePercent {
-		return false, fmt.Sprintf("source %s is at %d%% utilization, above the %d%% ceiling for decoding a move",
+		return false, BlockedBySourceLoad, fmt.Sprintf(
+			"source %s is at %d%% utilization, above the %d%% ceiling for decoding a move",
 			source.Name, source.UtilizationPercent(), g.Policy.ForbidMoveAboveSourcePercent)
 	}
 	if g.Signals.MigrationsFromSource[source.Name] > 0 {
-		return false, fmt.Sprintf("a migration from %s is already in flight", source.Name)
+		return false, BlockedByInFlight,
+			fmt.Sprintf("a migration from %s is already in flight", source.Name)
 	}
-	return true, ""
+	return true, "", ""
 }
 
 // consolidationDwell is how long the instance scale-in has chosen has been consolidatable.

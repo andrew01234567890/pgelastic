@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -69,6 +70,7 @@ const (
 	eventActionExecuted   = "AutoscaleActionExecuted"
 	eventActionRefused    = "AutoscaleActionRefused"
 	eventMigrationEmitted = "TenantMigrationEmitted"
+	eventDrainStalled     = "InstanceDrainStalled"
 )
 
 // PgElasticPoolReconciler publishes the pool's reservation ledger and its capacity plan.
@@ -147,6 +149,9 @@ func (r *PgElasticPoolReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	plan := autoscale.Recommend(view.signals, view.policy)
+	if err := r.evacuateDraining(ctx, pool, view, plan); err != nil {
+		return ctrl.Result{}, err
+	}
 	executed, err := r.execute(ctx, pool, view, plan)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -742,6 +747,103 @@ func (r *PgElasticPoolReconciler) scaleIn(
 	patch := client.MergeFrom(pool.DeepCopy())
 	pool.Spec.Instances.Replicas = ptr.To(current - 1)
 	return true, r.Patch(ctx, pool, patch)
+}
+
+// evacuateDraining carries out spec.drain on every instance that asks for it.
+//
+// `mode: Requested` documents itself as cordoning the instance *and* emitting a
+// PgTenantMigration per bound tenant. Only the first half existed: the sole reader set
+// Schedulable=false, so a drained instance stopped receiving new tenants and kept every
+// tenant it already had, for ever. An operator retiring hardware had no way to say "move
+// these off, now" and no way to see that nothing was happening.
+//
+// A drain is an instruction rather than a recommendation, so it is not gated behind the
+// Rebalance action class being enabled - the operator has already decided. It goes through
+// the same emitter and the same eligibility as every other move, because the concurrency
+// limit and the blackout windows protect the tenants being moved and do not care why they
+// are moving. One per pass, like the rest: a drain that emitted every migration at once
+// would move the whole instance's population through logical replication simultaneously.
+func (r *PgElasticPoolReconciler) evacuateDraining(
+	ctx context.Context,
+	pool *pgelasticv1alpha1.PgElasticPool,
+	view *poolView,
+	plan autoscale.Plan,
+) error {
+	draining := map[string]bool{}
+	for index := range view.instances {
+		if drainRequested(&view.instances[index]) {
+			draining[view.instances[index].Name] = true
+		}
+	}
+	if len(draining) == 0 {
+		return nil
+	}
+	// The disruption budget, and only that: the concurrency cap, the rate cap and the
+	// migration windows. Not `rebalance()`, which would also require the rebalancer to be
+	// switched on - an operator draining an instance has already decided, and a pool that
+	// never rebalances still has to be able to evacuate hardware.
+	if !plan.MigrationsPermitted {
+		for _, name := range slices.Sorted(maps.Keys(draining)) {
+			if stranded := boundTo(view, name); stranded > 0 {
+				r.event(pool, corev1.EventTypeNormal, eventDrainStalled, actionEmitMigration,
+					"%s is draining with %d tenant(s) still on it, waiting for the pool's "+
+						"migration budget: %s", name, stranded, plan.MigrationsRefusedBecause)
+			}
+		}
+		return nil
+	}
+
+	evacuation := make([]autoscale.Move, 0, len(plan.Moves))
+	for _, move := range plan.Moves {
+		if !draining[move.From] {
+			continue
+		}
+		// Heat is the one refusal a drain overrules. "The tenant is hot, so moving it would
+		// consume the capacity the move is meant to relieve" is an argument about whether a
+		// rebalance is worth it, and an evacuation has already answered that: the operator
+		// said empty this instance. Every other blocker is about safety - the source is too
+		// busy to decode a move, a move from it is already streaming, the workload class
+		// forbids automatic migration at all - and those hold whatever the reason.
+		if move.Eligible || move.Blocker == autoscale.BlockedByHeat {
+			evacuation = append(evacuation, move)
+		}
+	}
+	if len(evacuation) == 0 {
+		// Said out loud rather than left as silence. A drain with nowhere to send its
+		// tenants is the state an operator most needs to see: the instance is cordoned, the
+		// tenants are staying, and without this the pool looks like it is draining.
+		for _, name := range slices.Sorted(maps.Keys(draining)) {
+			if stranded := boundTo(view, name); stranded > 0 {
+				r.event(pool, corev1.EventTypeWarning, eventDrainStalled, actionEmitMigration,
+					"%s is draining and %d tenant(s) are still on it, with no move the pool "+
+						"can make right now: no other instance both fits them and admits them, "+
+						"or the guardrails are holding every move back", name, stranded)
+			}
+		}
+		return nil
+	}
+
+	_, err := r.emitMigrations(ctx, pool, evacuation, 1)
+	return err
+}
+
+// boundTo counts the tenants still bound to one instance.
+func boundTo(view *poolView, instance string) int {
+	bound := 0
+	for _, tenant := range view.tenants {
+		if placement.BoundInstanceFor(tenant.tenant) == instance {
+			bound++
+		}
+	}
+	return bound
+}
+
+// drainRequested reports the instruction, which is separate from being cordoned: a cordoned
+// instance keeps its tenants deliberately, and a draining one is being emptied.
+func drainRequested(instance *pgelasticv1alpha1.PgInstance) bool {
+	drain := instance.Spec.Drain
+	return drain != nil && drain.Mode != nil &&
+		*drain.Mode == pgelasticv1alpha1.InstanceDrainRequested
 }
 
 // emitMigrations creates PgTenantMigration objects for the moves the plan may afford.

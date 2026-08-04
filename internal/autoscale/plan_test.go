@@ -613,7 +613,7 @@ func TestAHotTenantIsNotMoved(t *testing.T) {
 	guard := Guard{Policy: basePolicy(), Signals: baseSignals()}
 	tenant := TenantSignal{Name: someTenant, Cold: false, MigrationAllowed: true}
 
-	eligible, why := guard.MoveEligible(tenant, readyInstance(instanceA, 225, 10))
+	eligible, _, why := guard.MoveEligible(tenant, readyInstance(instanceA, 225, 10))
 	if eligible {
 		t.Error("a hot tenant was made eligible to move")
 	}
@@ -629,7 +629,7 @@ func TestATenantIsNotMovedOffABusySource(t *testing.T) {
 	guard := Guard{Policy: policy, Signals: baseSignals()}
 	tenant := TenantSignal{Name: someTenant, Cold: true, MigrationAllowed: true}
 
-	if eligible, _ := guard.MoveEligible(tenant, readyInstance(instanceA, 100, 90)); eligible {
+	if eligible, _, _ := guard.MoveEligible(tenant, readyInstance(instanceA, 100, 90)); eligible {
 		t.Error("a move was allowed off a source at 90% utilization: logical decoding would consume " +
 			"exactly the capacity the move is meant to relieve")
 	}
@@ -642,10 +642,10 @@ func TestASecondMoveOffTheSameSourceWaits(t *testing.T) {
 	guard := Guard{Policy: basePolicy(), Signals: signals}
 	tenant := TenantSignal{Name: someTenant, Cold: true, MigrationAllowed: true}
 
-	if eligible, _ := guard.MoveEligible(tenant, readyInstance(instanceA, 225, 10)); eligible {
+	if eligible, _, _ := guard.MoveEligible(tenant, readyInstance(instanceA, 225, 10)); eligible {
 		t.Error("a second move off pg-a was allowed while the first was still decoding")
 	}
-	if eligible, _ := guard.MoveEligible(tenant, readyInstance(instanceB, 225, 10)); !eligible {
+	if eligible, _, _ := guard.MoveEligible(tenant, readyInstance(instanceB, 225, 10)); !eligible {
 		t.Error("a move off pg-b was blocked by an in-flight move off pg-a")
 	}
 }
@@ -654,7 +654,7 @@ func TestATenantWhoseClassForbidsAutomaticMigrationIsNotMoved(t *testing.T) {
 	guard := Guard{Policy: basePolicy(), Signals: baseSignals()}
 	tenant := TenantSignal{Name: "premium", Cold: true, MigrationAllowed: false}
 
-	if eligible, _ := guard.MoveEligible(tenant, readyInstance(instanceA, 225, 10)); eligible {
+	if eligible, _, _ := guard.MoveEligible(tenant, readyInstance(instanceA, 225, 10)); eligible {
 		t.Error("a tenant whose workload class requires approval was moved automatically")
 	}
 }

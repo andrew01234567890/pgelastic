@@ -138,8 +138,34 @@ type Move struct {
 	ExpectedImprovementPercent int32
 	Reason                     string
 	Eligible                   bool
-	BlockedBy                  string
+	// Blocker is why the move is ineligible, in a form a caller can branch on. BlockedBy is
+	// the same fact in a sentence a person reads; both are kept because a status field that
+	// only a human can interpret cannot be acted on, and a code without a sentence tells an
+	// operator nothing.
+	Blocker   Blocker
+	BlockedBy string
 }
+
+// Blocker names what is holding a move back.
+//
+// The distinction that matters is between a refusal about *safety* and a refusal about
+// *worth*. Decoding a move off an overloaded source, or starting a second move from a source
+// that is already streaming one, are physical limits and hold whatever the reason for the
+// move. Whether a tenant is hot enough to be worth rebalancing is a question about the
+// rebalancer's own objective, and an instance being drained has already answered it: the
+// operator said empty this, and heat is not a reason to leave a tenant behind.
+type Blocker string
+
+const (
+	// BlockedByWorkloadClass means the tenant's class forbids automatic migration outright.
+	BlockedByWorkloadClass Blocker = "WorkloadClass"
+	// BlockedByHeat means the tenant is not cold and the pool only rebalances cold tenants.
+	BlockedByHeat Blocker = "Heat"
+	// BlockedBySourceLoad means the source is too busy to decode a move off it.
+	BlockedBySourceLoad Blocker = "SourceLoad"
+	// BlockedByInFlight means a migration from that source is already running.
+	BlockedByInFlight Blocker = "InFlight"
+)
 
 // InstanceTarget is what one instance looks like once the plan is applied.
 type InstanceTarget struct {
@@ -162,7 +188,13 @@ type Plan struct {
 	RecommendedInstances       int32
 	ObservedUtilizationPercent int32
 	TargetUtilizationPercent   int32
-	Summary                    string
+	// MigrationsPermitted is the disruption budget alone - concurrency cap, rate cap and
+	// migration windows - with no opinion about whether any particular move is worth making.
+	// It is what an evacuation asks, because a drain has already been decided by an operator
+	// and only needs to know whether the pool can carry a move right now.
+	MigrationsPermitted      bool
+	MigrationsRefusedBecause string
+	Summary                  string
 
 	InstanceTargets []InstanceTarget
 	Moves           []Move
@@ -251,6 +283,14 @@ func Recommend(signals Signals, policy Policy) Plan {
 	// plan that proposes nothing because nothing is wrong from one that proposes nothing
 	// because it cannot see.
 	plan.MetricsStale = !guard.staleness().permitted
+	// The disruption budget on its own, separate from whether rebalancing is switched on.
+	// An evacuation is an instruction rather than a recommendation, so it is not subject to
+	// the rebalancer being enabled - but it is subject to the concurrency cap, the rate cap
+	// and the migration windows, because those exist to protect the tenants being moved and
+	// do not care why a move was decided.
+	migrations := guard.migrationBudget()
+	plan.MigrationsPermitted = migrations.permitted
+	plan.MigrationsRefusedBecause = migrations.message
 
 	plan.Actions = actions(signals, policy, guard, plan)
 	plan.Summary = summarise(plan)
@@ -400,7 +440,7 @@ func moves(signals Signals, guard Guard, packing placement.Result) []Move {
 				guard.Policy.Placement.PackOn, assignment.Tenant, assignment.Instance),
 			ExpectedImprovementPercent: improvement(tenant, source),
 		}
-		move.Eligible, move.BlockedBy = guard.MoveEligible(tenant, source)
+		move.Eligible, move.Blocker, move.BlockedBy = guard.MoveEligible(tenant, source)
 		planned = append(planned, move)
 	}
 	return planned
