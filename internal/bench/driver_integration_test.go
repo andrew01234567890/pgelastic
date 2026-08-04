@@ -59,7 +59,7 @@ func withPostgres(m *testing.M) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	container, err := postgres.Run(ctx, pgtest.Image,
+	container, err := postgres.Run(ctx, pgtest.Image(),
 		postgres.WithDatabase("bench"),
 		postgres.WithUsername("bench"),
 		postgres.WithPassword("bench"),

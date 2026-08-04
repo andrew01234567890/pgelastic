@@ -203,7 +203,17 @@ impl ControlPki {
     }
 }
 
-/// A running `postgres:18`.
+/// The `PostgreSQL` major these tests run against.
+///
+/// An environment variable rather than a literal, and the same one the Go suites read, so a
+/// second major is a variable rather than four edits in this file. It defaults to the major
+/// the merge gate runs, because a test run that silently chose a different one would be
+/// answering a question nobody asked.
+fn postgres_tag() -> String {
+    std::env::var("PGELASTIC_PG_MAJOR").unwrap_or_else(|_| "18".to_owned())
+}
+
+/// A running `PostgreSQL` container.
 pub struct Postgres {
     _container: ContainerAsync<postgres::Postgres>,
     pub port: u16,
@@ -230,7 +240,7 @@ impl Postgres {
     }
 }
 
-/// Starts `postgres:18` with TLS enabled and SCRAM required on host connections.
+/// Starts `PostgreSQL` with TLS enabled and SCRAM required on host connections.
 ///
 /// The certificate is written by an `initdb.d` script rather than copied in:
 /// the script runs as the `postgres` user, so the key ends up owned by the user
@@ -275,14 +285,14 @@ pub async fn start_postgres_with(extra_conf: &str) -> Postgres {
         .with_user(BACKEND_USER)
         .with_password(BACKEND_PASSWORD)
         .with_db_name(BACKEND_DATABASE)
-        .with_tag("18")
+        .with_tag(postgres_tag())
         .with_copy_to(
             "/docker-entrypoint-initdb.d/00-enable-ssl.sh",
             script.into_bytes(),
         )
         .start()
         .await
-        .expect("postgres:18 must start — these tests require a working Docker daemon");
+        .expect("PostgreSQL must start - these tests require a working Docker daemon");
 
     let port = container
         .get_host_port_ipv4(5432)
@@ -322,7 +332,7 @@ async fn await_ready(postgres: &Postgres) {
             // startup fault without them.
             Err(error) => assert!(
                 std::time::Instant::now() < deadline,
-                "postgres:18 never became reachable after {attempts} attempts over {:?}: {error}",
+                "PostgreSQL never became reachable after {attempts} attempts over {:?}: {error}",
                 started.elapsed()
             ),
         }
