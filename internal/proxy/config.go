@@ -317,6 +317,10 @@ const defaultIdleInTransactionSeconds = 60
 // spec.pooling.maxPinnedFractionPercent.
 const defaultMaxPinnedPercent = 20
 
+// defaultMaxPinDurationSeconds must match the +kubebuilder:default on
+// spec.pooling.maxPinDuration, which is one hour.
+const defaultMaxPinDurationSeconds = 3600
+
 func (c Config) renderRouting(out *strings.Builder, dynamic bool) {
 	out.WriteString("[routing]\n")
 	discriminators := tenantDiscriminators(c.Pool)
@@ -364,6 +368,8 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 		writeInt(out, "clientIdleInTransactionSeconds",
 			openBoundSeconds(timeouts(c.Pool).ClientIdleInTransaction, defaultIdleInTransactionSeconds))
 		writeInt(out, "maxPinnedPercent", int64(maxPinnedPercent(pooling)))
+		writeInt(out, "maxPinDurationSeconds",
+			openBoundSeconds(maxPinDuration(pooling), defaultMaxPinDurationSeconds))
 	}
 	writeInt(out, "notifyAfterSeconds", int64(queryWaitNotifySeconds(c.Pool)))
 	writeInt(out, "queueDepthPerTenant", int64(queueDepthPerTenant(c.Pool)))
@@ -559,6 +565,13 @@ func maxPinnedPercent(pooling *pgelasticv1alpha1.PoolingConfig) int32 {
 		return defaultMaxPinnedPercent
 	}
 	return *pooling.MaxPinnedFractionPercent
+}
+
+func maxPinDuration(pooling *pgelasticv1alpha1.PoolingConfig) *metav1.Duration {
+	if pooling == nil {
+		return nil
+	}
+	return pooling.MaxPinDuration
 }
 
 func poolMode(pooling *pgelasticv1alpha1.PoolingConfig) string {

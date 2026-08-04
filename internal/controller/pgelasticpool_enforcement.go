@@ -62,6 +62,12 @@ var enforcedBounds = []struct {
 		costs: "a client whose session state would pin a backend past this share of the " +
 			"budget is closed rather than given a shared link",
 	},
+	{
+		key:   "maxPinDurationSeconds",
+		field: "spec.pooling.maxPinDuration",
+		unit:  "s",
+		costs: "a client that has held a pinned backend for longer than this is closed",
+	},
 }
 
 // warnNewlyEnforcedTimeouts reports a bound that this operator will start enforcing and the

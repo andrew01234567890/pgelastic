@@ -264,6 +264,8 @@ pub struct PoolManager {
     client_idle_in_transaction_seconds: AtomicU64,
     /// The pinned share ceiling as a percentage, zero for none.
     max_pinned_percent: AtomicU64,
+    /// How long one link may stay pinned, in seconds, zero for no bound.
+    max_pin_duration_seconds: AtomicU64,
     /// When the budget gauges were last refreshed, in milliseconds since
     /// `budget_epoch`. See [`publish_budget`](Self::publish_budget).
     budget_published_ms: AtomicU64,
@@ -308,6 +310,7 @@ impl PoolManager {
         let query_deadline_seconds = config.query_deadline_seconds;
         let client_idle_in_transaction_seconds = config.client_idle_in_transaction_seconds;
         let max_pinned_percent = u64::from(config.max_pinned_percent);
+        let max_pin_duration_seconds = config.max_pin_duration_seconds;
         let mut allocator = Allocator::new(pool_spec, admission)
             .map_err(|e| ProxyError::config(format!("pool capacity: {e}")))?;
 
@@ -351,6 +354,7 @@ impl PoolManager {
             query_deadline_seconds: AtomicU64::new(query_deadline_seconds),
             client_idle_in_transaction_seconds: AtomicU64::new(client_idle_in_transaction_seconds),
             max_pinned_percent: AtomicU64::new(max_pinned_percent),
+            max_pin_duration_seconds: AtomicU64::new(max_pin_duration_seconds),
             budget_published_ms: AtomicU64::new(0),
             budget_epoch: std::time::Instant::now(),
         }))
@@ -438,7 +442,12 @@ impl PoolManager {
             != idle;
         let pinned = u64::from(config.max_pinned_percent);
         let pinned_moved = self.max_pinned_percent.swap(pinned, Ordering::Relaxed) != pinned;
-        deadline_moved || idle_moved || pinned_moved
+        let pin_for = config.max_pin_duration_seconds;
+        let pin_for_moved = self
+            .max_pin_duration_seconds
+            .swap(pin_for, Ordering::Relaxed)
+            != pin_for;
+        deadline_moved || idle_moved || pinned_moved || pin_for_moved
     }
 
     /// The statement deadline in force now, or `None` when the pool sets none.
@@ -610,6 +619,13 @@ impl PoolManager {
         };
         self.publish_budget_now();
         outcome
+    }
+
+    /// How long a link may stay pinned, or `None` when the pool sets no bound.
+    #[must_use]
+    pub fn max_pin_duration(&self) -> Option<Duration> {
+        let seconds = self.max_pin_duration_seconds.load(Ordering::Relaxed);
+        (seconds > 0).then(|| Duration::from_secs(seconds))
     }
 
     /// The pinned share ceiling in force now, or `None` when the pool sets none.

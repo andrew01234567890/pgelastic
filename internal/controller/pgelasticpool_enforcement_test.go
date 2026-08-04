@@ -88,16 +88,19 @@ var _ = Describe("warning about a timeout this upgrade starts enforcing", func()
 		}
 		reconciler.warnNewlyEnforcedTimeouts(ctx, pool,
 			"[pool]\nqueryWaitSeconds = 30\nqueryDeadlineSeconds = 120\n"+
-				"clientIdleInTransactionSeconds = 60\nmaxPinnedPercent = 20\n")
+				"clientIdleInTransactionSeconds = 60\nmaxPinnedPercent = 20\n"+
+				"maxPinDurationSeconds = 3600\n")
 
 		events := drain()
-		Expect(events).To(HaveLen(3))
+		Expect(events).To(HaveLen(4))
 		Expect(events[0]).To(ContainSubstring("spec.timeouts.query is now enforced at 120s"))
 		Expect(events[0]).To(ContainSubstring("Set it to 0"))
 		Expect(events[1]).To(ContainSubstring(
 			"spec.timeouts.clientIdleInTransaction is now enforced at 60s"))
 		Expect(events[2]).To(ContainSubstring(
 			"spec.pooling.maxPinnedFractionPercent is now enforced at 20%"))
+		Expect(events[3]).To(ContainSubstring(
+			"spec.pooling.maxPinDuration is now enforced at 3600s"))
 	})
 
 	// The second reconcile of the same pool, and every one after it. A warning repeated on
@@ -108,14 +111,14 @@ var _ = Describe("warning about a timeout this upgrade starts enforcing", func()
 		awaitCached(pool)
 		writePreviousDocument(poolName,
 			"[pool]\nqueryDeadlineSeconds = 120\nclientIdleInTransactionSeconds = 60\n"+
-				"maxPinnedPercent = 20\n")
+				"maxPinnedPercent = 20\nmaxPinDurationSeconds = 3600\n")
 
 		reconciler := &PgElasticPoolReconciler{
 			Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: recorder,
 		}
 		reconciler.warnNewlyEnforcedTimeouts(ctx, pool,
 			"[pool]\nqueryDeadlineSeconds = 90\nclientIdleInTransactionSeconds = 60\n"+
-				"maxPinnedPercent = 50\n")
+				"maxPinnedPercent = 50\nmaxPinDurationSeconds = 900\n")
 
 		Expect(drain()).To(BeEmpty())
 	})
@@ -133,7 +136,7 @@ var _ = Describe("warning about a timeout this upgrade starts enforcing", func()
 		}
 		reconciler.warnNewlyEnforcedTimeouts(ctx, pool,
 			"[pool]\nqueryDeadlineSeconds = 0\nclientIdleInTransactionSeconds = 0\n"+
-				"maxPinnedPercent = 0\n")
+				"maxPinnedPercent = 0\nmaxPinDurationSeconds = 0\n")
 
 		Expect(drain()).To(BeEmpty())
 	})

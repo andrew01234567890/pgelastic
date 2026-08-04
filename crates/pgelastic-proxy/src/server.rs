@@ -1025,7 +1025,8 @@ async fn relay(
             Ending::PeerClosed
             | Ending::StatementTimeout
             | Ending::IdleInTransaction
-            | Ending::PinCeiling,
+            | Ending::PinCeiling
+            | Ending::PinExpired,
         ) => {
             session::terminate_backend(&mut link.stream).await;
             Ok(())
@@ -1140,7 +1141,8 @@ async fn multiplexed(
             Ending::PeerClosed
             | Ending::StatementTimeout
             | Ending::IdleInTransaction
-            | Ending::PinCeiling,
+            | Ending::PinCeiling
+            | Ending::PinExpired,
         ) => Ok(()),
         Err(error) => Err(error),
     }

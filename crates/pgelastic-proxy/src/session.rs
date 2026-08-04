@@ -26,6 +26,9 @@ pub enum Ending {
     /// link is closed rather than pinned or shared: it carries state no reset
     /// removes, which is what asked for the pin in the first place.
     PinCeiling,
+    /// A client held a pinned link for longer than the pool allows. Closed for the
+    /// same reason a refused pin is: the state it carries cannot be handed on.
+    PinExpired,
     /// A client held an open transaction without working for longer than the
     /// pool allows. The link is closed rather than rolled back and returned: what
     /// the transaction held is released by the backend going away, and a rollback

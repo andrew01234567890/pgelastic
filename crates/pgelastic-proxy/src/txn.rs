@@ -284,23 +284,7 @@ impl Running<'_> {
         let mut draining = *shutdown.borrow_and_update();
         let deadline = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(deadline);
-        // The statement deadline, armed while a request is outstanding on the
-        // backend and disarmed by its ReadyForQuery.
-        //
-        // A branch of this select! rather than a timeout() around the loop, for
-        // the reason the drain deadline beside it is one: an outer timeout drops
-        // the future mid-write_all and truncates a frame on the wire, and a
-        // truncated frame is not a cancelled statement, it is a corrupt session.
-        let statement = tokio::time::sleep(Duration::ZERO);
-        tokio::pin!(statement);
-        let mut statement_armed = false;
-        // The complement of the statement deadline, armed exactly when that one
-        // is not: a client holding an open transaction and running nothing.
-        // Between them they bound both ways a backend can be held, and neither
-        // fires on the state the other governs.
-        let idle = tokio::time::sleep(Duration::ZERO);
-        tokio::pin!(idle);
-        let mut idle_armed = false;
+        let mut holds = HoldDeadlines::new();
         if draining {
             deadline
                 .as_mut()
@@ -329,25 +313,15 @@ impl Running<'_> {
                 return Ok(Ending::Drained);
             }
 
-            // Armed on what the backend owes, not on what the client holds. A
-            // client inside an explicit transaction keeps its backend while it
-            // thinks, and a deadline counting that would end a session running
-            // nothing and report it as a query timeout - a different limit with a
-            // different name. Placed at the top of the loop rather than beside any
-            // one message because a request reaches the backend down several
-            // paths, and one that armed nothing is the hold this exists to bound.
-            arm(
-                &mut statement_armed,
-                statement.as_mut(),
-                self.statement_outstanding(),
-                self.manager().query_deadline(),
-            );
-            arm(
-                &mut idle_armed,
-                idle.as_mut(),
-                self.idle_in_transaction(),
-                self.manager().client_idle_in_transaction(),
-            );
+            holds.arm(self);
+            let HoldDeadlines {
+                statement,
+                statement_armed,
+                idle,
+                idle_armed,
+                pinned_for,
+                pinned_armed,
+            } = &mut holds;
 
             let event = tokio::select! {
                 biased;
@@ -356,8 +330,9 @@ impl Running<'_> {
                 // reach the policy before another client byte is forwarded.
                 _ = self.epochs.changed() => Event::EpochChanged,
                 () = &mut deadline, if draining => Event::Deadline,
-                () = &mut statement, if statement_armed => Event::StatementDeadline,
-                () = &mut idle, if idle_armed => Event::IdleInTransaction,
+                () = &mut *statement, if *statement_armed => Event::StatementDeadline,
+                () = &mut *idle, if *idle_armed => Event::IdleInTransaction,
+                () = &mut *pinned_for, if *pinned_armed => Event::PinExpired,
                 read = self.session.client.read_buf(self.from_client.read_target()) => {
                     Event::FromClient(read)
                 }
@@ -383,6 +358,10 @@ impl Running<'_> {
                     self.on_idle_in_transaction().await;
                     return Ok(Ending::IdleInTransaction);
                 }
+                Event::PinExpired => {
+                    self.on_pin_expired().await;
+                    return Ok(Ending::PinExpired);
+                }
                 Event::FromClient(read) => {
                     if read? == 0 {
                         return Ok(Ending::PeerClosed);
@@ -403,6 +382,38 @@ impl Running<'_> {
                 }
             }
         }
+    }
+
+    /// Whether this session is holding a pinned link.
+    fn holds_a_pin(&self) -> bool {
+        self.checkout
+            .as_ref()
+            .is_some_and(|checkout| checkout.conn.link.pin().is_some())
+    }
+
+    /// Ends a session that has held a pinned link for longer than the pool allows.
+    ///
+    /// The link is closed, not returned. The state it was pinned for is state no
+    /// reset removes, which is the whole reason it was pinned, so it can no more
+    /// be shared at the end of the bound than at the start of it. What the bound
+    /// buys is the connection itself: a pool at its pinned ceiling otherwise stays
+    /// there for as long as its longest-lived client.
+    async fn on_pin_expired(&mut self) {
+        self.session.metrics.pin_expired();
+        // The pin timer is armed on holding a pin and nothing else, so unlike the
+        // idle bound it can fire with a statement still running. Ending the
+        // session would otherwise take the statement deadline with it, so a pin
+        // that expires first silently voids the deadline that would have stopped
+        // the statement.
+        self.cancel_anything_outstanding().await;
+        crate::wire_io::send_fatal(
+            self.session.client,
+            "53300",
+            "terminating a connection that has held a pinned backend for longer than this \
+             pool allows",
+        )
+        .await;
+        self.abandon();
     }
 
     /// Ends a session whose link could not be pinned.
@@ -1649,6 +1660,7 @@ enum Event {
     Deadline,
     StatementDeadline,
     IdleInTransaction,
+    PinExpired,
     EpochChanged,
     FromClient(std::io::Result<usize>),
     FromBackend(std::io::Result<usize>),
@@ -1750,6 +1762,73 @@ fn close_statement(name: &pgelastic_pool::StatementName) -> FrontendMessage {
 
 /// Re-emits a frame byte-identically rather than re-encoding the message it
 /// decoded to, so field order and unknown fields survive the relay.
+/// The three deadlines that bound how long one session may hold a backend.
+///
+/// Grouped because they are armed together on every pass of the relay loop and
+/// because each is a branch of the same `select!`. Boxed rather than pinned to the
+/// stack of `drive` so that arming them can be one call instead of three.
+///
+/// Never an outer `timeout()` around the loop, for the reason `session.rs` gives
+/// about the drain deadline: an outer timeout drops the future mid-`write_all` and
+/// truncates a frame on the wire, and a truncated frame is not a bounded session,
+/// it is a corrupt one.
+struct HoldDeadlines {
+    /// A request is outstanding on the backend. Disarmed by its `ReadyForQuery`.
+    statement: std::pin::Pin<Box<tokio::time::Sleep>>,
+    statement_armed: bool,
+    /// The complement of the statement deadline, armed exactly when that one is
+    /// not: a client holding an open transaction and running nothing. Between them
+    /// they bound both ways a backend can be held, and neither fires on the state
+    /// the other governs.
+    idle: std::pin::Pin<Box<tokio::time::Sleep>>,
+    idle_armed: bool,
+    /// A link is pinned. Never disarmed while it is, because a pin is a state the
+    /// client stays in rather than an operation it repeats.
+    pinned_for: std::pin::Pin<Box<tokio::time::Sleep>>,
+    pinned_armed: bool,
+}
+
+impl HoldDeadlines {
+    fn new() -> Self {
+        Self {
+            statement: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            statement_armed: false,
+            idle: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            idle_armed: false,
+            pinned_for: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            pinned_armed: false,
+        }
+    }
+
+    /// Arms each deadline the session has just entered the state for, and disarms
+    /// each one it has just left.
+    ///
+    /// Called at the top of the loop rather than beside any one message, because
+    /// each of these states is reached down several paths and one that armed
+    /// nothing is exactly the hold these exist to bound.
+    fn arm(&mut self, running: &Running<'_>) {
+        let manager = running.manager();
+        arm(
+            &mut self.statement_armed,
+            self.statement.as_mut(),
+            running.statement_outstanding(),
+            manager.query_deadline(),
+        );
+        arm(
+            &mut self.idle_armed,
+            self.idle.as_mut(),
+            running.idle_in_transaction(),
+            manager.client_idle_in_transaction(),
+        );
+        arm(
+            &mut self.pinned_armed,
+            self.pinned_for.as_mut(),
+            running.holds_a_pin(),
+            manager.max_pin_duration(),
+        );
+    }
+}
+
 /// Arms a deadline while a condition holds and disarms it when it stops.
 ///
 /// A timer only ever starts on the transition into the state it bounds, so a

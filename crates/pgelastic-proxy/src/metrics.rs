@@ -249,6 +249,7 @@ pub struct Metrics {
     statement_deadlines: [AtomicU64; STATEMENT_DEADLINES.len()],
     idle_in_transaction_closed: AtomicU64,
     pins_refused: AtomicU64,
+    pins_expired: AtomicU64,
     connect_gate: [AtomicU64; 4],
     bytes_to_backend: AtomicU64,
     bytes_to_client: AtomicU64,
@@ -403,6 +404,11 @@ impl Metrics {
     /// all. `pgelastic_proxy_pins_total` already carries the breakdown.
     pub fn pin_refused(&self) {
         self.pins_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pinned link the duration bound closed.
+    pub fn pin_expired(&self) {
+        self.pins_expired.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn idle_in_transaction_closed(&self) {
@@ -959,6 +965,12 @@ impl Metrics {
             "pgelastic_proxy_pins_refused_total",
             "Pins refused because the pool was at its pinned share of the budget.",
             &[("", load(&self.pins_refused))],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_pins_expired_total",
+            "Pinned links closed for having been held longer than the pool allows.",
+            &[("", load(&self.pins_expired))],
         );
     }
 
