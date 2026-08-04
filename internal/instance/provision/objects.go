@@ -796,3 +796,15 @@ func StorageQuantity(size resource.Quantity) *resource.Quantity {
 	copied := size.DeepCopy()
 	return &copied
 }
+
+// DroppedParameters lists the parameters in spec.parameters that will not be rendered.
+//
+// The refusal happens at admission now, so reaching this with anything in it means the
+// object was stored before that parameter became owned - which is the exact case the second
+// pass exists for, and the exact case that used to happen in total silence: the sole caller
+// of UserParameters discarded this return, so a stale `max_connections` was written to the
+// object, never rendered, and never mentioned again.
+func (b Builder) DroppedParameters() []string {
+	_, dropped := pgconf.UserParameters(b.Instance.Spec.Parameters)
+	return dropped
+}

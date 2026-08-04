@@ -17,11 +17,13 @@ limitations under the License.
 package provision
 
 import (
+	"slices"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
+	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 )
 
@@ -92,5 +94,30 @@ func TestTheNonPostgresReserveIsSubtractedBeforeTheFraction(t *testing.T) {
 func TestASmallClassStillGetsTheCatalogFloor(t *testing.T) {
 	if got := sharedBuffersFor(nil, classNamed(t, "dev-1")); got != megabytes(minSharedBuffers) {
 		t.Errorf("dev-1 shared_buffers = %s, want the floor %s", got, megabytes(minSharedBuffers))
+	}
+}
+
+// The second pass, and the reason it stays even now that the webhook refuses these at
+// admission: an object stored before a parameter became owned is admitted history, and it
+// must not be able to poison a pod that reads it later. It used to be dropped in silence -
+// the only caller of UserParameters discarded the list - so the value sat in the manifest,
+// absent from the postmaster, with nothing anywhere saying the two disagreed.
+func TestAnOwnedParameterIsDroppedAndNamed(t *testing.T) {
+	builder := Builder{Instance: &pgelasticv1alpha1.PgInstance{
+		Spec: pgelasticv1alpha1.PgInstanceSpec{
+			Parameters: map[string]pgelasticv1alpha1.GUCValue{
+				"max_connections":  "5000",
+				"random_page_cost": "1.1",
+			},
+		},
+	}}
+
+	dropped := builder.DroppedParameters()
+
+	if !slices.Equal(dropped, []string{"max_connections"}) {
+		t.Errorf("dropped = %v, want exactly [max_connections]", dropped)
+	}
+	if _, kept := pgconf.UserParameters(builder.Instance.Spec.Parameters); len(kept) != 1 {
+		t.Errorf("the tenant's own parameter did not survive alongside the refusal")
 	}
 }
