@@ -133,6 +133,24 @@ var _ = Describe("PgTenantUser containment", Ordered, func() {
 
 	// A group role authenticates nobody, so a credential attached to one is a contradiction
 	// rather than a harmless extra: it reads as though somebody may log in with it.
+	// spec.userName is a tenant operator's to choose, and the tenant's owner is a name they
+	// can read off their own object. Both render into the proxy's [[auth.users]] keyed by the
+	// name a client sends, so the proxy would have two entries for one session - and taking
+	// the owner's would hand this login the owner's privileges while leaving it
+	// indistinguishable from the owner in pg_stat_activity.
+	It("refuses a login named after its own tenant's owner", func() {
+		user := makeUser("wh-app-owner", tenantA, "acme")
+
+		err := k8sClient.Create(ctx, user)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.userName"))
+	})
+
+	It("admits a login named after another tenant's owner, which is a different identity", func() {
+		mustCreate(makeUser("wh-app-other-owner", tenantA, "globex"))
+	})
+
 	It("refuses a credentials Secret on a login that may not log in", func() {
 		user := makeUser("wh-group-with-secret", tenantA, "grouped")
 		user.Spec.Login = ptrTo(false)

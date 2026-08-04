@@ -471,9 +471,7 @@ impl Proxy {
         // would hold the owner's privileges and be indistinguishable from it in
         // `pg_stat_activity`, which is the whole of what this kind exists not to be - and no
         // amount of care in the control plane's naming would show up on the far side.
-        if let Some(entry) = dynamic.users.iter().find(|u| u.name == login)
-            && !entry.backend_role.is_empty()
-        {
+        if let Some(entry) = dynamic.users.iter().find(|u| identity_of(u, tenant, login)) {
             {
                 if entry.backend_salted_password.is_empty() {
                     return Err(ProxyError::config(format!(
@@ -524,9 +522,7 @@ impl Proxy {
     /// half that matters - rotating it would not reliably evict its own.
     pub fn credential_generation(&self, tenant: &str, login: &str) -> u64 {
         let dynamic = self.dynamic.load();
-        if let Some(entry) = dynamic.users.iter().find(|u| u.name == login)
-            && !entry.backend_role.is_empty()
-        {
+        if let Some(entry) = dynamic.users.iter().find(|u| identity_of(u, tenant, login)) {
             return entry.backend_credential_generation;
         }
         dynamic
@@ -535,6 +531,31 @@ impl Proxy {
             .find(|t| t.name == tenant)
             .map_or(0, |t| t.credential_generation)
     }
+}
+
+/// Whether one `[[auth.users]]` entry is the backend identity of this session.
+///
+/// Three conditions, and each is load bearing. The name has to match, obviously. The entry
+/// has to carry a backend role, or there is no identity to assume and the tenant's own is
+/// still correct. And the entry has to belong to this tenant - an empty `tenant` meaning
+/// unbound, which is what the single-tenant development shape publishes.
+///
+/// Matching on the name alone is what made this worth a function. `spec.userName` is a
+/// tenant operator's to choose, so a login could be named after its own tenant's owner; the
+/// owner and the login then both render into `[[auth.users]]`, `find` takes whichever comes
+/// first, and the login authenticates with its own password and is dialled as the *owner* -
+/// carrying the owner's privileges, and indistinguishable from it in `pg_stat_activity`.
+/// That is precisely the escalation a contained user exists to prevent, reachable through
+/// one CRD field.
+///
+/// The two call sites must use this and not their own copies: `backend_for` decides who a
+/// session runs as and `credential_generation` decides which pooled links belong to it, and
+/// two predicates that disagree would key a session's links on one identity and open them
+/// as another.
+fn identity_of(user: &crate::config::UserConfig, tenant: &str, login: &str) -> bool {
+    user.name == login
+        && !user.backend_role.is_empty()
+        && (user.tenant.is_empty() || user.tenant == tenant)
 }
 
 /// The instance's address and TLS posture, dialled as somebody else's role.

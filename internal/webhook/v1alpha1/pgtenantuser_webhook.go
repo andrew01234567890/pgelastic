@@ -104,6 +104,26 @@ func (v *PgTenantUserCustomValidator) validate(
 			fmt.Sprintf("no PgTenant of that name exists in namespace %q", user.Namespace))})
 	}
 
+	// A login may not answer to its own tenant's owner name.
+	//
+	// Both render into the proxy's [[auth.users]], keyed by the name a client sends, so the
+	// proxy would have two entries to choose between for one session - and choosing the
+	// owner's would hand this login the owner's privileges while leaving it indistinguishable
+	// from the owner in pg_stat_activity. That is the exact escalation a contained user exists
+	// to prevent, reachable through one field a tenant operator controls.
+	//
+	// Refused here rather than only fenced at render time because an operator should be told
+	// at admission, in terms of the field they wrote. The render-side dedup stays as the
+	// backstop for two objects admitted concurrently, which no webhook can see.
+	owner := tenant.Spec.DatabaseName
+	if tenant.Spec.Owner != nil && *tenant.Spec.Owner != "" {
+		owner = *tenant.Spec.Owner
+	}
+	if user.Spec.UserName == owner {
+		problems = append(problems, field.Duplicate(
+			field.NewPath("spec", "userName"), user.Spec.UserName))
+	}
+
 	// A group role authenticates nobody, so a credential on one is a contradiction rather than
 	// an unused field: it reads as though somebody may log in with it, and nothing downstream
 	// would ever prove that wrong.

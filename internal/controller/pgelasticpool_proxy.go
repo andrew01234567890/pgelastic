@@ -459,7 +459,29 @@ func (r *PgElasticPoolReconciler) proxyUsers(
 	if err != nil {
 		return nil, err
 	}
-	return append(users, contained...), nil
+
+	// A contained login may not shadow its own tenant's owner. spec.userName is a tenant
+	// operator's to choose, so a login can be named after the owner it sits beside, and both
+	// would render here under one (name, tenant). The proxy would then have two entries to
+	// pick between for one session.
+	//
+	// The owner entry is the one kept, and the direction is not arbitrary: dropping the owner
+	// would take the tenant offline, while dropping the login leaves it with the mock
+	// verifier and refused at authentication - visible, and confined to the login that
+	// caused it. The webhook refuses the collision at admission; this is the backstop for the
+	// two objects admitted concurrently that no webhook can see.
+	type identity struct{ name, tenant string }
+	owners := make(map[identity]bool, len(users))
+	for _, user := range users {
+		owners[identity{user.Name, user.Tenant}] = true
+	}
+	for _, login := range contained {
+		if owners[identity{login.Name, login.Tenant}] {
+			continue
+		}
+		users = append(users, login)
+	}
+	return users, nil
 }
 
 // containedUsers collects the PgTenantUser logins for the pool's tenants.
