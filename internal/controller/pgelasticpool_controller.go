@@ -710,13 +710,24 @@ func (r *PgElasticPoolReconciler) scaleOut(
 	pool *pgelasticv1alpha1.PgElasticPool,
 	plan autoscale.Plan,
 ) (bool, error) {
-	if plan.RecommendedInstances <= plan.ObservedInstances {
+	// Against the same count the proposal was made against. The recommendation is expressed
+	// in members that serve, and holding it up against the whole membership makes this class
+	// selected on every pass and applied on none - which starves every class beneath it,
+	// because at most one executes per pass and this one is above Rebalance and ScaleIn.
+	if plan.RecommendedInstances <= plan.ServingInstances {
 		return false, nil
 	}
-	// One instance at a time, so the stabilization window gets to observe the effect of
-	// each addition before the next is considered.
+	// One more than the pool declares, not one more than it can see. Membership is poolRef and
+	// nothing else, so the count includes instances that are not the pool's to keep: a
+	// PgRestore's recovery instance is handed the source's poolRef, reaches Ready, and is
+	// deleted again when the restore finishes. Declaring against that count raises the
+	// declaration while the recovery exists and never lowers it when it goes, so an operator
+	// who asked for one more member pays for two primaries and their volumes, permanently.
+	//
+	// The guard above this refuses the class while the declaration runs ahead of the
+	// membership, so this only ever adds to a number the pool has already made good on.
 	patch := client.MergeFrom(pool.DeepCopy())
-	pool.Spec.Instances.Replicas = ptr.To(plan.ObservedInstances + 1)
+	pool.Spec.Instances.Replicas = ptr.To(declaredInstances(pool) + 1)
 	return true, r.Patch(ctx, pool, patch)
 }
 

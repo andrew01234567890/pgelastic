@@ -153,6 +153,19 @@ func (s Signals) ServingInstances() int32 {
 	return serving
 }
 
+// ReadyInstances is how many of them have come up. It is deliberately not the measurable
+// count: a cordoned member is up, and the difference between "not up yet" and "up but not
+// taking new work" is the difference between waiting and replacing.
+func (s Signals) ReadyInstances() int32 {
+	ready := int32(0)
+	for _, instance := range s.Instances {
+		if instance.Ready {
+			ready++
+		}
+	}
+	return ready
+}
+
 // Action is one proposed change class.
 type Action struct {
 	Class     pgelasticv1alpha1.AutoAction

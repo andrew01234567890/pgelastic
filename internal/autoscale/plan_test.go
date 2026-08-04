@@ -699,6 +699,44 @@ func TestAnUnrealisedScaleOutDoesNotStarveTheClassesBelowIt(t *testing.T) {
 	}
 }
 
+// The same disagreement one step further along. Once something provisions members, the pool
+// stops being short of *declared* members and starts being short of *serving* ones - and the
+// recommendation counts serving members while the declared count counts objects. A guard that
+// only watched the declaration would let the scale-out become permitted, inert and selected
+// all over again.
+func TestAScaleOutIsRefusedWhileAMemberHasNotComeUp(t *testing.T) {
+	policy := basePolicy()
+	signals := crowdedAndSkewedSignals()
+	signals.Instances = append(signals.Instances, InstanceSignal{
+		Name: "pg-d", Schedulable: true, AllocatableConnections: 225,
+	})
+	signals.DeclaredInstances = int32(len(signals.Instances))
+
+	plan := Recommend(signals, policy)
+	action := actionOf(t, plan, pgelasticv1alpha1.AutoActionScaleOut)
+	if action.Permitted {
+		t.Fatalf("permitted a scale-out while a member was still coming up: %s", action.Detail)
+	}
+	if action.Reason != ReasonScaleOutUnrealised {
+		t.Errorf("refused with %q, want %q", action.Reason, ReasonScaleOutUnrealised)
+	}
+}
+
+// A cordoned member is up. A pool draining one is exactly a pool that may need to replace it,
+// so the gate above must not read "not taking new work" as "not there yet".
+func TestACordonedMemberDoesNotHoldUpAScaleOut(t *testing.T) {
+	policy := basePolicy()
+	signals := crowdedAndSkewedSignals()
+	signals.Instances[2].Schedulable = false
+
+	plan := Recommend(signals, policy)
+	action := actionOf(t, plan, pgelasticv1alpha1.AutoActionScaleOut)
+	if !action.Permitted {
+		t.Errorf("refused a scale-out on a pool whose every member is up: %s / %s",
+			action.Reason, action.Message)
+	}
+}
+
 func TestAScaleOutIsPermittedOnceThePoolHasTheMembersItDeclares(t *testing.T) {
 	policy := basePolicy()
 	signals := crowdedAndSkewedSignals()
