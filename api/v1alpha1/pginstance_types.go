@@ -212,10 +212,18 @@ type PgInstanceSpec struct {
 	// +required
 	Class string `json:"class"`
 
-	// postgresVersion is pinned to 18 for the whole of v1. There is no major-version
-	// upgrade path, so the field exists only to make the assumption explicit and to leave
-	// room for one later.
-	// +kubebuilder:validation:Enum="18"
+	// postgresVersion is the major this instance runs, and it is immutable.
+	//
+	// Immutable on purpose, and it is not a limitation to be lifted later: there is no
+	// in-place major upgrade here and there is not going to be one. The answer to "make this
+	// a 19" is "there is a 19 over there, move your tenants onto it" - which is a thing this
+	// tree can already do one tenant at a time, and which none of the operators that
+	// implement pg_upgrade can do for a subset of a cluster's databases.
+	//
+	// A migration onto an older major is refused at preflight rather than attempted, because
+	// both of this tree's dumps run in the *target's* container and pg_dump refuses to read a
+	// server newer than itself.
+	// +kubebuilder:validation:Enum="18";"19"
 	// +kubebuilder:default="18"
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="postgresVersion is immutable"
 	// +optional

@@ -28,7 +28,10 @@ import (
 
 // InstanceSignal is one member instance as the planner sees it.
 type InstanceSignal struct {
-	Name                   string
+	Name string
+	// Major is the PostgreSQL major this instance runs, so the packer can refuse a move the
+	// migration could never perform. Zero means unknown and refuses nothing.
+	Major                  int
 	Ready                  bool
 	Schedulable            bool
 	Progressing            bool
@@ -345,6 +348,7 @@ func repack(signals Signals, policy Policy) placement.Result {
 			AntiAffinity:   tenant.AntiAffinity,
 			PinnedInstance: tenant.PinnedInstance,
 			BoundInstance:  tenant.Instance,
+			BoundMajor:     majorOfInstance(signals, tenant.Instance),
 		})
 	}
 	instances := make([]placement.Instance, 0, len(signals.Instances))
@@ -353,6 +357,7 @@ func repack(signals Signals, policy Policy) placement.Result {
 			Name:        instance.Name,
 			Capacity:    placement.Capacity{Connections: instance.AllocatableConnections},
 			Schedulable: instance.Schedulable,
+			Major:       instance.Major,
 			Ready:       instance.Ready,
 		})
 	}
@@ -615,4 +620,18 @@ func signalsFor(signals Signals, move Move) (TenantSignal, InstanceSignal) {
 		}
 	}
 	return tenant, source
+}
+
+// majorOfInstance is the PostgreSQL major a bound tenant currently sits on, which is the floor
+// a destination has to clear. A tenant bound nowhere has no floor.
+func majorOfInstance(signals Signals, name string) int {
+	if name == "" {
+		return 0
+	}
+	for _, instance := range signals.Instances {
+		if instance.Name == name {
+			return instance.Major
+		}
+	}
+	return 0
 }

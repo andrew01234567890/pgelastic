@@ -96,6 +96,16 @@ type InstanceConfig struct {
 	// Zero renders the worker counts a tree with no CPU input rendered, which is what every
 	// instance got while spec.resources was read by nothing.
 	ParallelWorkers int32
+	// Major is the PostgreSQL major this configuration is rendered for, from the instance's
+	// own spec.postgresVersion. Zero means "whatever this tree was pinned to", which is the
+	// shape every caller had before more than one major could be expressed.
+	//
+	// It exists because a parameter's *value* can be version-dependent even when its name is
+	// not. There is one such parameter today and it is not a corner case: PostgreSQL 19
+	// doubles max_locks_per_transaction's default and its release note says settings "must
+	// now be doubled to match their capacity in previous releases", so rendering 18's literal
+	// on a 19 postmaster halves the lock table without saying so.
+	Major int
 	// PrimaryEpoch is the fence token bound into the postmaster.
 	PrimaryEpoch int64
 	// UserParameters are the tenant-settable parameters that survived UserParameters.
@@ -131,7 +141,7 @@ func RenderCustomConf(config InstanceConfig) []Setting {
 		GUCMaxWorkerProcesses:            strconv.Itoa(int(workerProcesses(config.ParallelWorkers))),
 		GUCMaxParallelWorkers:            strconv.Itoa(int(parallelWorkers(config.ParallelWorkers))),
 		GUCMaxPreparedTransactions:       "0",
-		GUCMaxLocksPerTransaction:        "64",
+		GUCMaxLocksPerTransaction:        maxLocksPerTransaction(config.Major),
 		"autovacuum_worker_slots":        strconv.Itoa(int(config.AutovacuumWorkerSlots)),
 
 		"listen_addresses":        "*",

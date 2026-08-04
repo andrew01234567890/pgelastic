@@ -28,8 +28,21 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// Image is the PostgreSQL the oracle calibrates against. pgelastic is PG18-only.
-const Image = "postgres:18"
+// MajorEnv names the PostgreSQL major these containers run, and is the same variable the
+// Rust harness and the e2e suites read. The oracle's verdict covers exactly the major it ran
+// on, so which one that is has to be a decision rather than a literal buried here.
+const MajorEnv = "PGELASTIC_PG_MAJOR"
+
+// defaultMajor is the major the merge gate runs.
+const defaultMajor = "18"
+
+// Image is the PostgreSQL the oracle calibrates against.
+func Image() string {
+	if major := os.Getenv(MajorEnv); major != "" {
+		return "postgres:" + major
+	}
+	return "postgres:" + defaultMajor
+}
 
 const (
 	database = "verify"
@@ -51,7 +64,7 @@ func Start(t *testing.T) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	container, err := postgres.Run(ctx, Image,
+	container, err := postgres.Run(ctx, Image(),
 		postgres.WithDatabase(database),
 		postgres.WithUsername(username),
 		postgres.WithPassword(password),
@@ -61,7 +74,7 @@ func Start(t *testing.T) string {
 		if isRuntimeUnavailable(err) {
 			t.Skipf("no container runtime available: %v", err)
 		}
-		t.Fatalf("starting %s: %v", Image, err)
+		t.Fatalf("starting %s: %v", Image(), err)
 	}
 	testcontainers.CleanupContainer(t, container)
 

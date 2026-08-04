@@ -25,6 +25,9 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 )
 
+// acmeTenantName is the tenant most of these fixtures are about.
+const acmeTenantName = "acme"
+
 // The instances every fixture names.
 const (
 	instanceA = "pg-a"
@@ -486,5 +489,53 @@ func TestQuantileForMapsEveryPercentileTheAPIAccepts(t *testing.T) {
 		if got := QuantileFor(percentile); got != want {
 			t.Errorf("QuantileFor(%q) = %v, want %v", percentile, got, want)
 		}
+	}
+}
+
+// Widening the version enum makes a mixed-major pool constructible, and the packer was blind
+// to it. Both of this tree's dumps run in the *target's* container, so pg_dump cannot read a
+// server newer than itself: a move onto an older major is refused at preflight, permanently
+// and by construction. A packer that proposes those moves manufactures migrations that can
+// never succeed - and each one then sits at the gate.
+func TestAMoveIsNotProposedOntoAMajorTheMigrationCannotReach(t *testing.T) {
+	tenant := Tenant{
+		Name:          acmeTenantName,
+		Demand:        Demand{GuaranteedConnections: 10},
+		BoundInstance: "pg-19",
+		BoundMajor:    19,
+	}
+	// pg-18 is the tightest fit and pg-21 the next, so a packer judging only on capacity
+	// picks one of the two destinations the migration can never reach. That is deliberate:
+	// with the version rule removed this test has to fail, and a fixture where best-fit
+	// happens to choose a legal instance anyway proves nothing.
+	instances := []Instance{
+		{Name: "pg-18", Capacity: Capacity{Connections: 10}, Schedulable: true, Ready: true, Major: 18},
+		{Name: "pg-21", Capacity: Capacity{Connections: 12}, Schedulable: true, Ready: true, Major: 21},
+		{Name: "pg-19", Capacity: Capacity{Connections: 400}, Schedulable: true, Ready: true, Major: 19},
+		{Name: "pg-20", Capacity: Capacity{Connections: 500}, Schedulable: true, Ready: true, Major: 20},
+	}
+
+	result, err := Pack([]Tenant{tenant}, instances, Policy{})
+	if err != nil {
+		t.Fatalf("packing: %v", err)
+	}
+	assignment, ok := result.AssignmentFor(acmeTenantName)
+	if !ok {
+		t.Fatal("a tenant with three reachable destinations was refused outright")
+	}
+	switch assignment.Instance {
+	case "pg-18":
+		t.Error("packed a tenant from 19 onto 18; the dump runs in the target and cannot read a newer server")
+	case "pg-21":
+		t.Error("packed a tenant two majors forward; majors are crossed one at a time")
+	}
+
+	// A tenant bound nowhere carries no floor, so a first admission is unaffected.
+	fresh, err := Pack([]Tenant{{Name: "new", Demand: Demand{GuaranteedConnections: 10}}}, instances, Policy{})
+	if err != nil {
+		t.Fatalf("packing a new tenant: %v", err)
+	}
+	if _, ok := fresh.AssignmentFor("new"); !ok {
+		t.Error("a tenant with no binding was refused on a version axis it has no position on")
 	}
 }

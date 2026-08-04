@@ -53,6 +53,9 @@ func Bootstrap(ctx context.Context, options Options) error {
 	log := logf.FromContext(ctx)
 	tools := toolchain(options)
 
+	if err := checkMajorMatchesTheData(options); err != nil {
+		return err
+	}
 	if pgtool.DataDirectoryInitialised(options.DataDir) {
 		if _, err := tools.ControlData(ctx, options.DataDir); err == nil {
 			log.Info("adopting an existing data directory", "dataDir", options.DataDir)
@@ -75,6 +78,40 @@ func Bootstrap(ctx context.Context, options Options) error {
 		return initialise(ctx, options, tools)
 	}
 	return join(ctx, options, tools, primary)
+}
+
+// checkMajorMatchesTheData refuses to render a configuration for one PostgreSQL major onto a
+// data directory created by another.
+//
+// The two are set independently and nothing related them. spec.postgresVersion decides what
+// the operator renders - and, since this milestone, what max_locks_per_transaction is worth -
+// while the image the postmaster actually comes from is an operator-global environment
+// variable. A 19 image under the CRD's default of "18" therefore rendered 18's literal onto a
+// 19 postmaster and halved the lock table of every instance, silently, on a field that is
+// immutable and so cannot be corrected afterwards.
+//
+// It is checked by observation rather than by trying to make one setting derive from the
+// other, because they legitimately come from different places: the version is a property of
+// the instance and the image is a property of the deployment. What must never happen is the
+// two disagreeing without anybody being told.
+//
+// Only a data directory that already exists can answer. A first boot has no PG_VERSION yet,
+// and initdb is about to create one from whichever binary is in the image - which is the
+// moment the disagreement is created rather than detected, and the next start catches it.
+func checkMajorMatchesTheData(options Options) error {
+	declared := options.Config.Postgres.Major
+	if declared <= 0 {
+		declared = pgconf.DefaultMajor
+	}
+	found := pgtool.DataDirectoryMajor(options.DataDir)
+	if found == 0 || found == declared {
+		return nil
+	}
+	return fmt.Errorf(
+		"this member's data directory was created by PostgreSQL %d and spec.postgresVersion "+
+			"says %d; the configuration rendered for %d would be wrong for it - "+
+			"max_locks_per_transaction alone differs by a factor of two across 18 and 19",
+		found, declared, declared)
 }
 
 // PrepareToFollow makes an existing data directory consistent with whoever the instance's
