@@ -24,8 +24,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -86,7 +86,7 @@ var _ = Describe("a pool whose declared member count outran its members", Ordere
 			Spec: pgelasticv1alpha1.PgElasticPoolSpec{
 				ClassRef: pgelasticv1alpha1.ClassReference{
 					APIGroup: pgelasticv1alpha1.SchemeGroupVersion.Group,
-					Kind:     "PgElasticClass",
+					Kind:     elasticClassKind,
 					Name:     className,
 				},
 				Capacity: pgelasticv1alpha1.PoolCapacity{BackendConnections: 240},
@@ -95,7 +95,7 @@ var _ = Describe("a pool whose declared member count outran its members", Ordere
 					// scaling out once, and never leaves.
 					Replicas: ptr.To(int32(4)),
 					Template: pgelasticv1alpha1.PgInstanceTemplate{
-						Class: "gp-8",
+						Class: memberClass,
 						Storage: pgelasticv1alpha1.InstanceStorage{
 							Size:      resource.MustParse("100Gi"),
 							WALVolume: pgelasticv1alpha1.WALVolume{Size: resource.MustParse("20Gi")},
@@ -151,7 +151,7 @@ var _ = Describe("a pool whose declared member count outran its members", Ordere
 			Expect(k8sClient.Patch(suiteCtx, instance, patch)).To(Succeed())
 		}
 
-		var tenants []*pgelasticv1alpha1.PgTenant
+		tenants := make([]*pgelasticv1alpha1.PgTenant, 0, jammedTenantCount)
 		for i := range jammedTenantCount {
 			name := fmt.Sprintf("e2e-jam-tenant-%02d", i)
 			tenant := &pgelasticv1alpha1.PgTenant{
