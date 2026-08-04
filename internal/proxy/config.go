@@ -313,6 +313,10 @@ const defaultQueryDeadlineSeconds = 120
 // spec.timeouts.clientIdleInTransaction, and is reached for the same reason as its sibling.
 const defaultIdleInTransactionSeconds = 60
 
+// defaultMaxPinnedPercent must match the +kubebuilder:default on
+// spec.pooling.maxPinnedFractionPercent.
+const defaultMaxPinnedPercent = 20
+
 func (c Config) renderRouting(out *strings.Builder, dynamic bool) {
 	out.WriteString("[routing]\n")
 	discriminators := tenantDiscriminators(c.Pool)
@@ -359,6 +363,7 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 		writeInt(out, "queryDeadlineSeconds", queryDeadlineSeconds(c.Pool))
 		writeInt(out, "clientIdleInTransactionSeconds",
 			openBoundSeconds(timeouts(c.Pool).ClientIdleInTransaction, defaultIdleInTransactionSeconds))
+		writeInt(out, "maxPinnedPercent", int64(maxPinnedPercent(pooling)))
 	}
 	writeInt(out, "notifyAfterSeconds", int64(queryWaitNotifySeconds(c.Pool)))
 	writeInt(out, "queueDepthPerTenant", int64(queueDepthPerTenant(c.Pool)))
@@ -544,6 +549,16 @@ func openBoundSeconds(duration *metav1.Duration, fallback int64) int64 {
 		return 0
 	}
 	return int64((duration.Duration + time.Second - 1) / time.Second)
+}
+
+// maxPinnedPercent renders spec.pooling.maxPinnedFractionPercent. Zero is no ceiling, which
+// is what the field's own Minimum=0 offers and what a pool that would rather run out of
+// reusable connections than refuse a LISTEN is asking for.
+func maxPinnedPercent(pooling *pgelasticv1alpha1.PoolingConfig) int32 {
+	if pooling == nil || pooling.MaxPinnedFractionPercent == nil {
+		return defaultMaxPinnedPercent
+	}
+	return *pooling.MaxPinnedFractionPercent
 }
 
 func poolMode(pooling *pgelasticv1alpha1.PoolingConfig) string {

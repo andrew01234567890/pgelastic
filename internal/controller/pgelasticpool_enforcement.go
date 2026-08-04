@@ -40,17 +40,27 @@ const actionEnforce = "Enforce"
 var enforcedBounds = []struct {
 	key   string
 	field string
+	unit  string
 	costs string
 }{
 	{
 		key:   "queryDeadlineSeconds",
 		field: "spec.timeouts.query",
+		unit:  "s",
 		costs: "a statement running longer than this is cancelled and its connection closed",
 	},
 	{
 		key:   "clientIdleInTransactionSeconds",
 		field: "spec.timeouts.clientIdleInTransaction",
+		unit:  "s",
 		costs: "a transaction left open and idle for longer than this has its connection closed",
+	},
+	{
+		key:   "maxPinnedPercent",
+		field: "spec.pooling.maxPinnedFractionPercent",
+		unit:  "%",
+		costs: "a client whose session state would pin a backend past this share of the " +
+			"budget is closed rather than given a shared link",
 	},
 }
 
@@ -104,9 +114,9 @@ func (r *PgElasticPoolReconciler) warnNewlyEnforcedTimeouts(
 		}
 		r.Recorder.Eventf(pool, nil, corev1.EventTypeWarning, eventTimeoutNowEnforced,
 			actionEnforce,
-			"%s is now enforced at %ds by the proxy: %s. It was stored but unread before this "+
-				"upgrade. Set it to 0s to leave it unbounded.",
-			bound.field, seconds, bound.costs)
+			"%s is now enforced at %d%s by the proxy: %s. It was stored but unread before "+
+				"this upgrade. Set it to 0 to leave it unbounded.",
+			bound.field, seconds, bound.unit, bound.costs)
 	}
 }
 

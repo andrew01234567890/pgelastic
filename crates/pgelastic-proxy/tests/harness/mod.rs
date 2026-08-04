@@ -602,6 +602,54 @@ impl RawClient {
         client
     }
 
+    /// Connects with the first query written in the same buffer as the startup
+    /// packet, the way a client that pipelines does.
+    ///
+    /// Those bytes reach the relay as `pending_from_client` and are pumped once
+    /// before its loop begins, which is a path no `connect` + `send` pair can
+    /// reach: by the time `send` runs, the loop has started.
+    pub async fn connect_pipelining(
+        address: SocketAddr,
+        user: &str,
+        database: &str,
+        sql: &str,
+    ) -> Self {
+        use bytes::{Bytes, BytesMut};
+        use pgelastic_wire::{ProtocolVersion, StartupMessage};
+
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connecting to the proxy");
+        let mut wire = BytesMut::new();
+        StartupMessage::new(
+            ProtocolVersion::V3_0,
+            vec![
+                (
+                    Bytes::from_static(b"user"),
+                    Bytes::copy_from_slice(user.as_bytes()),
+                ),
+                (
+                    Bytes::from_static(b"database"),
+                    Bytes::copy_from_slice(database.as_bytes()),
+                ),
+                (
+                    Bytes::from_static(b"client_encoding"),
+                    Bytes::from_static(b"UTF8"),
+                ),
+            ],
+        )
+        .encode(&mut wire);
+        pgelastic_wire::FrontendMessage::Query(Bytes::copy_from_slice(sql.as_bytes()))
+            .encode(&mut wire);
+        tokio::io::AsyncWriteExt::write_all(&mut socket, &wire)
+            .await
+            .expect("writing the startup packet and its pipelined query");
+        Self {
+            socket,
+            buf: pgelastic_wire::MessageBuffer::new(),
+        }
+    }
+
     pub async fn send(&mut self, messages: &[pgelastic_wire::FrontendMessage]) {
         pgelastic_proxy::wire_io::write_frontend(&mut self.socket, messages)
             .await

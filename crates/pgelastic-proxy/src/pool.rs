@@ -262,6 +262,8 @@ pub struct PoolManager {
     /// The idle-in-transaction bound in seconds, zero for none. An atomic for
     /// the same reason as the deadline above it.
     client_idle_in_transaction_seconds: AtomicU64,
+    /// The pinned share ceiling as a percentage, zero for none.
+    max_pinned_percent: AtomicU64,
     /// When the budget gauges were last refreshed, in milliseconds since
     /// `budget_epoch`. See [`publish_budget`](Self::publish_budget).
     budget_published_ms: AtomicU64,
@@ -305,6 +307,7 @@ impl PoolManager {
         };
         let query_deadline_seconds = config.query_deadline_seconds;
         let client_idle_in_transaction_seconds = config.client_idle_in_transaction_seconds;
+        let max_pinned_percent = u64::from(config.max_pinned_percent);
         let mut allocator = Allocator::new(pool_spec, admission)
             .map_err(|e| ProxyError::config(format!("pool capacity: {e}")))?;
 
@@ -347,6 +350,7 @@ impl PoolManager {
             next_link_id: AtomicU64::new(1),
             query_deadline_seconds: AtomicU64::new(query_deadline_seconds),
             client_idle_in_transaction_seconds: AtomicU64::new(client_idle_in_transaction_seconds),
+            max_pinned_percent: AtomicU64::new(max_pinned_percent),
             budget_published_ms: AtomicU64::new(0),
             budget_epoch: std::time::Instant::now(),
         }))
@@ -432,7 +436,9 @@ impl PoolManager {
             .client_idle_in_transaction_seconds
             .swap(idle, Ordering::Relaxed)
             != idle;
-        deadline_moved || idle_moved
+        let pinned = u64::from(config.max_pinned_percent);
+        let pinned_moved = self.max_pinned_percent.swap(pinned, Ordering::Relaxed) != pinned;
+        deadline_moved || idle_moved || pinned_moved
     }
 
     /// The statement deadline in force now, or `None` when the pool sets none.
@@ -577,14 +583,40 @@ impl PoolManager {
     /// [`BudgetLedger::elastic_limit`](pgelastic_pool::BudgetLedger::elastic_limit)
     /// is the ceiling that drops as a result. Without this split the drop has no
     /// attributable cause.
-    pub fn record_pin(&self, reason: PinReason) {
-        {
+    /// Refuses the pin when the pinned account is already at its share of the
+    /// budget, reporting whether the link may be pinned at all.
+    ///
+    /// The caller must close a link it was refused a pin for. There is no third
+    /// option: the state that provoked the pin is state no reset removes, so
+    /// handing the link on would give one tenant's `LISTEN`, cursor or advisory
+    /// lock to whoever gets it next.
+    pub fn record_pin(&self, reason: PinReason) -> PinOutcome {
+        let outcome = {
             let mut inner = self.lock();
-            if let Err(error) = inner.ledger.pin(reason) {
+            let ceiling = pin_ceiling(inner.ledger.limit(), self.max_pinned_percent());
+            if let Some(ceiling) = ceiling
+                && inner.ledger.pinned() >= ceiling
+            {
+                PinOutcome::Refused {
+                    pinned: inner.ledger.pinned(),
+                    ceiling,
+                }
+            } else if let Err(error) = inner.ledger.pin(reason) {
                 warn!(%error, %reason, "pinning a link the ledger does not know about");
+                PinOutcome::Pinned
+            } else {
+                PinOutcome::Pinned
             }
-        }
+        };
         self.publish_budget_now();
+        outcome
+    }
+
+    /// The pinned share ceiling in force now, or `None` when the pool sets none.
+    #[must_use]
+    pub fn max_pinned_percent(&self) -> Option<u32> {
+        let percent = self.max_pinned_percent.load(Ordering::Relaxed);
+        (percent > 0).then(|| u32::try_from(percent).unwrap_or(u32::MAX))
     }
 
     /// Returns a pinned link to the elastic pool, once the client that dirtied
@@ -1659,8 +1691,59 @@ fn transport_failure(error: &ProxyError) -> bool {
     )
 }
 
+/// What a pin request was allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinOutcome {
+    Pinned,
+    /// The pinned account is already at its share of the budget. The link must be
+    /// closed rather than pinned or shared.
+    Refused {
+        pinned: u32,
+        ceiling: u32,
+    },
+}
+
+/// How many links of a budget may be pinned at once.
+///
+/// Rounded up, so a small pool with a small percentage is allowed one pinned link
+/// rather than none: a ceiling of zero derived from a non-zero percentage would
+/// refuse every `LISTEN` in the pool and read as a bug rather than a limit. A pool
+/// that wants none says so by pinning being off.
+fn pin_ceiling(limit: u32, percent: Option<u32>) -> Option<u32> {
+    let percent = percent?;
+    let ceiling = u64::from(limit) * u64::from(percent.min(100));
+    Some(
+        u32::try_from(ceiling.div_ceil(100))
+            .unwrap_or(u32::MAX)
+            .max(1),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A ceiling of zero derived from a non-zero percentage would refuse every
+    /// LISTEN in a small pool and read as a bug rather than a limit.
+    #[test]
+    fn a_small_pool_with_a_small_percentage_still_gets_one_pinned_link() {
+        assert_eq!(super::pin_ceiling(4, Some(20)), Some(1));
+        assert_eq!(super::pin_ceiling(1, Some(1)), Some(1));
+    }
+
+    #[test]
+    fn the_ceiling_rounds_up_and_never_exceeds_the_budget() {
+        assert_eq!(super::pin_ceiling(100, Some(20)), Some(20));
+        assert_eq!(super::pin_ceiling(10, Some(25)), Some(3));
+        assert_eq!(super::pin_ceiling(10, Some(100)), Some(10));
+        // A percentage above 100 is clamped rather than allowed to exceed the
+        // budget it is a share of.
+        assert_eq!(super::pin_ceiling(10, Some(250)), Some(10));
+    }
+
+    #[test]
+    fn no_percentage_is_no_ceiling() {
+        assert_eq!(super::pin_ceiling(100, None), None);
+    }
     use std::time::Duration;
 
     use super::*;
