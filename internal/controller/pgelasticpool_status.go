@@ -390,16 +390,33 @@ func readyPoolReason(ready bool) string {
 	return pgelasticv1alpha1.ReasonPending
 }
 
-func readyPoolMessage(view *poolView) string {
+// readyPoolMessage names all three counts, because they answer different questions and a
+// message carrying only two of them cannot be read. A pool declaring three members with one
+// of them made and that one serving used to report "1 of 1 member instances are ready",
+// which is true of everything it can see and says nothing about the two it is missing.
+func readyPoolMessage(view *poolView, pool *pgelasticv1alpha1.PgElasticPool) string {
+	declared := declaredInstances(pool)
+	if int32(len(view.instances)) < declared {
+		return fmt.Sprintf("%d of %d member instances are ready; %d of %d members exist",
+			readyInstanceCount(view), len(view.instances), len(view.instances), declared)
+	}
 	return fmt.Sprintf("%d of %d member instances are ready", readyInstanceCount(view), len(view.instances))
 }
 
-// poolPhase is a pure function of the conditions, present only so kubectl output has one
-// column to show.
-func poolPhase(view *poolView, conditions []metav1.Condition) pgelasticv1alpha1.PoolPhase {
+// poolPhase is a pure function of the conditions and the counts, present only so kubectl
+// output has one column to show.
+func poolPhase(
+	view *poolView,
+	pool *pgelasticv1alpha1.PgElasticPool,
+	conditions []metav1.Condition,
+) pgelasticv1alpha1.PoolPhase {
 	switch {
 	case !conditionTrue(conditions, pgelasticv1alpha1.ConditionAccepted):
 		return pgelasticv1alpha1.PoolPhasePending
+	// Missing a member it declares is a different state from having every member and one of
+	// them unwell, and Provisioning was unreachable for as long as nothing made members.
+	case int32(len(view.instances)) < declaredInstances(pool):
+		return pgelasticv1alpha1.PoolPhaseProvisioning
 	case readyInstanceCount(view) == 0:
 		return pgelasticv1alpha1.PoolPhasePending
 	case readyInstanceCount(view) < len(view.instances):

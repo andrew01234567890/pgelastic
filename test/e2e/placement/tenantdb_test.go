@@ -109,8 +109,8 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 				Admission: &pgelasticv1alpha1.PoolAdmission{DefaultWorkloadClassName: workloadName},
 			},
 		}
-		Expect(k8sClient.Create(suiteCtx, pool)).To(Succeed())
-
+		// The member goes first, and the pool last. A pool provisions the members it
+		// declares, so creating it ahead of them opens a window in which it makes its own.
 		instance := &pgelasticv1alpha1.PgInstance{
 			ObjectMeta: metav1.ObjectMeta{Name: instanceName, Namespace: provisioningNamespace},
 			Spec: pgelasticv1alpha1.PgInstanceSpec{
@@ -123,6 +123,8 @@ var _ = Describe("provisioning a tenant's database on a real instance", Ordered,
 			},
 		}
 		Expect(k8sClient.Create(suiteCtx, instance)).To(Succeed())
+
+		Expect(k8sClient.Create(suiteCtx, pool)).To(Succeed())
 
 		DeferCleanup(func() {
 			for _, tenant := range []*pgelasticv1alpha1.PgTenant{reclaimed, retained} {

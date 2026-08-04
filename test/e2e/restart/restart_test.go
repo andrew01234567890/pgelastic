@@ -637,13 +637,15 @@ var _ = Describe("Rolling a PostgreSQL 18 instance under load", Ordered, Label("
 	BeforeAll(func() {
 		Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx,
 			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: e2eNamespace}}))).To(Succeed())
-		for _, object := range poolObjects() {
-			Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, object))).To(Succeed())
-		}
+		// The members go first, and the pool last. A pool provisions the members it declares,
+		// so creating it ahead of them opens a window in which it makes its own.
 		Expect(client.IgnoreAlreadyExists(
 			k8sClient.Create(suiteCtx, makeInstance(instanceA)))).To(Succeed())
 		Expect(client.IgnoreAlreadyExists(
 			k8sClient.Create(suiteCtx, makeInstance(instanceB)))).To(Succeed())
+		for _, object := range poolObjects() {
+			Expect(client.IgnoreAlreadyExists(k8sClient.Create(suiteCtx, object))).To(Succeed())
+		}
 
 		awaitReady(instanceA)
 		awaitReady(instanceB)

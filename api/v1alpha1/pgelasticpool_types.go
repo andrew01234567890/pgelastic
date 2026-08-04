@@ -317,9 +317,15 @@ type PgInstanceTemplate struct {
 	// +required
 	Class string `json:"class"`
 
-	// postgresVersion is fixed at 18 in v1. There is no major-version upgrade path, so
-	// changing this later is an instance replacement rather than an upgrade.
-	// +kubebuilder:validation:Enum="18"
+	// postgresVersion is the major the members provisioned from this template run.
+	//
+	// It accepts what PgInstanceSpec.PostgresVersion accepts, because that is the field it is
+	// stamped onto and a pool that could not express a major its own instances can is a pool
+	// that cannot be built on this template. Changing it later does not upgrade the members
+	// that already exist - the version is immutable on an instance, and there is no in-place
+	// major upgrade here - so a pool moves majors by provisioning new members and migrating
+	// its tenants onto them, one tenant at a time.
+	// +kubebuilder:validation:Enum="18";"19"
 	// +kubebuilder:default="18"
 	// +optional
 	PostgresVersion *string `json:"postgresVersion,omitempty"`

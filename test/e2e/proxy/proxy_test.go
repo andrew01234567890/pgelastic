@@ -163,11 +163,14 @@ var _ = Describe("the pool's inline proxy fleet", Ordered, func() {
 				},
 			},
 		}
-		Expect(k8sClient.Create(suiteCtx, pool)).To(Succeed())
-
+		// The members go first. A pool provisions the members it declares, so creating it
+		// ahead of them opens a window in which it makes its own - and this suite wants the
+		// two it writes by hand, not four.
 		for _, name := range []string{instanceA, instanceB} {
 			Expect(k8sClient.Create(suiteCtx, makeInstance(name))).To(Succeed())
 		}
+
+		Expect(k8sClient.Create(suiteCtx, pool)).To(Succeed())
 
 		// The tenants go first, and the namespace only once they are gone. A PgTenant's
 		// finalizer is released by the tenant controller, the controller reaches the tenant's

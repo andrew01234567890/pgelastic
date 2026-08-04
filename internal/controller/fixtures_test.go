@@ -55,6 +55,11 @@ func makePool(namespace, name, className string, backendConnections int32) *pgel
 			},
 			Capacity: pgelasticv1alpha1.PoolCapacity{BackendConnections: backendConnections},
 			Instances: pgelasticv1alpha1.PoolInstances{
+				// Declared, rather than left to the CRD's default of three. These fixtures
+				// hand-write the members they want; a pool that declares three and is given
+				// one now provisions the other two, which is correct and is not what any of
+				// them is about.
+				Replicas: ptrTo(int32(1)),
 				Template: pgelasticv1alpha1.PgInstanceTemplate{
 					Class: instanceClassName,
 					Storage: pgelasticv1alpha1.InstanceStorage{

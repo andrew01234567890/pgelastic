@@ -30,7 +30,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
-	"github.com/andrew01234567890/pgelastic/internal/autoscale"
 )
 
 const (
@@ -91,9 +90,11 @@ var _ = Describe("a pool whose declared member count outran its members", Ordere
 				},
 				Capacity: pgelasticv1alpha1.PoolCapacity{BackendConnections: 240},
 				Instances: pgelasticv1alpha1.PoolInstances{
-					// Four declared against the three that exist: the state a pool reaches by
-					// scaling out once, and never leaves.
-					Replicas: ptr.To(int32(4)),
+					// Three to begin with, so the population lands where this container puts
+					// it. The fourth is declared later, once the tenants are bound: a pool
+					// that declares a member it does not have provisions one, and a member
+					// provisioned mid-population would take a share of it.
+					Replicas: ptr.To(int32(3)),
 					Template: pgelasticv1alpha1.PgInstanceTemplate{
 						Class: memberClass,
 						Storage: pgelasticv1alpha1.InstanceStorage{
@@ -178,6 +179,12 @@ var _ = Describe("a pool whose declared member count outran its members", Ordere
 			}
 		}).Should(Succeed())
 
+		By("declaring a fourth member, which is the state a pool reaches by scaling out once")
+		pool := fetchPool(namespace, poolName)
+		poolPatch := client.MergeFrom(pool.DeepCopy())
+		pool.Spec.Instances.Replicas = ptr.To(int32(4))
+		Expect(k8sClient.Patch(suiteCtx, pool, poolPatch)).To(Succeed())
+
 		By("publishing enough load that the pool wants a member it will never get")
 		// Uneven across the members, and over the 40% target either way: a pool small enough
 		// to want a fourth member, and a spread wide enough to be worth rebalancing once the
@@ -186,44 +193,27 @@ var _ = Describe("a pool whose declared member count outran its members", Ordere
 		setInUse(namespace, instances[1], 39)
 		setInUse(namespace, instances[2], 21)
 
-		// The jam has to be established before a rebalance is possible at all, or the spec
-		// below can be satisfied by a move made in the window before this load was visible -
-		// which passes without ever exercising the ordering it exists to prove.
+		// The pool closes the gap by making the member it declared, rather than by declaring
+		// another. Waiting for that here is what makes the rebalance below a statement about
+		// ordering rather than about a race with provisioning.
 		Eventually(func(g Gomega) {
-			plan := fetchPool(namespace, poolName).Status.Autoscaling
-			g.Expect(plan).NotTo(BeNil())
-			g.Expect(plan.Actions).To(ContainElement(HaveField("Name", pgelasticv1alpha1.AutoActionScaleOut)),
-				"the fixture is not over its target, so there is no unrealised scale-out to jam on: %s",
-				plan.Summary)
+			members := &pgelasticv1alpha1.PgInstanceList{}
+			g.Expect(k8sClient.List(suiteCtx, members, client.InNamespace(namespace))).To(Succeed())
+			owned := 0
+			for i := range members.Items {
+				if members.Items[i].Spec.PoolRef.Name == poolName {
+					owned++
+				}
+			}
+			g.Expect(owned).To(Equal(4), "the pool declares 4 members and has %d", owned)
+			g.Expect(*fetchPool(namespace, poolName).Spec.Instances.Replicas).To(Equal(int32(4)),
+				"the pool asked for a fifth member while the fourth had not been made")
 		}).Should(Succeed())
 
 		By("checking nothing has been moved yet, so the spec below measures what it claims to")
 		migrations := &pgelasticv1alpha1.PgTenantMigrationList{}
 		Expect(k8sClient.List(suiteCtx, migrations, client.InNamespace(namespace))).To(Succeed())
 		Expect(migrations.Items).To(BeEmpty())
-	})
-
-	It("refuses to declare a fifth member while the fourth has never been made", func() {
-		Eventually(func(g Gomega) {
-			pool := fetchPool(namespace, poolName)
-			g.Expect(pool.Status.Autoscaling).NotTo(BeNil())
-
-			var scaleOut *pgelasticv1alpha1.PlannedAction
-			for i := range pool.Status.Autoscaling.Actions {
-				if pool.Status.Autoscaling.Actions[i].Name == pgelasticv1alpha1.AutoActionScaleOut {
-					scaleOut = &pool.Status.Autoscaling.Actions[i]
-				}
-			}
-			g.Expect(scaleOut).NotTo(BeNil(),
-				"the fixture is not over target, so there is no scale-out to refuse: %s",
-				pool.Status.Autoscaling.Summary)
-			g.Expect(scaleOut.Permitted).To(BeFalse())
-			g.Expect(scaleOut.Reason).To(Equal(autoscale.ReasonScaleOutUnrealised))
-		}).Should(Succeed())
-
-		By("checking the declared count did not ratchet again")
-		Expect(*fetchPool(namespace, poolName).Spec.Instances.Replicas).To(Equal(int32(4)),
-			"the pool asked for a fifth member while the fourth had never been made")
 	})
 
 	// The whole point of the layer. Rebalance sits below ScaleOut, so it only ever runs if
@@ -262,7 +252,9 @@ var _ = Describe("a pool whose declared member count outran its members", Ordere
 		migrations := &pgelasticv1alpha1.PgTenantMigrationList{}
 		Expect(k8sClient.List(suiteCtx, migrations, client.InNamespace(namespace))).To(Succeed())
 		for i := range migrations.Items {
-			Expect(migrations.Items[i].Spec.TargetInstanceRef.Name).To(BeElementOf(instances[1:]),
+			// Not "one of the two written by hand": by now the pool has made the fourth member
+			// it declared, and moving a tenant onto that one is just as good an answer.
+			Expect(migrations.Items[i].Spec.TargetInstanceRef.Name).NotTo(Equal(instances[0]),
 				"a tenant was moved onto the member it was already crowded onto")
 		}
 	})

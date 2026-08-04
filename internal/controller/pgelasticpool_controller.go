@@ -115,7 +115,7 @@ const envProxyImage = "PGELASTIC_PROXY_IMAGE"
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgelasticpools/finalizers,verbs=update
-// +kubebuilder:rbac:groups=pgelastic.io,resources=pginstances,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=pgelastic.io,resources=pginstances,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenants,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenantusers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgelastic.io,resources=pgtenantusers/status,verbs=get;update;patch
@@ -146,6 +146,23 @@ func (r *PgElasticPoolReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	view, err := r.observe(ctx, pool)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// Making a member changes every number the plan is computed from, so the pass that makes
+	// one publishes what it can see and plans nothing. The instance watch calls this back the
+	// moment the new member lands, which is sooner than any interval would.
+	provisioned, err := r.provisionMembers(ctx, pool, view)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if provisioned {
+		// Nothing is published on this pass. Every number a plan carries has just been
+		// invalidated by the member that was made, and writing an empty one in their place
+		// does not merely report nothing - it blanks the proxy status and resets the dwell
+		// clock under every consolidation candidate, so a pool that provisions occasionally
+		// would never accumulate the days of patience scale-in is gated on. The new member's
+		// own watch brings this straight back.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	plan := autoscale.Recommend(view.signals, view.policy)
@@ -961,7 +978,7 @@ func (r *PgElasticPoolReconciler) publish(
 		},
 		Autoscaling: planStatus(pool, plan, applied, r.now()),
 	}
-	status.Phase = poolPhase(view, status.Conditions)
+	status.Phase = poolPhase(view, pool, status.Conditions)
 
 	r.recordPlan(pool, plan)
 	setCondition(&status.Conditions, pool.Generation, pgelasticv1alpha1.ConditionAccepted,
@@ -969,8 +986,8 @@ func (r *PgElasticPoolReconciler) publish(
 		acceptedMessageOf(view, pool))
 	ready := view.elasticClass != nil && readyInstanceCount(view) > 0
 	setCondition(&status.Conditions, pool.Generation, pgelasticv1alpha1.ConditionReady,
-		conditionStatus(ready), readyPoolReason(ready), readyPoolMessage(view))
-	status.Phase = poolPhase(view, status.Conditions)
+		conditionStatus(ready), readyPoolReason(ready), readyPoolMessage(view, pool))
+	status.Phase = poolPhase(view, pool, status.Conditions)
 
 	// The plan is recomputed every pass and is usually identical to the last one. Stamping a
 	// fresh computedAt on an unchanged plan would make every reconcile a write, and every
