@@ -952,12 +952,18 @@ impl PoolManager {
     /// that is about to be closed, and the sockets are closed after it is
     /// released.
     pub fn reap_idle(&self) {
+        // Before the idle-timeout guard on purpose. Reaping links is configurable and off by
+        // default; the map sweep is a bound on what a client can make this process allocate,
+        // and a bound that a configuration knob can switch off is not one.
         let Some(idle_for) = self.server_idle_timeout() else {
+            Self::forget_empty_pools(&mut self.lock());
             return;
         };
         let reaped = {
             let mut inner = self.lock();
-            Self::take_idle(&mut inner, idle_for)
+            let reaped = Self::take_idle(&mut inner, idle_for);
+            Self::forget_empty_pools(&mut inner);
+            reaped
         };
         if reaped.is_empty() {
             return;
@@ -971,6 +977,23 @@ impl PoolManager {
             tokio::spawn(conn.close());
         }
         self.publish_budget_now();
+    }
+
+    /// Drops the per-key state of a pool that is holding nothing.
+    ///
+    /// `pools` is keyed on the whole `PoolKey`, and part of that key is the startup
+    /// fingerprint - which the client chooses. A client that varies a tracked startup
+    /// parameter on every connection therefore mints a new entry every time, and nothing ever
+    /// removed one: the map grew for as long as the process lived, on input an unauthenticated
+    /// peer supplies, until the proxy died and took every tenant's sessions with it.
+    ///
+    /// Only entries holding no link at all are dropped, so nothing in use is disturbed. What
+    /// is lost is the cached greeting, which the next client of that key pays one backend
+    /// round trip to rebuild - the same price the first one paid.
+    fn forget_empty_pools(inner: &mut Inner) {
+        inner
+            .pools
+            .retain(|_, pool| !pool.idle.is_empty() || !pool.active.is_empty());
     }
 
     /// Removes every link parked longer than `idle_for` that its tenant does not
@@ -2076,6 +2099,57 @@ mod tests {
                 .tenant(&CapacityTenant::new("goes"))
                 .is_none(),
             "the departed tenant still has an entry"
+        );
+    }
+
+    // `pools` is keyed on the whole PoolKey, and part of that key is the startup fingerprint,
+    // which the client chooses. A client varying a tracked parameter on every connection mints
+    // a new entry each time and nothing removed one, so the map grew for as long as the
+    // process lived - on input an unauthenticated peer supplies.
+    #[test]
+    fn a_pool_holding_nothing_is_not_kept_for_ever() {
+        let manager = PoolManager::new(
+            InstanceId::new("default"),
+            PoolConfig {
+                mode: PoolModeConfig::Transaction,
+                backend_connections: 10,
+                ..PoolConfig::default()
+            },
+            std::sync::Arc::default(),
+            FenceRuntime::in_memory(),
+            Metrics::new(),
+        )
+        .unwrap();
+        {
+            let mut inner = manager.lock();
+            for index in 0..64 {
+                let key = PoolKey::new(pgelastic_pool::PoolKeySpec {
+                    tenant: pgelastic_pool::TenantId::new("acme"),
+                    target: pgelastic_pool::BackendTarget::new("127.0.0.1", 5432),
+                    database: pgelastic_pool::DatabaseName::new("acme"),
+                    role: pgelastic_pool::RoleName::new("ops"),
+                    fingerprint: pgelastic_pool::StartupFingerprint::build(
+                        [("application_name", format!("client-{index}"))],
+                        &pgelastic_pool::FingerprintPolicy::default(),
+                    )
+                    .unwrap(),
+                    tls: pgelastic_pool::TlsPosture::Plaintext,
+                    replication: pgelastic_pool::ReplicationKind::None,
+                    configured_mode: pgelastic_pool::PoolMode::Transaction,
+                    credentials: pgelastic_pool::CredentialGeneration::new(0),
+                });
+                inner.pools.insert(key, Pool::new(Duration::from_secs(1)));
+            }
+            assert_eq!(inner.pools.len(), 64);
+        }
+
+        manager.reap_idle();
+
+        assert_eq!(
+            manager.lock().pools.len(),
+            0,
+            "empty pools survive, so a client that varies its startup packet grows this map \
+             without bound"
         );
     }
 
