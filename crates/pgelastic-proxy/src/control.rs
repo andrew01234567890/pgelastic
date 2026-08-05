@@ -744,7 +744,8 @@ mod tests {
         let config = Config::from_str(TWO).expect("the configuration parses");
         let metrics = Metrics::new();
         Control {
-            fleet: Fleet::build(&config, &metrics).expect("the fleet builds"),
+            fleet: Fleet::build(&config, &std::sync::Arc::default(), &metrics)
+                .expect("the fleet builds"),
             quiesce: QuiesceRegistry::new(),
             metrics,
             config: config.control,
@@ -1093,7 +1094,8 @@ mod auth_tests {
         let config = Config::from_str(SINGLE).expect("the configuration parses");
         let metrics = Metrics::new();
         Control {
-            fleet: crate::route::Fleet::build(&config, &metrics).expect("the fleet builds"),
+            fleet: crate::route::Fleet::build(&config, &std::sync::Arc::default(), &metrics)
+                .expect("the fleet builds"),
             quiesce: QuiesceRegistry::new(),
             metrics,
             config: config.control,

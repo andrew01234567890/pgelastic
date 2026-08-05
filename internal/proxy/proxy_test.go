@@ -389,6 +389,24 @@ func TestChangingTheStartupParameterPolicyRollsTheFleet(t *testing.T) {
 	}
 }
 
+func TestTrackExtraParametersReachesTheProxy(t *testing.T) {
+	document := testConfig().Render().TOML
+	if !strings.Contains(document, "trackExtraParameters = []") {
+		t.Fatalf("an unset spec.pooling.trackExtraParameters must render an empty list, which "+
+			"is what \"the proxy's own set\" means:\n%s", document)
+	}
+
+	config := testConfig()
+	config.Pool.Spec.Pooling = &pgelasticv1alpha1.PoolingConfig{
+		TrackExtraParameters: []string{"search_path", "plpgsql.check_asserts"},
+	}
+	document = config.Render().TOML
+	if !strings.Contains(document,
+		`trackExtraParameters = ["search_path", "plpgsql.check_asserts"]`) {
+		t.Fatalf("the tracked set never reached the proxy:\n%s", document)
+	}
+}
+
 func TestAddingAnInstanceRollsTheFleet(t *testing.T) {
 	before := testConfig().Render()
 

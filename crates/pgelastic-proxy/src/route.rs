@@ -95,7 +95,11 @@ impl Fleet {
     /// named [`DEFAULT_INSTANCE`], at `backend.address` — so the single-instance
     /// deployment keeps its meaning and never pays for a fleet it does not
     /// have.
-    pub fn build(config: &Config, metrics: &Arc<Metrics>) -> Result<Arc<Self>> {
+    pub fn build(
+        config: &Config,
+        tracked: &Arc<crate::vars::Tracked>,
+        metrics: &Arc<Metrics>,
+    ) -> Result<Arc<Self>> {
         let declared: Vec<(InstanceId, BackendConfig, Option<u32>)> = if config.instances.is_empty()
         {
             vec![(
@@ -130,8 +134,13 @@ impl Fleet {
                 ..config.pool.clone()
             };
             let fence = FenceRuntime::from(&config.fence);
-            let pools =
-                PoolManager::new(id.clone(), pool_config, fence.clone(), Arc::clone(metrics))?;
+            let pools = PoolManager::new(
+                id.clone(),
+                pool_config,
+                Arc::clone(tracked),
+                fence.clone(),
+                Arc::clone(metrics),
+            )?;
             pools.publish_budget_now();
             let stall = StallMonitor::new(
                 id.clone(),
@@ -331,7 +340,8 @@ mod tests {
 
     fn fleet(source: &str) -> Arc<Fleet> {
         let config = Config::from_str(source).expect("the configuration parses");
-        Fleet::build(&config, &Metrics::new()).expect("the fleet builds")
+        Fleet::build(&config, &std::sync::Arc::default(), &Metrics::new())
+            .expect("the fleet builds")
     }
 
     #[test]

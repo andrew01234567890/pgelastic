@@ -945,6 +945,44 @@ async fn an_untracked_parameter_still_separates_two_clients() {
     );
 }
 
+// The shape an adversarial review of this layer reproduced against a real backend, and the
+// reason tracking a parameter does not license ignoring it. A client that names search_path
+// puts it on the link through a SET the proxy issues itself - one that never reaches the
+// tripwire, taints nothing and is answered by no ParameterStatus, because PostgreSQL does not
+// report search_path. The next client, if it named none of its own, has nothing to diff and
+// would read the previous tenant's schema for its whole session. Keeping the parameter in the
+// pool key is what stops that, so the two clients here must NOT share a link.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_names_no_search_path_never_inherits_one() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\ntrackExtraParameters = [\"search_path\"]\n",
+    )
+    .await;
+
+    let first = stack
+        .connect_with(&format!("{} options='-c search_path=alpha'", stack.url()))
+        .await;
+    first
+        .simple_query("SELECT 1")
+        .await
+        .expect("the first client runs under its own schema");
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // No options at all: the ordinary client, and the one the leak was invisible to.
+    let second = stack.connect().await;
+    let seen: String = second
+        .query_one("SELECT current_setting('search_path')", &[])
+        .await
+        .expect("what the second client is actually reading")
+        .get(0);
+    assert_ne!(
+        seen, "alpha",
+        "a client that asked for no schema is reading the previous client's, which no reset \
+         restores and no ParameterStatus reports"
+    );
+}
+
 #[tokio::test]
 async fn a_cancel_request_cancels_a_long_running_query() {
     let stack = stack().await;

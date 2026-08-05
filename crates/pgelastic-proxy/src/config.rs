@@ -194,6 +194,27 @@ impl Config {
     /// because by then it is one client's `search_path` on another client's link
     /// and nothing reports it.
     fn validate_ignored_startup_parameters(&self) -> Result<()> {
+        // Deliberately the built-in six, not this process's set.
+        //
+        // Tracking a parameter is NOT enough to make ignoring it safe, and an
+        // adversarial review of the commit that first assumed it was proved so
+        // against a real backend. The correction rests on two properties the six
+        // have and an added name need not: the backend answers the proxy's `SET`
+        // with a `ParameterStatus`, which is what teaches the link's own cache
+        // the value; and every client is told all six in its greeting, which is
+        // what gives `sync_statement` something to diff. For a name `PostgreSQL`
+        // does not report - `search_path` above all - neither holds, so the
+        // proxy's own `SET` is one-way: it is issued with `Relay::Skip`, never
+        // reaches the tripwire, taints nothing, and the link goes back to the
+        // pool carrying it. The next client, if it named no `search_path` of its
+        // own, has no cache entry, emits no clause, and reads the previous
+        // tenant's schema for the life of its session.
+        //
+        // So `trackExtraParameters` widens what the cache follows and nothing
+        // else. A tracked parameter that stays in the pool key is safe, because
+        // two clients with different values never share a link in the first
+        // place.
+        self.tracked_parameters()?;
         for name in &self.pool.ignore_startup_parameters {
             if crate::vars::is_tracked(name)
                 || IGNORABLE_UNTRACKED
@@ -210,6 +231,16 @@ impl Config {
             )));
         }
         Ok(())
+    }
+
+    /// The parameters this process's variable cache follows.
+    ///
+    /// Refuses a `trackExtraParameters` entry that is not a plain GUC identifier.
+    /// The cache writes `SET <name> = <quoted value>`, and the name is the one
+    /// side of that statement nothing can quote.
+    pub fn tracked_parameters(&self) -> Result<crate::vars::Tracked> {
+        crate::vars::Tracked::with_extra(&self.pool.track_extra_parameters)
+            .map_err(|e| ProxyError::config(format!("pool.trackExtraParameters: {e}")))
     }
 
     /// The startup-parameter policy this process was built with.
@@ -1008,6 +1039,15 @@ pub struct PoolConfig {
     /// somebody else's for the life of the link.
     #[serde(default = "default_ignore_startup_parameters")]
     pub ignore_startup_parameters: Vec<String>,
+    /// GUCs the variable cache follows beyond its built-in set, so a client
+    /// assigning one does not silently inherit another client's value.
+    ///
+    /// Every name here becomes the unquoted name side of a `SET` the proxy
+    /// writes, so each is checked at start-up for being a plain GUC identifier -
+    /// see the CVE note on [`crate::vars`]. Structural, like the two above it: a
+    /// process follows one set for its whole life.
+    #[serde(default)]
+    pub track_extra_parameters: Vec<String>,
     /// When a queued client is sent a `NoticeResponse` telling it why it is
     /// still waiting.
     #[serde(default = "default_notify_after_seconds")]
@@ -1057,6 +1097,7 @@ impl Default for PoolConfig {
             max_pin_duration_seconds: 0,
             startup_parameter_policy: StartupParameterPolicy::default(),
             ignore_startup_parameters: default_ignore_startup_parameters(),
+            track_extra_parameters: Vec::new(),
             notify_after_seconds: default_notify_after_seconds(),
             queue_depth_per_tenant: default_queue_depth_per_tenant(),
             max_server_statements: default_max_server_statements(),
@@ -1785,6 +1826,59 @@ mod tests {
         assert_eq!(
             config.fingerprint_policy().policy_for("extra_float_digits"),
             pgelastic_pool::StartupParamPolicy::Ignore
+        );
+    }
+
+    /// Tracking a parameter does NOT license ignoring it, and the commit that
+    /// first assumed it did shipped a cross-tenant leak past its own tests.
+    ///
+    /// The correction rests on the backend *reporting* the parameter, which is
+    /// what teaches the link's cache the value and what puts an entry in every
+    /// client's greeting. `search_path` is not reported: the proxy's own `SET`
+    /// is one-way, the link goes back to the pool carrying it, and a client that
+    /// named no `search_path` of its own has nothing to diff and reads the last
+    /// tenant's schema.
+    #[test]
+    fn tracking_a_parameter_does_not_make_ignoring_it_permitted() {
+        let error = Config::from_str(&format!(
+            "{MINIMAL}\n[pool]\ntrackExtraParameters = [\"search_path\"]\n\
+             ignoreStartupParameters = [\"search_path\"]\n"
+        ))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("search_path"),
+            "the refusal must name the parameter: {error}"
+        );
+    }
+
+    /// And tracking on its own is still accepted: a tracked parameter that stays
+    /// in the pool key is safe, because two clients with different values never
+    /// share a link.
+    #[test]
+    fn tracking_a_parameter_without_ignoring_it_is_accepted() {
+        let config = Config::from_str(&format!(
+            "{MINIMAL}\n[pool]\ntrackExtraParameters = [\"search_path\"]\n"
+        ))
+        .expect("tracking alone changes no pool key");
+        assert!(config.tracked_parameters().unwrap().contains("search_path"));
+        assert_eq!(
+            config.fingerprint_policy().policy_for("search_path"),
+            pgelastic_pool::StartupParamPolicy::PoolKey
+        );
+    }
+
+    /// The name side of the `SET` the cache writes is the one thing it cannot
+    /// quote, so a document that would put a statement there is refused before
+    /// the listener binds rather than at the checkout it would corrupt.
+    #[test]
+    fn a_tracked_name_that_is_not_an_identifier_is_refused_at_start_up() {
+        let error = Config::from_str(&format!(
+            "{MINIMAL}\n[pool]\ntrackExtraParameters = [\"x; DROP TABLE t --\"]\n"
+        ))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("trackExtraParameters"),
+            "the refusal must name the field: {error}"
         );
     }
 

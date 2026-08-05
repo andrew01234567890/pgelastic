@@ -264,6 +264,8 @@ pub struct PoolManager {
     client_idle_in_transaction_seconds: AtomicU64,
     /// The pinned share ceiling as a percentage, zero for none.
     max_pinned_percent: AtomicU64,
+    /// The parameters a link's own variable cache follows.
+    tracked: Arc<crate::vars::Tracked>,
     /// How long one link may stay pinned, in seconds, zero for no bound.
     max_pin_duration_seconds: AtomicU64,
     /// When the budget gauges were last refreshed, in milliseconds since
@@ -291,6 +293,7 @@ impl PoolManager {
     pub fn new(
         instance: InstanceId,
         config: PoolConfig,
+        tracked: Arc<crate::vars::Tracked>,
         fence: FenceRuntime,
         metrics: Arc<Metrics>,
     ) -> Result<Arc<Self>> {
@@ -355,6 +358,7 @@ impl PoolManager {
             client_idle_in_transaction_seconds: AtomicU64::new(client_idle_in_transaction_seconds),
             max_pinned_percent: AtomicU64::new(max_pinned_percent),
             max_pin_duration_seconds: AtomicU64::new(max_pin_duration_seconds),
+            tracked,
             budget_published_ms: AtomicU64::new(0),
             budget_epoch: std::time::Instant::now(),
         }))
@@ -1224,7 +1228,7 @@ impl PoolManager {
                 ),
         );
 
-        let mut vars = VariableCache::new();
+        let mut vars = VariableCache::with_tracked(Arc::clone(&self.tracked));
         // The zero-round-trip half of the verify path: if the epoch GUC is
         // `GUC_REPORT` the postmaster volunteers it in the start-up parameter
         // set, and the probe below has nothing left to learn.
@@ -1805,6 +1809,7 @@ mod tests {
         PoolManager::new(
             InstanceId::new("default"),
             config,
+            std::sync::Arc::default(),
             FenceRuntime::in_memory(),
             Metrics::new(),
         )
@@ -1849,6 +1854,7 @@ mod tests {
             PoolManager::new(
                 InstanceId::new("default"),
                 config,
+                std::sync::Arc::default(),
                 FenceRuntime::in_memory(),
                 Metrics::new(),
             )
