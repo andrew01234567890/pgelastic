@@ -93,6 +93,15 @@ pub fn can_check_in(link: &ServerLink) -> Result<(), CheckInBlock> {
         return Err(CheckInBlock::OutstandingRequests(link.outstanding().len()));
     }
 
+    // Asked of the link rather than left to the caller. A batch ended with `Flush` draws no
+    // `ReadyForQuery`, so the status checked above is the one the PREVIOUS batch left - idle,
+    // usually - while PostgreSQL sits inside the implicit transaction this one opened. The
+    // outstanding queue has emptied as the rows arrived. Every other signal this gate reads
+    // says the link is clean, and it is holding another client's transaction.
+    if link.batch_open() {
+        return Err(CheckInBlock::NoReadyForQuery);
+    }
+
     if link.copy().is_open() {
         return Err(CheckInBlock::CopyOpen(link.copy()));
     }
@@ -260,6 +269,35 @@ mod tests {
         assert_eq!(link.can_check_in(), Err(CheckInBlock::ResetRequired));
         link.reset_completed();
         assert_eq!(link.can_check_in(), Ok(()));
+    }
+
+    // Every other signal this gate reads says a link inside a Flush-terminated batch is
+    // clean: the status is the idle the PREVIOUS batch left, because an unsynced batch draws
+    // no ReadyForQuery, and the outstanding queue empties as the rows arrive. Without asking
+    // the link directly the gate hands the next client a link holding an open implicit
+    // transaction, and every caller has to remember not to let it.
+    #[test]
+    fn a_link_inside_an_unsynced_batch_is_not_releasable() {
+        let mut link = idle_after_a_query();
+        assert_eq!(link.can_check_in(), Ok(()), "the fixture is not releasable");
+
+        link.observe_frontend(
+            &FrontendMessage::Execute(pgelastic_wire::Execute {
+                portal: Bytes::new(),
+                max_rows: 0,
+            }),
+            Relay::Forward,
+            Origin::Client,
+        );
+        link.observe_backend(&BackendMessage::CommandComplete(Bytes::from_static(
+            b"SELECT 1",
+        )))
+        .unwrap();
+
+        assert!(
+            link.can_check_in().is_err(),
+            "a link inside an unsynced batch was handed to the next client"
+        );
     }
 
     #[test]

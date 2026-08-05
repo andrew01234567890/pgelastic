@@ -184,6 +184,15 @@ pub struct ServerLink {
     key: PoolKey,
     state: ServerState,
     tx_status: Option<TransactionStatus>,
+    /// A batch the client ended with something other than `Sync` is still open.
+    ///
+    /// `tx_status` cannot answer this. It is read off the last `ReadyForQuery`, and a batch
+    /// ended with `Flush` draws none - so the status reports whatever the batch BEFORE it
+    /// left, which is usually idle, while `PostgreSQL` is inside the implicit transaction this
+    /// one opened. The outstanding queue empties as the rows arrive, so it cannot answer it
+    /// either. Without this the check-in gate had no way to see the state at all, and its
+    /// callers had to remember not to release on it.
+    batch_open: bool,
     outstanding: OutstandingQueue,
     copy: CopyState,
     taint: TaintSet,
@@ -200,6 +209,7 @@ impl ServerLink {
             key,
             state: ServerState::Login,
             tx_status: None,
+            batch_open: false,
             outstanding: OutstandingQueue::new(),
             copy: CopyState::None,
             taint: TaintSet::new(),
@@ -220,6 +230,11 @@ impl ServerLink {
 
     pub fn state(&self) -> ServerState {
         self.state
+    }
+
+    /// Whether a batch the client has not ended with `Sync` is still open.
+    pub fn batch_open(&self) -> bool {
+        self.batch_open
     }
 
     pub fn tx_status(&self) -> Option<TransactionStatus> {
@@ -382,6 +397,11 @@ impl ServerLink {
         }
 
         if let Some(kind) = RequestKind::from_frontend(message) {
+            // Only the client's own messages open a batch. A `Parse` the pool injects is
+            // followed by the client's own `Sync`, or by nothing at all.
+            if origin == Origin::Client {
+                self.batch_open = !kind.terminates_batch();
+            }
             self.outstanding.record(kind, relay);
         }
     }
@@ -404,7 +424,15 @@ impl ServerLink {
             // readiness before the COPY subprotocol has drained, and treating
             // this byte as the end of the COPY is what hands a link to another
             // client mid-transfer.
-            BackendMessage::ReadyForQuery(status) => self.tx_status = Some(*status),
+            BackendMessage::ReadyForQuery(status) => {
+                self.tx_status = Some(*status);
+                // Only when it answers the last thing the client sent. A client may pipeline
+                // a Sync and a Flush-terminated batch in one write, and this byte belongs to
+                // the Sync - clearing it then would call the batch behind it closed.
+                if self.outstanding.is_empty() {
+                    self.batch_open = false;
+                }
+            }
             BackendMessage::CopyInResponse(_) => self.copy = CopyState::In,
             BackendMessage::CopyOutResponse(_) => self.copy = CopyState::Out,
             BackendMessage::CopyBothResponse(_) => self.copy = CopyState::Both,
