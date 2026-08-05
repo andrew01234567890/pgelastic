@@ -408,8 +408,7 @@ func (r *PgElasticPoolReconciler) proxyTenants(
 	// the tenant that holds the database is the tenant that holds the route to it. Taking the
 	// first the List happened to return would sooner or later award them to different objects.
 	holder := map[string]*pgelasticv1alpha1.PgTenant{}
-	for i := range view.tenants {
-		tenant := view.tenants[i].tenant
+	for _, tenant := range view.allTenants() {
 		database := tenant.Spec.DatabaseName
 		if database == "" {
 			continue
@@ -419,9 +418,21 @@ func (r *PgElasticPoolReconciler) proxyTenants(
 		}
 	}
 
-	tenants := make([]proxy.Tenant, 0, len(view.tenants))
+	// The capacity of every tenant whose class resolved. One whose class did not gets the
+	// zero value, which reserves nothing and bursts to nothing: unknown capacity, admitted to
+	// no credit, but still routed and still able to log in. Dropping it instead took away the
+	// route as well as the numbers.
+	resolved := make(map[string]policy.Effective, len(view.tenants))
 	for i := range view.tenants {
-		entry := &view.tenants[i]
+		resolved[view.tenants[i].tenant.Name] = view.tenants[i].effective
+	}
+
+	tenants := make([]proxy.Tenant, 0, len(view.tenants)+len(view.unresolved))
+	for _, tenant := range view.allTenants() {
+		entry := struct {
+			tenant    *pgelasticv1alpha1.PgTenant
+			effective policy.Effective
+		}{tenant: tenant, effective: resolved[tenant.Name]}
 		if entry.tenant.Spec.DatabaseName == "" {
 			continue
 		}
@@ -467,9 +478,12 @@ func (r *PgElasticPoolReconciler) proxyUsers(
 	pool *pgelasticv1alpha1.PgElasticPool,
 	view *poolView,
 ) ([]proxy.User, error) {
-	users := make([]proxy.User, 0, len(view.tenants))
-	for i := range view.tenants {
-		tenant := view.tenants[i].tenant
+	// Resolved and unresolved alike. A tenant whose workload class could not be read has
+	// unknown capacity, not a cancelled existence, and leaving it out of the login table
+	// takes away its clients' ability to authenticate at all - so deleting one
+	// PgWorkloadClass locked out every tenant that named it.
+	users := make([]proxy.User, 0, len(view.tenants)+len(view.unresolved))
+	for _, tenant := range view.allTenants() {
 		auth := tenant.Spec.Auth
 		if auth == nil || auth.CredentialsSecretRef == nil {
 			continue

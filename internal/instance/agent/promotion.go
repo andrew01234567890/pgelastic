@@ -86,6 +86,12 @@ func Promote(ctx context.Context, options Options) (PromotionResult, error) {
 		return result, err
 	}
 	result.Epoch = ha.Epoch(ha.InitialPrimaryEpoch, LeaderTransitions(held))
+	// Published before the promotion proceeds rather than after it returns: everything below
+	// this line can fail or be slow, and the fence token must not be observable as the old
+	// one for any of that time.
+	if options.OnEpoch != nil {
+		options.OnEpoch(result.Epoch)
+	}
 	log.Info("acquired the promotion lease", "member", options.Member, "epoch", result.Epoch)
 
 	instance, err := reReadInstance(ctx, options)
