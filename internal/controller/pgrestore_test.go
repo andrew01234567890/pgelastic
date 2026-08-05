@@ -561,3 +561,51 @@ func TestATenantRestoreStaysInsideTheSourcesPool(t *testing.T) {
 		})
 	}
 }
+
+// Every refusal in planRestore lands on status.Error except this one, which returned a Go
+// error - and converge propagates it, so Reconcile returns above the publish. On the first
+// pass status is still zero, so nothing is written at all: the operator whose cluster has just
+// burned down gets a blank TARGET and a blank PHASE while the controller retries for ever.
+func TestAGoneSourceIsARefusalOnTheObjectRatherThanAnErrorInTheLog(t *testing.T) {
+	scheme := credentialScheme(t)
+	stopped := metav1.NewTime(time.Date(2026, 8, 1, 2, 0, 0, 0, time.UTC))
+	backup := &pgelasticv1alpha1.PgBackup{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: backupName},
+		Spec: pgelasticv1alpha1.PgBackupSpec{
+			InstanceRef: corev1.LocalObjectReference{Name: primaryInstanceName},
+		},
+		Status: pgelasticv1alpha1.PgBackupStatus{
+			Phase:      pgelasticv1alpha1.BackupPhaseCompleted,
+			Stanza:     "pgelastic",
+			StoppedAt:  &stopped,
+			Repository: &pgelasticv1alpha1.ObjectStore{},
+		},
+	}
+	restore := &pgelasticv1alpha1.PgRestore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "recover"},
+		Spec: pgelasticv1alpha1.PgRestoreSpec{
+			SourceInstanceRef: corev1.LocalObjectReference{Name: primaryInstanceName},
+			BackupRef:         &corev1.LocalObjectReference{Name: backupName},
+		},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(backup, restore).Build()
+	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
+
+	instance, reason, err := reconciler.planRestore(context.Background(), restore)
+
+	if err != nil {
+		t.Fatalf("the refusal came back as an error, which Reconcile returns above the "+
+			"publish, so the PgRestore is never written to at all: %v", err)
+	}
+	if instance != nil {
+		t.Fatal("a restore was planned without its source instance")
+	}
+	if !strings.Contains(reason, primaryInstanceName) {
+		t.Fatalf("the refusal does not name what is missing: %q", reason)
+	}
+	// The remedy has to say what recreating does and does not give back, because recreating
+	// mints fresh passwords the restored catalogue has never seen.
+	if !strings.Contains(reason, "credentials Secret") {
+		t.Fatalf("the remedy does not warn that recreating mints new passwords: %q", reason)
+	}
+}

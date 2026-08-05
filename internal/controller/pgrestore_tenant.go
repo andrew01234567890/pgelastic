@@ -68,10 +68,14 @@ func (r *PgRestoreReconciler) reconcileTenantRestore(
 ) (time.Duration, error) {
 	log := logf.FromContext(ctx)
 
+	// The mirror of planRestore's gone-source refusal, and the same shape: a refusal returned
+	// as a Go error never reaches the object. This one is a misconfigured operator rather than
+	// a missing instance, which makes it worse - nothing about the PgRestore will ever change,
+	// so a blank object is all anybody gets.
 	if r.SQL == nil || r.Shell == nil {
-		return 0, fmt.Errorf(
-			"this operator was started without the SQL and shell ports a tenant restore " +
-				"copies through")
+		status.Error = "this operator was started without the SQL and shell ports a tenant " +
+			"restore copies through, so it cannot run one"
+		return restoreRequeue, nil
 	}
 
 	tenant, reason, err := r.tenantUnderRestore(ctx, restore)

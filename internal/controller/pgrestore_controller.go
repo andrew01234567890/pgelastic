@@ -279,10 +279,22 @@ func (r *PgRestoreReconciler) planRestore(
 		return nil, "the backup does not record its repository stanza, so the archive it " +
 			"belongs to cannot be addressed", nil
 	}
+	// A reason, like every other refusal in this function, and not a Go error. This one alone
+	// returned an error, which converge propagates and Reconcile returns *above* the publish -
+	// so on the first pass, when status is still zero, nothing is ever written. The operator
+	// whose cluster has just burned down runs `kubectl get pgrestore` and sees a blank TARGET
+	// and a blank PHASE, while the controller retries with backoff for ever and the only copy
+	// of the reason is in its log.
+	//
+	// The remedy is spelled out rather than left at "recreate it first", because recreating
+	// mints fresh random passwords and the catalogue this backup restores has never seen them.
 	if !sourceExists {
-		return nil, "", fmt.Errorf(
+		return nil, fmt.Sprintf(
 			"restoring without the source instance needs its sizing, which is not yet "+
-				"recorded on a backup; recreate %s first", restore.Spec.SourceInstanceRef.Name)
+				"recorded on a backup, so %[1]s has to exist. Recreating it mints new role "+
+				"passwords, which the restored catalogue will not carry - so recreate %[1]s "+
+				"with its original credentials Secret still in place",
+			restore.Spec.SourceInstanceRef.Name), nil
 	}
 	// The recovered instance inherits the source's role passwords, because the catalogue it
 	// restores is the source's. Checking here means a missing Secret is a reason an operator

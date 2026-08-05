@@ -354,8 +354,9 @@ type PgInstanceTemplate struct {
 	// +optional
 	Backup *InstanceBackup `json:"backup,omitempty"`
 
-	// perTenantLogicalBackup configures nightly per-tenant dumps, which are the only path
-	// that restores one tenant without touching the others.
+	// perTenantLogicalBackup reserves dump capacity on every member this template provisions.
+	// It schedules no dumps - see the field of the same name on PgInstance. Restoring one
+	// tenant without touching the others is what a PgRestore of scope Tenant does.
 	// +optional
 	PerTenantLogicalBackup *PerTenantLogicalBackup `json:"perTenantLogicalBackup,omitempty"`
 }
