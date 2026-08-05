@@ -221,16 +221,35 @@ func nextGeneration(secret *corev1.Secret) int32 {
 // Reports absence rather than an error, because absence is an ordinary state: the tenant
 // controller mints the credential on its own reconcile, and a pool reconcile that happens
 // first should render the tenant without one rather than fail the whole fleet's document.
+//
+// A NotFound is that state. Anything else is not: an RBAC change, an expired token or an
+// unreachable API server are all reasons the Secret could not be read, and reading them as
+// "this tenant has no credential" would rewrite the fleet's document to drop the credential
+// of every tenant at once. That is returned as an error and fails the reconcile instead.
+//
+// The role name comes back either way. It is a pure function of namespace and tenant, and it
+// is the same value the tenant controller provisions the database owner as, so it is knowable
+// without the Secret - which is what lets the proxy tell "no identity was published for this
+// tenant" from "an identity was published and its credential is missing".
 func (r *PgElasticPoolReconciler) backendCredentialFor(
 	ctx context.Context,
 	tenant *pgelasticv1alpha1.PgTenant,
-) (backendCredential, bool) {
+) (backendCredential, bool, error) {
+	role := migration.BackendRoleName(tenant.Namespace, tenant.Name)
 	secret := &corev1.Secret{}
 	key := client.ObjectKey{
 		Namespace: tenant.Namespace, Name: backendCredentialSecretName(tenant.Name),
 	}
 	if err := r.Get(ctx, key, secret); err != nil {
-		return backendCredential{}, false
+		if apierrors.IsNotFound(err) {
+			return backendCredential{Role: role}, false, nil
+		}
+		return backendCredential{}, false, fmt.Errorf(
+			"reading the backend credential of PgTenant %q: %w", tenant.Name, err)
 	}
-	return readBackendCredential(secret, migration.BackendRoleName(tenant.Namespace, tenant.Name))
+	credential, ok := readBackendCredential(secret, role)
+	if !ok {
+		credential.Role = role
+	}
+	return credential, ok, nil
 }

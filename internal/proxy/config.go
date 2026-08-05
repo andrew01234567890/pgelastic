@@ -434,12 +434,19 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 		// The identity this tenant's backend sessions run as, and the credential that proves
 		// it. Here rather than in [[instances]] because that half is structural: a credential
 		// rotation there would roll the whole fleet, and the point of rotating is that nobody
-		// notices. Omitted together when the tenant controller has not published them yet -
-		// the fleet refuses such a tenant rather than falling back to the instance identity,
-		// so a partial rollout costs one tenant one reconcile instead of running every tenant
-		// as the control plane.
-		if tenant.BackendRole != "" && tenant.BackendSaltedPassword != "" {
+		// notices.
+		//
+		// The role is written on its own when the credential has not been published yet, and
+		// the two halves are deliberately not one gate. An entry naming a role with no
+		// credential is refused by the proxy; an entry naming neither is the single-tenant
+		// shape, whose documented answer is the instance's own identity - the control plane's
+		// role. Omitting both therefore did the opposite of what this comment used to claim,
+		// and ran that tenant's SQL as pgelastic_ops for as long as the credential was
+		// missing.
+		if tenant.BackendRole != "" {
 			writeString(out, "backendRole", tenant.BackendRole)
+		}
+		if tenant.BackendRole != "" && tenant.BackendSaltedPassword != "" {
 			writeString(out, "backendSaltedPassword", tenant.BackendSaltedPassword)
 			writeString(out, "backendSalt", tenant.BackendSalt)
 			writeInt(out, "backendIterations", int64(tenant.BackendIterations))
