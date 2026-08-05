@@ -134,7 +134,7 @@ func (r *PgTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		Binding:            tenant.Status.Binding,
 		Utilization:        tenant.Status.Utilization,
 		Throttle:           tenant.Status.Throttle,
-		Conditions:         tenant.Status.Conditions,
+		Conditions:         carriedConditions(tenant.Status.Conditions),
 	}
 
 	resolved, err := r.resolve(ctx, tenant)

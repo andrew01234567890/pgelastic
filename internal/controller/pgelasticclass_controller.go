@@ -105,7 +105,7 @@ func (r *PgElasticClassReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		ObservedGeneration: elasticClass.Generation,
 		PoolCount:          poolCount,
 		SupportedFeatures:  slices.Clone(supportedClassFeatures),
-		Conditions:         elasticClass.Status.Conditions,
+		Conditions:         carriedConditions(elasticClass.Status.Conditions),
 	}
 
 	reason, message := pgelasticv1alpha1.ReasonAccepted, "class is claimed by "+r.controllerName()
@@ -143,7 +143,7 @@ func (r *PgElasticClassReconciler) reconcileDeletion(
 			ObservedGeneration: elasticClass.Generation,
 			PoolCount:          poolCount,
 			SupportedFeatures:  slices.Clone(supportedClassFeatures),
-			Conditions:         elasticClass.Status.Conditions,
+			Conditions:         carriedConditions(elasticClass.Status.Conditions),
 		}
 		setCondition(&status.Conditions, elasticClass.Generation, pgelasticv1alpha1.ConditionReady,
 			metav1.ConditionFalse, pgelasticv1alpha1.ReasonPending,

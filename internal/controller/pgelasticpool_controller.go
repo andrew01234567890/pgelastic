@@ -988,7 +988,7 @@ func (r *PgElasticPoolReconciler) publish(
 		ObservedGeneration: pool.Generation,
 		Selector:           poolSelector(pool),
 		Proxy:              view.proxy,
-		Conditions:         pool.Status.Conditions,
+		Conditions:         carriedConditions(pool.Status.Conditions),
 		Capacity:           ledgerStatus(view),
 		PerInstance:        perInstanceStatus(view),
 		Tenants: &pgelasticv1alpha1.PoolTenantCounts{
