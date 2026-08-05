@@ -41,7 +41,7 @@ func completedAt(name string, stopped time.Time) pgelasticv1alpha1.PgBackup {
 	return pgelasticv1alpha1.PgBackup{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: pgelasticv1alpha1.PgBackupSpec{
-			InstanceRef: corev1.LocalObjectReference{Name: "pg-a"},
+			InstanceRef: corev1.LocalObjectReference{Name: primaryInstanceName},
 		},
 		Status: pgelasticv1alpha1.PgBackupStatus{
 			Phase:     pgelasticv1alpha1.BackupPhaseCompleted,
@@ -475,5 +475,89 @@ func TestAnInterruptedCopyIsNotRetried(t *testing.T) {
 	if !strings.Contains(status.Error, recoveryInstanceName(restore)) {
 		t.Errorf("the error does not name the instance still holding the recovered copy: %q",
 			status.Error)
+	}
+}
+
+// Database names are unique within a pool, not across the estate, so a backup of pool A
+// holding `orders` and a live tenant of pool B also called `orders` are a legal pair - and a
+// tenant restore reads out of the first and writes over the second. Both ends are checked:
+// the tenant's own pool, and the pool of whatever instance its binding points at, because
+// nothing constrains a binding to stay inside the tenant's pool either.
+const restoredDatabase = "orders"
+
+func TestATenantRestoreStaysInsideTheSourcesPool(t *testing.T) {
+	scheme := credentialScheme(t)
+	instance := func(name, pool string) *pgelasticv1alpha1.PgInstance {
+		return &pgelasticv1alpha1.PgInstance{
+			ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: name},
+			Spec: pgelasticv1alpha1.PgInstanceSpec{
+				PoolRef: corev1.LocalObjectReference{Name: pool},
+			},
+		}
+	}
+	tenant := func(pool, bound string) *pgelasticv1alpha1.PgTenant {
+		return &pgelasticv1alpha1.PgTenant{
+			ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: restoredDatabase},
+			Spec: pgelasticv1alpha1.PgTenantSpec{
+				PoolRef:      corev1.LocalObjectReference{Name: pool},
+				DatabaseName: restoredDatabase,
+			},
+			Status: pgelasticv1alpha1.PgTenantStatus{
+				Binding: &pgelasticv1alpha1.PgTenantBinding{
+					InstanceRef: &corev1.LocalObjectReference{Name: bound},
+				},
+			},
+		}
+	}
+	restore := &pgelasticv1alpha1.PgRestore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "put-orders-back"},
+		Spec: pgelasticv1alpha1.PgRestoreSpec{
+			Scope:             pgelasticv1alpha1.RestoreScopeTenant,
+			SourceInstanceRef: corev1.LocalObjectReference{Name: primaryInstanceName},
+			TenantRef:         &corev1.LocalObjectReference{Name: restoredDatabase},
+		},
+	}
+
+	for _, probe := range []struct {
+		name    string
+		objects []client.Object
+		refused string
+	}{
+		{
+			name: "a tenant of another pool",
+			objects: []client.Object{
+				instance(primaryInstanceName, "pool-a"), instance(targetInstanceName, "pool-b"),
+				tenant("pool-b", targetInstanceName),
+			},
+			refused: "pool-b",
+		},
+		{
+			// The write end, which a fix constraining only the tenant leaves open.
+			name: "a tenant of the right pool bound outside it",
+			objects: []client.Object{
+				instance(primaryInstanceName, "pool-a"), instance(targetInstanceName, "pool-b"),
+				tenant("pool-a", targetInstanceName),
+			},
+			refused: "the copy would be written outside the pool it came from",
+		},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			kube := fake.NewClientBuilder().WithScheme(scheme).
+				WithObjects(append(probe.objects, restore)...).Build()
+			reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
+
+			got, reason, err := reconciler.tenantUnderRestore(context.Background(), restore)
+
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != nil || reason == "" {
+				t.Fatalf("the restore was accepted, so a PITR copy of one pool's data is "+
+					"written over another pool's live tenant (reason %q)", reason)
+			}
+			if !strings.Contains(reason, probe.refused) {
+				t.Fatalf("the refusal does not say why: %q", reason)
+			}
+		})
 	}
 }

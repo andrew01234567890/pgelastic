@@ -114,6 +114,11 @@ const (
 	ReasonRestoreFailed       = "RestoreFailed"
 	ReasonTenantsStillBound   = "TenantsStillBound"
 	ReasonAwaitingCredentials = "AwaitingRestoreCredentials"
+
+	// ReasonCredentialsConflict reports a Secret under this instance's credentials name that
+	// the operator did not create, so the instance would boot with passwords it did not
+	// choose.
+	ReasonCredentialsConflict = "CredentialsConflict"
 	ReasonRecloning           = "Recloning"
 	ReasonPreflightFailed     = "PreflightFailed"
 	ReasonCutoverComplete     = "CutoverComplete"

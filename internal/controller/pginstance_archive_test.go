@@ -31,7 +31,7 @@ func archivingInstance(
 	health *pgelasticv1alpha1.ArchiveHealthStatus,
 ) *pgelasticv1alpha1.PgInstance {
 	return &pgelasticv1alpha1.PgInstance{
-		ObjectMeta: metav1.ObjectMeta{Name: "pg-a", Namespace: "tenants", Generation: 4},
+		ObjectMeta: metav1.ObjectMeta{Name: primaryInstanceName, Namespace: "tenants", Generation: 4},
 		Spec:       pgelasticv1alpha1.PgInstanceSpec{Backup: backup},
 		Status:     pgelasticv1alpha1.PgInstanceStatus{ArchiveHealth: health},
 	}
