@@ -163,8 +163,46 @@ func (b Builder) Service() *corev1.Service {
 			Protocol:   corev1.ProtocolTCP,
 		}},
 	}
+	// A CancelRequest arrives on a second connection carrying nothing a load balancer can
+	// associate with the first, and only the replica holding the session can act on it. Without
+	// affinity the Service spreads the two independently, so Ctrl-C reaches the right pod one
+	// time in the number of replicas.
+	// Stated on the object either way rather than left empty for the cluster to interpret: a
+	// Service that says None is one somebody chose, and one that says nothing is one nobody
+	// can tell from a default.
+	affinity := sessionAffinity(spec.Service)
+	service.Spec.SessionAffinity = affinity
+	if affinity == corev1.ServiceAffinityClientIP {
+		service.Spec.SessionAffinityConfig = &corev1.SessionAffinityConfig{
+			ClientIP: &corev1.ClientIPConfig{
+				TimeoutSeconds: ptr.To(sessionAffinityTimeoutSeconds(spec.Service)),
+			},
+		}
+	}
 	return service
 }
+
+// sessionAffinity is ClientIP unless the pool asked for None. Defaulted here as well as in the
+// CRD, because a pool object that predates the field carries no value and would otherwise get
+// Kubernetes' own default, which is None - the behaviour this exists to change.
+func sessionAffinity(service *pgelasticv1alpha1.ProxyService) corev1.ServiceAffinity {
+	if service == nil || service.SessionAffinity == "" {
+		return corev1.ServiceAffinityClientIP
+	}
+	return service.SessionAffinity
+}
+
+func sessionAffinityTimeoutSeconds(service *pgelasticv1alpha1.ProxyService) int32 {
+	if service == nil || service.SessionAffinityTimeoutSeconds == nil {
+		return defaultSessionAffinityTimeoutSeconds
+	}
+	return *service.SessionAffinityTimeoutSeconds
+}
+
+// defaultSessionAffinityTimeoutSeconds must match the +kubebuilder:default on
+// spec.proxy.service.sessionAffinityTimeoutSeconds, which is Kubernetes' own default of three
+// hours.
+const defaultSessionAffinityTimeoutSeconds = 10800
 
 // PodDisruptionBudget bounds voluntary disruption of the fleet.
 //

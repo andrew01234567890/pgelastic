@@ -1154,6 +1154,29 @@ type ProxyService struct {
 	// +kubebuilder:default=5432
 	// +optional
 	Port *int32 `json:"port,omitempty"`
+
+	// sessionAffinity pins a client address to one proxy replica.
+	//
+	// ClientIP by default, because a PostgreSQL CancelRequest arrives on a *second* connection
+	// and carries no way for a load balancer to associate it with the first. Without affinity
+	// it lands on whichever replica the Service picks, and only the replica holding the session
+	// can act on it, so Ctrl-C works one time in the number of replicas.
+	//
+	// This is a mitigation, not the whole answer: affinity is per client address, so clients
+	// behind a single SNAT address share one replica, and a replica that restarts loses the
+	// sessions pinned to it either way. Routing a cancel between replicas is what makes it
+	// unconditional.
+	// +kubebuilder:validation:Enum=ClientIP;None
+	// +kubebuilder:default=ClientIP
+	// +optional
+	SessionAffinity corev1.ServiceAffinity `json:"sessionAffinity,omitempty"`
+
+	// sessionAffinityTimeoutSeconds bounds how long a client address stays pinned.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=86400
+	// +kubebuilder:default=10800
+	// +optional
+	SessionAffinityTimeoutSeconds *int32 `json:"sessionAffinityTimeoutSeconds,omitempty"`
 }
 
 // ProxyPodTemplate is the proxy pod escape hatch.

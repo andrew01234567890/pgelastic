@@ -407,6 +407,55 @@ func TestTrackExtraParametersReachesTheProxy(t *testing.T) {
 	}
 }
 
+// A PostgreSQL CancelRequest arrives on a second connection and carries nothing a load
+// balancer can associate with the first, so without affinity the Service spreads the two
+// independently and only the replica holding the session can act on the cancel. At the
+// default three replicas that is Ctrl-C working one time in three.
+func TestTheProxyServicePinsAClientToOneReplica(t *testing.T) {
+	service := Builder{Pool: testPool(), Image: testImage}.Service()
+
+	if service.Spec.SessionAffinity != corev1.ServiceAffinityClientIP {
+		t.Fatalf("the Service spreads a client's cancel independently of its session: %q",
+			service.Spec.SessionAffinity)
+	}
+	if service.Spec.SessionAffinityConfig == nil ||
+		service.Spec.SessionAffinityConfig.ClientIP == nil ||
+		service.Spec.SessionAffinityConfig.ClientIP.TimeoutSeconds == nil {
+		t.Fatal("ClientIP affinity with no timeout leaves the pin to the cluster's default")
+	}
+	if got := *service.Spec.SessionAffinityConfig.ClientIP.TimeoutSeconds; got != 10800 {
+		t.Fatalf("the affinity timeout is %d, not the CRD's own default", got)
+	}
+}
+
+// A pool object written before the field existed carries no value, and Kubernetes' own default
+// is None - the behaviour this exists to change. So the renderer defaults it too.
+func TestAPoolWithNoServiceBlockStillPinsItsClients(t *testing.T) {
+	pool := testPool()
+	pool.Spec.Proxy.Service = nil
+
+	got := Builder{Pool: pool, Image: testImage}.Service().Spec.SessionAffinity
+	if got != corev1.ServiceAffinityClientIP {
+		t.Fatalf("a pool that predates the field got %q", got)
+	}
+}
+
+// And an operator who wants the spread back can say so.
+func TestAPoolMayTurnSessionAffinityOff(t *testing.T) {
+	pool := testPool()
+	pool.Spec.Proxy.Service = &pgelasticv1alpha1.ProxyService{
+		SessionAffinity: corev1.ServiceAffinityNone,
+	}
+
+	service := Builder{Pool: pool, Image: testImage}.Service()
+	if service.Spec.SessionAffinity != corev1.ServiceAffinityNone {
+		t.Fatalf("the pool asked for no affinity and got %q", service.Spec.SessionAffinity)
+	}
+	if service.Spec.SessionAffinityConfig != nil {
+		t.Fatal("a Service with no affinity must carry no affinity config")
+	}
+}
+
 func TestAddingAnInstanceRollsTheFleet(t *testing.T) {
 	before := testConfig().Render()
 
