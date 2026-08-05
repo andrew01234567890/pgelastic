@@ -211,6 +211,13 @@ struct Running<'a> {
     /// implicit transaction that nothing else here can see, and without this bit
     /// neither bound would ever fire on it.
     unsynced_batch: bool,
+    /// How much of `to_backend` and `to_client` the far side has already accepted.
+    ///
+    /// Held here rather than inside the write future so that abandoning a write loses
+    /// nothing: the buffer and the offset both outlive it, and the next flush resumes from
+    /// exactly the byte the last one stopped at, mid-frame or not.
+    backend_written: usize,
+    client_written: usize,
     /// Set when a tripwire asked to pin a link the pool had no pinned budget for.
     /// The link cannot be pinned and must not be shared, so the session ends.
     pin_refused: Option<PinReason>,
@@ -260,6 +267,8 @@ pub async fn run(
         witness: TransactionWitness::new(),
         draining_fence: false,
         unsynced_batch: false,
+        backend_written: 0,
+        client_written: 0,
         pin_refused: None,
         holding: None,
         instance_gate: instance_gate_of(&session),
@@ -1655,26 +1664,86 @@ impl Running<'_> {
         self.manager().publish_budget();
     }
 
+    /// Writes both legs, resumably.
+    ///
+    /// Every byte is written through `write`, which tokio documents as cancel safe - dropped
+    /// before it resolves, it is guaranteed to have written nothing - and the count of bytes
+    /// already accepted lives in `self`, never in the future. That is the same shape
+    /// `read_backend` and `session::run`'s `FrameRelay` use, and it is what makes this
+    /// abandonable: dropping this future loses no bytes and truncates no frame, because the
+    /// buffer and the offset both survive it and the next call resumes mid-frame exactly
+    /// where the last one stopped.
+    ///
+    /// `write_all` could not offer that. Dropped mid-frame it leaves the wire with a partial
+    /// message and no record of how much went out, which is why the comment above
+    /// `HoldDeadlines` forbids putting a timeout around a loop that used it.
     async fn flush(&mut self) -> Result<()> {
+        // The same bound the statement deadline applies, on the other half of holding a
+        // backend. A client that stops reading parks this task where no deadline branch can
+        // fire, and it keeps its backend for as long as it likes; PostgreSQL sees an active
+        // session and its own idle_in_transaction_session_timeout never looks at it.
+        //
+        // Safe to bound only because the writes above are resumable: expiry abandons a future
+        // that has written a known number of bytes, not one that has truncated a frame with no
+        // record of how much went out.
+        let deadline = self
+            .manager()
+            .query_deadline()
+            .map(|limit| tokio::time::Instant::now() + limit);
         if !self.to_backend.is_empty() {
-            let Some(checkout) = self.checkout.as_mut() else {
+            if self.checkout.is_none() {
                 self.to_backend.clear();
+                self.backend_written = 0;
                 return Err(ProxyError::backend(
                     "there is no backend to write the client's request to",
                 ));
-            };
-            checkout.conn.stream.write_all(&self.to_backend).await?;
+            }
+            while self.backend_written < self.to_backend.len() {
+                let checkout = self.checkout.as_mut().expect("just observed");
+                let pending = checkout
+                    .conn
+                    .stream
+                    .write(&self.to_backend[self.backend_written..]);
+                let wrote = match deadline {
+                    Some(at) => tokio::time::timeout_at(at, pending)
+                        .await
+                        .map_err(|_| ProxyError::backend("the backend stopped accepting bytes"))?,
+                    None => pending.await,
+                }?;
+                if wrote == 0 {
+                    return Err(ProxyError::backend("the backend accepted no bytes"));
+                }
+                self.backend_written += wrote;
+            }
+            let checkout = self.checkout.as_mut().expect("just observed");
             checkout.conn.stream.flush().await?;
             self.session
                 .metrics
                 .relayed_to_backend(self.to_backend.len());
             self.to_backend.clear();
+            self.backend_written = 0;
         }
         if !self.to_client.is_empty() {
-            self.session.client.write_all(&self.to_client).await?;
+            while self.client_written < self.to_client.len() {
+                let pending = self
+                    .session
+                    .client
+                    .write(&self.to_client[self.client_written..]);
+                let wrote = match deadline {
+                    Some(at) => tokio::time::timeout_at(at, pending)
+                        .await
+                        .map_err(|_| ProxyError::client("the client stopped reading"))?,
+                    None => pending.await,
+                }?;
+                if wrote == 0 {
+                    return Err(ProxyError::client("the client accepted no bytes"));
+                }
+                self.client_written += wrote;
+            }
             self.session.client.flush().await?;
             self.session.metrics.relayed_to_client(self.to_client.len());
             self.to_client.clear();
+            self.client_written = 0;
         }
         Ok(())
     }
