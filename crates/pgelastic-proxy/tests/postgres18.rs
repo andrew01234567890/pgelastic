@@ -983,6 +983,99 @@ async fn a_client_that_names_no_search_path_never_inherits_one() {
     );
 }
 
+// A parked link is a backend PostgreSQL holds open for nobody: a process, its work_mem and one
+// of the instance's max_connections. The pool opened them on demand and gave none of them back,
+// so an estate's connection count only ever ratcheted to its busiest minute and stayed there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_left_parked_past_the_pool_idle_timeout_is_closed() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\nserverIdleTimeoutSeconds = 2\n\n\
+         [[pool.tenants]]\nname = \"tenant\"\nburstable = 8\n",
+    )
+    .await;
+
+    let client = stack.connect().await;
+    let pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("opening a link")
+        .get(0);
+    drop(client);
+
+    let (observer, conn) =
+        tokio_postgres::connect(&stack.pg.direct_url("reap_observer"), tokio_postgres::NoTls)
+            .await
+            .expect("an observer connection straight to PostgreSQL");
+    tokio::spawn(conn);
+
+    // The reaper looks on its own interval, so this waits it out rather than assuming an
+    // instant the pool can guarantee.
+    let waited = Instant::now();
+    loop {
+        // Excluding this backend is load-bearing: the observer's own row is in the view.
+        let alive: i64 = observer
+            .query_one(
+                "SELECT count(*) FROM pg_catalog.pg_stat_activity \
+                 WHERE pid <> pg_backend_pid() AND pid = $1",
+                &[&pid],
+            )
+            .await
+            .expect("counting the parked backend")
+            .get(0);
+        if alive == 0 {
+            break;
+        }
+        assert!(
+            waited.elapsed() < Duration::from_secs(40),
+            "a link parked past the idle timeout is still open"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+// The guarantee is the one promise this allocator makes that nothing else may take back:
+// acquire admits a tenant under its floor without queueing, so closing a link that puts it
+// there turns the next arrival from an immediate grant into a connect. Idle is not unpromised.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guaranteed_link_is_not_reaped_however_long_it_sits() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\nserverIdleTimeoutSeconds = 2\n\n\
+         [[pool.tenants]]\nname = \"tenant\"\nguaranteed = 1\nburstable = 8\n",
+    )
+    .await;
+
+    let client = stack.connect().await;
+    let pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("opening a link")
+        .get(0);
+    drop(client);
+    tokio::time::sleep(Duration::from_secs(25)).await;
+
+    let (observer, conn) = tokio_postgres::connect(
+        &stack.pg.direct_url("floor_observer"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("an observer connection straight to PostgreSQL");
+    tokio::spawn(conn);
+    let alive: i64 = observer
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND pid = $1",
+            &[&pid],
+        )
+        .await
+        .expect("counting the guaranteed backend")
+        .get(0);
+    assert_eq!(
+        alive, 1,
+        "the tenant's guaranteed link was reaped, so its next client connects instead of \
+         being granted one"
+    );
+}
+
 #[tokio::test]
 async fn a_cancel_request_cancels_a_long_running_query() {
     let stack = stack().await;

@@ -321,6 +321,10 @@ const defaultMaxPinnedPercent = 20
 // spec.pooling.maxPinDuration, which is one hour.
 const defaultMaxPinDurationSeconds = 3600
 
+// defaultServerIdleTimeoutSeconds must match the +kubebuilder:default on
+// spec.pooling.serverIdleTimeout.
+const defaultServerIdleTimeoutSeconds = 600
+
 func (c Config) renderRouting(out *strings.Builder, dynamic bool) {
 	out.WriteString("[routing]\n")
 	discriminators := tenantDiscriminators(c.Pool)
@@ -370,6 +374,8 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 		writeInt(out, "maxPinnedPercent", int64(maxPinnedPercent(pooling)))
 		writeInt(out, "maxPinDurationSeconds",
 			openBoundSeconds(maxPinDuration(pooling), defaultMaxPinDurationSeconds))
+		writeInt(out, "serverIdleTimeoutSeconds",
+			openBoundSeconds(serverIdleTimeout(c.Pool), defaultServerIdleTimeoutSeconds))
 	}
 	writeInt(out, "notifyAfterSeconds", int64(queryWaitNotifySeconds(c.Pool)))
 	writeInt(out, "queueDepthPerTenant", int64(queueDepthPerTenant(c.Pool)))
@@ -580,6 +586,16 @@ func maxPinnedPercent(pooling *pgelasticv1alpha1.PoolingConfig) int32 {
 		return defaultMaxPinnedPercent
 	}
 	return *pooling.MaxPinnedFractionPercent
+}
+
+// serverIdleTimeout is how long a parked link may sit before the pool closes it. It lives on
+// the class rather than the pool, because how long an idle backend is worth keeping is a
+// property of the fleet's density rather than of one pool's workload.
+func serverIdleTimeout(pool *pgelasticv1alpha1.PgElasticPool) *metav1.Duration {
+	if pool == nil || pool.Spec.Pooling == nil {
+		return nil
+	}
+	return pool.Spec.Pooling.ServerIdleTimeout
 }
 
 func maxPinDuration(pooling *pgelasticv1alpha1.PoolingConfig) *metav1.Duration {

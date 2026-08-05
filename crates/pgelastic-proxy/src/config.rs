@@ -367,6 +367,7 @@ impl Config {
         structural.pool.client_idle_in_transaction_seconds = 0;
         structural.pool.max_pinned_percent = 0;
         structural.pool.max_pin_duration_seconds = 0;
+        structural.pool.server_idle_timeout_seconds = 0;
         // An instance's allocatable capacity moves whenever that instance rolls, because the
         // operator withholds it while a member is not serving. Leaving it here meant rolling
         // one instance restarted the whole fleet and dropped every client of every tenant on
@@ -1018,6 +1019,18 @@ pub struct PoolConfig {
     /// Adopted rather than structural.
     #[serde(default)]
     pub max_pin_duration_seconds: u64,
+    /// How long a link may sit parked before the pool closes it. Zero keeps every
+    /// link the pool has ever opened.
+    ///
+    /// A parked link is a backend `PostgreSQL` is holding open for nobody: its
+    /// process, its `work_mem`, and one of the instance's `max_connections`. The
+    /// pool opens links on demand and, until now, gave none of them back - so an
+    /// estate's connection count only ever ratcheted to its busiest minute and
+    /// stayed there.
+    ///
+    /// Adopted rather than structural.
+    #[serde(default)]
+    pub server_idle_timeout_seconds: u64,
     /// What to do with a startup parameter that has no policy of its own,
     /// including one nested inside `options`.
     ///
@@ -1095,6 +1108,7 @@ impl Default for PoolConfig {
             client_idle_in_transaction_seconds: 0,
             max_pinned_percent: 0,
             max_pin_duration_seconds: 0,
+            server_idle_timeout_seconds: 0,
             startup_parameter_policy: StartupParameterPolicy::default(),
             ignore_startup_parameters: default_ignore_startup_parameters(),
             track_extra_parameters: Vec::new(),
@@ -1924,6 +1938,17 @@ mod tests {
             default.fingerprint_policy().policy_for("search_path"),
             pgelastic_pool::StartupParamPolicy::PoolKey
         );
+    }
+
+    #[test]
+    fn changing_the_server_idle_timeout_changes_no_process_either() {
+        let current = Config::from_str(MINIMAL).unwrap();
+        let next = Config::from_str(&format!(
+            "configVersion = \"2\"\n{MINIMAL}\n[pool]\nserverIdleTimeoutSeconds = 90\n"
+        ))
+        .unwrap();
+        assert_eq!(next.pool.server_idle_timeout_seconds, 90);
+        assert!(current.is_dynamic_change(&next));
     }
 
     #[test]

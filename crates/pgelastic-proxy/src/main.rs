@@ -58,7 +58,6 @@ async fn main() -> Result<()> {
     if let Some(reloader) = reloader {
         tokio::spawn(reload::run(reloader, config, shutdown.subscribe()));
     }
-
     // Readiness is admin state and is set here, once the listener is bound and
     // the fleet is built. A probe that answers before this point would report a
     // replica ready while every client on it would be refused.

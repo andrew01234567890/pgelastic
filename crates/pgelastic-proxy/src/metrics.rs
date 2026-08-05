@@ -250,6 +250,7 @@ pub struct Metrics {
     idle_in_transaction_closed: AtomicU64,
     pins_refused: AtomicU64,
     pins_expired: AtomicU64,
+    backends_reaped: AtomicU64,
     connect_gate: [AtomicU64; 4],
     bytes_to_backend: AtomicU64,
     bytes_to_client: AtomicU64,
@@ -404,6 +405,12 @@ impl Metrics {
     /// all. `pgelastic_proxy_pins_total` already carries the breakdown.
     pub fn pin_refused(&self) {
         self.pins_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Links closed for having sat parked longer than the pool allows.
+    pub fn backends_reaped(&self, count: usize) {
+        self.backends_reaped
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 
     /// A pinned link the duration bound closed.
@@ -971,6 +978,12 @@ impl Metrics {
             "pgelastic_proxy_pins_expired_total",
             "Pinned links closed for having been held longer than the pool allows.",
             &[("", load(&self.pins_expired))],
+        );
+        counter(
+            out,
+            "pgelastic_proxy_backends_reaped_total",
+            "Parked links closed for having sat idle longer than the pool allows.",
+            &[("", load(&self.backends_reaped))],
         );
     }
 

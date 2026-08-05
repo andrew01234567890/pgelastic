@@ -207,6 +207,10 @@ impl Pool {
 struct Parked {
     key: PoolKey,
     conn: BackendConn,
+    /// When this link was last given back, which is what `serverIdleTimeout`
+    /// measures. Stamped at every park rather than at open: a link handed round
+    /// all day has been idle for none of it.
+    since: std::time::Instant,
 }
 
 #[derive(Debug)]
@@ -264,6 +268,8 @@ pub struct PoolManager {
     client_idle_in_transaction_seconds: AtomicU64,
     /// The pinned share ceiling as a percentage, zero for none.
     max_pinned_percent: AtomicU64,
+    /// How long a link may sit parked, in seconds, zero for no reaping.
+    server_idle_timeout_seconds: AtomicU64,
     /// The parameters a link's own variable cache follows.
     tracked: Arc<crate::vars::Tracked>,
     /// How long one link may stay pinned, in seconds, zero for no bound.
@@ -313,6 +319,7 @@ impl PoolManager {
         let query_deadline_seconds = config.query_deadline_seconds;
         let client_idle_in_transaction_seconds = config.client_idle_in_transaction_seconds;
         let max_pinned_percent = u64::from(config.max_pinned_percent);
+        let server_idle_timeout_seconds = config.server_idle_timeout_seconds;
         let max_pin_duration_seconds = config.max_pin_duration_seconds;
         let mut allocator = Allocator::new(pool_spec, admission)
             .map_err(|e| ProxyError::config(format!("pool capacity: {e}")))?;
@@ -357,6 +364,7 @@ impl PoolManager {
             query_deadline_seconds: AtomicU64::new(query_deadline_seconds),
             client_idle_in_transaction_seconds: AtomicU64::new(client_idle_in_transaction_seconds),
             max_pinned_percent: AtomicU64::new(max_pinned_percent),
+            server_idle_timeout_seconds: AtomicU64::new(server_idle_timeout_seconds),
             max_pin_duration_seconds: AtomicU64::new(max_pin_duration_seconds),
             tracked,
             budget_published_ms: AtomicU64::new(0),
@@ -446,12 +454,17 @@ impl PoolManager {
             != idle;
         let pinned = u64::from(config.max_pinned_percent);
         let pinned_moved = self.max_pinned_percent.swap(pinned, Ordering::Relaxed) != pinned;
+        let reap = config.server_idle_timeout_seconds;
+        let reap_moved = self
+            .server_idle_timeout_seconds
+            .swap(reap, Ordering::Relaxed)
+            != reap;
         let pin_for = config.max_pin_duration_seconds;
         let pin_for_moved = self
             .max_pin_duration_seconds
             .swap(pin_for, Ordering::Relaxed)
             != pin_for;
-        deadline_moved || idle_moved || pinned_moved || pin_for_moved
+        deadline_moved || idle_moved || pinned_moved || pin_for_moved || reap_moved
     }
 
     /// The statement deadline in force now, or `None` when the pool sets none.
@@ -870,6 +883,109 @@ impl PoolManager {
             }
         }
         severed
+    }
+
+    /// Closes links that have sat parked longer than the pool allows.
+    ///
+    /// A parked link is a backend `PostgreSQL` is holding open for nobody - a
+    /// process, its `work_mem`, and one of the instance's `max_connections`. The
+    /// pool opens them on demand and gave none of them back, so an estate's
+    /// connection count ratcheted to its busiest minute and stayed there.
+    ///
+    /// **A tenant is never reaped below its guarantee.** The guarantee is the one
+    /// promise this allocator makes that nothing else may take back: `acquire`
+    /// admits a tenant under its floor without queueing, and closing a link that
+    /// puts it there would turn the next arrival from an immediate grant into a
+    /// connect. Idle is not the same as unpromised.
+    ///
+    /// Shaped like [`sever_superseded`](Self::sever_superseded), and for the same
+    /// reason: the removal happens under the lock so no checkout can claim a link
+    /// that is about to be closed, and the sockets are closed after it is
+    /// released.
+    pub fn reap_idle(&self) {
+        let Some(idle_for) = self.server_idle_timeout() else {
+            return;
+        };
+        let reaped = {
+            let mut inner = self.lock();
+            Self::take_idle(&mut inner, idle_for)
+        };
+        if reaped.is_empty() {
+            return;
+        }
+        self.metrics.backends_reaped(reaped.len());
+        for conn in reaped {
+            self.metrics.backend_closed();
+            // Spawned, like every other close on this path: a Terminate is
+            // best-effort and the reaper must not wait on a backend that has
+            // stopped answering to get to the next one.
+            tokio::spawn(conn.close());
+        }
+        self.publish_budget_now();
+    }
+
+    /// Removes every link parked longer than `idle_for` that its tenant does not
+    /// need to honour a guarantee, from a caller-held lock.
+    fn take_idle(inner: &mut Inner, idle_for: Duration) -> Vec<BackendConn> {
+        let now = std::time::Instant::now();
+        let stale: Vec<pgelastic_capacity::ServerId> = inner
+            .parked
+            .iter()
+            .filter(|(_, parked)| now.duration_since(parked.since) >= idle_for)
+            .map(|(server, _)| *server)
+            .collect();
+
+        // The tenant's parked links, counted once and decremented as they go.
+        //
+        // The *physical* links, deliberately, and not the allocator's `live`
+        // count. A capacity slot outlives its link on every `discard` - an
+        // abandoned session, a failed reset, an expired `serverLifetime` - and it
+        // also counts links the allocator has already marked `close_needed` for
+        // somebody else's guarantee, which `revocation_candidates` nets out for
+        // exactly this reason. Reaping against `live` closes a tenant's last warm
+        // link while reporting its floor covered, and an adversarial review
+        // reproduced that both ways.
+        let mut parked_per_tenant: HashMap<CapacityTenant, u32> = HashMap::new();
+        for parked in inner.parked.values() {
+            *parked_per_tenant
+                .entry(CapacityTenant::new(parked.key.tenant().as_str()))
+                .or_default() += 1;
+        }
+
+        let mut reaped = Vec::new();
+        for server in stale {
+            let Some(tenant) = inner
+                .parked
+                .get(&server)
+                .map(|parked| CapacityTenant::new(parked.key.tenant().as_str()))
+            else {
+                continue;
+            };
+            let guaranteed = inner
+                .allocator
+                .budget()
+                .tenant(&tenant)
+                .map_or(0, pgelastic_capacity::TenantEntry::guaranteed);
+            // The floor is a count of warm links kept, so a tenant at it keeps
+            // what it has however long any one of them has been sitting.
+            if parked_per_tenant.get(&tenant).copied().unwrap_or(0) <= guaranteed {
+                continue;
+            }
+            if let Some(conn) = inner.unpark(server) {
+                let grants = inner.allocator.backend_died(server);
+                inner.dispatch(grants);
+                reaped.push(conn);
+                *parked_per_tenant.entry(tenant).or_default() -= 1;
+            }
+        }
+        reaped
+    }
+
+    /// How long a link may sit parked, or `None` when the pool reaps nothing.
+    #[must_use]
+    pub fn server_idle_timeout(&self) -> Option<Duration> {
+        let seconds = self.server_idle_timeout_seconds.load(Ordering::Relaxed);
+        (seconds > 0).then(|| Duration::from_secs(seconds))
     }
 
     /// Closes what [`take_superseded`](Self::take_superseded) removed, with the
@@ -1653,7 +1769,14 @@ impl Inner {
         let pool = self.pool(&key);
         pool.active.remove(&server);
         pool.idle.insert(server);
-        self.parked.insert(server, Parked { key, conn });
+        self.parked.insert(
+            server,
+            Parked {
+                key,
+                conn,
+                since: std::time::Instant::now(),
+            },
+        );
     }
 
     fn unpark(&mut self, server: pgelastic_capacity::ServerId) -> Option<BackendConn> {
@@ -1710,6 +1833,29 @@ fn transport_failure(error: &ProxyError) -> bool {
             | std::io::ErrorKind::HostUnreachable
             | std::io::ErrorKind::NetworkUnreachable
     )
+}
+
+/// How often the reaper looks. Coarse on purpose: `serverIdleTimeout` is measured
+/// in minutes, and a link that lives ten seconds past its welcome has cost
+/// nothing a tighter loop would have saved.
+const REAP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Closes each instance's over-idle parked links, for as long as the proxy runs.
+///
+/// A loop of its own rather than a step of the reload loop, which returns early
+/// down several paths - a document that has not changed, one that does not parse -
+/// and would take the reaper with it.
+pub async fn reap_loop(fleet: Arc<crate::route::Fleet>, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            () = tokio::time::sleep(REAP_INTERVAL) => {}
+        }
+        for instance in fleet.instances() {
+            instance.pools.reap_idle();
+        }
+    }
 }
 
 /// What a pin request was allowed to do.
