@@ -107,11 +107,15 @@ func (r *PgElasticPoolReconciler) reconcileProxy(
 	if err != nil {
 		return nil, err
 	}
+	tenants, err := r.proxyTenants(ctx, view, instances)
+	if err != nil {
+		return nil, err
+	}
 
 	config := proxy.Config{
 		Pool:      pool,
 		Instances: instances,
-		Tenants:   r.proxyTenants(ctx, view, instances),
+		Tenants:   tenants,
 		Users:     users,
 		Control:   r.certManagerInstalled(),
 	}
@@ -413,7 +417,7 @@ func (r *PgElasticPoolReconciler) proxyInstances(
 // already reserved while its connections still land on the default instance.
 func (r *PgElasticPoolReconciler) proxyTenants(
 	ctx context.Context, view *poolView, instances []proxy.Instance,
-) []proxy.Tenant {
+) ([]proxy.Tenant, error) {
 	known := make(map[string]struct{}, len(instances))
 	for _, instance := range instances {
 		known[instance.Name] = struct{}{}
@@ -430,16 +434,7 @@ func (r *PgElasticPoolReconciler) proxyTenants(
 	// The winner is whichever one the tenant controller will provision, by the same rule, so
 	// the tenant that holds the database is the tenant that holds the route to it. Taking the
 	// first the List happened to return would sooner or later award them to different objects.
-	holder := map[string]*pgelasticv1alpha1.PgTenant{}
-	for _, tenant := range view.allTenants() {
-		database := tenant.Spec.DatabaseName
-		if database == "" {
-			continue
-		}
-		if held, taken := holder[database]; !taken || olderClaim(tenant, held) {
-			holder[database] = tenant
-		}
-	}
+	holder := databaseHolders(view)
 
 	// The capacity of every tenant whose class resolved. One whose class did not gets the
 	// zero value, which reserves nothing and bursts to nothing: unknown capacity, admitted to
@@ -456,10 +451,7 @@ func (r *PgElasticPoolReconciler) proxyTenants(
 			tenant    *pgelasticv1alpha1.PgTenant
 			effective policy.Effective
 		}{tenant: tenant, effective: resolved[tenant.Name]}
-		if entry.tenant.Spec.DatabaseName == "" {
-			continue
-		}
-		if holder[entry.tenant.Spec.DatabaseName].Name != entry.tenant.Name {
+		if !holds(holder, entry.tenant) {
 			continue
 		}
 		bound := placement.BoundInstanceFor(entry.tenant)
@@ -474,12 +466,21 @@ func (r *PgElasticPoolReconciler) proxyTenants(
 			Weight:     entry.effective.Weight,
 			Priority:   priorityOf(entry.effective),
 		}
-		// The identity this tenant's backend sessions run as. Left out when the tenant
-		// controller has not minted it yet, mirroring how an instance whose Secret is absent
-		// is left out rather than rendered with an empty password: the fleet then refuses
-		// that one tenant for a reconcile rather than serving it as the control plane.
-		if credential, ok := r.backendCredentialFor(ctx, entry.tenant); ok {
-			rendered.BackendRole = credential.Role
+		// The identity this tenant's backend sessions run as. The role is named whether or
+		// not the tenant controller has minted the credential yet, and the credential alone
+		// is left out - which is what makes the proxy refuse this tenant for a reconcile
+		// rather than dial it on the instance's own identity.
+		//
+		// Naming nothing at all was read on the far side as the single-tenant shape, whose
+		// documented answer is the instance identity: the control plane's role, which holds
+		// pg_monitor and pg_signal_backend. Every comment on both sides of the boundary said
+		// such a tenant was refused. Nothing refused it.
+		credential, ok, err := r.backendCredentialFor(ctx, entry.tenant)
+		if err != nil {
+			return nil, err
+		}
+		rendered.BackendRole = credential.Role
+		if ok {
 			rendered.BackendSaltedPassword = credential.SaltedPassword
 			rendered.BackendSalt = credential.Salt
 			rendered.BackendIterations = credential.Iterations
@@ -487,7 +488,41 @@ func (r *PgElasticPoolReconciler) proxyTenants(
 		}
 		tenants = append(tenants, rendered)
 	}
-	return tenants
+	return tenants, nil
+}
+
+// databaseHolders picks, for each database name, the one tenant that holds it.
+//
+// Two tenants of one pool may not name one database; the webhook refuses the second and the
+// tenant controller refuses to provision it. Neither is a guarantee at render time - a pair
+// admitted by racing webhooks is visible here before either reconcile has refused one - and
+// the webhook's own comment says it is best effort for exactly that reason.
+//
+// Every consumer of this document must agree on the winner. The routing table and the login
+// table disagreeing is not a cosmetic drift: the route resolves to the winner's instance and
+// backend role while the loser's password still authenticates, so the loser's client is
+// dialled into the winner's database as the winner's owner. One helper, three call sites.
+func databaseHolders(view *poolView) map[string]*pgelasticv1alpha1.PgTenant {
+	holder := map[string]*pgelasticv1alpha1.PgTenant{}
+	for _, tenant := range view.allTenants() {
+		database := tenant.Spec.DatabaseName
+		if database == "" {
+			continue
+		}
+		if held, taken := holder[database]; !taken || olderClaim(tenant, held) {
+			holder[database] = tenant
+		}
+	}
+	return holder
+}
+
+// holds reports whether this tenant is the one that holds its database name.
+func holds(holder map[string]*pgelasticv1alpha1.PgTenant, tenant *pgelasticv1alpha1.PgTenant) bool {
+	if tenant.Spec.DatabaseName == "" {
+		return false
+	}
+	held, taken := holder[tenant.Spec.DatabaseName]
+	return taken && held.Name == tenant.Name
 }
 
 // proxyUsers collects the SCRAM identities the fleet authenticates clients against.
@@ -505,8 +540,17 @@ func (r *PgElasticPoolReconciler) proxyUsers(
 	// unknown capacity, not a cancelled existence, and leaving it out of the login table
 	// takes away its clients' ability to authenticate at all - so deleting one
 	// PgWorkloadClass locked out every tenant that named it.
+	// The routing table drops a tenant that lost a duplicate databaseName; this must drop the
+	// same one. Emitting its login while dropping its route does not leave it unreachable, it
+	// leaves it reachable as somebody else: the database resolves to the winner's tenant
+	// entry, and backend_for assumes the winner's owner role.
+	holder := databaseHolders(view)
+
 	users := make([]proxy.User, 0, len(view.tenants)+len(view.unresolved))
 	for _, tenant := range view.allTenants() {
+		if !holds(holder, tenant) {
+			continue
+		}
 		auth := tenant.Spec.Auth
 		if auth == nil || auth.CredentialsSecretRef == nil {
 			continue
@@ -536,7 +580,7 @@ func (r *PgElasticPoolReconciler) proxyUsers(
 		})
 	}
 
-	contained, err := r.containedUsers(ctx, pool, view)
+	contained, err := r.containedUsers(ctx, pool, view, holder)
 	if err != nil {
 		return nil, err
 	}
@@ -578,14 +622,22 @@ func (r *PgElasticPoolReconciler) containedUsers(
 	ctx context.Context,
 	pool *pgelasticv1alpha1.PgElasticPool,
 	view *poolView,
+	holder map[string]*pgelasticv1alpha1.PgTenant,
 ) ([]proxy.User, error) {
 	logins := &pgelasticv1alpha1.PgTenantUserList{}
 	if err := r.List(ctx, logins, client.InNamespace(pool.Namespace)); err != nil {
 		return nil, err
 	}
+	// Only logins of a tenant that holds its own database name. A contained login carries the
+	// database as its tenant, so one belonging to the loser of a duplicate name renders bound
+	// to the winner's database - authenticated by its own password, routed to somebody else's
+	// data. The routing table has always dropped that tenant; this had no such check at all.
 	databases := map[string]string{}
 	for i := range view.tenants {
 		tenant := view.tenants[i].tenant
+		if !holds(holder, tenant) {
+			continue
+		}
 		databases[tenant.Name] = tenant.Spec.DatabaseName
 	}
 
