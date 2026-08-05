@@ -66,7 +66,7 @@ func (r *PgWorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	status := pgelasticv1alpha1.PgWorkloadClassStatus{
 		ObservedGeneration: workloadClass.Generation,
-		Conditions:         workloadClass.Status.Conditions,
+		Conditions:         carriedConditions(workloadClass.Status.Conditions),
 	}
 
 	tenantCount, err := r.countTenants(ctx, workloadClass.Name)

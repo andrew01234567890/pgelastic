@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
+
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -38,6 +40,20 @@ func setCondition(
 		Message:            message,
 		ObservedGeneration: generation,
 	})
+}
+
+// carriedConditions copies an object's conditions into a status a reconcile is building.
+//
+// A copy, never the slice itself. `meta.SetStatusCondition` mutates an existing condition in
+// place, so a status seeded with the object's own slice shares its backing array - and by the
+// time the `DeepEqual` gate every one of these reconcilers ends with compares the two, the
+// change is present on both sides. A pass whose only change is a condition then reaches the API
+// server never: not late, not on the next pass, never, until some other field happens to move.
+//
+// The elements are values, so one clone is enough; nothing inside a `metav1.Condition` is
+// shared.
+func carriedConditions(conditions []metav1.Condition) []metav1.Condition {
+	return slices.Clone(conditions)
 }
 
 // conditionStatus maps a boolean outcome onto a condition status.
