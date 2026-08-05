@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(RequestKind::from_tag(b'B'), Some(RequestKind::Bind));
         assert_eq!(RequestKind::from_tag(b'E'), Some(RequestKind::Execute));
         assert_eq!(RequestKind::from_tag(b'S'), Some(RequestKind::Sync));
-        for tag in [b'd', b'c', b'f', b'H', b'X'] {
+        for tag in *b"dcfHX" {
             assert_eq!(RequestKind::from_tag(tag), None, "tag {}", char::from(tag));
         }
     }
