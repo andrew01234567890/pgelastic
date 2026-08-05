@@ -358,9 +358,9 @@ func (b Builder) Pod(serial int32, stamp RollStamp) *corev1.Pod {
 				{Name: "status", ContainerPort: StatusPort},
 			},
 			VolumeMounts:   b.mounts(),
-			StartupProbe:   probe("/startup", 1, 3, 120),
-			ReadinessProbe: probe("/readiness", 2, 3, 0),
-			LivenessProbe:  probe("/liveness", 10, 6, 0),
+			StartupProbe:   probe("/startup", 1, 120),
+			ReadinessProbe: probe("/readiness", 2, 3),
+			LivenessProbe:  probe("/liveness", 10, 6),
 		}},
 		Volumes: b.volumes(serial),
 	}
@@ -370,11 +370,7 @@ func (b Builder) Pod(serial int32, stamp RollStamp) *corev1.Pod {
 	return pod
 }
 
-func probe(path string, period, failures, startupFailures int32) *corev1.Probe {
-	threshold := failures
-	if startupFailures > 0 {
-		threshold = startupFailures
-	}
+func probe(path string, period, failures int32) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 			Path: path,
@@ -382,7 +378,7 @@ func probe(path string, period, failures, startupFailures int32) *corev1.Probe {
 		}},
 		PeriodSeconds:    period,
 		TimeoutSeconds:   5,
-		FailureThreshold: threshold,
+		FailureThreshold: failures,
 	}
 }
 
@@ -722,10 +718,6 @@ func ConcurrentDumps(spec pgelasticv1alpha1.PgInstanceSpec) int32 {
 	return 4
 }
 
-// memoryFraction returns the given fraction of the pod's memory allocation as a PostgreSQL
-// size literal, or the empty string when the pod declares no memory at all. Inventing a
-// number in that case would be worse than leaving the boot default: the default is at
-// least a value somebody chose.
 // nonPostgresReserve is what the Pod runs besides the postmaster: the instance agent, the
 // physical-backup shim and the syslogger.
 //

@@ -258,12 +258,6 @@ END $pgelastic$;`,
 		QuoteLiteral(provision.ReplicationRole))
 }
 
-// SettleTargetGrants applies the database ACL and removes the replication role's temporary
-// reads, for the path that has no schema-apply transaction to fold them into.
-//
-// The online path appends these to the dump file so they commit with the schema and the stamp.
-// Offline restores with pg_restore --jobs, which is not one transaction, so its equivalent runs
-// here as ordinary statements against the target.
 // HoldTenantOut keeps a tenant's own roles out of its database while the database is being
 // rewritten underneath them.
 //
@@ -400,6 +394,12 @@ func RevokeReplicationReads(ctx context.Context, sql SQL, target Endpoint) error
 	return nil
 }
 
+// SettleTargetGrants applies the database ACL and removes the replication role's temporary
+// reads, for the path that has no schema-apply transaction to fold them into.
+//
+// The online path appends these to the dump file so they commit with the schema and the stamp.
+// Offline restores with pg_restore --jobs, which is not one transaction, so its equivalent runs
+// here as ordinary statements against the target.
 func SettleTargetGrants(ctx context.Context, sql SQL, plan Plan, owner string) error {
 	roles, err := EnumerateTenantRoles(ctx, sql, plan.Source)
 	if err != nil {

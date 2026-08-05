@@ -223,10 +223,10 @@ func (m *LeaseManager) Renew(ctx context.Context) ha.RenewOutcome {
 	}
 	lease.Spec.RenewTime = ptr.To(metav1.NowMicro())
 	lease.Spec.LeaseDurationSeconds = ptr.To(int32(m.Config.LeaseDuration.Seconds()))
+	// Every failure is unverified, conflict included: a renew that did not commit leaves the
+	// holder unable to say whether it still holds the lease, and that is the same answer
+	// whatever the API server's reason was.
 	if err := m.Client.Update(ctx, lease); err != nil {
-		if apierrors.IsConflict(err) {
-			return ha.RenewUnverified
-		}
 		return ha.RenewUnverified
 	}
 	return ha.RenewOK
