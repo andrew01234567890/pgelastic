@@ -26,7 +26,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -811,12 +810,6 @@ func effectiveCacheSizeFor(resources *corev1.ResourceRequirements, class pgconf.
 
 func megabytes(bytes int64) string {
 	return strconv.FormatInt(bytes/(1<<20), 10) + "MB"
-}
-
-// StorageQuantity is a convenience for reporting allocated bytes in status.
-func StorageQuantity(size resource.Quantity) *resource.Quantity {
-	copied := size.DeepCopy()
-	return &copied
 }
 
 // DroppedParameters lists the parameters in spec.parameters that will not be rendered.

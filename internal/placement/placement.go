@@ -116,9 +116,6 @@ type Tenant struct {
 	// leave it there when the alternatives are equally good, because every move is a live
 	// migration.
 	BoundInstance string
-	// GuaranteedOnly marks a tenant that has never been metered, so its observed demand is
-	// an absence rather than a zero.
-	GuaranteedOnly bool
 	// BoundMajor is the PostgreSQL major the tenant currently sits on. Zero means it sits
 	// nowhere yet, which is what makes a first admission unconstrained by any of this.
 	BoundMajor int

@@ -37,9 +37,6 @@ const (
 	SubscriptionPrefix = "pgelastic_sub_"
 )
 
-// ObjectPrefixes is every prefix the sweeper looks for.
-var ObjectPrefixes = []string{PublicationPrefix, SlotPrefix, SubscriptionPrefix}
-
 // nameBudget bounds the transliterated part of a generated name. PostgreSQL identifiers
 // are 63 bytes; the longest prefix is 14 and the digest suffix is 9, so 40 leaves room to
 // spare and keeps a truncated name from ever colliding with an untruncated one.

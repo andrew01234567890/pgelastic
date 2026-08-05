@@ -414,16 +414,6 @@ const backgroundWorkerReserve = 8
 // floor so no instance shape can end up with fewer workers than the tree has always had.
 const minWorkerProcesses = 16
 
-// WorkerProcesses is max_worker_processes: the envelope every other worker count sits inside.
-//
-// Fixed rather than Tuned, and the reason is the pool it governs. A user who lowered it below
-// what the parallel and logical-replication settings already promise would not get a smaller
-// instance; they would get migrations that cannot start and parallel plans that silently run
-// serially, with nothing saying why.
-func WorkerProcesses(parallelWorkers int32) int32 {
-	return workerProcesses(parallelWorkers)
-}
-
 func workerProcesses(parallelWorkers int32) int32 {
 	return max(minWorkerProcesses,
 		parallelWorkers+logicalReplicationWorkers+backgroundWorkerReserve)

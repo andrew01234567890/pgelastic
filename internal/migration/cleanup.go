@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // LadderStep names one rung of the cleanup ladder, so a failure can say which rung it
@@ -356,15 +355,4 @@ func LiveObjectNames(namespaced [][2]string) map[string]bool {
 		live[SubscriptionName(namespace, name)] = true
 	}
 	return live
-}
-
-// IsAlreadyGone reports an error that means the object this statement addressed does not
-// exist. Cleanup treats it as success: the ladder's job is that the object is gone, not
-// that this particular call is what removed it.
-func IsAlreadyGone(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "does not exist")
 }

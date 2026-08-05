@@ -4,7 +4,7 @@ use subtle::ConstantTimeEq;
 
 use super::crypto::{self, Key};
 use super::message::{
-    ClientFinal, ClientFirst, ScramError, ServerFinal, ServerFirst, auth_message, encode_b64,
+    ClientFinal, ClientFirst, ScramError, ServerFinal, ServerFirst, auth_message,
 };
 use super::verifier::ScramVerifier;
 
@@ -123,22 +123,12 @@ impl ScramServer {
     }
 }
 
-/// The `e=` form of `server-final-message`, for a failure the client should see
-/// as a SCRAM error rather than a transport fault.
-pub fn server_error(reason: &str) -> String {
-    format!("e={reason}")
-}
-
-/// Base64 of a value, exposed for callers assembling their own messages.
-pub fn b64(value: &[u8]) -> String {
-    encode_b64(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scram::client::ScramClient;
     use crate::scram::crypto::salted_password_blocking;
+    use crate::scram::message::encode_b64;
     use crate::scram::verifier::{DEFAULT_ITERATIONS, MockSecret};
     use std::num::NonZeroU32;
     use zeroize::Zeroizing;
