@@ -317,12 +317,21 @@ func operatorIsolated(observation Observation) *Decision {
 }
 
 func healthyPrimary(observation Observation) Decision {
+	// The primary is reachable and out of recovery on every path from here, including the
+	// maintenance one - plannedSwitchover exists precisely because the primary is alive. So a
+	// debounce origin left by an earlier blip is stale whichever way this goes, and clearing
+	// it only on the ordinary path meant a primary under maintenance kept one indefinitely.
+	// failing() then reads that stale instant as the start of a new failure and can skip
+	// failoverDelay entirely on the next real one.
+	stale := !observation.FailingSince.IsZero()
 	if observation.UnderMaintenance(observation.CurrentPrimary) {
-		return plannedSwitchover(observation)
+		decision := plannedSwitchover(observation)
+		decision.ClearFailingSince = decision.ClearFailingSince || stale
+		return decision
 	}
 	decision := Decision{
 		Phase:             PhaseSteady,
-		ClearFailingSince: !observation.FailingSince.IsZero(),
+		ClearFailingSince: stale,
 		Reason:            "PrimaryHealthy",
 		Message:           observation.CurrentPrimary + " is serving",
 	}

@@ -515,8 +515,14 @@ func feasible(tenant Tenant, bins []*bin, policy Policy) []*bin {
 		return candidates
 	}
 
+	// Measured over the candidates rather than over every bin. A member that is cordoned,
+	// draining or not yet ready is a bin nothing may be placed on, and one of those sitting
+	// at zero tenants dragged the reference to zero - which turns a relative skew bound into
+	// an absolute cap of MaxSkewTenants tenants per instance. Every candidate then fails it,
+	// the fallback below returns them all, and the bound that was supposed to spread tenants
+	// applies to nothing at all.
 	emptiest := int32(0)
-	for i, candidate := range bins {
+	for i, candidate := range candidates {
 		if i == 0 || candidate.tenants < emptiest {
 			emptiest = candidate.tenants
 		}

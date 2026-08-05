@@ -326,3 +326,30 @@ func TestAPromotionIsNotAwaitedFromAMemberThatDoesNotExist(t *testing.T) {
 			observation.TargetPrimary)
 	}
 }
+
+// healthyPrimary cleared the persisted debounce origin, but returned into plannedSwitchover
+// before doing so when the primary was under maintenance. The primary is alive on that path by
+// definition, so an origin left by an earlier blip survived its recovery indefinitely - and
+// failing() reads a stale instant as the start of a new failure, which can skip failoverDelay
+// on the next real one.
+func TestMaintenanceDoesNotPreserveAStaleFailureOrigin(t *testing.T) {
+	now := time.Now()
+	observation := Observation{
+		CurrentPrimary: memberOne,
+		TargetPrimary:  memberOne,
+		FailingSince:   now.Add(-time.Hour),
+		Now:            now,
+		Maintenance:    []string{memberOne},
+		Members: []Member{
+			{Name: memberOne, PodReady: true, StatusReachable: true, InRecovery: false},
+			{Name: memberTwo, PodReady: true, StatusReachable: true, InRecovery: true},
+		},
+	}
+
+	decision := healthyPrimary(observation)
+
+	if !decision.ClearFailingSince {
+		t.Fatal("a primary under maintenance kept an hour-old failure origin, so the next " +
+			"real failure is measured from it")
+	}
+}
