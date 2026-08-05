@@ -1182,3 +1182,53 @@ async fn a_graceful_shutdown_drains_in_flight_work_instead_of_resetting_it() {
             .contains("outcome=\"graceful\"} 1")
     );
 }
+
+// The pipelined half of the same hole. A client may send a Sync and a Flush-terminated batch
+// in one write. The batch sets unsynced_batch; the ReadyForQuery that answers the SYNC then
+// cleared it, while the batch it does not belong to is still open. tx_status reports the idle
+// the Sync left, the flag says no batch is open, and the idle bound never arms - and the
+// statement deadline disarms the moment the batch's rows arrive. No bound of any kind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_pipelined_behind_a_sync_is_still_bounded() {
+    let stack =
+        harness::stack_with("[pool]\nmode = \"transaction\"\nclientIdleInTransactionSeconds = 2\n")
+            .await;
+    let mut raw = RawClient::connect(stack.localhost(), "tenant", BACKEND_DATABASE).await;
+
+    let batch = |query: &'static str| {
+        vec![
+            FrontendMessage::Parse(Parse {
+                name: Bytes::new(),
+                query: Bytes::from_static(query.as_bytes()),
+                param_types: vec![],
+            }),
+            FrontendMessage::Bind(Bind {
+                portal: Bytes::new(),
+                statement: Bytes::new(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![Format::Text],
+            }),
+            FrontendMessage::Execute(Execute {
+                portal: Bytes::new(),
+                max_rows: 0,
+            }),
+        ]
+    };
+
+    // One write: a batch the client ends properly, then a second it leaves open.
+    let mut pipelined = batch("SELECT 1");
+    pipelined.push(FrontendMessage::Sync);
+    pipelined.extend(batch("SELECT 2"));
+    pipelined.push(FrontendMessage::Flush);
+    raw.send(&pipelined).await;
+
+    let started = Instant::now();
+    raw.read_until(|message| matches!(message, pgelastic_wire::BackendMessage::ReadyForQuery(_)))
+        .await;
+    assert!(
+        raw.closed_within(Duration::from_secs(15)).await,
+        "a batch pipelined behind a Sync held its backend past the bound: {:?}",
+        started.elapsed()
+    );
+}

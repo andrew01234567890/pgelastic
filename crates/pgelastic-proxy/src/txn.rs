@@ -1082,7 +1082,18 @@ impl Running<'_> {
                         // The byte that ends a batch, which is what makes the
                         // implicit transaction behind an unsynced one visible
                         // again in `tx_status`.
-                        self.unsynced_batch = false;
+                        //
+                        // Only when it is answering the last thing the client sent. A client
+                        // may pipeline a Sync and a Flush-terminated batch in one write: the
+                        // batch sets the flag, and this ReadyForQuery - which belongs to the
+                        // Sync, not to the batch - would clear it while the batch is still
+                        // open. tx_status then reports the idle the Sync left, the flag says
+                        // no batch is open, and the idle-in-transaction bound never arms. The
+                        // statement deadline disarms too the moment the batch is answered, so
+                        // the backend is held with no bound of any kind.
+                        if checkout.conn.link.outstanding().is_empty() {
+                            self.unsynced_batch = false;
+                        }
                     }
                 }
             }
