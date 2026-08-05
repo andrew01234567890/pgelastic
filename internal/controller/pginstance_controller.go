@@ -162,6 +162,12 @@ func (r *PgInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{RequeueAfter: credentialsRecheck},
 				r.publishAwaitingCredentials(ctx, instance)
 		}
+		// Requeued rather than hard-errored: the remedy is to remove the foreign Secret, and
+		// the instance should then continue without anybody touching it again.
+		if errors.Is(err, errCredentialsNotOurs) {
+			return ctrl.Result{RequeueAfter: credentialsRecheck},
+				r.publishCredentialsConflict(ctx, instance, err)
+		}
 		return ctrl.Result{}, err
 	}
 	groups, err := r.ensurePVCGroups(ctx, instance, builder)
@@ -372,6 +378,20 @@ func (r *PgInstanceReconciler) ensureCredentials(
 	secret := &corev1.Secret{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: instance.Namespace, Name: name}, secret)
 	if err == nil {
+		// Adopting whatever is sitting under the predictable name hands an instance
+		// passwords somebody else chose. Member names are derived from the pool and an
+		// ordinal, so the name is guessable before the object exists, and a namespace
+		// principal who can create Secrets can plant one - then dial the instance's Service
+		// as the replication role it named and take a physical base backup of every tenant
+		// database on it.
+		//
+		// Refused rather than deleted. Deleting would need `delete` on Secrets across the
+		// namespace and turn this controller into a Secret reaper; requeued rather than
+		// hard-errored, because the operator's remedy is to remove the Secret and the
+		// instance should then continue on its own.
+		if !metav1.IsControlledBy(secret, instance) {
+			return fmt.Errorf("%w: %s", errCredentialsNotOurs, name)
+		}
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -1137,12 +1157,39 @@ func (r *PgInstanceReconciler) publishInvalid(
 var errAwaitingRestoreCredentials = errors.New(
 	"waiting for the restore to hand over the source's credentials")
 
+// errCredentialsNotOurs is a Secret under this instance's predictable credentials name that
+// the operator did not create. Reported rather than adopted, and rather than deleted.
+var errCredentialsNotOurs = errors.New(
+	"a credentials Secret of this name already exists and the operator does not own it, so " +
+		"the instance would boot with passwords it did not choose; remove it")
+
 // publishAwaitingCredentials says why a recovered instance has not started building yet.
 //
 // A restored cluster's pg_authid is its source's, copied verbatim, so its roles keep the
 // source's passwords and the PgRestore controller is what copies the matching Secret across.
 // Until it does, there is nothing to build with, and saying so is the difference between a
 // wait somebody can explain and one they have to dig for.
+// publishCredentialsConflict says on the instance what is wrong, because the alternative is a
+// Pod stuck in ContainerCreating with the reason buried in its events.
+func (r *PgInstanceReconciler) publishCredentialsConflict(
+	ctx context.Context,
+	instance *pgelasticv1alpha1.PgInstance,
+	cause error,
+) error {
+	object := statusApplyObject(instance)
+	object.Object["status"] = map[string]any{
+		fieldObservedGeneration: instance.Generation,
+		fieldPhase:              string(pgelasticv1alpha1.InstancePhasePending),
+		fieldConditions: []any{
+			condition(instance.Status.Conditions, pgelasticv1alpha1.ConditionReady, false,
+				instance.Generation, pgelasticv1alpha1.ReasonCredentialsConflict,
+				cause.Error()),
+		},
+	}
+	return r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(object),
+		client.FieldOwner("pgelastic-operator"), client.ForceOwnership)
+}
+
 func (r *PgInstanceReconciler) publishAwaitingCredentials(
 	ctx context.Context,
 	instance *pgelasticv1alpha1.PgInstance,

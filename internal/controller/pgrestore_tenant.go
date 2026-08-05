@@ -385,6 +385,50 @@ func (r *PgRestoreReconciler) tenantUnderRestore(
 		return nil, fmt.Sprintf("%s is not bound to an instance, so there is nothing to "+
 			"restore over", tenant.Name), nil
 	}
+
+	// Both ends have to be inside the source's pool, and checking one is not checking the
+	// other. Database names are unique within a pool, so a backup of pool A holding `orders`
+	// and a live tenant of pool B also called `orders` are a legal pair - and this restore
+	// copies out of the first and over the second. The read end is the tenant's own pool; the
+	// write end is wherever its binding points, which nothing constrains to that pool either.
+	//
+	// Refused here, in Preflight, so a cross-pool restore is stopped before a full PITR copy
+	// of somebody else's data has been built.
+	source := &pgelasticv1alpha1.PgInstance{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: restore.Namespace, Name: restore.Spec.SourceInstanceRef.Name,
+	}, source); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Sprintf("%s no longer exists, so there is no pool to check this "+
+				"tenant against", restore.Spec.SourceInstanceRef.Name), nil
+		}
+		return nil, "", err
+	}
+	pool := source.Spec.PoolRef.Name
+	if pool == "" {
+		return nil, fmt.Sprintf("%s belongs to no pool, so a tenant restore out of it cannot "+
+			"be shown to stay inside one", source.Name), nil
+	}
+	if tenant.Spec.PoolRef.Name != pool {
+		return nil, fmt.Sprintf("%s belongs to pool %s and %s to pool %s; a tenant restore "+
+			"may only put a tenant back from a backup of its own pool",
+			tenant.Name, tenant.Spec.PoolRef.Name, source.Name, pool), nil
+	}
+	live := &pgelasticv1alpha1.PgInstance{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: restore.Namespace, Name: tenant.Status.Binding.InstanceRef.Name,
+	}, live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Sprintf("%s is bound to %s, which does not exist", tenant.Name,
+				tenant.Status.Binding.InstanceRef.Name), nil
+		}
+		return nil, "", err
+	}
+	if live.Spec.PoolRef.Name != pool {
+		return nil, fmt.Sprintf("%s is bound to %s, which belongs to pool %s rather than %s; "+
+			"the copy would be written outside the pool it came from",
+			tenant.Name, live.Name, live.Spec.PoolRef.Name, pool), nil
+	}
 	return tenant, "", nil
 }
 

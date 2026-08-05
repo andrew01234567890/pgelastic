@@ -308,7 +308,7 @@ func TestARestoreWithNoObjectStoreCredentialsIsRefused(t *testing.T) {
 func TestAnOrdinaryInstanceGetsFreshCredentials(t *testing.T) {
 	scheme := credentialScheme(t)
 	fresh := &pgelasticv1alpha1.PgInstance{
-		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "pg-b"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: targetInstanceName},
 	}
 	kube := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(sourceCredentials(), fresh).Build()
@@ -321,7 +321,7 @@ func TestAnOrdinaryInstanceGetsFreshCredentials(t *testing.T) {
 	got := &corev1.Secret{}
 	if err := kube.Get(context.Background(), types.NamespacedName{
 		Namespace: credentialNamespace,
-		Name:      provision.CredentialsSecretName("pg-b"),
+		Name:      provision.CredentialsSecretName(targetInstanceName),
 	}, got); err != nil {
 		t.Fatalf("reading: %v", err)
 	}
@@ -414,5 +414,71 @@ func TestTheCredentialsHandOverIsRetriedAfterTheInstanceExists(t *testing.T) {
 		Name:      provision.CredentialsSecretName(target.Name),
 	}, handed); err != nil {
 		t.Fatalf("the credentials were never handed over, so the instance waits for ever: %v", err)
+	}
+}
+
+// Member names are derived from the pool and an ordinal, so the credentials Secret's name is
+// guessable before the instance exists. A namespace principal who can create Secrets can plant
+// one, and adopting it hands the instance passwords somebody else chose - including the
+// replication role's, which is enough to dial the instance's Service and take a physical base
+// backup of every tenant database on it.
+func TestACredentialsSecretTheOperatorDoesNotOwnIsRefused(t *testing.T) {
+	scheme := credentialScheme(t)
+	instance := &pgelasticv1alpha1.PgInstance{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: targetInstanceName},
+	}
+	planted := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: credentialNamespace,
+			Name:      provision.CredentialsSecretName(targetInstanceName),
+		},
+		Data: map[string][]byte{
+			provision.SecretKeyReplicationPassword: []byte("chosen-by-somebody-else"),
+		},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(instance, planted).Build()
+	reconciler := &PgInstanceReconciler{Client: kube, Scheme: scheme}
+
+	err := reconciler.ensureCredentials(context.Background(), instance)
+
+	if !errors.Is(err, errCredentialsNotOurs) {
+		t.Fatalf("the instance adopted a Secret it does not own, so it boots with the "+
+			"replication password whoever planted it chose: %v", err)
+	}
+	// Refused, not deleted: deleting would need delete on every Secret in the namespace.
+	if err := kube.Get(context.Background(), types.NamespacedName{
+		Namespace: credentialNamespace, Name: provision.CredentialsSecretName(targetInstanceName),
+	}, &corev1.Secret{}); err != nil {
+		t.Fatalf("the controller deleted a Secret it does not own: %v", err)
+	}
+}
+
+// The other half, and the one a one-sided fix leaves reversed: a restore hands the source's
+// credentials to the instance it built, and its own adoption check has to agree. Refusing only
+// in ensureCredentials would leave the recovered catalogue and the Secret describing it
+// permanently out of step.
+func TestARestoreWillNotHandCredentialsToASquattedSecret(t *testing.T) {
+	scheme := credentialScheme(t)
+	recovered := &pgelasticv1alpha1.PgInstance{
+		ObjectMeta: metav1.ObjectMeta{Namespace: credentialNamespace, Name: "pg-recovered"},
+	}
+	planted := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: credentialNamespace,
+			Name:      provision.CredentialsSecretName("pg-recovered"),
+		},
+		Data: map[string][]byte{
+			provision.SecretKeyReplicationPassword: []byte("chosen-by-somebody-else"),
+		},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(recovered, planted, sourceCredentials()).Build()
+	reconciler := &PgRestoreReconciler{Client: kube, Scheme: scheme}
+
+	err := reconciler.handOverCredentials(context.Background(), "pg-a", recovered)
+
+	if !errors.Is(err, errCredentialsNotOurs) {
+		t.Fatalf("the restore accepted a credentials Secret it did not write, so the "+
+			"recovered catalogue's passwords and the Secret describing them disagree: %v", err)
 	}
 }

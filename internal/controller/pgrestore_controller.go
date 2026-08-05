@@ -377,6 +377,14 @@ func (r *PgRestoreReconciler) handOverCredentials(
 	existing := &corev1.Secret{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: instance.Namespace, Name: target}, existing)
 	if err == nil {
+		// The mirror of ensureCredentials' own check, and it has to be here too. Fixing only
+		// that one inverts the failure without closing it: the instance controller would
+		// refuse the squatted Secret while this one still read "it exists" and never copied
+		// the source's passwords over, so the recovered catalogue and the Secret describing
+		// it would disagree for ever.
+		if !metav1.IsControlledBy(existing, instance) {
+			return fmt.Errorf("%w: %s", errCredentialsNotOurs, target)
+		}
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {

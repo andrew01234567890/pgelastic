@@ -74,6 +74,8 @@ func TestATenantWhoseClassIsGoneIsStillServed(t *testing.T) {
 //
 // Driven through proxyUsers rather than through the holder helper, because a test that asks
 // the helper the question the helper answers proves only that it was called.
+const duplicateDatabase = "orders"
+
 func TestTheLoserOfADuplicateDatabaseNameGetsNoLogin(t *testing.T) {
 	const namespace = "dup-login"
 	scheme := runtime.NewScheme()
@@ -92,7 +94,7 @@ func TestTheLoserOfADuplicateDatabaseNameGetsNoLogin(t *testing.T) {
 				CreationTimestamp: metav1.NewTime(time.Unix(int64(age), 0)),
 			},
 			Spec: pgelasticv1alpha1.PgTenantSpec{
-				DatabaseName: "orders",
+				DatabaseName: duplicateDatabase,
 				Owner:        ptr.To(name + "-owner"),
 				Auth: &pgelasticv1alpha1.PgTenantAuth{
 					CredentialsSecretRef: &corev1.LocalObjectReference{Name: name + "-auth"},
