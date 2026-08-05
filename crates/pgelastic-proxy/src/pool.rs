@@ -515,7 +515,56 @@ impl PoolManager {
                 }
             }
         }
+        changed += Self::forget_departed(&mut inner, tenants);
         changed
+    }
+
+    /// Gives back the budget a tenant that has left the document was holding.
+    ///
+    /// `apply_tenants` only ever added and updated, so a deleted tenant kept its entry - and
+    /// with it its `guaranteed`, which `free()` subtracts from the pool whether anybody is
+    /// using it or not. Every surviving tenant was refused capacity on behalf of one that no
+    /// longer existed, on every replica, until the process happened to restart.
+    ///
+    /// Absence from the document is not proof of deletion, which is why this only takes
+    /// tenants holding nothing. `proxyTenants` also omits a tenant whose backend credential it
+    /// could not read this pass, and one whose database name a sibling holds; dropping those
+    /// would kill live sessions over a Secret that was briefly unreadable. A tenant with
+    /// backends open keeps its entry and is reconsidered next time, by which point the reaper
+    /// has closed its idle links.
+    fn forget_departed(inner: &mut Inner, published: &[crate::config::TenantConfig]) -> usize {
+        let known: std::collections::HashSet<CapacityTenant> = published
+            .iter()
+            .map(|tenant| CapacityTenant::new(tenant.name.as_str()))
+            .collect();
+        let departed: Vec<CapacityTenant> = inner
+            .tenants
+            .iter()
+            .filter(|id| !known.contains(*id))
+            .filter(|id| {
+                inner
+                    .allocator
+                    .budget()
+                    .tenant(id)
+                    .is_none_or(|entry| entry.live() == 0)
+            })
+            .cloned()
+            .collect();
+
+        let mut forgotten = 0;
+        for id in departed {
+            match inner.allocator.remove_tenant(&id) {
+                Ok(grants) => {
+                    inner.tenants.remove(&id);
+                    forgotten += 1;
+                    inner.dispatch(grants);
+                }
+                Err(error) => {
+                    warn!(tenant = %id, %error, "a departed tenant could not be forgotten");
+                }
+            }
+        }
+        forgotten
     }
 
     pub fn connect_client(&self, tenant: &CapacityTenant) -> std::result::Result<ClientId, Denial> {
@@ -1977,6 +2026,57 @@ mod tests {
         assert_eq!(tenant.as_str(), "acme");
         // Idempotent: a second client of the same tenant must not re-add it.
         assert_eq!(manager.ensure_tenant("acme").unwrap(), tenant);
+    }
+
+    // apply_tenants only ever added and updated. A tenant deleted from the pool kept its
+    // entry, and with it its guarantee, which free() subtracts whether anybody is using it or
+    // not - so every surviving tenant was refused capacity on behalf of one that no longer
+    // existed, on every replica, until the process happened to restart.
+    #[test]
+    fn a_tenant_that_leaves_the_document_gives_its_guarantee_back() {
+        let claim = |name: &str, guaranteed: u32| TenantConfig {
+            name: name.to_owned(),
+            guaranteed,
+            burstable: 4,
+            weight: 100,
+            priority: 1_000,
+            max_client_connections: 10,
+            ..TenantConfig::default()
+        };
+        let config = PoolConfig {
+            mode: PoolModeConfig::Transaction,
+            backend_connections: 10,
+            headroom_percent: 0,
+            tenants: vec![claim("stays", 2), claim("goes", 4)],
+            ..PoolConfig::default()
+        };
+        let manager = PoolManager::new(
+            InstanceId::new("default"),
+            config,
+            std::sync::Arc::default(),
+            FenceRuntime::in_memory(),
+            Metrics::new(),
+        )
+        .unwrap();
+        let before = manager.lock().allocator.budget().free();
+
+        manager.apply_tenants(&[claim("stays", 2)]);
+
+        let after = manager.lock().allocator.budget().free();
+        assert_eq!(
+            after,
+            before + 4,
+            "the departed tenant's guarantee is still reserved against every survivor"
+        );
+        assert!(
+            manager
+                .lock()
+                .allocator
+                .budget()
+                .tenant(&CapacityTenant::new("goes"))
+                .is_none(),
+            "the departed tenant still has an entry"
+        );
     }
 
     #[test]
