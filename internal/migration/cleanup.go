@@ -166,8 +166,14 @@ func DropSlot(ctx context.Context, sql SQL, at Endpoint, slot string) error {
 }
 
 func ifSubscriptionExists(ctx context.Context, sql SQL, plan Plan, statement string) error {
+	// Scoped to this database, because pg_subscription is a shared catalog: another tenant's
+	// migration on the same instance can carry a subscription of the same name, and answering
+	// "it exists" for that one runs this ladder's next statement against nothing.
 	count, err := scalarInt64(ctx, sql, plan.Target, fmt.Sprintf(
-		`SELECT count(*)::text FROM pg_subscription WHERE subname = %s`, QuoteLiteral(plan.Subscription)))
+		`SELECT count(*)::text FROM pg_subscription `+
+			`WHERE subname = %s `+
+			`AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+		QuoteLiteral(plan.Subscription)))
 	if err != nil {
 		return err
 	}

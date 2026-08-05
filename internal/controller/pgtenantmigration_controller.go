@@ -240,8 +240,13 @@ func (r *PgTenantMigrationReconciler) resolve(
 			Concurrency:    provision.ConcurrentDumps(source.Spec),
 			DumpDir:        migration.DumpDir(object.Namespace, object.Name),
 		},
-		ReplicationRole:      provision.ReplicationRole,
-		Owner:                ptr.Deref(tenant.Spec.Owner, tenant.Spec.DatabaseName),
+		ReplicationRole: provision.ReplicationRole,
+		// The role the tenant controller owns this database as on the source, so the target
+		// comes out owned by the same one. spec.owner is the tenant's own spelling and is
+		// namespaced into a backend role before it ever reaches PostgreSQL - taking it raw
+		// here created the target owned by a role that may not exist, and left the migrated
+		// database owned by something other than what the proxy dials as.
+		Owner:                migration.BackendRoleName(tenant.Namespace, tenant.Name),
 		AbortRequested:       object.Annotations[AnnotationAbort] != "",
 		AbortMessage:         object.Annotations[AnnotationAbort],
 		RollbackRequested:    object.Annotations[AnnotationRollback] != "",

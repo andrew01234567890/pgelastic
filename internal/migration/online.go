@@ -425,7 +425,15 @@ func DropTargetDatabase(ctx context.Context, sql SQL, target Endpoint) error {
 // order the ladder uses: a subscription dropped without SET (slot_name = NONE) first can block
 // indefinitely trying to reach a publisher that may no longer be there.
 func dropSubscriptionsIn(ctx context.Context, sql SQL, at Endpoint) error {
-	names, err := firstColumn(ctx, sql, at, `SELECT subname FROM pg_subscription ORDER BY 1`)
+	// pg_subscription is a shared catalog: every database in the cluster sees every
+	// subscription, including those belonging to other tenants on the same instance. Dropping
+	// by that unfiltered list would take somebody else's subscription; failing to reach its
+	// publisher would block this drop for ever. SweepOrphans already joins on subdbid for the
+	// same reason.
+	names, err := firstColumn(ctx, sql, at,
+		`SELECT s.subname FROM pg_subscription s `+
+			`WHERE s.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database()) `+
+			`ORDER BY 1`)
 	if err != nil {
 		// A database that cannot be read is one that may not exist, which is the ordinary case
 		// on a path that is about to issue DROP DATABASE IF EXISTS.

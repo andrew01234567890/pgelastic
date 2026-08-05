@@ -268,7 +268,7 @@ func TestAStampedTargetIsNeverDiscarded(t *testing.T) {
 // PostgreSQL refuses to drop a database that still owns a subscription however the connections
 // are behaving, so WITH (FORCE) is not enough on its own.
 func TestTheTargetsSubscriptionsAreRemovedBeforeItIsDropped(t *testing.T) {
-	sql := newFakeSQL().answer("SELECT subname FROM pg_subscription", Row{"pgelastic_sub_move"})
+	sql := newFakeSQL().answer("FROM pg_subscription", Row{"pgelastic_sub_move"})
 	if err := DropTargetDatabase(context.Background(), sql, targetAt); err != nil {
 		t.Fatal(err)
 	}
@@ -276,6 +276,20 @@ func TestTheTargetsSubscriptionsAreRemovedBeforeItIsDropped(t *testing.T) {
 		if index := sql.ran(fragment); index < 0 || index > sql.ran("DROP DATABASE") {
 			t.Fatalf("%q did not run before the database was dropped", fragment)
 		}
+	}
+}
+
+// pg_subscription is a shared catalog, so every database in the cluster sees every
+// subscription - including those belonging to other tenants on the same instance. Listing it
+// unfiltered meant this drop took somebody else's subscription, and failing to reach that
+// one's publisher blocked the drop for ever.
+func TestOnlyThisDatabasesSubscriptionsAreDropped(t *testing.T) {
+	sql := newFakeSQL().answer("FROM pg_subscription", Row{"pgelastic_sub_move"})
+	if err := DropTargetDatabase(context.Background(), sql, targetAt); err != nil {
+		t.Fatal(err)
+	}
+	if sql.ran("subdbid") < 0 {
+		t.Fatalf("the subscription list was not scoped to this database:\n%s", sql.joined())
 	}
 }
 
