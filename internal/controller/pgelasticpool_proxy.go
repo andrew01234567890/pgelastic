@@ -35,6 +35,7 @@ import (
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/placement"
+	"github.com/andrew01234567890/pgelastic/internal/policy"
 	"github.com/andrew01234567890/pgelastic/internal/proxy"
 )
 
@@ -50,6 +51,20 @@ const tenantCredentialsKey = "password"
 
 // defaultTenantPriority matches the proxy's own default for a tenant nobody has ranked.
 const defaultTenantPriority int32 = 1000
+
+// priorityOf publishes the class's own ranking rather than one constant for everybody.
+//
+// spec.priority is required on a PgWorkloadClass and documented as ordering admission "in the
+// same sense as a Kubernetes PriorityClass value: larger wins". It reached nothing: every
+// tenant was rendered at the same number, so the admission ladder ranked them all equally and
+// the field was inert however it was set. Zero is a real ranking - the lowest - and only an
+// unresolved class falls back to the proxy's own default.
+func priorityOf(effective policy.Effective) int32 {
+	if effective.WorkloadClassName == "" {
+		return defaultTenantPriority
+	}
+	return effective.Priority
+}
 
 // The control listener's PKI. cert-manager is already a hard dependency of the webhooks,
 // so this issues certificates rather than adding a dependency.
@@ -423,7 +438,7 @@ func (r *PgElasticPoolReconciler) proxyTenants(
 			Guaranteed: entry.effective.Guaranteed,
 			Burstable:  entry.effective.Burstable,
 			Weight:     entry.effective.Weight,
-			Priority:   defaultTenantPriority,
+			Priority:   priorityOf(entry.effective),
 		}
 		// The identity this tenant's backend sessions run as. Left out when the tenant
 		// controller has not minted it yet, mirroring how an instance whose Secret is absent

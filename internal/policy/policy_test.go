@@ -201,3 +201,23 @@ var _ = Describe("self-consistency problems", func() {
 		Expect(policy.ElasticClassProblems(elasticClass)).To(BeEmpty())
 	})
 })
+
+// spec.priority is required on a PgWorkloadClass and orders admission across classes, but it
+// stopped at the class: nothing carried it into the effective capacity, so the renderer had
+// nothing to publish and gave every tenant the same rank however the class was set.
+func TestTheClassPriorityReachesTheEffectiveCapacity(t *testing.T) {
+	class := &pgelasticv1alpha1.PgWorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "urgent"},
+		Spec: pgelasticv1alpha1.PgWorkloadClassSpec{
+			Priority: 9000,
+			Capacity: pgelasticv1alpha1.WorkloadCapacity{Burstable: 8},
+		},
+	}
+
+	effective := policy.EffectiveFor(&pgelasticv1alpha1.PgTenant{}, class)
+
+	if effective.Priority != 9000 {
+		t.Fatalf("the class ranked its tenants at 9000 and the effective capacity says %d",
+			effective.Priority)
+	}
+}

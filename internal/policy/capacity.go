@@ -47,6 +47,9 @@ type Effective struct {
 	Burstable int32
 	// Weight is the share of contended surplus.
 	Weight int32
+	// Priority orders admission across tenants of different classes: larger wins. It comes
+	// from the class alone - a tenant does not get to rank itself above its neighbours.
+	Priority int32
 	// QoSClass is derived from Guaranteed and Burstable, never declared.
 	QoSClass pgelasticv1alpha1.QoSClass
 	// StatementTimeout is the deadline published to the proxy.
@@ -84,6 +87,7 @@ func EffectiveFor(tenant *pgelasticv1alpha1.PgTenant, class *pgelasticv1alpha1.P
 		WorkloadClassName: class.Name,
 		Burstable:         class.Spec.Capacity.Burstable,
 		Weight:            defaultWeight,
+		Priority:          class.Spec.Priority,
 	}
 	if class.Spec.Capacity.Guaranteed != nil {
 		effective.Guaranteed = *class.Spec.Capacity.Guaranteed
