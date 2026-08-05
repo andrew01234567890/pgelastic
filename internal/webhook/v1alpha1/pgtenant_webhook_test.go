@@ -315,4 +315,50 @@ var _ = Describe("a tenant guaranteed more than it may ever hold", Ordered, func
 
 		mustCreate(tenant)
 	})
+
+})
+
+// The reconciler's version of this rule skips a sibling carrying a deletion timestamp; this
+// validator did not, and it runs on update as well as create. So while a duplicate was
+// reclaiming its database - which takes as long as the reclaim takes - the tenant that is
+// keeping the name could not be edited at all, and the refusal named an object on its way out.
+var _ = Describe("a duplicate database name held by a tenant that is going away", Ordered, func() {
+	const (
+		namespace = "wh-dup-terminating"
+		className = "wh-dup-terminating-workload"
+		shared    = "shared"
+	)
+
+	var leaving *pgelasticv1alpha1.PgTenant
+
+	BeforeAll(func() {
+		ensureNamespace(namespace, nil)
+		mustCreate(makeElasticClass("wh-dup-terminating-class"),
+			makeWorkloadClass(className, 1, 4))
+		mustCreate(makePool(namespace, "wh-dup-terminating-pool", "wh-dup-terminating-class"))
+
+		leaving = makeTenant(namespace, "wh-dup-leaving", "wh-dup-terminating-pool",
+			shared, className)
+		leaving.Finalizers = []string{"pgelastic.io/test-hold"}
+		mustCreate(leaving)
+
+		// Deleted, but held by the finalizer - which is exactly the window a reclaim runs in.
+		Expect(k8sClient.Delete(ctx, leaving)).To(Succeed())
+		Expect(k8sClient.Get(ctx, keyIn(namespace, leaving.Name), leaving)).To(Succeed())
+		Expect(leaving.DeletionTimestamp).NotTo(BeNil())
+
+		DeferCleanup(func() {
+			if err := k8sClient.Get(ctx, keyIn(namespace, leaving.Name), leaving); err == nil {
+				leaving.Finalizers = nil
+				Expect(k8sClient.Update(ctx, leaving)).To(Succeed())
+			}
+		})
+	})
+
+	It("lets the name be claimed again", func() {
+		successor := makeTenant(namespace, "wh-dup-successor", "wh-dup-terminating-pool",
+			shared, className)
+
+		Expect(k8sClient.Create(ctx, successor)).To(Succeed())
+	})
 })

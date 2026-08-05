@@ -163,7 +163,13 @@ func (v *PgTenantCustomValidator) databaseNameProblems(
 	var problems field.ErrorList
 	for i := range siblings.Items {
 		sibling := &siblings.Items[i]
+		// A sibling on its way out holds no claim, and the reconciler's own version of this
+		// rule says so. Counting one here refuses every update to the tenant that is
+		// *keeping* the database - including, while a duplicate is reclaiming, ordinary spec
+		// edits that have nothing to do with the name - because this validator runs on update
+		// as well as create.
 		if sibling.Name == tenant.Name ||
+			!sibling.DeletionTimestamp.IsZero() ||
 			sibling.Spec.PoolRef.Name != tenant.Spec.PoolRef.Name ||
 			sibling.Spec.DatabaseName != tenant.Spec.DatabaseName {
 			continue
