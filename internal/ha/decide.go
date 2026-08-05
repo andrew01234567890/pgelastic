@@ -240,7 +240,14 @@ func decide(observation Observation) Decision {
 	if isolated := operatorIsolated(observation); isolated != nil {
 		return *isolated
 	}
-	if FailoverInProgress(observation.CurrentPrimary, observation.TargetPrimary) &&
+	// Waiting on a promotion is only waiting if there is something to wait for. Phase
+	// Promoting requeues every second and returns before every election below it, so a target
+	// that is not a member of the instance at all - deleted, renamed, or never created -
+	// leaves the instance with no primary and no way to elect one, for ever, one second at a
+	// time. A member that is merely slow or unreachable is still a member and is still
+	// waited for: this only steps aside when there is nobody of that name to promote.
+	if _, present := memberNamed(observation.Members, observation.TargetPrimary); present &&
+		FailoverInProgress(observation.CurrentPrimary, observation.TargetPrimary) &&
 		observation.TargetPrimary != TargetPrimaryPending {
 		return Decision{
 			Phase:        PhasePromoting,

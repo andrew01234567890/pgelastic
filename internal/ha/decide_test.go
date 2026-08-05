@@ -304,3 +304,25 @@ func TestNoCandidateSurvivesDisqualification(t *testing.T) {
 		t.Fatalf("decision was %+v", decision)
 	}
 }
+
+// PhasePromoting requeues every second and returns before every election below it, so it is
+// absorbing: nothing that follows can run while it holds. A target that is not a member of
+// the instance at all leaves it with no primary and no way to elect one, indefinitely, one
+// second at a time.
+func TestAPromotionIsNotAwaitedFromAMemberThatDoesNotExist(t *testing.T) {
+	observation := Observation{
+		CurrentPrimary: memberOne,
+		TargetPrimary:  "pg-9",
+		Members: []Member{
+			{Name: memberOne, PodReady: true, StatusReachable: true, InRecovery: false},
+			{Name: memberTwo, PodReady: true, StatusReachable: true, InRecovery: true},
+		},
+	}
+
+	decision := Decide(observation)
+
+	if decision.Phase == PhasePromoting {
+		t.Fatalf("the instance is waiting for %q to promote, and no such member exists",
+			observation.TargetPrimary)
+	}
+}
