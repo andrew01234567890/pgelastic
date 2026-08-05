@@ -356,6 +356,21 @@ func (r *PgTenantReconciler) provision(
 		return err
 	}
 
+	// The webhook refuses a database name a sibling already holds, but two creates racing each
+	// other each read a cluster without the other and both are admitted. Provisioning the
+	// loser would hand it CONNECT on the winner's database, so the loser is refused here
+	// instead - permanently, because the name is in its spec and will not change under it.
+	if owner, err := r.databaseClaimedElsewhere(ctx, tenant); err != nil {
+		return err
+	} else if owner != "" {
+		r.notServing(status, tenant.Generation, tenantdb.ReasonProvisioningFailed,
+			fmt.Sprintf("database %q is already held by PgTenant %q of pool %q; rename this "+
+				"tenant's spec.databaseName, because provisioning it here would grant this "+
+				"tenant access to the other's database",
+				database, owner, tenant.Spec.PoolRef.Name))
+		return nil
+	}
+
 	// Minted before the role is created, because the role is created with it. A tenant whose
 	// credential cannot be written is left unprovisioned rather than provisioned passwordless:
 	// a role the proxy cannot authenticate as is a tenant nobody can reach, and it would look
@@ -482,6 +497,47 @@ func (r *PgTenantReconciler) reportReclaimFailure(
 // tenantEndpoint addresses the tenant's database on the instance hosting it. No member is
 // named, which resolves to that instance's current primary: the only member a CREATE can
 // be issued on.
+// databaseClaimedElsewhere names the tenant that holds this one's database name, if another
+// one does. It answers "" when this tenant is the rightful holder.
+//
+// The winner is the oldest, and the name breaks a tie, so every replica of every controller
+// reaches the same verdict from the same cluster and the loser is the same object each time.
+// Deciding by which reconciled first would instead let the two swap places on a restart, and
+// each would then find the database already there and adopt it in turn.
+func (r *PgTenantReconciler) databaseClaimedElsewhere(
+	ctx context.Context,
+	tenant *pgelasticv1alpha1.PgTenant,
+) (string, error) {
+	siblings := &pgelasticv1alpha1.PgTenantList{}
+	if err := r.List(ctx, siblings, client.InNamespace(tenant.Namespace)); err != nil {
+		return "", err
+	}
+	for i := range siblings.Items {
+		sibling := &siblings.Items[i]
+		if sibling.Name == tenant.Name ||
+			sibling.DeletionTimestamp != nil ||
+			sibling.Spec.PoolRef.Name != tenant.Spec.PoolRef.Name ||
+			sibling.Spec.DatabaseName != tenant.Spec.DatabaseName {
+			continue
+		}
+		if olderClaim(sibling, tenant) {
+			return sibling.Name, nil
+		}
+	}
+	return "", nil
+}
+
+func olderClaim(sibling, tenant *pgelasticv1alpha1.PgTenant) bool {
+	switch {
+	case sibling.CreationTimestamp.Time.Before(tenant.CreationTimestamp.Time):
+		return true
+	case tenant.CreationTimestamp.Time.Before(sibling.CreationTimestamp.Time):
+		return false
+	default:
+		return sibling.Name < tenant.Name
+	}
+}
+
 func tenantEndpoint(tenant *pgelasticv1alpha1.PgTenant, instance string) tenantdb.Endpoint {
 	return tenantdb.Endpoint{
 		Namespace: tenant.Namespace,

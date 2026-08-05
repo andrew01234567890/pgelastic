@@ -1136,3 +1136,33 @@ func TestTheLogFormatThePoolAsksForReachesTheProxy(t *testing.T) {
 			"a value the proxy chooses anyway", EnvLogFormat)
 	}
 }
+
+// A TOML inline table may not define a key twice. Two tenants of one pool holding one
+// database name is refused at admission and refused again by the tenant controller, but a
+// pair admitted by two webhooks racing each other is visible to the renderer before either
+// reconcile has refused one - and a document that will not parse is not a partial outage. A
+// running replica keeps its old configuration for every tenant; a cold one cannot start.
+func TestRoutingWritesEachDatabaseNameOnce(t *testing.T) {
+	config := testConfig()
+	config.Tenants = append(config.Tenants,
+		Tenant{Name: "orders", Instance: testInstance, Guaranteed: 1, Burstable: 4, Weight: 100})
+
+	rendered := config.Render().TOML
+
+	line := routingTenantsLine(t, rendered)
+	if strings.Count(line, `"orders"`) != 1 {
+		t.Fatalf("database name written %d times, so the document does not parse:\n%s",
+			strings.Count(line, `"orders"`), line)
+	}
+}
+
+func routingTenantsLine(t *testing.T, rendered string) string {
+	t.Helper()
+	for line := range strings.SplitSeq(rendered, "\n") {
+		if strings.HasPrefix(line, "tenants = {") {
+			return line
+		}
+	}
+	t.Fatalf("no routing tenants line in:\n%s", rendered)
+	return ""
+}

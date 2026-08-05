@@ -340,10 +340,20 @@ func (c Config) renderRouting(out *strings.Builder, dynamic bool) {
 	if dynamic {
 		out.WriteString("tenants = { ")
 		entries := make([]string, 0, len(c.Tenants))
+		// A TOML inline table may not define a key twice, and a document a replica cannot
+		// parse is one it refuses whole: it keeps its old configuration for every tenant and
+		// cannot start at all from cold. Callers are expected to have picked one holder per
+		// database name already; writing the key once regardless is what makes a document
+		// this renderer emits always loadable, whoever built the Config.
+		written := make(map[string]struct{}, len(c.Tenants))
 		for _, tenant := range c.sortedTenants() {
 			if tenant.Instance == "" {
 				continue
 			}
+			if _, taken := written[tenant.Name]; taken {
+				continue
+			}
+			written[tenant.Name] = struct{}{}
 			entries = append(entries,
 				tomlString(tenant.Name)+" = "+tomlString(tenant.Instance))
 		}

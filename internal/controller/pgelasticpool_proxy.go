@@ -381,10 +381,36 @@ func (r *PgElasticPoolReconciler) proxyTenants(
 		known[instance.Name] = struct{}{}
 	}
 
+	// Two tenants of one pool may not hold one database name; the webhook refuses the second
+	// and the tenant controller refuses to provision it. Neither is a guarantee at render
+	// time - a pair admitted by racing webhooks is visible here before either reconcile has
+	// refused one - and rendering both would put one key twice in the routing table, which is
+	// a document no replica can parse. A replica that cannot parse it keeps the configuration
+	// it has, for every tenant, until somebody notices. Dropping the duplicate costs the
+	// loser its route until it is renamed; keeping it costs the pool its whole control plane.
+	//
+	// The winner is whichever one the tenant controller will provision, by the same rule, so
+	// the tenant that holds the database is the tenant that holds the route to it. Taking the
+	// first the List happened to return would sooner or later award them to different objects.
+	holder := map[string]*pgelasticv1alpha1.PgTenant{}
+	for i := range view.tenants {
+		tenant := view.tenants[i].tenant
+		database := tenant.Spec.DatabaseName
+		if database == "" {
+			continue
+		}
+		if held, taken := holder[database]; !taken || olderClaim(tenant, held) {
+			holder[database] = tenant
+		}
+	}
+
 	tenants := make([]proxy.Tenant, 0, len(view.tenants))
 	for i := range view.tenants {
 		entry := &view.tenants[i]
 		if entry.tenant.Spec.DatabaseName == "" {
+			continue
+		}
+		if holder[entry.tenant.Spec.DatabaseName].Name != entry.tenant.Name {
 			continue
 		}
 		bound := placement.BoundInstanceFor(entry.tenant)
