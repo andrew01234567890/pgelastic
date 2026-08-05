@@ -125,6 +125,8 @@ func (v *PgElasticPoolCustomValidator) validate(ctx context.Context, pool *pgela
 		field.NewPath("spec", "instances", "template", "parameters"),
 		pool.Spec.Instances.Template.Parameters)...)
 
+	problems = append(problems, proxyPodTemplateProblems(pool)...)
+
 	return invalid(pool, problems)
 }
 
@@ -215,4 +217,69 @@ func defaultWorkloadClassProblems(
 	return field.ErrorList{field.NotSupported(
 		field.NewPath("spec", "admission", "defaultWorkloadClassName"),
 		pool.Spec.Admission.DefaultWorkloadClassName, allowed)}
+}
+
+// proxyPodTemplateProblems keeps the proxy pod-spec escape hatch to the fields it exists for.
+//
+// spec.proxy.template.spec is a whole corev1.PodSpec, strategically merged over the pod the
+// controller generates. A strategic merge adds; it does not replace. So the fields refused
+// here are not overrides of the operator's choices, they are additions to the pod: another
+// container, another volume, another identity.
+//
+// That matters because of what the proxy pod can reach. Its ServiceAccount is deliberately
+// narrow - the fleet is on the client's data path and is not allowed to watch Secrets - but
+// the pod itself is mounted with the rendered proxy configuration, which carries every
+// tenant's password and backend SCRAM keys. A container added here runs beside it with that
+// mount, and a volume added here can name any Secret in the namespace, including every
+// instance's bootstrap credentials. Placement and resources are what the hatch is for; a
+// second identity inside the same pod is not.
+func proxyPodTemplateProblems(pool *pgelasticv1alpha1.PgElasticPool) field.ErrorList {
+	if pool.Spec.Proxy == nil || pool.Spec.Proxy.Template == nil ||
+		pool.Spec.Proxy.Template.Spec == nil {
+		return nil
+	}
+	spec := pool.Spec.Proxy.Template.Spec
+	path := field.NewPath("spec", "proxy", "template", "spec")
+
+	var problems field.ErrorList
+	refuse := func(name, why string) {
+		problems = append(problems, field.Forbidden(path.Child(name), why))
+	}
+	// A strategic merge keys containers by name, which is the whole design of the hatch: an
+	// entry called ContainerName patches the generated proxy container rather than replacing
+	// it. Any other name is a new container in the same pod. The list itself cannot be refused
+	// - the PodSpec schema requires it - so the name is what decides.
+	for index, container := range spec.Containers {
+		if container.Name != proxy.ContainerName {
+			problems = append(problems, field.Invalid(
+				path.Child("containers").Index(index).Child("name"), container.Name,
+				fmt.Sprintf("a container of any other name runs beside the proxy with the "+
+					"rendered configuration mounted, which carries every tenant's credentials; "+
+					"name it %q to patch the generated container instead",
+					proxy.ContainerName)))
+		}
+	}
+	if len(spec.InitContainers) > 0 {
+		refuse("initContainers", "an init container shares the pod's volumes and service account")
+	}
+	if len(spec.EphemeralContainers) > 0 {
+		refuse("ephemeralContainers", "an ephemeral container shares the pod's volumes")
+	}
+	if len(spec.Volumes) > 0 {
+		refuse("volumes", "a volume added here may name any Secret in the namespace, including "+
+			"every instance's bootstrap credentials")
+	}
+	if spec.ServiceAccountName != "" || spec.DeprecatedServiceAccount != "" {
+		refuse("serviceAccountName", "the proxy runs as the ServiceAccount the operator "+
+			"created for it, which is deliberately narrower than any other in the namespace")
+	}
+	if spec.HostNetwork || spec.HostPID || spec.HostIPC {
+		refuse("hostNetwork", "the proxy may not share the node's network, process or IPC "+
+			"namespaces")
+	}
+	if spec.SecurityContext != nil {
+		refuse("securityContext", "the pod security context is the operator's; set what you "+
+			"need through spec.proxy")
+	}
+	return problems
 }

@@ -17,8 +17,12 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"fmt"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	corev1 "k8s.io/api/core/v1"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 )
@@ -152,4 +156,79 @@ var _ = Describe("PgElasticPool admission", func() {
 					To(Succeed())
 			})
 		})
+})
+
+// spec.proxy.template.spec is a whole corev1.PodSpec, strategically merged over the pod the
+// controller generates - and a strategic merge adds rather than replaces. The proxy pod is
+// mounted with the rendered configuration, which carries every tenant's password and backend
+// SCRAM keys, so a container or volume added here is a second identity inside that mount.
+var _ = Describe("the proxy pod template escape hatch", Ordered, func() {
+	const namespace = "wh-podspec"
+
+	var poolNumber int
+
+	BeforeAll(func() {
+		ensureNamespace(namespace, nil)
+		mustCreate(makeElasticClass("wh-podspec-class"))
+	})
+
+	// Every template must carry containers - the PodSpec schema requires it - so the
+	// legitimate shape names the generated container and patches it. The image is never
+	// pulled: the merge takes the generated container's, and no pod is created here.
+	const unusedImage = "ignored"
+	patchesTheProxy := []corev1.Container{{Name: "proxy", Image: unusedImage}}
+
+	poolWith := func(spec *corev1.PodSpec) *pgelasticv1alpha1.PgElasticPool {
+		if len(spec.Containers) == 0 {
+			spec.Containers = patchesTheProxy
+		}
+		poolNumber++
+		pool := makePool(namespace, fmt.Sprintf("wh-podspec-%d", poolNumber), "wh-podspec-class")
+		pool.Spec.Proxy = &pgelasticv1alpha1.ProxySpec{
+			Template: &pgelasticv1alpha1.ProxyPodTemplate{Spec: spec},
+		}
+		return pool
+	}
+
+	DescribeTable("refuses what would put a second identity in the proxy's pod",
+		func(spec *corev1.PodSpec, expected string) {
+			err := k8sClient.Create(ctx, poolWith(spec))
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(expected))
+		},
+		Entry("a container beside the proxy", &corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: "proxy", Image: unusedImage},
+				{Name: "sidecar", Image: "busybox"},
+			},
+		}, "containers[1].name"),
+		Entry("an init container", &corev1.PodSpec{
+			InitContainers: []corev1.Container{{Name: "init", Image: "busybox"}},
+		}, "template.spec.initContainers"),
+		Entry("a volume naming any Secret in the namespace", &corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "loot",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: "px-pool-proxy-config"},
+				},
+			}},
+		}, "template.spec.volumes"),
+		Entry("another service account", &corev1.PodSpec{
+			ServiceAccountName: "something-wider",
+		}, "template.spec.serviceAccountName"),
+		Entry("the node's namespaces", &corev1.PodSpec{
+			HostNetwork: true,
+		}, "template.spec.hostNetwork"),
+	)
+
+	// The hatch exists for placement, and that half stays open.
+	It("admits the scheduling fields the hatch is for", func() {
+		mustCreate(poolWith(&corev1.PodSpec{
+			Containers:        patchesTheProxy,
+			NodeSelector:      map[string]string{"kubernetes.io/os": "linux"},
+			PriorityClassName: "system-cluster-critical",
+			Tolerations:       []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpExists}},
+		}))
+	})
 })
