@@ -221,6 +221,13 @@ type poolView struct {
 	elasticClass *pgelasticv1alpha1.PgElasticClass
 	instances    []pgelasticv1alpha1.PgInstance
 	tenants      []tenantView
+	// unresolved are the pool's tenants whose workload class could not be read this pass -
+	// deleted, renamed, or not yet created. They are left out of every plan, because a
+	// capacity nobody can resolve is not a number to plan against, and kept for the fleet,
+	// because a tenant whose class went missing has not stopped existing. Rendering only the
+	// resolved ones took away the tenant's route AND its authentication entry, so deleting
+	// one PgWorkloadClass made every tenant that named it unreachable.
+	unresolved   []*pgelasticv1alpha1.PgTenant
 	ledger       policy.Ledger
 	signals      autoscale.Signals
 	policy       autoscale.Policy
@@ -277,7 +284,8 @@ func (r *PgElasticPoolReconciler) observe(
 	if err != nil {
 		return nil, err
 	}
-	view.tenants, err = r.tenantsOf(ctx, pool, elasticClass, resolver, view.policy.Placement.PackOn)
+	view.tenants, view.unresolved, err = r.tenantsOf(
+		ctx, pool, elasticClass, resolver, view.policy.Placement.PackOn)
 	if err != nil {
 		return nil, err
 	}
@@ -323,20 +331,34 @@ func (r *PgElasticPoolReconciler) instancesOf(
 	return members, nil
 }
 
+// allTenants is every tenant of the pool, whether or not its workload class resolved.
+//
+// The two lists are kept apart because they answer different questions: a plan may only be
+// computed from capacity somebody can read, and the fleet must serve every tenant that
+// exists. Anything that renders the document wants this one.
+func (v *poolView) allTenants() []*pgelasticv1alpha1.PgTenant {
+	all := make([]*pgelasticv1alpha1.PgTenant, 0, len(v.tenants)+len(v.unresolved))
+	for i := range v.tenants {
+		all = append(all, v.tenants[i].tenant)
+	}
+	return append(all, v.unresolved...)
+}
+
 func (r *PgElasticPoolReconciler) tenantsOf(
 	ctx context.Context,
 	pool *pgelasticv1alpha1.PgElasticPool,
 	elasticClass *pgelasticv1alpha1.PgElasticClass,
 	resolver policy.Resolver,
 	packOn pgelasticv1alpha1.Percentile,
-) ([]tenantView, error) {
+) ([]tenantView, []*pgelasticv1alpha1.PgTenant, error) {
 	list := &pgelasticv1alpha1.PgTenantList{}
 	if err := r.List(ctx, list, client.InNamespace(pool.Namespace)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	classes := map[string]*pgelasticv1alpha1.PgWorkloadClass{}
 	views := make([]tenantView, 0, len(list.Items))
+	var unresolved []*pgelasticv1alpha1.PgTenant
 	for i := range list.Items {
 		tenant := &list.Items[i]
 		if tenant.Spec.PoolRef.Name != pool.Name || !tenant.DeletionTimestamp.IsZero() {
@@ -344,9 +366,10 @@ func (r *PgElasticPoolReconciler) tenantsOf(
 		}
 		effective, ok, err := resolveEffective(ctx, resolver, r.Client, tenant, pool, elasticClass, classes)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if !ok {
+			unresolved = append(unresolved, tenant)
 			continue
 		}
 		view := tenantView{tenant: tenant, effective: effective}
@@ -360,7 +383,7 @@ func (r *PgElasticPoolReconciler) tenantsOf(
 	slices.SortFunc(views, func(a, b tenantView) int {
 		return strings.Compare(a.tenant.Name, b.tenant.Name)
 	})
-	return views, nil
+	return views, unresolved, nil
 }
 
 // ledgerOf sums the pool's reservations. It counts every tenant whose policy resolves,
