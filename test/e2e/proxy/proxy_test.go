@@ -51,6 +51,7 @@ import (
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
+	"github.com/andrew01234567890/pgelastic/internal/migration"
 	proxyobjects "github.com/andrew01234567890/pgelastic/internal/proxy"
 	"github.com/andrew01234567890/pgelastic/test/e2e/certcheck"
 )
@@ -283,6 +284,30 @@ var _ = Describe("the pool's inline proxy fleet", Ordered, func() {
 		var answer int
 		Expect(connection.QueryRow(suiteCtx, "SELECT 6 * 7").Scan(&answer)).To(Succeed())
 		Expect(answer).To(Equal(42))
+	})
+
+	// The client authenticates at the proxy as the control plane's role, and the statement
+	// still arrives on the far side as the tenant's own. That substitution is what lets
+	// pg_stat_activity, log_line_prefix and any audit extension attribute a statement to
+	// whoever ran it, and until this spec existed nothing exercised it: the suite had been
+	// granting its fixtures to the role the client dials with, so it went on passing for
+	// three days after the proxy stopped using that role and then failed on the first
+	// privileged read with no test naming the cause.
+	It("puts the tenant's own role on the backend, not the role the client dialled with", func() {
+		connection := connect(tenantAlpha)
+		defer func() { _ = connection.Close(suiteCtx) }()
+
+		var sessionUser, currentUser string
+		Expect(connection.QueryRow(suiteCtx, "SELECT session_user, current_user").
+			Scan(&sessionUser, &currentUser)).To(Succeed())
+
+		Expect(sessionUser).To(Equal(backendRole(tenantAlpha)),
+			"the backend is open as %s; a session that is still the control plane's role "+
+				"attributes every tenant statement to pgelastic", sessionUser)
+		Expect(currentUser).To(Equal(sessionUser),
+			"SET ROLE moves current_user and leaves session_user behind, which is the "+
+				"impersonation this deliberately does not use")
+		Expect(sessionUser).NotTo(Equal(provision.OpsRole))
 	})
 
 	// The routing claim and the isolation claim are one spec because they are one property:
@@ -744,17 +769,28 @@ func awaitInstanceReady(name string) string {
 }
 
 // seedMarker puts one row in each tenant's database that names the database it is in, and
-// grants the proxy's backend role enough to read it. The grant is explicit because the ops
-// role holds pg_monitor and nothing that implies access to a tenant's tables.
+// grants the role the proxy will actually arrive as enough to read it.
+//
+// That is the tenant's own backend role, not the role the client dials with: the proxy
+// assumes the tenant's identity on the backend leg. The grant is explicit and goes to that
+// role alone, so a proxy that regressed to dialling on the control plane's identity would
+// fail this read rather than pass it - which is the failure the suite missed the first time.
 func seedMarker(member, database string) {
 	GinkgoHelper()
+	role := backendRole(database)
 	_, err := psql(member, database, fmt.Sprintf(
 		`CREATE TABLE marker (tag text NOT NULL);
 		 INSERT INTO marker VALUES ('%s');
 		 GRANT USAGE ON SCHEMA public TO %s;
 		 GRANT SELECT ON marker TO %s`,
-		marker(database), provision.OpsRole, provision.OpsRole))
+		marker(database), role, role))
 	Expect(err).NotTo(HaveOccurred())
+}
+
+// backendRole is the role the proxy opens a backend as for one tenant. The suite's tenants
+// are named after their databases, which is what makes this derivable here.
+func backendRole(database string) string {
+	return migration.BackendRoleName(e2eNamespace, database)
 }
 
 func marker(database string) string { return database + "-marker" }
@@ -767,9 +803,10 @@ func markerOn(connection *pgx.Conn) string {
 }
 
 // connect dials the pool's Service, which is the only route these specs ever take to
-// PostgreSQL. The role is the proxy's own backend role: the tenant roles pgelastic creates
-// have no password and therefore no TCP route, which is a property of the tenant path rather
-// than of the proxy, and is not what this suite is testing.
+// PostgreSQL. The role dialled is the control plane's, because the tenant roles pgelastic
+// creates have no password a client could hold - that is a property of the tenant path rather
+// than of the proxy, and is not what this suite is testing. What the proxy does with it is:
+// the backend leg arrives as the tenant's own role, which the spec above asserts.
 func connect(database string) *pgx.Conn {
 	GinkgoHelper()
 	var connection *pgx.Conn
@@ -868,15 +905,19 @@ func backendSourcesFor(database string) string {
 	return fmt.Sprintf(
 		`SELECT count(DISTINCT client_addr) FROM pg_stat_activity `+
 			`WHERE datname = '%s' AND usename = '%s'`,
-		database, provision.OpsRole)
+		database, backendRole(database))
 }
 
 // backendsFor counts the backends the proxy currently holds on one database. It is the
 // question the whole pooling claim reduces to, and only PostgreSQL can answer it.
+//
+// It counts by the tenant's own role because that is who the backend is open as. Counting by
+// the control plane's role instead answers zero for every tenant, which reads as "the proxy
+// opened nothing" and would pass the isolation assertions for the wrong reason.
 func backendsFor(database string) string {
 	return fmt.Sprintf(
 		`SELECT count(*) FROM pg_stat_activity WHERE datname = '%s' AND usename = '%s'`,
-		database, provision.OpsRole)
+		database, backendRole(database))
 }
 
 // controlGet issues one request at the control listener and answers with the status and the
