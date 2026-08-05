@@ -24,7 +24,10 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 )
@@ -165,7 +168,11 @@ var _ = Describe("PgElasticPool admission", func() {
 // mounted with the rendered configuration, which carries every tenant's password and backend
 // SCRAM keys, so a container or volume added here is a second identity inside that mount.
 var _ = Describe("the proxy pod template escape hatch", Ordered, func() {
-	const namespace = "wh-podspec"
+	const (
+		namespace         = "wh-podspec"
+		proxyContainer    = "proxy"
+		fleetConfigSecret = "px-pool-proxy-config"
+	)
 
 	var poolNumber int
 
@@ -175,10 +182,11 @@ var _ = Describe("the proxy pod template escape hatch", Ordered, func() {
 	})
 
 	// Every template must carry containers - the PodSpec schema requires it - so the
-	// legitimate shape names the generated container and patches it. The image is never
-	// pulled: the merge takes the generated container's, and no pod is created here.
-	const unusedImage = "ignored"
-	patchesTheProxy := []corev1.Container{{Name: "proxy", Image: unusedImage}}
+	// legitimate shape names the generated container and patches it, and the name is the only
+	// field it needs. It once carried an image too, behind a comment saying the merge would
+	// ignore it. The merge does not ignore it: a strategic merge keys containers by name and
+	// then replaces the scalars inside the matched entry, so that image was the one that ran.
+	patchesTheProxy := []corev1.Container{{Name: proxyContainer}}
 
 	poolWith := func(spec *corev1.PodSpec) *pgelasticv1alpha1.PgElasticPool {
 		if len(spec.Containers) == 0 {
@@ -201,10 +209,74 @@ var _ = Describe("the proxy pod template escape hatch", Ordered, func() {
 		},
 		Entry("a container beside the proxy", &corev1.PodSpec{
 			Containers: []corev1.Container{
-				{Name: "proxy", Image: unusedImage},
+				{Name: proxyContainer},
 				{Name: "sidecar", Image: "busybox"},
 			},
 		}, "containers[1].name"),
+		// Everything below patches the container the configuration is already mounted into,
+		// so none of it needs a second identity in the pod - which is what the rules above
+		// were written to stop, and why they did not see any of this.
+		Entry("a replacement image", &corev1.PodSpec{
+			Containers: []corev1.Container{{Name: proxyContainer, Image: "attacker/exfil"}},
+		}, "containers[0].image"),
+		Entry("a replacement command", &corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:    proxyContainer,
+				Command: []string{"/bin/sh", "-c", "cat /etc/pgelastic/proxy/proxy.toml"},
+			}},
+		}, "containers[0].command"),
+		Entry("a container security context, which the pod-level refusal does not reach",
+			&corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: proxyContainer,
+					SecurityContext: &corev1.SecurityContext{
+						Privileged: ptr.To(true),
+						RunAsUser:  ptr.To(int64(0)),
+					},
+				}},
+			}, "containers[0].securityContext"),
+		Entry("a lifecycle hook, which runs a command with no image override at all",
+			&corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: proxyContainer,
+					Lifecycle: &corev1.Lifecycle{PostStart: &corev1.LifecycleHandler{
+						Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", "true"}},
+					}},
+				}},
+			}, "containers[0].lifecycle"),
+		Entry("the termination message as an exfiltration channel", &corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:                     proxyContainer,
+				TerminationMessagePath:   "/etc/pgelastic/proxy/proxy.toml",
+				TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+			}},
+		}, "containers[0].terminationMessagePath"),
+		Entry("envFrom naming any Secret in the namespace", &corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: proxyContainer,
+				EnvFrom: []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: fleetConfigSecret},
+				}}},
+			}},
+		}, "containers[0].envFrom"),
+		Entry("an env var sourced from a Secret rather than a literal", &corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: proxyContainer,
+				Env: []corev1.EnvVar{{Name: "STOLEN", ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: fleetConfigSecret},
+						Key:                  "proxy.toml",
+					},
+				}}},
+			}},
+		}, "containers[0].env[0].valueFrom"),
+		Entry("a mount of the configuration somewhere the process can be made to print it",
+			&corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:         proxyContainer,
+					VolumeMounts: []corev1.VolumeMount{{Name: "config", MountPath: "/tmp/loot"}},
+				}},
+			}, "containers[0].volumeMounts"),
 		Entry("an init container", &corev1.PodSpec{
 			InitContainers: []corev1.Container{{Name: "init", Image: "busybox"}},
 		}, "template.spec.initContainers"),
@@ -212,7 +284,7 @@ var _ = Describe("the proxy pod template escape hatch", Ordered, func() {
 			Volumes: []corev1.Volume{{
 				Name: "loot",
 				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{SecretName: "px-pool-proxy-config"},
+					Secret: &corev1.SecretVolumeSource{SecretName: fleetConfigSecret},
 				},
 			}},
 		}, "template.spec.volumes"),
@@ -224,13 +296,33 @@ var _ = Describe("the proxy pod template escape hatch", Ordered, func() {
 		}, "template.spec.hostNetwork"),
 	)
 
-	// The hatch exists for placement, and that half stays open.
+	// The hatch exists for placement, and that half stays open. The turn-it-off direction
+	// matters as much as the turn-it-on one: a refusal that also refuses sizing and probes
+	// would close the hatch entirely, which is how this rule was got wrong the first time.
 	It("admits the scheduling fields the hatch is for", func() {
 		mustCreate(poolWith(&corev1.PodSpec{
 			Containers:        patchesTheProxy,
 			NodeSelector:      map[string]string{"kubernetes.io/os": "linux"},
 			PriorityClassName: "system-cluster-critical",
 			Tolerations:       []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpExists}},
+		}))
+	})
+
+	It("admits sizing, probes and a literal environment variable on the proxy container", func() {
+		mustCreate(poolWith(&corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: proxyContainer,
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+				},
+				Env: []corev1.EnvVar{{Name: "RUST_LOG", Value: "debug"}},
+				ReadinessProbe: &corev1.Probe{
+					PeriodSeconds: 3,
+					ProbeHandler: corev1.ProbeHandler{
+						HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromInt32(9090)},
+					},
+				},
+			}},
 		}))
 	})
 })

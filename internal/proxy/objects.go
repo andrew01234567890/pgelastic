@@ -293,6 +293,7 @@ func (b Builder) podTemplate() (*corev1.PodTemplateSpec, error) {
 		if err != nil {
 			return nil, err
 		}
+		reassertProxyContainer(merged, b.container())
 		podSpec = merged
 	}
 
@@ -557,6 +558,64 @@ func mergePodSpec(generated *corev1.PodSpec, override *corev1.PodSpec) (*corev1.
 		return nil, fmt.Errorf("decoding the merged proxy pod spec: %w", err)
 	}
 	return result, nil
+}
+
+// reassertProxyContainer puts back the fields of the proxy container that decide what runs
+// in it, after the strategic merge has had its say.
+//
+// A strategic merge keys containers by name, so the entry the hatch exists for patches the
+// generated container - and for scalars inside a matched element, patching means replacing.
+// The container it patches is the one already carrying the rendered configuration, which
+// holds every tenant's password and backend SCRAM keys. So an image, a command, a lifecycle
+// hook or a termination message path chosen here is arbitrary code, or a copy of that file,
+// running beside those credentials.
+//
+// The webhook refuses all of this at admission. This is the half that still holds when the
+// webhook is not installed: `../webhook` is one line of kustomize, and a gate nobody can see
+// through is what this whole class of finding has been.
+//
+// Placement, scheduling, resources, probes and literal environment variables survive, which
+// is what the hatch is documented for.
+func reassertProxyContainer(spec *corev1.PodSpec, generated corev1.Container) {
+	for i := range spec.Containers {
+		if spec.Containers[i].Name != ContainerName {
+			continue
+		}
+		merged := &spec.Containers[i]
+		merged.Image = generated.Image
+		merged.ImagePullPolicy = generated.ImagePullPolicy
+		merged.Command = generated.Command
+		merged.Args = generated.Args
+		merged.WorkingDir = generated.WorkingDir
+		merged.EnvFrom = generated.EnvFrom
+		merged.VolumeMounts = generated.VolumeMounts
+		merged.VolumeDevices = generated.VolumeDevices
+		merged.Lifecycle = generated.Lifecycle
+		merged.SecurityContext = generated.SecurityContext
+		merged.TerminationMessagePath = generated.TerminationMessagePath
+		merged.TerminationMessagePolicy = generated.TerminationMessagePolicy
+		// A literal value is the documented use. valueFrom names any Secret in the namespace,
+		// which is the same reach the refused `volumes` list has - so the only valueFrom
+		// entries kept are the operator's own, which is where PGELASTIC_POD_NAME comes from.
+		ours := make(map[string]*corev1.EnvVarSource, len(generated.Env))
+		for _, env := range generated.Env {
+			if env.ValueFrom != nil {
+				ours[env.Name] = env.ValueFrom
+			}
+		}
+		kept := merged.Env[:0]
+		for _, env := range merged.Env {
+			if env.ValueFrom != nil {
+				source, mine := ours[env.Name]
+				if !mine {
+					continue
+				}
+				env.ValueFrom = source
+			}
+			kept = append(kept, env)
+		}
+		merged.Env = kept
+	}
 }
 
 // marshalOverride encodes the template's pod spec with its explicit nulls removed.

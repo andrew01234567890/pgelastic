@@ -626,6 +626,67 @@ var _ = Describe("the pool's inline proxy fleet", Ordered, func() {
 		}).WithTimeout(3 * time.Minute).Should(Succeed())
 	})
 
+	// The pod-template hatch patches the container the rendered configuration is mounted
+	// into, and that document carries every tenant's password and backend SCRAM keys. The
+	// webhook refuses this at admission; this asserts the half that still holds when the
+	// webhook is not installed, which is one line of kustomize away.
+	It("keeps the operator's image and command on the proxy container", func() {
+		operatorImage := func() (string, []string) {
+			GinkgoHelper()
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(suiteCtx, client.ObjectKey{
+				Namespace: e2eNamespace, Name: proxyobjects.DeploymentName(poolName),
+			}, deployment)).To(Succeed())
+			for _, container := range deployment.Spec.Template.Spec.Containers {
+				if container.Name == proxyobjects.ContainerName {
+					return container.Image, container.Command
+				}
+			}
+			Fail("the fleet Deployment carries no container named " + proxyobjects.ContainerName)
+			return "", nil
+		}
+		before, _ := operatorImage()
+		Expect(before).NotTo(BeEmpty())
+
+		Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fetched := &pgelasticv1alpha1.PgElasticPool{}
+			if err := k8sClient.Get(suiteCtx, client.ObjectKey{
+				Namespace: e2eNamespace, Name: poolName,
+			}, fetched); err != nil {
+				return err
+			}
+			fetched.Spec.Proxy.Template = &pgelasticv1alpha1.ProxyPodTemplate{
+				Spec: &corev1.PodSpec{Containers: []corev1.Container{{
+					Name:    proxyobjects.ContainerName,
+					Image:   "busybox:latest",
+					Command: []string{"sleep", "3600"},
+				}}},
+			}
+			return k8sClient.Update(suiteCtx, fetched)
+		})).To(Succeed())
+
+		Consistently(func(g Gomega) {
+			image, command := operatorImage()
+			g.Expect(image).To(Equal(before),
+				"the template replaced the proxy image, so an arbitrary process now runs "+
+					"with every tenant's credentials mounted")
+			g.Expect(command).To(BeEmpty(),
+				"the template replaced the proxy command: %v", command)
+		}).WithTimeout(30 * time.Second).WithPolling(3 * time.Second).Should(Succeed())
+
+		Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fetched := &pgelasticv1alpha1.PgElasticPool{}
+			if err := k8sClient.Get(suiteCtx, client.ObjectKey{
+				Namespace: e2eNamespace, Name: poolName,
+			}, fetched); err != nil {
+				return err
+			}
+			fetched.Spec.Proxy.Template = nil
+			return k8sClient.Update(suiteCtx, fetched)
+		})).To(Succeed())
+		awaitFleet(scaledReplicas)
+	})
+
 	// The whole point of splitting the document into a structural half and a dynamic one:
 	// a tenant's claim changing must reach every replica without any of them restarting,
 	// because a restart drops every client on the replica.
