@@ -186,6 +186,54 @@ jobs:
         if: always()
         run: make cleanup-test-e2e
 
+  # The proxy suite is the only gate on the connection proxy, which is the component that
+  # changes most and the one every client byte crosses. It used to run only in the nightly
+  # chaos job, so a whole milestone of relay work - deadlines, pinning, the idle reaper, the
+  # pool key - merged without it ever executing, and it was red for two days before anyone
+  # looked: on a push the chaos job's `if:` is false, so the run went green with the job
+  # reported as skipped. It runs in its own job rather than on the back of `make test-e2e`
+  # because the jobs run concurrently: the gate learns about the proxy without anything else
+  # waiting for it.
+  proxy:
+    if: github.event_name != 'schedule'
+    permissions:
+      contents: read
+    name: proxy e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KIND_CLUSTER: pgelastic-proxy
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl -fsSLo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-$(go env GOARCH)"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Create the kind cluster
+        run: make setup-test-e2e
+
+      - name: Run the proxy suite
+        run: make test-e2e-proxy E2E_CONTEXT="kind-${KIND_CLUSTER}"
+
+      - name: Tear down the kind cluster
+        if: always()
+        run: make cleanup-test-e2e
+
   chaos:
     if: github.event_name == 'schedule' || inputs.chaos
     permissions:
