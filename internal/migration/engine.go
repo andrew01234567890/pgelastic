@@ -337,6 +337,21 @@ func (e Engine) cutover(ctx context.Context, run Run, result *StepResult) error 
 		return errors.New("verification refused the cutover: " + verdict.Message())
 	}
 
+	// Before the fence, not after: fencing a tenant somebody else has already moved takes it
+	// offline on an instance this migration has no claim to, and there is nothing here that
+	// would undo it. An error rather than a silent skip, because a cutover that does not cut
+	// over must not go on to report CutoverComplete.
+	routed, err := e.Router.RoutedTo(ctx, run.Tenant)
+	if err != nil {
+		return err
+	}
+	if !ownsRouting(run, routed) {
+		return fmt.Errorf(
+			"the tenant is routed to %q, which is neither this migration's source %q nor its "+
+				"target %q, so another migration has moved it",
+			routed, run.Plan.Source.Instance, run.Plan.Target.Instance)
+	}
+
 	if err := FenceSource(ctx, e.SQL, run.Plan.Source); err != nil {
 		return err
 	}
@@ -414,7 +429,24 @@ func (e Engine) Apply(ctx context.Context, run Run, decision Decision) error {
 
 // restoreSource is the invariant made executable: whatever went wrong, the tenant ends up
 // reachable on the instance it started on, with its database admitting connections again.
+//
+// The unfence is unconditional, and that is the whole of one bug. Cutover fences the source
+// and then flips the routing, as two calls; the fence is a committed
+// `ALTER DATABASE ... ALLOW_CONNECTIONS false`, which admits nobody, superuser included. So
+// anything that interrupts the pair after the ALTER - the terminate failing, the routing
+// write failing, the process dying between them - leaves the tenant fenced with the routing
+// still naming the source. Gating the unfence on `routed != source` then reads that as
+// "nothing to undo" and returns, for ever. One predicate was deciding two independent
+// questions, and the fence is the effect that can outlive the flip that was meant to follow
+// it. Re-fencing a source that was never fenced is a no-op; not unfencing one that was is an
+// outage with no way out.
+//
+// The routing write stays gated, because Route is a status write and repeating it on every
+// poll would churn BoundAt and race the tenant controller.
 func (e Engine) restoreSource(ctx context.Context, run Run) error {
+	if err := UnfenceSource(ctx, e.SQL, run.Plan.Source); err != nil {
+		return fmt.Errorf("readmitting connections to the source: %w", err)
+	}
 	routed, err := e.Router.RoutedTo(ctx, run.Tenant)
 	if err != nil {
 		return err
@@ -422,8 +454,26 @@ func (e Engine) restoreSource(ctx context.Context, run Run) error {
 	if routed == run.Plan.Source.Instance {
 		return nil
 	}
-	if err := UnfenceSource(ctx, e.SQL, run.Plan.Source); err != nil {
-		return fmt.Errorf("readmitting connections to the source: %w", err)
+	if !ownsRouting(run, routed) {
+		return nil
 	}
 	return e.Router.Route(ctx, run.Tenant, run.Plan.Source.Instance)
+}
+
+// ownsRouting reports whether this migration may still write the tenant's binding.
+//
+// A tenant standing on an instance that is neither this migration's source nor its target has
+// been moved by somebody else, and nothing stops two migrations of one tenant being active at
+// once: sourceInstanceRef is frozen when each is admitted, and there is no migration webhook.
+// So A→B can complete and commit writes on B while A→C is still in flight; when A→C settles,
+// its terminal decision serves from the source it captured, and Route overwrites the binding
+// with no expected-current precondition. The tenant is then pointed at A, which stopped being
+// current the moment B took its first write - stale data, silently.
+//
+// Asked at both write sites, because closing only the backward flip leaves the forward one
+// able to do the same thing in the other direction.
+func ownsRouting(run Run, routed string) bool {
+	return routed == "" ||
+		routed == run.Plan.Source.Instance ||
+		routed == run.Plan.Target.Instance
 }

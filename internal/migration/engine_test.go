@@ -443,3 +443,76 @@ func TestAnEmptyAnswerIsNotAnAbsentOne(t *testing.T) {
 		t.Fatalf("two rows parsed as %#v", rows)
 	}
 }
+
+// A cutover fences the source and then flips the routing, as two calls. If the flip never
+// lands, the tenant is left on a source that admits nobody - ALLOW_CONNECTIONS false refuses
+// the superuser too - and the routing still names it. Gating the unfence on the routing
+// having moved reads that state as "nothing to undo" and returns, on every retry, for ever.
+func TestASourceFencedWithoutTheFlipIsReadmitted(t *testing.T) {
+	sql := runningSQL().scalarAnswer("FROM pg_subscription WHERE subname", "1")
+	router := &fakeRouter{routed: sourceInstance, quiesced: true}
+	run := testRun(cutover, online)
+	run.AbortRequested = true
+	engine := testEngine(sql, router, &fakeShell{})
+
+	step := engine.Step(context.Background(), run)
+	if err := engine.Apply(context.Background(), run, Decide(cutover, step.Observation)); err != nil {
+		t.Fatal(err)
+	}
+
+	if sql.ran("ALLOW_CONNECTIONS true") < 0 {
+		t.Fatal("the source was left refusing every connection, including the superuser's, " +
+			"because the routing had not moved and the unfence was gated on that")
+	}
+	if router.routed != sourceInstance {
+		t.Fatalf("the tenant ended up routed to %q", router.routed)
+	}
+}
+
+// Nothing stops two migrations of one tenant being active at once. A→B can complete and take
+// writes on B while A→C is still in flight; when A→C settles, its terminal decision serves
+// from the source it captured and would overwrite the binding with A.
+func TestAMigrationDoesNotRerouteATenantSomebodyElseHasMoved(t *testing.T) {
+	const elsewhere = "pg-elsewhere"
+	sql := runningSQL().scalarAnswer("FROM pg_subscription WHERE subname", "1")
+	router := &fakeRouter{routed: elsewhere, quiesced: true}
+	run := testRun(cutover, online)
+	run.AbortRequested = true
+	engine := testEngine(sql, router, &fakeShell{})
+
+	step := engine.Step(context.Background(), run)
+	if err := engine.Apply(context.Background(), run, Decide(cutover, step.Observation)); err != nil {
+		t.Fatal(err)
+	}
+
+	if router.routed != elsewhere {
+		t.Fatalf("a settled migration routed the tenant back to %q, which stopped being "+
+			"current the moment another migration took a write on %q", router.routed, elsewhere)
+	}
+	if sql.ran("ALLOW_CONNECTIONS true") < 0 {
+		t.Fatal("the source was left fenced; the unfence is this migration's own to undo " +
+			"whoever the tenant is routed to now")
+	}
+}
+
+// The mirror of the test above. Closing only the backward flip leaves the forward one able to
+// fence and take offline an instance this migration has no claim to any more.
+func TestACutoverRefusesToFenceATenantSomebodyElseHasMoved(t *testing.T) {
+	const elsewhere = "pg-elsewhere"
+	sql := runningSQL().scalarAnswer("FROM pg_subscription WHERE subname", "1")
+	router := &fakeRouter{routed: elsewhere}
+	engine := testEngine(sql, router, &fakeShell{})
+
+	err := engine.cutover(context.Background(), testRun(cutover, online), &StepResult{})
+
+	if err == nil {
+		t.Fatal("the cutover fenced and reflagged a tenant another migration had moved")
+	}
+	if sql.ran("ALLOW_CONNECTIONS false") >= 0 {
+		t.Fatal("the source was fenced before the ownership of the routing was checked, so " +
+			"the refusal left an instance offline that this migration does not own")
+	}
+	if router.routed != elsewhere {
+		t.Fatalf("the cutover flipped the routing to %q anyway", router.routed)
+	}
+}
