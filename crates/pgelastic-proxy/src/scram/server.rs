@@ -8,6 +8,9 @@ use super::message::{
 };
 use super::verifier::ScramVerifier;
 
+/// The longest client nonce the exchange will carry. libpq sends 24 characters.
+const MAX_CLIENT_NONCE: usize = 256;
+
 /// How a completed exchange ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScramOutcome {
@@ -54,6 +57,14 @@ impl ScramServer {
         let text =
             std::str::from_utf8(client_first).map_err(|_| ScramError::Malformed("not UTF-8"))?;
         let parsed = ClientFirst::parse(text)?;
+        // The client's nonce is echoed into the combined nonce, into server-first, and kept in
+        // the state until the exchange finishes - so an unauthenticated peer that sends a long
+        // one has the proxy hold several copies of it, per connection, before proving anything.
+        // libpq sends 24 characters; PostgreSQL refuses an authentication token over 10 000
+        // bytes outright. Refusing here bounds the exchange rather than the connection.
+        if parsed.nonce.len() > MAX_CLIENT_NONCE {
+            return Err(ScramError::Malformed("client nonce is too long"));
+        }
 
         let nonce = format!("{}{}", parsed.nonce, self.server_nonce);
         let server_first =
@@ -134,6 +145,25 @@ mod tests {
 
     fn iterations() -> NonZeroU32 {
         NonZeroU32::new(DEFAULT_ITERATIONS).unwrap()
+    }
+
+    // The client's nonce is echoed into the combined nonce, into server-first, and held in
+    // the state until the exchange ends, so an unauthenticated peer sending a long one has the
+    // proxy hold several copies of it per connection before proving anything at all.
+    #[test]
+    fn a_client_nonce_longer_than_any_client_sends_is_refused() {
+        let verifier = ScramVerifier::generate("hunter2").unwrap();
+        let mut server = ScramServer::new(verifier, "server-nonce-xyz".to_owned());
+        let nonce = "a".repeat(MAX_CLIENT_NONCE + 1);
+        let client_first = format!("n,,n=user,r={nonce}");
+
+        let refused = server.server_first(client_first.as_bytes());
+
+        assert!(
+            matches!(refused, Err(ScramError::Malformed(_))),
+            "a {} byte nonce was accepted: {refused:?}",
+            nonce.len()
+        );
     }
 
     fn exchange(verifier: ScramVerifier, password: &str) -> Result<ScramOutcome, ScramError> {

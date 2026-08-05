@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use harness::{BACKEND_DATABASE, config_for, stack, start_postgres, start_proxy};
+use harness::{
+    BACKEND_DATABASE, config_for, config_for_listener, stack, start_postgres, start_proxy,
+};
 use pgelastic_wire::startup::{encode_gssenc_request, encode_ssl_request};
 use pgelastic_wire::{
     BackendMessage, MessageBuffer, ProtocolVersion, StartupMessage, TransactionStatus,
@@ -609,5 +611,44 @@ async fn both_legs_can_be_encrypted_at_once() {
             .await
             .unwrap()
             .get::<_, bool>(0)
+    );
+}
+
+// The login deadline used to cover only the pre-startup negotiation. Everything after it -
+// the protocol-version exchange and the whole SCRAM round trip - read from a peer that had
+// proved nothing, with no bound at all, while holding one of listen.maxClientConnections. A
+// client that sent a well-formed startup packet and then simply stopped writing kept that
+// permit for as long as it liked, and enough of them shut the listener to everybody.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_stalls_before_answering_the_password_challenge_is_cut_loose() {
+    let pg = start_postgres().await;
+    let proxy = start_proxy(&config_for_listener(
+        &pg,
+        "clientLoginSeconds = 1",
+        &scram_users(),
+    ))
+    .await;
+
+    let mut socket = TcpStream::connect(proxy.address()).await.unwrap();
+    socket.write_all(&startup_packet("tenant")).await.unwrap();
+    socket.flush().await.unwrap();
+
+    // The proxy answers with its SCRAM challenge. We never reply to it.
+    let mut challenge = [0_u8; 1];
+    let _ = socket.read(&mut challenge).await;
+
+    let started = Instant::now();
+    let mut drain = Vec::new();
+    let closed =
+        tokio::time::timeout(Duration::from_secs(20), socket.read_to_end(&mut drain)).await;
+
+    assert!(
+        closed.is_ok(),
+        "the proxy still held the connection 20s after a 1s login deadline, so an \
+         unauthenticated peer holds its permit for as long as it likes"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "closed only at the test's own deadline"
     );
 }
