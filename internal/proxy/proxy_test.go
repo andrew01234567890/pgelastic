@@ -456,6 +456,43 @@ func TestAPoolMayTurnSessionAffinityOff(t *testing.T) {
 	}
 }
 
+// A parked link is a backend PostgreSQL holds open for nobody. The pool opened them on demand
+// and gave none back, so an estate's connection count only ever ratcheted to its busiest minute.
+func TestTheServerIdleTimeoutReachesTheProxyAndDoesNotRollTheFleet(t *testing.T) {
+	before := testConfig().Render()
+	if !strings.Contains(before.TOML, "serverIdleTimeoutSeconds = 600") {
+		t.Fatalf("an unset spec.pooling.serverIdleTimeout rendered something other than its "+
+			"own CRD default:\n%s", before.TOML)
+	}
+
+	config := testConfig()
+	config.Pool.Spec.Pooling = &pgelasticv1alpha1.PoolingConfig{
+		ServerIdleTimeout: &metav1.Duration{Duration: 90 * time.Second},
+	}
+	after := config.Render()
+
+	if !strings.Contains(after.TOML, "serverIdleTimeoutSeconds = 90") {
+		t.Fatalf("the idle timeout never reached the proxy:\n%s", after.TOML)
+	}
+	if before.StructuralHash != after.StructuralHash {
+		t.Fatalf("changing how long an idle link is kept moved the pod template hash from %q "+
+			"to %q", before.StructuralHash, after.StructuralHash)
+	}
+}
+
+// A pool that would rather keep every link it has ever opened says so with zero.
+func TestAZeroServerIdleTimeoutKeepsEveryLink(t *testing.T) {
+	config := testConfig()
+	config.Pool.Spec.Pooling = &pgelasticv1alpha1.PoolingConfig{
+		ServerIdleTimeout: &metav1.Duration{},
+	}
+
+	document := config.Render().TOML
+	if !strings.Contains(document, "serverIdleTimeoutSeconds = 0") {
+		t.Fatalf("an explicit zero was folded into the default:\n%s", document)
+	}
+}
+
 func TestAddingAnInstanceRollsTheFleet(t *testing.T) {
 	before := testConfig().Render()
 

@@ -327,6 +327,13 @@ pub async fn spawn(proxy: Arc<Proxy>, shutdown: watch::Sender<bool>) -> Result<R
     let receiver = shutdown.subscribe();
     let push_address = spawn_fence_paths(&proxy, &shutdown).await?;
     let control_address = spawn_availability_paths(&proxy, &shutdown).await?;
+    // Part of a running proxy rather than of the binary that starts one: the
+    // reaper is a property of the fleet, and a fleet started any other way - by a
+    // test, say - would otherwise never give a parked link back.
+    tokio::spawn(crate::pool::reap_loop(
+        Arc::clone(&proxy.fleet),
+        shutdown.subscribe(),
+    ));
     let accept = tokio::spawn(accept_loop(proxy, listener, receiver, alive));
 
     info!(%address, "proxy listening");
