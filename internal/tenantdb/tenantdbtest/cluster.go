@@ -31,6 +31,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,11 +49,12 @@ type database struct {
 // Cluster answers the SQL port with the catalog it holds. The zero value is not usable;
 // build one with NewCluster.
 type Cluster struct {
-	mutex     sync.Mutex
-	roles     map[string]int32
-	databases map[string]*database
-	failures  map[string]error
-	nextOID   int64
+	mutex      sync.Mutex
+	roles      map[string]int32
+	roleConfig map[string]map[string]string
+	databases  map[string]*database
+	failures   map[string]error
+	nextOID    int64
 
 	// concealed hides objects from the next catalog read only. It is how a spec produces
 	// the one race that cannot be closed in SQL: a read that says absent, followed by a
@@ -137,6 +139,34 @@ func (c *Cluster) HasRole(name string) bool {
 	defer c.mutex.Unlock()
 	_, ok := c.roles[name]
 	return ok
+}
+
+// RoleSetting is what ALTER ROLE ... SET left in the role's rolconfig, or the empty string.
+func (c *Cluster) RoleSetting(role, name string) string {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.roleConfig[role][strings.ToLower(name)]
+}
+
+// renderRoleConfig spells rolconfig the way array_to_string does, in a stable order.
+func (c *Cluster) renderRoleConfig(role string) string {
+	settings := c.roleConfig[role]
+	if len(settings) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(settings))
+	for name := range settings {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	lines := make([]string, 0, len(names))
+	for _, name := range names {
+		lines = append(lines, name+"="+settings[name])
+	}
+	// The separator the real projection uses, and deliberately not a newline: the transport
+	// splits rows on a newline, so a fake that joined with one would agree with an
+	// implementation that could never read its own answer back.
+	return strings.Join(lines, "\x1e")
 }
 
 // ConnectionLimit is the role's rolconnlimit, or zero if there is no such role.
@@ -263,6 +293,11 @@ func (c *Cluster) createDatabase(names []string) error {
 
 var connectionLimitPattern = regexp.MustCompile(`CONNECTION LIMIT (-?\d+)`)
 
+// roleSettingPattern matches the ALTER ROLE ... SET the tier-2 limits are applied with. The
+// value is a quoted literal, and PostgreSQL doubles an embedded quote, so the capture stops at
+// the first unescaped one.
+var roleSettingPattern = regexp.MustCompile(`SET ([a-zA-Z_][a-zA-Z0-9_]*) = '([^']*)'`)
+
 func (c *Cluster) alterRole(statement string, names []string) error {
 	if len(names) != 1 {
 		return fmt.Errorf(`syntax error at or near "%s"`, statement)
@@ -274,6 +309,18 @@ func (c *Cluster) alterRole(statement string, names []string) error {
 	// only what it was handed; whether PostgreSQL accepts the form, and whether the proxy can
 	// then authenticate against it, is a question for a real postmaster.
 	if strings.Contains(statement, " PASSWORD ") {
+		return nil
+	}
+	// ALTER ROLE ... SET <guc> = '<value>' lands in rolconfig, which is a different column
+	// from rolconnlimit and is read back as a "name=value" list.
+	if set := roleSettingPattern.FindStringSubmatch(statement); set != nil {
+		if c.roleConfig == nil {
+			c.roleConfig = map[string]map[string]string{}
+		}
+		if c.roleConfig[names[0]] == nil {
+			c.roleConfig[names[0]] = map[string]string{}
+		}
+		c.roleConfig[names[0]][strings.ToLower(set[1])] = set[2]
 		return nil
 	}
 	match := connectionLimitPattern.FindStringSubmatch(statement)
@@ -332,9 +379,10 @@ func (c *Cluster) observe(statement string) ([]migration.Row, error) {
 		return nil, fmt.Errorf("no fake answer for %q", statement)
 	}
 
-	roles, limit := "0", "-1"
+	roles, limit, config := "0", "-1", ""
 	if held, ok := c.roles[role[1]]; ok && !c.concealed[role[1]] {
 		roles, limit = "1", strconv.FormatInt(int64(held), 10)
+		config = c.renderRoleConfig(role[1])
 	}
 	// datallowconn comes back as the "1"/"0" the query casts it to, not as psql's displayed
 	// "t"/"f": a fake that answered in the displayed spelling would agree with a client that
@@ -347,7 +395,7 @@ func (c *Cluster) observe(statement string) ([]migration.Row, error) {
 		}
 	}
 	clear(c.concealed)
-	return []migration.Row{{roles, oid, allowsConn, limit}}, nil
+	return []migration.Row{{roles, oid, allowsConn, limit, config}}, nil
 }
 
 func (c *Cluster) matchFailure(statement string) error {

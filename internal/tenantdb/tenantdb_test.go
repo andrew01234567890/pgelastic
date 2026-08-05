@@ -40,6 +40,12 @@ func spec() tenantdb.Spec {
 	return tenantdb.Spec{Database: tenantDatabase, Owner: tenantRole, ConnectionLimit: 60}
 }
 
+// The tier-2 limits as PostgreSQL spells them, which is what the role carries.
+const (
+	thirtySeconds = "30000ms"
+	oneGigabyte   = "1048576kB"
+)
+
 func TestProvisioningCreatesTheRoleBeforeTheDatabaseThatIsOwnedByIt(t *testing.T) {
 	cluster := tenantdbtest.NewCluster()
 
@@ -158,6 +164,61 @@ func TestTheConnectionLimitMirrorsTheTenantsCeilingAndIsNotReappliedOnceItMatche
 	}
 	if limit := cluster.ConnectionLimit(tenantRole); limit != 90 {
 		t.Fatalf("a raised ceiling left the role at %d", limit)
+	}
+}
+
+// spec.limits.statementTimeout and spec.limits.tempFileLimit were resolved by
+// policy.EffectiveFor and published in status.effective, and applied by nothing. The one place
+// proxy.Tenant is built dropped them, and no ALTER ROLE SET existed anywhere.
+func TestTheTierTwoLimitsReachTheRoleAndAreNotReappliedOnceTheyMatch(t *testing.T) {
+	cluster := tenantdbtest.NewCluster()
+	ctx := context.Background()
+
+	limited := spec()
+	limited.StatementTimeout = thirtySeconds
+	limited.TempFileLimit = oneGigabyte
+	if _, err := tenantdb.Ensure(ctx, cluster, endpoint(), limited); err != nil {
+		t.Fatalf("provisioning failed: %v", err)
+	}
+	if got := cluster.RoleSetting(tenantRole, "statement_timeout"); got != thirtySeconds {
+		t.Fatalf("the role carries statement_timeout %q", got)
+	}
+	if got := cluster.RoleSetting(tenantRole, "temp_file_limit"); got != oneGigabyte {
+		t.Fatalf("the role carries temp_file_limit %q", got)
+	}
+
+	cluster.Forget()
+	if _, err := tenantdb.Ensure(ctx, cluster, endpoint(), limited); err != nil {
+		t.Fatalf("the second pass failed: %v", err)
+	}
+	if cluster.Ran("SET statement_timeout") != 0 || cluster.Ran("SET temp_file_limit") != 0 {
+		t.Fatal("an unchanged limit was reapplied, so every reconcile writes to the catalog")
+	}
+
+	raised := limited
+	raised.StatementTimeout = "60000ms"
+	if _, err := tenantdb.Ensure(ctx, cluster, endpoint(), raised); err != nil {
+		t.Fatalf("raising the timeout failed: %v", err)
+	}
+	if got := cluster.RoleSetting(tenantRole, "statement_timeout"); got != "60000ms" {
+		t.Fatalf("a raised timeout left the role at %q", got)
+	}
+}
+
+// A class that declares no statement timeout is not a class that overrides whatever the
+// instance sets. Only one that declared a value and then removed it would be, and that is a
+// change worth making explicit rather than inferring from an absence.
+func TestAnUndeclaredLimitLeavesTheParameterAlone(t *testing.T) {
+	cluster := tenantdbtest.NewCluster()
+
+	if _, err := tenantdb.Ensure(context.Background(), cluster, endpoint(), spec()); err != nil {
+		t.Fatalf("provisioning failed: %v", err)
+	}
+	if cluster.Ran("ALTER ROLE") == 0 {
+		t.Fatal("the fixture should still have applied a connection limit")
+	}
+	if cluster.Ran("SET statement_timeout") != 0 || cluster.Ran("SET temp_file_limit") != 0 {
+		t.Fatal("a tenant that declared no tier-2 limit had one written to its role")
 	}
 }
 
@@ -304,5 +365,27 @@ func TestTheTenantRoleIsCreatedWithNoPrivilegedAttribute(t *testing.T) {
 		if !strings.Contains(create, want) {
 			t.Fatalf("the tenant role was created without %s: %s", want, create)
 		}
+	}
+}
+
+// The fake returns already-structured rows, so it cannot by itself catch a projection whose
+// text the real transport mis-splits. This asserts the property the transport actually needs:
+// whatever separator the query joins rolconfig with must survive migration.parseRows, which
+// splits rows on a newline and columns on \x1f.
+//
+// The first version of this feature joined with a newline. A role carrying two settings then
+// came back as two rows, Observe rejected the answer, and because rolconfig is durable and the
+// failure happens before anything could undo it, the tenant failed every reconcile afterwards.
+func TestTheRoleConfigProjectionSurvivesTheTransportsRowSplitting(t *testing.T) {
+	joined := tenantdb.RoleConfigSeparator
+	if strings.ContainsAny(joined, "\n\x1f") {
+		t.Fatalf("rolconfig is joined with %q, which the transport reads as a row or column "+
+			"break, so a role with two settings is unreadable", joined)
+	}
+
+	settings := tenantdb.ParseRoleConfig(
+		"statement_timeout=" + thirtySeconds + joined + "temp_file_limit=" + oneGigabyte)
+	if settings["statement_timeout"] != thirtySeconds || settings["temp_file_limit"] != oneGigabyte {
+		t.Fatalf("two settings did not round-trip: %v", settings)
 	}
 }

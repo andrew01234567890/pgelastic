@@ -96,6 +96,58 @@ type Spec struct {
 	// Readers are the tenant's other roles that must be able to reach the database. The owner
 	// is always granted; this is everything else.
 	Readers []string
+	// StatementTimeout and TempFileLimit are the tenant's tier-2 limits, applied to the role
+	// with ALTER ROLE ... SET so they are the session-start value of every backend opened as
+	// it. Empty leaves the parameter alone rather than resetting it, because a class that
+	// declares no limit is not a class that overrides the instance's.
+	//
+	// Advisory by construction, and the CRD says so: a client may SET them back, and a
+	// startup parameter outranks ALTER ROLE outright - PGC_S_CLIENT beats PGC_S_DATABASE_USER,
+	// and it is the value DISCARD ALL restores. spec.pooling.startupParameterPolicy: Reject is
+	// what closes that, and until an operator sets it these bound only the clients that do not
+	// try.
+	StatementTimeout string
+	TempFileLimit    string
+}
+
+// roleSettings is the tier-2 limits as GUC name and value, in a fixed order so two passes
+// over one spec issue the same statements.
+func (s Spec) roleSettings() []struct{ Name, Value string } {
+	return []struct{ Name, Value string }{
+		{"statement_timeout", s.StatementTimeout},
+		{"temp_file_limit", s.TempFileLimit},
+	}
+}
+
+// roleConfigSeparator joins rolconfig's entries in the projection above.
+//
+// ASCII record separator, and NOT a newline. The transport is psql --tuples-only --no-align,
+// which splits *rows* on a newline and columns on \x1f, so a value carrying a newline is read
+// back as a second row - and Observe, seeing two rows where it demands one, rejects the answer.
+// A role with two settings would have failed every reconcile from the moment the second was
+// applied, permanently, because rolconfig is durable and the failure happens before anything
+// could undo it.
+// RoleConfigSeparator is exported so a test can assert the transport can carry it.
+const RoleConfigSeparator = "\x1e"
+
+// parseRoleConfig turns pg_roles.rolconfig - a list of "name=value" strings - into a map.
+//
+// A value may itself contain an equals sign, so the split is on the first one only.
+// ParseRoleConfig is exported for the same reason RoleConfigSeparator is.
+func ParseRoleConfig(raw string) map[string]string {
+	settings := map[string]string{}
+	for line := range strings.SplitSeq(raw, RoleConfigSeparator) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		settings[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
+	}
+	return settings
 }
 
 // State is what the catalog currently says about a tenant's objects.
@@ -111,6 +163,8 @@ type State struct {
 	AllowsConnections bool
 	// ConnectionLimit is the role's rolconnlimit as PostgreSQL currently holds it.
 	ConnectionLimit int32
+	// RoleSettings is pg_roles.rolconfig as a map, which is where ALTER ROLE ... SET lands.
+	RoleSettings map[string]string
 }
 
 // Serving reports whether both objects exist and the database admits connections.
@@ -166,6 +220,10 @@ func Ensure(ctx context.Context, sql SQL, at Endpoint, spec Spec) (State, error)
 			return State{}, err
 		}
 	}
+	if err := ensureRoleSettings(ctx, sql, postgres, spec, &state); err != nil {
+		return state, err
+	}
+
 	if state.ConnectionLimit != spec.ConnectionLimit {
 		if err := sql.Exec(ctx, postgres, fmt.Sprintf(`ALTER ROLE %s CONNECTION LIMIT %d`,
 			migration.QuoteIdentifier(spec.Owner), spec.ConnectionLimit)); err != nil {
@@ -178,6 +236,42 @@ func Ensure(ctx context.Context, sql SQL, at Endpoint, spec Spec) (State, error)
 		return state, fmt.Errorf("%w: %s", ErrNotServing, state.describe(spec))
 	}
 	return state, connectable(ctx, sql, at, spec)
+}
+
+// ensureRoleSettings brings the tenant's tier-2 limits onto its role.
+//
+// ALTER ROLE ... SET rather than a parameter on the instance: these are per tenant, and the
+// value has to be the session-start value of every backend opened as this role so that a
+// RESET or a DISCARD ALL lands back on it rather than on the instance's.
+//
+// An empty limit leaves the parameter alone rather than issuing RESET. A class that declares
+// no statement timeout is not a class that overrides whatever the instance sets; only one that
+// declared a value and then removed it would be, and that is a change worth making explicit
+// rather than inferring from an absence.
+func ensureRoleSettings(
+	ctx context.Context,
+	sql SQL,
+	postgres Endpoint,
+	spec Spec,
+	state *State,
+) error {
+	for _, setting := range spec.roleSettings() {
+		if setting.Value == "" || state.RoleSettings[setting.Name] == setting.Value {
+			continue
+		}
+		// The name is a compile-time constant from roleSettings and never client text; the
+		// value is a quoted literal, which is what PostgreSQL accepts here for both of these.
+		if err := sql.Exec(ctx, postgres, fmt.Sprintf(`ALTER ROLE %s SET %s = %s`,
+			migration.QuoteIdentifier(spec.Owner), setting.Name,
+			migration.QuoteLiteral(setting.Value))); err != nil {
+			return fmt.Errorf("setting %s on role %q: %w", setting.Name, spec.Owner, err)
+		}
+		if state.RoleSettings == nil {
+			state.RoleSettings = map[string]string{}
+		}
+		state.RoleSettings[setting.Name] = setting.Value
+	}
+	return nil
 }
 
 // ErrNotServing reports objects that the catalog does not agree exist and admit
@@ -222,7 +316,8 @@ func Drop(ctx context.Context, sql SQL, at Endpoint, spec Spec) error {
 const observeQuery = `SELECT (SELECT count(*)::text FROM pg_roles WHERE rolname = %[1]s),
  coalesce((SELECT d.oid::text FROM pg_database d WHERE d.datname = %[2]s), '0'),
  coalesce((SELECT d.datallowconn::int::text FROM pg_database d WHERE d.datname = %[2]s), '0'),
- coalesce((SELECT r.rolconnlimit::text FROM pg_roles r WHERE r.rolname = %[1]s), '-1')`
+ coalesce((SELECT r.rolconnlimit::text FROM pg_roles r WHERE r.rolname = %[1]s), '-1'),
+ coalesce((SELECT array_to_string(r.rolconfig, e'\x1e') FROM pg_roles r WHERE r.rolname = %[1]s), '')`
 
 // Observe reads the tenant's objects out of the catalog. The endpoint is expected to name
 // a maintenance database; pg_roles is shared, and pg_database has to be readable when the
@@ -233,7 +328,7 @@ func Observe(ctx context.Context, sql SQL, at Endpoint, spec Spec) (State, error
 	if err != nil {
 		return State{}, fmt.Errorf("reading the catalog on %s/%s: %w", at.Namespace, at.Instance, err)
 	}
-	if len(rows) != 1 || len(rows[0]) != 4 {
+	if len(rows) != 1 || len(rows[0]) != 5 {
 		return State{}, fmt.Errorf("unreadable catalog answer for database %q: %v", spec.Database, rows)
 	}
 
@@ -254,6 +349,7 @@ func Observe(ctx context.Context, sql SQL, at Endpoint, spec Spec) (State, error
 		DatabaseOID:       oid,
 		AllowsConnections: strings.TrimSpace(rows[0][2]) == "1",
 		ConnectionLimit:   int32(limit),
+		RoleSettings:      ParseRoleConfig(rows[0][4]),
 	}, nil
 }
 
