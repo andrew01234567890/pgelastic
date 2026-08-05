@@ -713,6 +713,7 @@ var _ = Describe("the pool's inline proxy fleet", Ordered, func() {
 		}
 		before, _ := operatorImage()
 		Expect(before).NotTo(BeEmpty())
+		podsBefore := proxyPodUIDs()
 
 		Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			fetched := &pgelasticv1alpha1.PgElasticPool{}
@@ -731,9 +732,7 @@ var _ = Describe("the pool's inline proxy fleet", Ordered, func() {
 			return k8sClient.Update(suiteCtx, fetched)
 		})).To(Succeed())
 
-		var patched map[string]types.UID
 		Consistently(func(g Gomega) {
-			patched = proxyPodUIDs()
 			image, command := operatorImage()
 			g.Expect(image).To(Equal(before),
 				"the template replaced the proxy image, so an arbitrary process now runs "+
@@ -741,6 +740,12 @@ var _ = Describe("the pool's inline proxy fleet", Ordered, func() {
 			g.Expect(command).To(BeEmpty(),
 				"the template replaced the proxy command: %v", command)
 		}).WithTimeout(30 * time.Second).WithPolling(3 * time.Second).Should(Succeed())
+
+		// And nothing rolled. A template that names only fields the operator re-asserts
+		// produces the pod spec the fleet is already running, so the pod-template hash does
+		// not move - which is why this spec can set and clear it without dropping a client.
+		Expect(proxyPodUIDs()).To(Equal(podsBefore),
+			"a refused template still recreated the fleet, so every client on it was dropped")
 
 		Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			fetched := &pgelasticv1alpha1.PgElasticPool{}
@@ -752,13 +757,6 @@ var _ = Describe("the pool's inline proxy fleet", Ordered, func() {
 			fetched.Spec.Proxy.Template = nil
 			return k8sClient.Update(suiteCtx, fetched)
 		})).To(Succeed())
-		// The template is structural, so both the patch and its removal roll the fleet.
-		// awaitFleet alone would race the Deployment controller: until it has observed the
-		// new generation, ObservedGeneration still equals the old Generation and the fleet
-		// reads as settled when it has not started. So wait for the pod set to turn over
-		// first. This spec runs last in the container for the same reason.
-		Eventually(proxyPodUIDs).WithTimeout(fleetReadyTimeout).
-			WithPolling(2 * time.Second).ShouldNot(Equal(patched))
 		awaitFleet(scaledReplicas)
 	})
 
