@@ -421,7 +421,9 @@ mod tests {
 
         assert!(matches!(
             reaction,
-            Err(OutstandingError::Underflow { message: "ReadyForQuery" })
+            Err(OutstandingError::Underflow {
+                message: "ReadyForQuery"
+            })
         ));
     }
 
