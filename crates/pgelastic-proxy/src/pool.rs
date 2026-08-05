@@ -826,6 +826,13 @@ impl PoolManager {
 
         loop {
             tokio::select! {
+                // The waiter first, and this is the tree's convention for every long-lived
+                // select! for a reason. Without it tokio polls from a random index, so a grant
+                // already delivered into the channel loses a coin toss to a deadline that
+                // became ready in the same tick - and the Grant is dropped with the receiver.
+                // `Lease` has no `Drop`, so nothing hands the capacity back at that instant.
+                biased;
+
                 grant = &mut waiter => {
                     ticket.settled = true;
                     self.metrics.admission_dequeued();
@@ -848,6 +855,15 @@ impl PoolManager {
                     .await;
                 }
                 () = &mut deadline => {
+                    // `biased;` decides who wins a poll at which both are ready. It says
+                    // nothing about a hand-off that lands after the deadline arm has
+                    // legitimately won, so the arm has to look before it refuses.
+                    if let Some(grant) = waiter.take_delivered() {
+                        ticket.settled = true;
+                        self.metrics.admission_dequeued();
+                        Self::record_wait("granted", started.elapsed());
+                        return Ok(grant);
+                    }
                     let reason = DenialReason::AdmissionTimeout {
                         tenant: request.tenant.clone(),
                         waited: started.elapsed(),

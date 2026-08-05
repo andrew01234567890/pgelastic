@@ -198,6 +198,26 @@ pub struct Waiter<T> {
     settled: bool,
 }
 
+impl<T> Waiter<T> {
+    /// Takes a value already handed off, and closes the channel so no later one is lost.
+    ///
+    /// `hand_off` pops the queue slot under the lock and sends after releasing it, so there is
+    /// a window in which the slot is gone and the send has not happened yet. Closing the
+    /// receiver first makes any such later send fail, which `hand_off` already treats as a
+    /// waiter that went away and passes the value to the next one. Without the close this
+    /// would still drop a grant, one instant further on.
+    pub fn take_delivered(&mut self) -> Option<T> {
+        self.receiver.close();
+        match self.receiver.try_recv() {
+            Ok(value) => {
+                self.settled = true;
+                Some(value)
+            }
+            Err(_) => None,
+        }
+    }
+}
+
 impl<T> fmt::Debug for Waiter<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Waiter")
@@ -265,6 +285,43 @@ mod tests {
         assert_eq!(first.await.unwrap(), 7);
         assert_eq!(queue.len(), 1);
         drop(second);
+    }
+
+    // The admission select! races the waiter against a deadline. If a hand-off has already
+    // put a Grant in the channel and the deadline arm wins, the value goes with the receiver -
+    // and `Lease` has no `Drop`, so nothing returns the capacity at that instant. The deadline
+    // arm has to look before it refuses.
+    #[tokio::test]
+    async fn a_value_already_handed_off_can_be_taken_by_the_loser_of_the_race() {
+        let queue = WaitQueue::new();
+        let mut waiter = queue.enqueue(Priority::Normal, Instant::now()).unwrap();
+
+        queue.hand_off(9u32).unwrap();
+
+        assert_eq!(waiter.take_delivered(), Some(9));
+        assert_eq!(waiter.take_delivered(), None);
+    }
+
+    // Closing the receiver is the load-bearing half. `hand_off` pops the slot under the lock
+    // and sends after releasing it, so a send can still be in flight; a closed channel makes
+    // that send fail, which `hand_off` already reads as a waiter that went away and passes the
+    // value to the next one instead of dropping it.
+    #[tokio::test]
+    async fn a_hand_off_after_the_take_reaches_the_next_waiter() {
+        let queue = WaitQueue::new();
+        let now = Instant::now();
+        let mut first = queue.enqueue(Priority::Normal, now).unwrap();
+        let second = queue.enqueue(Priority::Normal, now).unwrap();
+
+        assert_eq!(first.take_delivered(), None);
+        queue.hand_off(4u32).unwrap();
+
+        // Bounded, because the failure this catches is a hand-off into a slot nobody is
+        // reading - which without a deadline is a hang rather than a red test.
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("the value went to a waiter that had already given up its slot");
+        assert_eq!(delivered.unwrap(), 4);
     }
 
     #[tokio::test]

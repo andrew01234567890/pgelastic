@@ -406,6 +406,24 @@ impl ServerLink {
         }
     }
 
+    /// Records a client request whose frame was too large to decode.
+    ///
+    /// The relay streams a frame over its inline limit straight through, so the request never
+    /// becomes a `FrontendMessage` and `observe_frontend` never sees it. The backend answers
+    /// it regardless: a >64KiB `Query` executes and commits, and its `ReadyForQuery` then
+    /// arrives against an empty ledger and underflows, so the session dies after the write
+    /// landed. A driver that retries what looks like a failure writes it twice.
+    ///
+    /// A `Parse` this size is always tainting: nothing here can show it was the unnamed
+    /// statement, and the framed path taints on exactly that doubt.
+    pub fn observe_frontend_opaque(&mut self, kind: RequestKind) {
+        if kind == RequestKind::Parse {
+            self.taint.insert(Taint::PreparedStatement);
+        }
+        self.batch_open = !kind.terminates_batch();
+        self.outstanding.record(kind, Relay::Forward);
+    }
+
     /// Records a backend message on its way to the client.
     pub fn observe_backend(&mut self, message: &BackendMessage) -> Result<Reaction, LinkError> {
         if self.state == ServerState::Login {

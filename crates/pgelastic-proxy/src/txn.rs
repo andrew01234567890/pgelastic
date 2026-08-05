@@ -807,6 +807,17 @@ impl Running<'_> {
                 );
                 self.pin(PinReason::DesyncedPipeline);
             }
+            // The request still has to reach the ledger, pinned or not. The backend answers a
+            // frame it could not decode exactly as it answers one it could, and the reply is
+            // matched against the outstanding queue - so an unrecorded request means the
+            // `ReadyForQuery` for a statement that has already committed underflows and kills
+            // the session. `CopyData` records nothing: it is payload inside a request already
+            // on the queue.
+            if let Some(kind) = pgelastic_pool::RequestKind::from_tag(tag)
+                && let Some(checkout) = self.checkout.as_mut()
+            {
+                checkout.conn.link.observe_frontend_opaque(kind);
+            }
         } else {
             self.client_streaming = self.client_streaming.saturating_sub(bytes.len());
         }
