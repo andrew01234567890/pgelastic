@@ -31,11 +31,15 @@ import (
 // runs, is what this file exists to make impossible: on 2026-07-31 four PRs of backup and
 // PITR work merged green against a suite that had never executed once, because adding the
 // Makefile target and a nightly step reads exactly like adding coverage and is not.
+//
+// A written excuse is not a substitute for the suite running. test-e2e-proxy was excused here
+// for its cost, and then broke on 2026-08-03 and stayed broken for two days: a push run
+// reports the nightly job as `skipped`, which renders as a green tick, so nothing said the
+// proxy had lost its only coverage. It is gated now. What this list can promise is that the
+// gap was chosen; it cannot promise that the choice is still a good one.
 var ungated = map[string]string{
 	"test-e2e-migration": "two full three-node instances through logical replication, and it " +
 		"needs cert-manager and a Rust proxy release build; nightly",
-	"test-e2e-proxy": "two three-node instances and a fleet in front of them, on the same " +
-		"prerequisites as migration; nightly",
 	"test-e2e-restart": "recreates every member Pod of a real instance and switches the " +
 		"primary away, so it is minutes of real restarts; nightly",
 	"test-e2e-coexistence": "needs a second operator already deployed on the cluster - the " +
