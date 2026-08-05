@@ -1365,6 +1365,20 @@ impl Running<'_> {
     async fn try_release(&mut self) -> Result<()> {
         self.flush().await?;
         self.settle_cancels().await;
+        // A batch the client ended with Flush rather than Sync is answered without a
+        // ReadyForQuery, so the gate below would read the transaction status the batch BEFORE
+        // it left - which said idle - while the server holds whatever this one opened: an
+        // implicit transaction, an unclosed portal, an unnamed statement. Nothing in the
+        // protocol has said so yet, so the gate cannot see it.
+        //
+        // No caller reaches here in that state today: try_release runs only behind a
+        // ReadyForQuery in the same pass, and an unsynced batch draws none. This is a guard
+        // against that stopping being true, not a fix for a reachable defect - a review
+        // claimed the path was live and it could not be reproduced. It costs a release
+        // deferred to the next Sync, which the idle-in-transaction bound already bounds.
+        if self.unsynced_batch {
+            return Ok(());
+        }
         let Some(checkout) = self.checkout.as_mut() else {
             return Ok(());
         };
