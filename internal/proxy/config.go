@@ -87,6 +87,14 @@ type User struct {
 	Verifier string
 	Password string
 
+	// Contained marks a login that belongs to a tenant rather than being the tenant.
+	//
+	// The two render into the same table, and until this field existed nothing told them
+	// apart: a tenant's own entry carries no backend role by design, and a contained login
+	// carries none either until the reconciler has provisioned one. The proxy skipped the
+	// login, fell through to the tenant, and dialled the client as the tenant's OWNER.
+	Contained bool
+
 	// BackendRole is the PostgreSQL role *this login's* backend sessions run as, and
 	// BackendSaltedPassword the client half of the SCRAM credential that proves it.
 	//
@@ -230,6 +238,9 @@ func (c Config) renderAuth(out *strings.Builder, dynamic bool) {
 		out.WriteString("[[auth.users]]\n")
 		writeString(out, "name", user.Name)
 		writeString(out, "tenant", user.Tenant)
+		if user.Contained {
+			writeBool(out, "contained", true)
+		}
 		if user.Verifier != "" {
 			writeString(out, "verifier", user.Verifier)
 		} else {

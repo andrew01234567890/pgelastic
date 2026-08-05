@@ -565,6 +565,37 @@ mod tests {
     /// backend role on it, and falls through to the tenant's own identity. The client would
     /// then authenticate with the login's password and run as the tenant OWNER, holding the
     /// owner's privileges and indistinguishable from it in `pg_stat_activity`.
+    /// The window between a contained login being admitted and its backend role being
+    /// provisioned. Both the tenant's own entry and a not-yet-provisioned contained login
+    /// carry no backendRole, so the two were indistinguishable: `backend_for` skipped the
+    /// login, fell through to the tenant, and dialled the client as the tenant's OWNER -
+    /// holding the owner's privileges and indistinguishable from it in `pg_stat_activity`.
+    /// That is the escalation a contained user exists to prevent, arriving silently and only
+    /// while nobody is watching.
+    #[test]
+    fn a_contained_login_awaiting_its_role_is_refused_not_dialled_as_the_owner() {
+        let current = Config::from_str(BASE).unwrap();
+        let mut reloader = reloader(&current);
+        let proxy = Arc::clone(&reloader.proxy);
+        let instance = proxy.fleet.route("orders");
+
+        let next = Config::from_str(&format!(
+            "{}{ORDERS_IDENTITY}\n[[auth.users]]\nname = \"app\"\ntenant = \"orders\"\n\
+             password = \"hunter2\"\ncontained = true\n",
+            BASE.replace("1-aaa", "2-bbb")
+        ))
+        .unwrap();
+        reloader.apply(&current, &next);
+
+        let refused = proxy.backend_for(&instance, "orders", "app");
+
+        assert!(
+            refused.is_err(),
+            "a contained login with no backend role yet was dialled as {:?}",
+            refused.map(|backend| backend.user)
+        );
+    }
+
     #[test]
     fn a_login_named_after_its_tenants_owner_is_not_dialled_as_the_owner() {
         let current = Config::from_str(BASE).unwrap();

@@ -500,6 +500,13 @@ impl Proxy {
         // amount of care in the control plane's naming would show up on the far side.
         if let Some(entry) = dynamic.users.iter().find(|u| identity_of(u, tenant, login)) {
             {
+                if entry.backend_role.is_empty() {
+                    return Err(ProxyError::config(format!(
+                        "login {login:?} is a contained user of tenant {tenant:?} and no \
+                         backend role has been published for it yet; refusing rather than \
+                         dialling as the tenant's owner"
+                    )));
+                }
                 if entry.backend_salted_password.is_empty() {
                     return Err(ProxyError::config(format!(
                         "login {login:?} names backend role {:?} but carries no credential for \
@@ -580,8 +587,17 @@ impl Proxy {
 /// two predicates that disagree would key a session's links on one identity and open them
 /// as another.
 fn identity_of(user: &crate::config::UserConfig, tenant: &str, login: &str) -> bool {
+    // A contained login matches whether or not its backend role has been published yet, and
+    // `backend_for` refuses it when it has not. A tenant's own entry matches only once it
+    // carries one, so an owner's authentication entry - which never does - falls through to
+    // the tenant below and is dialled as the tenant, which is what it is.
+    //
+    // Before `contained` existed the two were the same shape and the rule had to be "skip an
+    // entry with no backend role". That is right for the owner and wrong for a contained
+    // login the control plane has not finished provisioning: it fell through and was dialled
+    // as the OWNER.
     user.name == login
-        && !user.backend_role.is_empty()
+        && (user.contained || !user.backend_role.is_empty())
         && (user.tenant.is_empty() || user.tenant == tenant)
 }
 
