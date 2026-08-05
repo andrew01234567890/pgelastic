@@ -81,6 +81,27 @@ impl RequestKind {
         matches!(self, Self::Sync | Self::Query | Self::FunctionCall)
     }
 
+    /// The request kind of a frame too large to decode, from its tag byte alone.
+    ///
+    /// A frame over the relay's inline limit is streamed through without ever becoming a
+    /// `FrontendMessage`, so `from_frontend` never sees it - and the request went unrecorded
+    /// while the backend's reply for it arrived anyway. `d` (`CopyData`) must map to `None`
+    /// here: COPY payload is data inside a request already recorded, and recording each chunk
+    /// would desynchronise the ledger in the other direction.
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            b'P' => Some(Self::Parse),
+            b'B' => Some(Self::Bind),
+            b'D' => Some(Self::Describe),
+            b'E' => Some(Self::Execute),
+            b'C' => Some(Self::Close),
+            b'S' => Some(Self::Sync),
+            b'Q' => Some(Self::Query),
+            b'F' => Some(Self::FunctionCall),
+            _ => None,
+        }
+    }
+
     pub fn from_frontend(message: &FrontendMessage) -> Option<Self> {
         match message {
             FrontendMessage::Parse(_) => Some(Self::Parse),
@@ -372,6 +393,38 @@ mod tests {
 
     fn error() -> BackendMessage {
         BackendMessage::ErrorResponse(Fields::default())
+    }
+
+    // A frame over the relay's inline limit never becomes a `FrontendMessage`, so the request
+    // it carries has to be recovered from its tag byte. `d` must stay `None`: COPY payload is
+    // data inside a request already on the queue, and recording every chunk would
+    // desynchronise the ledger in the other direction.
+    #[test]
+    fn an_oversized_frame_is_recorded_from_its_tag() {
+        assert_eq!(RequestKind::from_tag(b'Q'), Some(RequestKind::Query));
+        assert_eq!(RequestKind::from_tag(b'P'), Some(RequestKind::Parse));
+        assert_eq!(RequestKind::from_tag(b'B'), Some(RequestKind::Bind));
+        assert_eq!(RequestKind::from_tag(b'E'), Some(RequestKind::Execute));
+        assert_eq!(RequestKind::from_tag(b'S'), Some(RequestKind::Sync));
+        for tag in *b"dcfHX" {
+            assert_eq!(RequestKind::from_tag(tag), None, "tag {}", char::from(tag));
+        }
+    }
+
+    // What the proxy did with an oversized `Query` before it recorded one: the statement
+    // executed and committed, and its `ReadyForQuery` arrived against an empty queue.
+    #[test]
+    fn a_reply_to_an_unrecorded_request_underflows() {
+        let mut queue = OutstandingQueue::new();
+
+        let reaction = queue.apply(&ready(TransactionStatus::Idle));
+
+        assert!(matches!(
+            reaction,
+            Err(OutstandingError::Underflow {
+                message: "ReadyForQuery"
+            })
+        ));
     }
 
     #[test]
