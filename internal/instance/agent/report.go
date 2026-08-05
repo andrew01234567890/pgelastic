@@ -71,13 +71,13 @@ func (r Reporter) object() *unstructured.Unstructured {
 	return object
 }
 
-// Report applies this member's own entry in the instances list.
-func (r Reporter) Report(
-	ctx context.Context,
+// memberEntry is this member's own row of status.instances, split out so the numbers it
+// carries can be asserted without a cluster to apply them to.
+func (r Reporter) memberEntry(
 	observation MemberObservation,
 	healthy bool,
 	rejoining RejoinMethod,
-) error {
+) map[string]any {
 	member := map[string]any{
 		"name":              r.Member,
 		"role":              string(instanceRole(observation.Role)),
@@ -89,6 +89,15 @@ func (r Reporter) Report(
 		"walReceiverActive": observation.WALReceiverActive,
 		"walVolumeFull":     observation.WALVolumeFull,
 		"agentSession":      r.Session,
+		// The three numbers the pool's planner reads back off the CR. Measured on every
+		// observe pass and, until now, reported only over the agent's HTTP surface - which
+		// nothing in the control plane calls. status.capacity.inUse is summed from
+		// clientBackends, so it answered zero for every instance however loaded it was, and
+		// storage autoscaling compares dataUsedBytes against the volume, so it could never
+		// fire whatever the disk was doing.
+		"clientBackends": int64(observation.ClientBackends),
+		"dataUsedBytes":  observation.DataUsedBytes,
+		"walUsedBytes":   observation.WALUsedBytes,
 	}
 	// The key is omitted rather than emptied when no rejoin is running. Under server-side
 	// apply a field the manager stops including is removed, which is exactly the clearing
@@ -96,6 +105,18 @@ func (r Reporter) Report(
 	if rejoining != "" {
 		member["rejoining"] = string(rejoining)
 	}
+
+	return member
+}
+
+// Report applies this member's own entry in the instances list.
+func (r Reporter) Report(
+	ctx context.Context,
+	observation MemberObservation,
+	healthy bool,
+	rejoining RejoinMethod,
+) error {
+	member := r.memberEntry(observation, healthy, rejoining)
 
 	object := r.object()
 	object.Object["status"] = map[string]any{"instances": []any{member}}
