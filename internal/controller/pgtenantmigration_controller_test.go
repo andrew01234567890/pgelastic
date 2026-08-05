@@ -59,22 +59,25 @@ func newScriptedSQL() *scriptedSQL {
 		"AND c.relreplident = 'd'": {},
 		// No matview and no unlogged table: both are unpublishable, so an online move of
 		// one is refused before anything is provisioned.
-		"c.relpersistence = 'u'":                    {},
-		"server_version_num":                        {{"18"}},
-		"FROM pg_prepared_xacts":                    {},
-		"FROM pg_largeobject_metadata":              {{"0"}},
-		"SELECT extname FROM pg_extension":          {{"plpgsql"}},
-		"FROM pg_database d WHERE d.datname":        {{"UTF8|C|C|b|C.UTF-8|"}},
-		"pg_database_size":                          {{"1048576"}},
-		"FROM pg_stat_activity WHERE backend_type":  {{"5"}},
-		"SHOW wal_level":                            {{"logical"}},
-		"SHOW synchronized_standby_slots":           {{"pgelastic_pg_src_2, pgelastic_pg_src_3"}},
-		"WHERE slot_type = 'physical'":              {{"pgelastic_pg_src_2"}, {"pgelastic_pg_src_3"}},
-		"FROM pg_stat_replication WHERE sync_state": {{"pg-src-2"}, {"pg-src-3"}},
-		"SHOW hot_standby_feedback":                 {{"on"}},
-		"SHOW sync_replication_slots":               {{"on"}},
-		"SHOW primary_slot_name":                    {{"pgelastic_pg_src_1"}},
-		"SHOW primary_conninfo":                     {{"host=pg-src-1 dbname=postgres"}},
+		"c.relpersistence = 'u'":       {},
+		"server_version_num":           {{"18"}},
+		"FROM pg_prepared_xacts":       {},
+		"FROM pg_largeobject_metadata": {{"0"}},
+		// A drop acts only on a database owned by the tenant's own role. The ordinary case
+		// is that the migration made it; a target in another pool answers 0 and is refused.
+		"FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba": {{"1"}},
+		"SELECT extname FROM pg_extension":                       {{"plpgsql"}},
+		"FROM pg_database d WHERE d.datname":                     {{"UTF8|C|C|b|C.UTF-8|"}},
+		"pg_database_size":                                       {{"1048576"}},
+		"FROM pg_stat_activity WHERE backend_type":               {{"5"}},
+		"SHOW wal_level":                                         {{"logical"}},
+		"SHOW synchronized_standby_slots":                        {{"pgelastic_pg_src_2, pgelastic_pg_src_3"}},
+		"WHERE slot_type = 'physical'":                           {{"pgelastic_pg_src_2"}, {"pgelastic_pg_src_3"}},
+		"FROM pg_stat_replication WHERE sync_state":              {{"pg-src-2"}, {"pg-src-3"}},
+		"SHOW hot_standby_feedback":                              {{"on"}},
+		"SHOW sync_replication_slots":                            {{"on"}},
+		"SHOW primary_slot_name":                                 {{"pgelastic_pg_src_1"}},
+		"SHOW primary_conninfo":                                  {{"host=pg-src-1 dbname=postgres"}},
 		// The roles a tenant's database depends on, the attributes they hold, and whether
 		// PUBLIC can still connect to it. A source with no roles of its own and no PUBLIC
 		// CONNECT is the ordinary case and the one that may be moved.
@@ -431,6 +434,45 @@ var _ = Describe("PgTenantMigration controller", func() {
 		}
 		Expect(refetch(object).Status.Phase).
 			To(Equal(pgelasticv1alpha1.TenantMigrationPhaseCatchup))
+	})
+
+	// Database names are unique within one pool, so two pools may each hold a database
+	// called `acme`. A migration pointed at another pool's instance provisions into
+	// somebody else's live tenant, and every departure from the happy path drops it by name.
+	It("refuses a target instance belonging to another pool", func() {
+		// A separate instance, because poolRef is immutable. Its pool is never created: the
+		// guard compares the two names and must not be gated on the pool object being
+		// readable, or deleting a pool would reopen the hole.
+		outsider := makeMigrationInstance("pg-outsider")
+		outsider.Spec.PoolRef = corev1.LocalObjectReference{Name: "somebody-elses-pool"}
+		Expect(k8sClient.Create(ctx, outsider)).To(Succeed())
+		outsider.Status = migrationInstanceStatus("pg-outsider")
+		Expect(k8sClient.Status().Update(ctx, outsider)).To(Succeed())
+		DeferCleanup(func() { deleteAndAwait(outsider) })
+
+		Expect(k8sClient.Delete(ctx, object)).To(Succeed())
+		Eventually(func() bool {
+			return k8sClient.Get(ctx, requestFor(object).NamespacedName,
+				&pgelasticv1alpha1.PgTenantMigration{}) != nil
+		}).Should(BeTrue())
+		object = &pgelasticv1alpha1.PgTenantMigration{
+			ObjectMeta: metav1.ObjectMeta{Name: "move-acme-out", Namespace: migrationNamespace},
+			Spec: pgelasticv1alpha1.PgTenantMigrationSpec{
+				TenantRef:         corev1.LocalObjectReference{Name: migrationTenant},
+				TargetInstanceRef: corev1.LocalObjectReference{Name: "pg-outsider"},
+				Strategy:          pgelasticv1alpha1.TenantMigrationOnline,
+			},
+		}
+		Expect(k8sClient.Create(ctx, object)).To(Succeed())
+
+		final := advance(5)
+
+		Expect(final.Status.Phase).NotTo(Equal(pgelasticv1alpha1.TenantMigrationPhaseCompleted))
+		Expect(conditionOf(final.Status.Conditions, pgelasticv1alpha1.ConditionAccepted).Message).
+			To(ContainSubstring("somebody-elses-pool"))
+		Expect(routedInstance()).To(Equal(sourceInstance))
+		Expect(sql.ran("DROP DATABASE")).To(BeFalse(),
+			"a migration refused for naming another pool's instance still reached its database")
 	})
 
 	It("refuses to run without the ports a migration acts through", func() {

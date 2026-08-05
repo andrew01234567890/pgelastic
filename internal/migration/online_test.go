@@ -268,8 +268,9 @@ func TestAStampedTargetIsNeverDiscarded(t *testing.T) {
 // PostgreSQL refuses to drop a database that still owns a subscription however the connections
 // are behaving, so WITH (FORCE) is not enough on its own.
 func TestTheTargetsSubscriptionsAreRemovedBeforeItIsDropped(t *testing.T) {
-	sql := newFakeSQL().answer("FROM pg_subscription", Row{"pgelastic_sub_move"})
-	if err := DropTargetDatabase(context.Background(), sql, targetAt); err != nil {
+	sql := newFakeSQL().answer("FROM pg_subscription", Row{"pgelastic_sub_move"}).
+		scalarAnswer(ownedByTenantFragment, "1")
+	if err := DropTargetDatabase(context.Background(), sql, targetAt, tenantDatabase); err != nil {
 		t.Fatal(err)
 	}
 	for _, fragment := range []string{"DISABLE", "slot_name = NONE", "DROP SUBSCRIPTION"} {
@@ -284,8 +285,9 @@ func TestTheTargetsSubscriptionsAreRemovedBeforeItIsDropped(t *testing.T) {
 // unfiltered meant this drop took somebody else's subscription, and failing to reach that
 // one's publisher blocked the drop for ever.
 func TestOnlyThisDatabasesSubscriptionsAreDropped(t *testing.T) {
-	sql := newFakeSQL().answer("FROM pg_subscription", Row{"pgelastic_sub_move"})
-	if err := DropTargetDatabase(context.Background(), sql, targetAt); err != nil {
+	sql := newFakeSQL().answer("FROM pg_subscription", Row{"pgelastic_sub_move"}).
+		scalarAnswer(ownedByTenantFragment, "1")
+	if err := DropTargetDatabase(context.Background(), sql, targetAt, tenantDatabase); err != nil {
 		t.Fatal(err)
 	}
 	if sql.ran("subdbid") < 0 {
@@ -311,5 +313,52 @@ func TestAnUnstampedTargetIsLeftAloneByTheCleanupLadder(t *testing.T) {
 	}
 	if sql.ran("COMMENT ON DATABASE") >= 0 {
 		t.Fatal("the ladder rewrote the comment on a database it had never stamped")
+	}
+}
+
+// Database names are unique within a pool, not across the estate. A migration that reaches
+// another pool's instance therefore meets a live database of the same name, and every
+// departure from the happy path - including an abort requested before a single check has run
+// - would otherwise force-drop it.
+func TestADatabaseThisMigrationDidNotCreateIsNotDropped(t *testing.T) {
+	for _, drop := range []struct {
+		name string
+		run  func(SQL) error
+	}{
+		{"the target", func(sql SQL) error {
+			return DropTargetDatabase(context.Background(), sql, targetAt, tenantDatabase)
+		}},
+		{"the source", func(sql SQL) error {
+			return DropSourceDatabase(context.Background(), sql, sourceAt, tenantDatabase)
+		}},
+	} {
+		t.Run(drop.name, func(t *testing.T) {
+			// Present, and owned by somebody else.
+			sql := newFakeSQL().
+				scalarAnswer(ownedByTenantFragment, "0").
+				scalarAnswer("FROM pg_database WHERE datname", "1")
+
+			err := drop.run(sql)
+
+			if err == nil {
+				t.Fatal("a database owned by another role was dropped without complaint")
+			}
+			if sql.ran("DROP DATABASE") >= 0 {
+				t.Fatalf("DROP DATABASE ran against a database this migration did not "+
+					"create:\n%s", sql.joined())
+			}
+		})
+	}
+}
+
+// The other half of the same rule: a drop is on a cleanup ladder that has to be safe to
+// re-enter, so a database that is simply not there is nothing to do rather than a refusal.
+func TestADatabaseThatIsAlreadyGoneIsNotAnError(t *testing.T) {
+	sql := newFakeSQL().
+		scalarAnswer(ownedByTenantFragment, "0").
+		scalarAnswer("FROM pg_database WHERE datname", "0")
+
+	if err := DropTargetDatabase(context.Background(), sql, targetAt, tenantDatabase); err != nil {
+		t.Fatalf("re-entering the cleanup ladder after the drop had already happened: %v", err)
 	}
 }

@@ -415,12 +415,12 @@ func (e Engine) Apply(ctx context.Context, run Run, decision Decision) error {
 		}
 	}
 	if decision.DiscardTarget {
-		if err := DropTargetDatabase(ctx, e.SQL, run.Plan.Target); err != nil {
+		if err := DropTargetDatabase(ctx, e.SQL, run.Plan.Target, run.Owner); err != nil {
 			problems = append(problems, fmt.Errorf("discarding the half-built target: %w", err))
 		}
 	}
 	if decision.DropSource {
-		if err := DropSourceDatabase(ctx, e.SQL, run.Plan.Source); err != nil {
+		if err := DropSourceDatabase(ctx, e.SQL, run.Plan.Source, run.Owner); err != nil {
 			problems = append(problems, err)
 		}
 	}
