@@ -53,6 +53,17 @@ func (s *Supervisor) reconcileRole(
 	}
 	switch observation.Role {
 	case RolePrimary:
+		// Driven off the CR rather than off the observed role. A promotion that got the
+		// member out of recovery and then failed - the lease renewed, the epoch written, and
+		// the status write lost - leaves it observing itself as primary while the CR still
+		// names it only as the target. Reached only from the replica arm, nothing would ever
+		// call this again: the instance keeps a primary nobody has been told about, and the
+		// failover it was in the middle of never completes.
+		//
+		// Safe to call here because its own guards are the whole condition: it returns
+		// immediately unless the CR still says this member is the target and is not yet the
+		// current primary, which is exactly the state a half-finished promotion leaves.
+		s.promoteIfChosen(ctx, instance)
 		s.holdPrimary(ctx, instance)
 	case RoleReplica:
 		s.promoteIfChosen(ctx, instance)
