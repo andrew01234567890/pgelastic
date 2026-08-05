@@ -983,6 +983,68 @@ async fn a_client_that_names_no_search_path_never_inherits_one() {
     );
 }
 
+// spec.density.maxStoragePerTenant is documented as a cap and had zero production readers; the
+// gate that would enforce it was built and unit-tested in the allocator with no caller, and the
+// quota it compares against was hardcoded to u64::MAX at all three construction sites.
+//
+// A tenant over its quota must still be able to SELECT what it has and DELETE some of it, or
+// the limit is one it can never get back under. That is the whole reason the gate is on the
+// write path rather than at the connection, and it is what the second half of this test asserts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_over_its_storage_quota_is_refused_writes_and_allowed_reads() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\n\n\
+         [[pool.tenants]]\nname = \"tenant\"\nburstable = 8\n\
+         storageBytes = 1000\nstorageUsedBytes = 4000\n",
+    )
+    .await;
+
+    // A read is untouched, which is what lets the tenant see what it has.
+    let reader = stack.connect().await;
+    let one: i32 = reader
+        .query_one("SELECT 1", &[])
+        .await
+        .expect("a tenant over quota must still be able to read")
+        .get(0);
+    assert_eq!(one, 1);
+
+    // And so is a DELETE, which is the statement the tenant needs to get back under its
+    // limit. A quota that refused it would trap the tenant at its ceiling for ever, which is
+    // why the gate asks whether a statement grows storage rather than whether it writes.
+    reader
+        .simple_query("DELETE FROM pg_catalog.pg_class WHERE false")
+        .await
+        .expect("a DELETE is how a tenant gets back under its quota and must not be refused");
+
+    let writer = stack.connect().await;
+    let error = writer
+        .simple_query("CREATE TABLE quota_probe (n int)")
+        .await
+        .expect_err("a write past the quota must be refused");
+    assert!(
+        error.to_string().contains("PGE0544") || error.code().is_some(),
+        "the refusal must say why: {error}"
+    );
+}
+
+// The other side of the same gate: a tenant inside its quota writes normally, so the bound
+// engages at the line rather than on any tenant that has a quota at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_inside_its_storage_quota_writes_normally() {
+    let stack = harness::stack_with(
+        "[pool]\nmode = \"transaction\"\n\n\
+         [[pool.tenants]]\nname = \"tenant\"\nburstable = 8\n\
+         storageBytes = 1000000000\nstorageUsedBytes = 4000\n",
+    )
+    .await;
+
+    let client = stack.connect().await;
+    client
+        .simple_query("CREATE TABLE inside_quota (n int)")
+        .await
+        .expect("a tenant well inside its quota must be able to write");
+}
+
 #[tokio::test]
 async fn a_cancel_request_cancels_a_long_running_query() {
     let stack = stack().await;

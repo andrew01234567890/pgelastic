@@ -211,6 +211,10 @@ struct Running<'a> {
     /// implicit transaction that nothing else here can see, and without this bit
     /// neither bound would ever fire on it.
     unsynced_batch: bool,
+    /// Set when a write was refused because the tenant is over its storage quota.
+    /// The message was not forwarded, so the session ends rather than waiting for
+    /// an answer that nobody is going to send.
+    storage_denied: Option<pgelastic_capacity::DenialReason>,
     /// Set when a tripwire asked to pin a link the pool had no pinned budget for.
     /// The link cannot be pinned and must not be shared, so the session ends.
     pin_refused: Option<PinReason>,
@@ -260,6 +264,7 @@ pub async fn run(
         witness: TransactionWitness::new(),
         draining_fence: false,
         unsynced_batch: false,
+        storage_denied: None,
         pin_refused: None,
         holding: None,
         instance_gate: instance_gate_of(&session),
@@ -306,6 +311,10 @@ impl Running<'_> {
             // The check lives here rather than beside a pump so that every pump -
             // including the one before this loop, over whatever the client
             // pipelined behind its startup packet - is covered by construction.
+            if let Some(denial) = self.storage_denied.take() {
+                self.on_storage_denied(&denial).await;
+                return Ok(Ending::StorageQuota);
+            }
             if let Some(reason) = self.pin_refused {
                 self.on_pin_refused(reason).await;
                 return Ok(Ending::PinCeiling);
@@ -383,6 +392,25 @@ impl Running<'_> {
                 }
             }
         }
+    }
+
+    /// Ends a session whose write the storage quota refused.
+    ///
+    /// The session ends rather than the statement being answered in band. An
+    /// `ErrorResponse` for a message the backend never saw leaves the extended
+    /// protocol out of step - the client's `Sync` would be answered by nobody -
+    /// and a desynchronised session is worse than a closed one, which is the
+    /// judgement `session.rs` already records about truncating a frame. The
+    /// client's next connection reads and deletes exactly as before.
+    async fn on_storage_denied(&mut self, denial: &pgelastic_capacity::DenialReason) {
+        self.session.metrics.storage_refused();
+        crate::wire_io::send_fatal(
+            self.session.client,
+            denial.code().as_str(),
+            &denial.to_string(),
+        )
+        .await;
+        self.abandon();
     }
 
     /// Whether this session is holding a pinned link.
@@ -1006,6 +1034,10 @@ impl Running<'_> {
     }
 
     fn dispatch_from(&mut self, message: &FrontendMessage, relay: Relay, origin: Origin) {
+        // Cloned before the checkout is borrowed mutably below: the quota check
+        // needs the manager and the tenant, and both live on the session.
+        let manager = Arc::clone(self.session.binding.manager());
+        let tenant = self.session.binding.tenant.clone();
         // Before the early return: a message that never reached a backend has
         // opened no batch. Only the client's own messages count - a `Parse` the
         // pool injects is followed by the client's own `Sync` or by nothing.
@@ -1024,6 +1056,14 @@ impl Running<'_> {
             // own cache executes nothing, so it can be neither a write nor an
             // undecidable commit.
             self.witness.observe_frontend(message);
+            if self.witness.pending_grows_storage()
+                && let Err(denial) = manager.check_storage(&tenant)
+            {
+                // Recorded and not forwarded. The loop ends the session at its
+                // top, where nothing is half-written in either direction.
+                self.storage_denied = Some(denial);
+                return;
+            }
             message.encode(&mut self.to_backend);
         }
         for response in checkout.conn.link.take_ready_fakes() {

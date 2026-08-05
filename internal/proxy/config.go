@@ -56,6 +56,13 @@ type Tenant struct {
 	Weight               int32
 	Priority             int32
 	MaxClientConnections int32
+	// StorageBytes is the tenant's storage quota and StorageUsedBytes what it is using now.
+	//
+	// Both, because the proxy compares them: it has no way to measure a database and the
+	// operator has no way to see a write. Zero quota is no quota, which is what a class that
+	// declares no maxStoragePerTenant means.
+	StorageBytes     int64
+	StorageUsedBytes int64
 	// BackendRole is the PostgreSQL role this tenant's backend sessions run as, and
 	// BackendSaltedPassword the client half of the SCRAM credential that proves it. The proxy
 	// is the SCRAM client on that leg, so a server-side verifier would be useless to it.
@@ -403,6 +410,13 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 		// per-tenant cap was configured".
 		if tenant.MaxClientConnections > 0 {
 			writeInt(out, "maxClientConnections", int64(tenant.MaxClientConnections))
+		}
+		// Both halves of the storage gate, in the adoptable document. The used figure moves on
+		// its own every scrape, so a structural one would roll the whole fleet twice a minute
+		// because a tenant wrote a row.
+		if tenant.StorageBytes > 0 {
+			writeInt(out, "storageBytes", tenant.StorageBytes)
+			writeInt(out, "storageUsedBytes", tenant.StorageUsedBytes)
 		}
 		// The identity this tenant's backend sessions run as, and the credential that proves
 		// it. Here rather than in [[instances]] because that half is structural: a credential

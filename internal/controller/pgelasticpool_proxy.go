@@ -135,6 +135,29 @@ func (r *PgElasticPoolReconciler) reconcileProxy(
 	return r.proxyStatus(ctx, pool, builder, view)
 }
 
+// storageQuotaBytes is spec.density.maxStoragePerTenant, or zero for no quota.
+//
+// Zero rather than an error when the class declares none: a pool whose class draws no line is
+// one where every tenant may write, which is what the field being optional means.
+func storageQuotaBytes(class *pgelasticv1alpha1.PgElasticClass) int64 {
+	if class == nil || class.Spec.Density == nil || class.Spec.Density.MaxStoragePerTenant == nil {
+		return 0
+	}
+	return class.Spec.Density.MaxStoragePerTenant.Value()
+}
+
+// storageUsedBytes is what the metering scrape last saw, or zero.
+//
+// Zero for a tenant nobody has measured yet, which admits its writes. The alternative -
+// refusing until a figure arrives - would refuse every tenant for the first scrape interval of
+// its life, and a quota that fires before anything is stored is not a quota.
+func storageUsedBytes(tenant *pgelasticv1alpha1.PgTenant) int64 {
+	if tenant.Status.Utilization == nil || tenant.Status.Utilization.StorageBytes == nil {
+		return 0
+	}
+	return *tenant.Status.Utilization.StorageBytes
+}
+
 // certManagerInstalled reports whether the cluster can issue the control listener's
 // certificates.
 //
@@ -399,6 +422,11 @@ func (r *PgElasticPoolReconciler) proxyTenants(
 			Weight:     entry.effective.Weight,
 			Priority:   defaultTenantPriority,
 		}
+		// The class draws the line and the tenant's own status says where it is. Both are
+		// needed or neither is useful: the proxy cannot measure a database, and the operator
+		// cannot see a write.
+		rendered.StorageBytes = storageQuotaBytes(view.elasticClass)
+		rendered.StorageUsedBytes = storageUsedBytes(entry.tenant)
 		// The identity this tenant's backend sessions run as. Left out when the tenant
 		// controller has not minted it yet, mirroring how an instance whose Secret is absent
 		// is left out rather than rendered with an empty password: the fleet then refuses

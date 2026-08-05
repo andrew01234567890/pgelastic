@@ -25,6 +25,9 @@ pub enum Ending {
     /// A tripwire asked to pin a link the pool had no pinned budget left for. The
     /// link is closed rather than pinned or shared: it carries state no reset
     /// removes, which is what asked for the pin in the first place.
+    /// A write was refused because the tenant is over its storage quota. Only
+    /// writes are refused; the client's next session reads and deletes as before.
+    StorageQuota,
     PinCeiling,
     /// A client held a pinned link for longer than the pool allows. Closed for the
     /// same reason a refused pin is: the state it carries cannot be handed on.

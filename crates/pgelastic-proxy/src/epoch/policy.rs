@@ -170,6 +170,11 @@ enum Kind {
 pub struct TransactionWitness {
     /// A write has been issued in the transaction currently open.
     wrote: bool,
+    /// Whether the request forwarded and not yet answered can only be satisfied
+    /// by storing more. Tracked beside `pending` rather than derived from it,
+    /// because the storage question and the correctness question classify the
+    /// same statement differently on purpose.
+    pending_grows: bool,
     /// The nature of the request forwarded and not yet answered.
     pending: Option<Kind>,
     /// The text of that request, so the in-doubt log records what it was rather
@@ -260,6 +265,16 @@ impl TransactionWitness {
         }
     }
 
+    /// Whether the request just recorded can only be satisfied by storing more.
+    ///
+    /// Deliberately not the fence's own read/write classification: a `DELETE` is
+    /// a write and shrinks storage, and a quota that refused it would trap the
+    /// tenant at its limit for ever.
+    #[must_use]
+    pub fn pending_grows_storage(&self) -> bool {
+        self.pending_grows
+    }
+
     /// The text of the request whose answer has not arrived, or a stated
     /// placeholder. Never a guess: an `Execute` for a portal this session did
     /// not `Bind` reports that it does not know the statement.
@@ -322,6 +337,7 @@ impl TransactionWitness {
     }
 
     fn begin_request(&mut self, kind: Kind, sql: String) {
+        self.pending_grows = grows_storage(sql.as_bytes());
         if kind == Kind::Write {
             self.wrote = true;
         }
@@ -370,6 +386,47 @@ pub const WRITE_FUNCTIONS: [&str; 6] = [
 /// A whitelist, deliberately: `false` is only ever returned for a statement
 /// that provably cannot modify data, and every other statement — including one
 /// this function does not recognise — is a write.
+/// Whether a statement can only be satisfied by storing more.
+///
+/// **Deliberately the opposite bias from [`may_write`].** That predicate answers
+/// a correctness question, so an unrecognised statement is a write; this one
+/// answers a quota question, so an unrecognised statement is allowed. Getting it
+/// wrong in the permissive direction costs one scrape interval before the quota
+/// engages. Getting it wrong in the other traps the tenant at its limit with no
+/// statement it can run to get back under - and `DELETE`, `TRUNCATE`, `DROP` and
+/// `VACUUM` are exactly the statements it needs.
+pub fn grows_storage(sql: &[u8]) -> bool {
+    let tokens = tokenize(sql);
+    let Some(first) = tokens.first().copied() else {
+        return false;
+    };
+    let has = |word: &str| tokens.iter().any(|token| eq(token, word));
+
+    // `SELECT ... INTO` materialises a new relation; a plain `SELECT` stores
+    // nothing however many rows it returns, and `FOR UPDATE` is a row lock rather
+    // than a write - which is why `update` is not consulted here and is below.
+    if eq(first, "select") || eq(first, "table") || eq(first, "values") {
+        return has("into");
+    }
+    // A CTE may carry any data-modifying statement, and an `UPDATE` inside one
+    // does write new row versions.
+    if eq(first, "with") {
+        return has("into") || has("insert") || has("update") || has("merge");
+    }
+    if eq(first, "copy") {
+        // `COPY ... TO` reads out; only `COPY ... FROM` brings data in.
+        return has("from");
+    }
+    for growing in [
+        "insert", "update", "merge", "create", "alter", "refresh", "import",
+    ] {
+        if eq(first, growing) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn may_write(sql: &[u8]) -> bool {
     let tokens = tokenize(sql);
     let Some(first) = tokens.first().copied() else {
@@ -550,6 +607,47 @@ fn tokenize(sql: &[u8]) -> Vec<&[u8]> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The predicate's bias is the opposite of `may_write`'s, and deliberately.
+    /// A miss costs one scrape before the quota engages; a false positive traps
+    /// the tenant at its limit with no statement it can run to get back under.
+    #[test]
+    fn only_statements_that_can_grow_storage_are_refused_by_the_quota() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "insert into t select * from u",
+            "UPDATE t SET n = 1",
+            "MERGE INTO t USING u ON true WHEN MATCHED THEN UPDATE SET n = 1",
+            "COPY t FROM STDIN",
+            "CREATE TABLE t (n int)",
+            "CREATE TEMP TABLE t (n int)",
+            "ALTER TABLE t ADD COLUMN m int",
+            "SELECT * INTO u FROM t",
+            "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x",
+            "REFRESH MATERIALIZED VIEW v",
+        ] {
+            assert!(grows_storage(sql.as_bytes()), "{sql} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_statements_a_tenant_needs_to_get_back_under_its_quota_are_allowed() {
+        for sql in [
+            "DELETE FROM t",
+            "delete from t where n = 1",
+            "TRUNCATE t",
+            "DROP TABLE t",
+            "VACUUM FULL t",
+            "SELECT * FROM t",
+            "SELECT count(*) FROM t FOR UPDATE",
+            "COPY t TO STDOUT",
+            "BEGIN",
+            "COMMIT",
+            "REINDEX TABLE t",
+        ] {
+            assert!(!grows_storage(sql.as_bytes()), "{sql} must not be refused");
+        }
+    }
     use super::*;
 
     fn query(sql: &str) -> FrontendMessage {

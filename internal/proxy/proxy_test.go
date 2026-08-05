@@ -456,6 +456,52 @@ func TestAPoolMayTurnSessionAffinityOff(t *testing.T) {
 	}
 }
 
+// spec.density.maxStoragePerTenant is documented as a cap and had zero production readers. The
+// gate that enforces it lives in the proxy, and it needs both halves: the proxy cannot measure
+// a database and the operator cannot see a write.
+func TestTheStorageQuotaAndUsageBothReachTheProxy(t *testing.T) {
+	config := testConfig()
+	config.Tenants[0].StorageBytes = 1 << 30
+	config.Tenants[0].StorageUsedBytes = 1 << 20
+
+	document := config.Render().TOML
+	if !strings.Contains(document, "storageBytes = 1073741824") ||
+		!strings.Contains(document, "storageUsedBytes = 1048576") {
+		t.Fatalf("the storage gate has nothing to compare:\n%s", document)
+	}
+}
+
+// A class that draws no line renders neither number, so the proxy's own "zero is no quota"
+// reading is never reached with a stale usage figure beside it.
+func TestATenantWithNoQuotaRendersNoStorageAtAll(t *testing.T) {
+	document := testConfig().Render().TOML
+	if strings.Contains(document, "storageBytes") || strings.Contains(document, "storageUsedBytes") {
+		t.Fatalf("a tenant with no quota carries storage keys:\n%s", document)
+	}
+}
+
+// The usage figure moves on its own every scrape. Structural would roll the whole fleet twice
+// a minute because a tenant wrote a row.
+func TestAChangedStorageFigureDoesNotRollTheFleet(t *testing.T) {
+	before := testConfig()
+	before.Tenants[0].StorageBytes = 1 << 30
+	before.Tenants[0].StorageUsedBytes = 1 << 20
+	first := before.Render()
+
+	after := testConfig()
+	after.Tenants[0].StorageBytes = 1 << 30
+	after.Tenants[0].StorageUsedBytes = 900 << 20
+	second := after.Render()
+
+	if first.TOML == second.TOML {
+		t.Fatal("the new measurement never reached the document")
+	}
+	if first.StructuralHash != second.StructuralHash {
+		t.Fatalf("a storage scrape moved the pod template hash from %q to %q, so the fleet "+
+			"rolls every time a tenant writes", first.StructuralHash, second.StructuralHash)
+	}
+}
+
 func TestAddingAnInstanceRollsTheFleet(t *testing.T) {
 	before := testConfig().Render()
 

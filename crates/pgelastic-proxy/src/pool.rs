@@ -321,17 +321,14 @@ impl PoolManager {
         for tenant in &config.tenants {
             let id = CapacityTenant::new(tenant.name.as_str());
             allocator
-                .add_tenant(
-                    id.clone(),
-                    TenantSpec {
-                        guaranteed: tenant.guaranteed,
-                        burstable: tenant.burstable,
-                        weight: tenant.weight,
-                        priority: tenant.priority,
-                        max_client_connections: tenant.max_client_connections,
-                        storage_bytes: u64::MAX,
-                    },
-                )
+                .add_tenant(id.clone(), tenant_spec(tenant))
+                .map_err(|e| ProxyError::config(format!("tenant {}: {e}", tenant.name)))?;
+            // The measured figure as well as the ceiling. Without it a replica
+            // starts every tenant at zero used and admits writes until the first
+            // reload - which for a tenant already over its quota is the whole
+            // window the gate exists to close.
+            allocator
+                .set_storage_used(&id, tenant.storage_used_bytes)
                 .map_err(|e| ProxyError::config(format!("tenant {}: {e}", tenant.name)))?;
             tenants.insert(id);
         }
@@ -475,14 +472,7 @@ impl PoolManager {
         let mut changed = 0;
         for tenant in tenants {
             let id = CapacityTenant::new(tenant.name.as_str());
-            let spec = TenantSpec {
-                guaranteed: tenant.guaranteed,
-                burstable: tenant.burstable,
-                weight: tenant.weight,
-                priority: tenant.priority,
-                max_client_connections: tenant.max_client_connections,
-                storage_bytes: u64::MAX,
-            };
+            let spec = tenant_spec(tenant);
             let outcome = if inner.tenants.contains(&id) {
                 inner.allocator.set_tenant_spec(&id, spec)
             } else {
@@ -493,16 +483,37 @@ impl PoolManager {
             };
             match outcome {
                 Ok(grants) => {
-                    inner.tenants.insert(id);
+                    inner.tenants.insert(id.clone());
                     changed += 1;
                     inner.dispatch(grants);
                 }
                 Err(error) => {
                     warn!(tenant = tenant.name, %error, "a published tenant claim was refused");
+                    continue;
                 }
+            }
+            // After the spec, because the quota it is compared against is part of
+            // it: setting the usage against a tenant the allocator has just
+            // refused would be recording a fact about a budget that does not
+            // exist.
+            if let Err(error) = inner
+                .allocator
+                .set_storage_used(&id, tenant.storage_used_bytes)
+            {
+                warn!(tenant = tenant.name, %error, "a published storage figure was refused");
             }
         }
         changed
+    }
+
+    /// The write path's gate: whether this tenant may store one more byte.
+    ///
+    /// Zero additional bytes, because the proxy cannot know how large a statement
+    /// will make the database - only whether the tenant is already past the line
+    /// the operator drew. What that buys is a bound that engages at the quota
+    /// rather than one that guesses.
+    pub fn check_storage(&self, tenant: &CapacityTenant) -> std::result::Result<(), DenialReason> {
+        self.lock().allocator.check_storage(tenant, 0)
     }
 
     pub fn connect_client(&self, tenant: &CapacityTenant) -> std::result::Result<ClientId, Denial> {
@@ -1710,6 +1721,30 @@ fn transport_failure(error: &ProxyError) -> bool {
             | std::io::ErrorKind::HostUnreachable
             | std::io::ErrorKind::NetworkUnreachable
     )
+}
+/// The allocator's view of one published tenant claim.
+///
+/// One function rather than three literals, because the three sites drifted the
+/// moment a field was added to the struct: every one of them hardcoded
+/// `storage_bytes: u64::MAX`, which is why the quota gate had a value to compare
+/// against and it was always infinity.
+fn tenant_spec(tenant: &crate::config::TenantConfig) -> TenantSpec {
+    TenantSpec {
+        guaranteed: tenant.guaranteed,
+        burstable: tenant.burstable,
+        weight: tenant.weight,
+        priority: tenant.priority,
+        max_client_connections: tenant.max_client_connections,
+        // Zero is the document's spelling of "no quota", and the allocator's is
+        // the largest budget there is. Passing the zero through would say the
+        // opposite - that the tenant may store nothing at all - and would refuse
+        // the first write of every tenant whose class sets no storage limit.
+        storage_bytes: if tenant.storage_bytes == 0 {
+            u64::MAX
+        } else {
+            tenant.storage_bytes
+        },
+    }
 }
 
 /// What a pin request was allowed to do.

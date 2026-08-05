@@ -1155,6 +1155,21 @@ pub struct TenantConfig {
     pub priority: u32,
     #[serde(default = "default_tenant_max_client_connections")]
     pub max_client_connections: u32,
+    /// The tenant's storage quota in bytes. Zero is no quota.
+    ///
+    /// The write path's gate, and only the write path's: a tenant over quota may
+    /// still `SELECT` and `DELETE`, which is the whole reason the bound is
+    /// applied where it is rather than at the connection. Refusing the connection
+    /// would leave the tenant no way back under its own limit.
+    #[serde(default)]
+    pub storage_bytes: u64,
+    /// What the tenant is using now, as the operator last measured it.
+    ///
+    /// Moves on its own every scrape interval, which is why it is in the half a
+    /// running replica adopts: making it structural would roll the whole fleet
+    /// twice a minute, for a number that changes because a tenant wrote a row.
+    #[serde(default)]
+    pub storage_used_bytes: u64,
     /// The `PostgreSQL` role this tenant's backend sessions run as.
     ///
     /// Empty until the operator has provisioned it. A tenant without one is
@@ -1195,6 +1210,8 @@ impl Default for TenantConfig {
             weight: default_weight(),
             priority: default_priority(),
             max_client_connections: default_tenant_max_client_connections(),
+            storage_bytes: 0,
+            storage_used_bytes: 0,
             backend_role: String::new(),
             backend_salted_password: String::new(),
             backend_salt: String::new(),
