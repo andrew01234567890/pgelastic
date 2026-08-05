@@ -619,6 +619,11 @@ func (r *PgElasticPoolReconciler) containedUsers(
 			Name:     login.Spec.UserName,
 			Tenant:   database,
 			Password: password,
+			// Told apart from the tenant's own entry, which carries no backend role by
+			// design. Without this the proxy cannot see the difference between "this login
+			// is not provisioned yet" and "this is the tenant", and answers the first as
+			// though it were the second - by dialling the client as the tenant's owner.
+			Contained: true,
 		}
 		// The login's own backend identity, when the reconciler has provisioned one. Rendered
 		// only once both the role and its credential exist, so that a proxy refusing a login

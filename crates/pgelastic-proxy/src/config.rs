@@ -785,6 +785,17 @@ pub struct UserConfig {
     /// single-tenant development shape should ever be.
     #[serde(default)]
     pub tenant: String,
+    /// This login is a contained user of its tenant rather than the tenant's own.
+    ///
+    /// The two render into the same table and are told apart by nothing else. A tenant's own
+    /// entry authenticates it and carries no backend role, by design - it is dialled as the
+    /// tenant. A contained login always has one once the control plane has provisioned it,
+    /// and until then carries none either, which used to be indistinguishable from the
+    /// tenant's entry. `backend_for` skipped it, fell through to the tenant, and dialled the
+    /// contained login as the tenant's OWNER: the escalation a contained user exists to
+    /// prevent, arriving silently and only during a window nobody is watching.
+    #[serde(default)]
+    pub contained: bool,
     /// A `PostgreSQL` `rolpassword` SCRAM secret. Preferred: the proxy then
     /// never holds a password it could replay.
     #[serde(default)]
