@@ -539,3 +539,46 @@ func TestAMoveIsNotProposedOntoAMajorTheMigrationCannotReach(t *testing.T) {
 		t.Error("a tenant with no binding was refused on a version axis it has no position on")
 	}
 }
+
+// The skew reference used to be the emptiest of ALL bins rather than of the ones a tenant may
+// actually land on. A member that is not ready holds no tenants and cannot take any, so it sat
+// at zero and dragged the reference there - which turns a relative bound into an absolute cap
+// of MaxSkewTenants per instance. Every real candidate then fails it, the fallback hands back
+// the whole list, and the bound that exists to spread tenants applies to nothing.
+func TestTheSkewReferenceIgnoresInstancesNothingMayLandOn(t *testing.T) {
+	unready := instanceOf("pg-draining", 1000)
+	unready.Ready = false
+	instances := []Instance{
+		instanceOf(instanceA, 1000), instanceOf(instanceB, 1000), instanceOf("pg-c", 1000),
+		unready,
+	}
+
+	policy := Policy{PackOn: pgelasticv1alpha1.PercentileP95, MaxSkewTenants: 1}
+	bins, _ := binsOf(instances)
+	for _, candidate := range bins {
+		switch candidate.instance.Name {
+		case instanceA:
+			candidate.tenants = 5
+		case instanceB:
+			candidate.tenants = 5
+		case "pg-c":
+			// Far enough ahead that the bound must exclude it, which is the whole
+			// discrimination: with a vacuous bound the fallback hands back all three.
+			candidate.tenants = 9
+		default:
+			candidate.tenants = 0
+		}
+	}
+
+	chosen := feasible(tenantOf("newcomer", 1, 1), bins, policy)
+
+	for _, candidate := range chosen {
+		if candidate.instance.Name == "pg-draining" {
+			t.Fatal("a tenant was offered an instance that is not ready")
+		}
+	}
+	if len(chosen) != 2 {
+		t.Fatalf("the skew bound admitted %d of 2 level candidates; an unplaceable member at "+
+			"zero tenants made the bound vacuous", len(chosen))
+	}
+}
