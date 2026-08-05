@@ -227,6 +227,7 @@ func (s *Supervisor) promoteIfChosen(ctx context.Context, instance *pgelasticv1a
 	}
 
 	options := s.options
+	options.OnEpoch = s.notePromotion
 	go func() {
 		defer s.endPromotion()
 		log := logf.FromContext(ctx)

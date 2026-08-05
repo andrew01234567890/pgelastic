@@ -114,6 +114,14 @@ const (
 
 // Options is everything the agent was told by the Pod it is running in.
 type Options struct {
+	// OnEpoch is called the moment a promotion derives its fence token from the lease,
+	// before any of the work that follows. The token has to be observable from that instant:
+	// the observe loop rewrites the member's configuration from the published epoch on its
+	// own schedule, and between deriving the token and finishing the promotion it would
+	// otherwise write the one this member held BEFORE it was promoted. A restart in that
+	// window comes back at the old epoch, which is the fence saying the opposite of what the
+	// lease says. Nil outside the supervisor, which is the only thing that needs to know.
+	OnEpoch     func(int64)
 	Config      provision.AgentConfig
 	Member      string
 	Serial      int32
