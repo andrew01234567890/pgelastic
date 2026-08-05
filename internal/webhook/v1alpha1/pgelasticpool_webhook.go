@@ -62,6 +62,14 @@ func (v *PgElasticPoolCustomValidator) ValidateUpdate(
 	ctx context.Context,
 	_, newObj *pgelasticv1alpha1.PgElasticPool,
 ) (admission.Warnings, error) {
+	// The same bypass the tenant and tenant-user validators carry. A pool being deleted is not
+	// being admitted against anything, and the only writes left on it are the controller
+	// clearing its own finalizer. Validating those against rules the pool now fails - a class
+	// that has been deleted, a ledger the tenants have outgrown - rejects them for ever: the
+	// pool keeps its finalizer, and the namespace never leaves Terminating.
+	if newObj.DeletionTimestamp != nil {
+		return nil, nil
+	}
 	return nil, v.validate(ctx, newObj)
 }
 

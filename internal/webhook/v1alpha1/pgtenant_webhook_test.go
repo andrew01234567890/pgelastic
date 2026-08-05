@@ -269,3 +269,50 @@ var _ = Describe("PgTenant webhook during deletion", func() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 })
+
+// A tenant's capacity is the class merged with the override, field by field, so raising
+// guaranteed alone - or lowering burstable alone - produces a floor above its own ceiling.
+// Nothing refused it, and the component that found out was the proxy: the allocator refuses
+// the claim when it loads the document, which lands on a pool-wide reload rather than on the
+// object that caused it.
+var _ = Describe("a tenant guaranteed more than it may ever hold", Ordered, func() {
+	const (
+		namespace = "wh-incoherent"
+		poolName  = "wh-incoherent-pool"
+		workload  = "wh-incoherent-class"
+	)
+
+	BeforeAll(func() {
+		ensureNamespace(namespace, nil)
+		elasticClass := makeElasticClass("wh-incoherent-elastic")
+		mustCreate(elasticClass)
+		mustCreate(makeWorkloadClass(workload, 2, 8))
+		mustCreate(makePool(namespace, poolName, elasticClass.Name))
+	})
+
+	It("refuses an override that raises the floor above the class ceiling", func() {
+		tenant := makeTenant(namespace, "wh-incoherent-floor", poolName, "incoherent_floor", workload)
+		tenant.Spec.Capacity = &pgelasticv1alpha1.PgTenantCapacity{Guaranteed: ptrTo(int32(9))}
+
+		err := k8sClient.Create(ctx, tenant)
+
+		Expect(err).To(MatchError(ContainSubstring("spec.capacity.guaranteed")))
+		Expect(err).To(MatchError(ContainSubstring("above the burstable ceiling")))
+	})
+
+	It("refuses an override that lowers the ceiling under the class floor", func() {
+		tenant := makeTenant(namespace, "wh-incoherent-ceiling", poolName, "incoherent_ceiling", workload)
+		tenant.Spec.Capacity = &pgelasticv1alpha1.PgTenantCapacity{Burstable: ptrTo(int32(1))}
+
+		err := k8sClient.Create(ctx, tenant)
+
+		Expect(err).To(MatchError(ContainSubstring("spec.capacity.burstable")))
+	})
+
+	It("admits an override that keeps the two coherent", func() {
+		tenant := makeTenant(namespace, "wh-incoherent-ok", poolName, "incoherent_ok", workload)
+		tenant.Spec.Capacity = &pgelasticv1alpha1.PgTenantCapacity{Guaranteed: ptrTo(int32(8))}
+
+		mustCreate(tenant)
+	})
+})

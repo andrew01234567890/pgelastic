@@ -18,11 +18,13 @@ package v1alpha1
 
 import (
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 )
@@ -230,5 +232,23 @@ var _ = Describe("the proxy pod template escape hatch", Ordered, func() {
 			PriorityClassName: "system-cluster-critical",
 			Tolerations:       []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpExists}},
 		}))
+	})
+})
+
+// The only writes left on a pool being deleted are the controller clearing its own
+// finalizer. Validating those against rules the pool now fails - a class that has since been
+// deleted, a ledger its tenants have outgrown - rejects them for ever, and the pool then
+// keeps its finalizer and the namespace never leaves Terminating. The tenant and tenant-user
+// validators already carried this bypass; the pool's did not.
+var _ = Describe("PgElasticPool webhook during deletion", func() {
+	It("admits a write to a pool being deleted whose class is already gone", func() {
+		validator := &PgElasticPoolCustomValidator{Reader: k8sClient}
+		pool := makePool("default", "doomed-pool", "class-that-does-not-exist")
+		pool.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+		pool.Finalizers = []string{"pgelastic.io/pool-members"}
+
+		_, err := validator.ValidateUpdate(ctx, pool, pool)
+
+		Expect(err).NotTo(HaveOccurred())
 	})
 })

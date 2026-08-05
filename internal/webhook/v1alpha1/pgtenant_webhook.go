@@ -271,6 +271,25 @@ func (v *PgTenantCustomValidator) reservationProblems(
 	}
 
 	problems := field.ErrorList{}
+	// A floor above its own ceiling is not a capacity question, it is an incoherent tenant.
+	// The class and the override merge field by field, so raising guaranteed alone - or
+	// lowering burstable alone - produces one, and it is the proxy that finds out: the
+	// allocator refuses the claim when it loads the document, and the refusal lands on a
+	// pool-wide reload rather than on the object that caused it.
+	if effective.Guaranteed > effective.Burstable {
+		path := field.NewPath("spec", "workloadClassName")
+		switch {
+		case tenant.Spec.Capacity != nil && tenant.Spec.Capacity.Guaranteed != nil:
+			path = field.NewPath("spec", "capacity", "guaranteed")
+		case tenant.Spec.Capacity != nil && tenant.Spec.Capacity.Burstable != nil:
+			path = field.NewPath("spec", "capacity", "burstable")
+		}
+		problems = append(problems, field.Invalid(path, effective.Guaranteed, fmt.Sprintf(
+			"a guarantee of %d is above the burstable ceiling of %d, so the tenant is "+
+				"guaranteed more than it is ever allowed to hold; PgWorkloadClass %q supplies "+
+				"whichever of the two spec.capacity does not override",
+			effective.Guaranteed, effective.Burstable, workloadClass.Name)))
+	}
 	if effective.Guaranteed > 0 && effective.Guaranteed > ledger.Available {
 		path := field.NewPath("spec", "workloadClassName")
 		if tenant.Spec.Capacity != nil && tenant.Spec.Capacity.Guaranteed != nil {
