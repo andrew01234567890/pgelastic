@@ -171,11 +171,8 @@ func resetUnstampedTarget(ctx context.Context, sql SQL, plan Plan, owner string)
 	// dropping it would destroy work nobody asked us to touch. Such a target is left alone and
 	// the copy fails on it loudly, which is the correct outcome for a name collision.
 	if owner != "" {
-		ours, err := scalarInt64(ctx, sql, plan.Target.WithDatabase("postgres"), fmt.Sprintf(
-			`SELECT count(*)::text FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba
-			 WHERE d.datname = %s AND r.rolname = %s`,
-			QuoteLiteral(plan.Target.Database), QuoteLiteral(owner)))
-		if err != nil || ours == 0 {
+		ours, err := ownedBy(ctx, sql, plan.Target, owner)
+		if err != nil || !ours {
 			return false, err
 		}
 	}
@@ -185,7 +182,7 @@ func resetUnstampedTarget(ctx context.Context, sql SQL, plan Plan, owner string)
 	if err != nil || objects == 0 {
 		return false, err
 	}
-	if err := DropTargetDatabase(ctx, sql, plan.Target); err != nil {
+	if err := DropTargetDatabase(ctx, sql, plan.Target, owner); err != nil {
 		return false, fmt.Errorf(
 			"discarding an unstamped target carrying %d object(s) from an earlier attempt: %w",
 			objects, err)
@@ -398,10 +395,32 @@ func UnfenceSource(ctx context.Context, sql SQL, source Endpoint) error {
 		fmt.Sprintf(`ALTER DATABASE %s WITH ALLOW_CONNECTIONS true`, QuoteIdentifier(source.Database)))
 }
 
+// ownedBy reports whether the database at an endpoint is owned by the role named.
+//
+// This is the only evidence a migration has that a database is its own to destroy.
+// ProvisionTarget creates the target OWNER the tenant's own role, so a database owned by
+// anybody else is one somebody else made - a human staging a restore, or another pool's
+// live tenant of the same name, since the database-name uniqueness rule is scoped to one
+// pool. An empty owner is not an answer and never authorises a drop.
+func ownedBy(ctx context.Context, sql SQL, at Endpoint, owner string) (bool, error) {
+	if owner == "" {
+		return false, nil
+	}
+	count, err := scalarInt64(ctx, sql, at.WithDatabase("postgres"), fmt.Sprintf(
+		`SELECT count(*)::text FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba
+		 WHERE d.datname = %s AND r.rolname = %s`,
+		QuoteLiteral(at.Database), QuoteLiteral(owner)))
+	return count > 0, err
+}
+
 // DropSourceDatabase is the last act of a migration, run only once the rollback window has
 // closed.
-func DropSourceDatabase(ctx context.Context, sql SQL, source Endpoint) error {
-	return dropDatabase(ctx, sql, source)
+//
+// Guarded by ownership for the same reason the target is. Without it this would be the only
+// unguarded DROP DATABASE left in the tree, which is how the guard on the other one came to
+// be missing in the first place.
+func DropSourceDatabase(ctx context.Context, sql SQL, source Endpoint, owner string) error {
+	return dropOwnedDatabase(ctx, sql, source, owner)
 }
 
 // DropTargetDatabase removes the copy a migration was building. It runs on every departure
@@ -414,11 +433,42 @@ func DropSourceDatabase(ctx context.Context, sql SQL, source Endpoint) error {
 // pg_subscription and raises object_in_use. So a cleanup ladder that failed to drop the
 // subscription, for any reason including one flaky exec, would otherwise leave a database that
 // can never be dropped and can never be re-provisioned.
-func DropTargetDatabase(ctx context.Context, sql SQL, target Endpoint) error {
+//
+// It drops only a database owned by the tenant's own role. A migration pointed at another
+// pool's instance meets a live database of the same name there - names are unique within a
+// pool, not across the estate - and every departure from the happy path, including an abort
+// requested before a single check has run, would otherwise force-drop it.
+func DropTargetDatabase(ctx context.Context, sql SQL, target Endpoint, owner string) error {
 	if err := dropSubscriptionsIn(ctx, sql, target); err != nil {
 		return err
 	}
-	return dropDatabase(ctx, sql, target)
+	return dropOwnedDatabase(ctx, sql, target, owner)
+}
+
+// dropOwnedDatabase drops a database only on the evidence that this migration made it.
+//
+// A database that is absent is nothing to do rather than a refusal: every drop here runs on
+// a cleanup ladder that has to be safe to re-enter.
+func dropOwnedDatabase(ctx context.Context, sql SQL, at Endpoint, owner string) error {
+	ours, err := ownedBy(ctx, sql, at, owner)
+	if err != nil {
+		return err
+	}
+	if !ours {
+		exists, err := scalarInt64(ctx, sql, at.WithDatabase("postgres"), fmt.Sprintf(
+			`SELECT count(*)::text FROM pg_database WHERE datname = %s`,
+			QuoteLiteral(at.Database)))
+		if err != nil {
+			return err
+		}
+		if exists == 0 {
+			return nil
+		}
+		return fmt.Errorf(
+			"refusing to drop database %s on %s: it is not owned by %s, so this migration "+
+				"did not create it", at.Database, at.Instance, owner)
+	}
+	return dropDatabase(ctx, sql, at)
 }
 
 // dropSubscriptionsIn detaches and drops every subscription defined in a database, in the

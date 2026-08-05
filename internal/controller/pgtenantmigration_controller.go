@@ -207,6 +207,19 @@ func (r *PgTenantMigrationReconciler) resolve(
 	if err != nil {
 		return migration.Run{}, err
 	}
+	// The API says the target must be a member of the tenant's pool and nothing checked it.
+	// Two pools may each hold a database of the same name - the uniqueness rule is scoped to
+	// one pool - so a migration pointed at the wrong pool's instance provisions into a
+	// database that already belongs to somebody else, and an abort then drops it by name.
+	//
+	// Compared as strings and never gated on the pool object being readable: a deleted or
+	// unreadable PgElasticPool must not reopen the hole.
+	if target.Spec.PoolRef.Name != tenant.Spec.PoolRef.Name {
+		return migration.Run{}, fmt.Errorf(
+			"PgInstance %q belongs to pool %q, and PgTenant %q to pool %q; a migration may "+
+				"only move a tenant within its own pool",
+			target.Name, target.Spec.PoolRef.Name, tenant.Name, tenant.Spec.PoolRef.Name)
+	}
 
 	pool := &pgelasticv1alpha1.PgElasticPool{}
 	poolKey := types.NamespacedName{Namespace: object.Namespace, Name: tenant.Spec.PoolRef.Name}

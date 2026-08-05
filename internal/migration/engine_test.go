@@ -38,6 +38,10 @@ func runningSQL() *fakeSQL {
 	completeStackInto(sql)
 	return sql.
 		answer("FROM pg_namespace n WHERE", Row{userSchema}).
+		// The ordinary case: the databases this migration acts on are the ones it made.
+		// Without an answer here every drop refuses, which is what a migration pointed at
+		// another pool's live database of the same name should meet.
+		scalarAnswer(ownedByTenantFragment, "1").
 		scalarAnswer("FROM pg_database WHERE datname", "0").
 		scalarAnswer("shobj_description(oid, 'pg_database')", "0").
 		scalarAnswer("FROM pg_publication WHERE pubname", "0").
