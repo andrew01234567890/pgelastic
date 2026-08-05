@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 )
@@ -194,6 +195,57 @@ var _ = Describe("bidirectional namespace consent", func() {
 		mustCreate(pool)
 
 		mustCreate(makeTenant(namespace, "wh-both-consent-tenant", pool.Name, "both_consent", ""))
+	})
+})
+
+// A database name is not a label. tenantdb adopts a database that already exists under the
+// name rather than creating one, and then grants the second tenant's backend role CONNECT on
+// it - so admitting the pair is admitting one tenant into the other's database. On separate
+// instances it fails differently and worse: the routing table is keyed on the name, and a key
+// written twice is a document no proxy replica can parse.
+var _ = Describe("two PgTenants claiming one database name", Ordered, func() {
+	const (
+		namespace = "wh-dbname"
+		poolName  = "wh-dbname-pool"
+		otherPool = "wh-dbname-other"
+		workload  = "wh-dbname-workload"
+		database  = "shared_db"
+	)
+
+	BeforeAll(func() {
+		ensureNamespace(namespace, nil)
+		elasticClass := makeElasticClass("wh-dbname-class")
+		mustCreate(elasticClass)
+		mustCreate(makeWorkloadClass(workload, 0, 8))
+		mustCreate(makePool(namespace, poolName, elasticClass.Name))
+		mustCreate(makePool(namespace, otherPool, elasticClass.Name))
+		mustCreate(makeTenant(namespace, "wh-dbname-holder", poolName, database, workload))
+	})
+
+	It("refuses the second, naming the tenant that already holds it", func() {
+		second := makeTenant(namespace, "wh-dbname-second", poolName, database, workload)
+
+		err := k8sClient.Create(ctx, second)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("wh-dbname-holder"))
+		Expect(err.Error()).To(ContainSubstring("spec.databaseName"))
+	})
+
+	// The claim is over one pool's databases, not the namespace's: two pools are two sets of
+	// instances, so the same name in each is two databases that never meet.
+	It("admits the same name in a different pool", func() {
+		mustCreate(makeTenant(namespace, "wh-dbname-elsewhere", otherPool, database, workload))
+	})
+
+	It("admits an update to the tenant that holds it, which collides only with itself", func() {
+		held := &pgelasticv1alpha1.PgTenant{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: namespace, Name: "wh-dbname-holder",
+		}, held)).To(Succeed())
+		held.Spec.Capacity = &pgelasticv1alpha1.PgTenantCapacity{Guaranteed: ptrTo(int32(1))}
+
+		Expect(k8sClient.Update(ctx, held)).To(Succeed())
 	})
 })
 

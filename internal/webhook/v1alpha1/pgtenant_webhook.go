@@ -115,6 +115,12 @@ func (v *PgTenantCustomValidator) validate(ctx context.Context, tenant *pgelasti
 		return err
 	}
 
+	claimed, err := v.databaseNameProblems(ctx, tenant)
+	if err != nil {
+		return err
+	}
+	problems = append(problems, claimed...)
+
 	workloadClass, membership, err := v.workloadClassProblems(ctx, resolver, tenant, pool, elasticClass)
 	if err != nil {
 		return err
@@ -130,6 +136,44 @@ func (v *PgTenantCustomValidator) validate(ctx context.Context, tenant *pgelasti
 	}
 
 	return invalid(tenant, problems)
+}
+
+// databaseNameProblems refuses a database name another tenant of the same pool already claims.
+//
+// The name is not a label. tenantdb treats a database that already exists under it as this
+// tenant's own and skips creation, and then grants this tenant's backend role CONNECT on it -
+// so a second tenant naming an existing database is admitted straight into somebody else's,
+// with a role of its own to reach it by. On separate instances it goes wrong differently: the
+// rendered document keys its routing table on the name, and two entries under one key is a TOML
+// document no replica can parse.
+//
+// Checked against the uncached reader, and still only best effort - two creates racing each
+// other each read a cluster without the other. PostgreSQL is no backstop here, because adopting
+// an existing database is exactly what it lets happen, so the reconciler refuses the loser too
+// and the renderer drops the duplicate. This turns the ordinary case into an admission error
+// naming both objects.
+func (v *PgTenantCustomValidator) databaseNameProblems(
+	ctx context.Context,
+	tenant *pgelasticv1alpha1.PgTenant,
+) (field.ErrorList, error) {
+	siblings := &pgelasticv1alpha1.PgTenantList{}
+	if err := v.Reader.List(ctx, siblings, client.InNamespace(tenant.Namespace)); err != nil {
+		return nil, err
+	}
+	var problems field.ErrorList
+	for i := range siblings.Items {
+		sibling := &siblings.Items[i]
+		if sibling.Name == tenant.Name ||
+			sibling.Spec.PoolRef.Name != tenant.Spec.PoolRef.Name ||
+			sibling.Spec.DatabaseName != tenant.Spec.DatabaseName {
+			continue
+		}
+		problems = append(problems, field.Duplicate(
+			field.NewPath("spec", "databaseName"),
+			fmt.Sprintf("PgTenant %q of pool %q already holds database %q",
+				sibling.Name, tenant.Spec.PoolRef.Name, tenant.Spec.DatabaseName)))
+	}
+	return problems, nil
 }
 
 // consentProblems enforces consent in both directions. A tenant naming a pool is not
