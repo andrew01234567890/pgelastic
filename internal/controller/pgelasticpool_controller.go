@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -70,6 +71,7 @@ const (
 	eventActionExecuted   = "AutoscaleActionExecuted"
 	eventActionRefused    = "AutoscaleActionRefused"
 	eventMigrationEmitted = "TenantMigrationEmitted"
+	eventMigrationBlocked = "TenantMigrationBlocked"
 	eventDrainStalled     = "InstanceDrainStalled"
 )
 
@@ -670,7 +672,7 @@ func (r *PgElasticPoolReconciler) execute(
 	case pgelasticv1alpha1.AutoActionScaleOut:
 		result.applied, err = r.scaleOut(ctx, pool, plan)
 	case pgelasticv1alpha1.AutoActionRebalance:
-		result.applied, err = r.emitMigrations(ctx, pool, plan.EligibleMoves(), 1, nil)
+		result.applied, err = r.emitMigrations(ctx, pool, plan.EligibleMoves(), nil)
 	case pgelasticv1alpha1.AutoActionScaleIn:
 		result.applied, err = r.scaleIn(ctx, pool, view, plan)
 	default:
@@ -788,7 +790,7 @@ func (r *PgElasticPoolReconciler) scaleIn(
 		}
 	}
 	if len(evacuation) > 0 {
-		return r.emitMigrations(ctx, pool, evacuation, 1, nil)
+		return r.emitMigrations(ctx, pool, evacuation, nil)
 	}
 
 	for i := range view.instances {
@@ -903,7 +905,7 @@ func (r *PgElasticPoolReconciler) evacuateDraining(
 	// own preflight defaults requireColdTenant to true and then reads the same coldness
 	// verdict the pool just overruled, so a drain that emitted a bare spec would emit a
 	// migration guaranteed to be refused - the override would look applied and do nothing.
-	return r.emitMigrations(ctx, pool, evacuation, 1,
+	return r.emitMigrations(ctx, pool, evacuation,
 		&pgelasticv1alpha1.TenantMigrationPreflight{RequireColdTenant: ptr.To(false)})
 }
 
@@ -935,14 +937,10 @@ func (r *PgElasticPoolReconciler) emitMigrations(
 	ctx context.Context,
 	pool *pgelasticv1alpha1.PgElasticPool,
 	moves []autoscale.Move,
-	limit int,
 	preflight *pgelasticv1alpha1.TenantMigrationPreflight,
 ) (bool, error) {
 	emitted := false
 	for _, move := range moves {
-		if limit <= 0 {
-			break
-		}
 		migration := &pgelasticv1alpha1.PgTenantMigration{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      migrationNameFor(move),
@@ -960,6 +958,15 @@ func (r *PgElasticPoolReconciler) emitMigrations(
 		}
 		if err := r.Create(ctx, migration); err != nil {
 			if apierrors.IsAlreadyExists(err) {
+				cleared, err := r.clearSettledMigration(ctx, pool, migration.Name, move)
+				if err != nil {
+					return emitted, err
+				}
+				if cleared {
+					// Recreated on the next pass rather than here, so this one does not
+					// race its own delete.
+					emitted = true
+				}
 				continue
 			}
 			return emitted, err
@@ -967,8 +974,10 @@ func (r *PgElasticPoolReconciler) emitMigrations(
 		r.event(pool, corev1.EventTypeNormal, eventMigrationEmitted, actionEmitMigration,
 			"moving %s from %s to %s, worth %d%% of the source's utilization",
 			move.Tenant, move.From, move.To, move.ExpectedImprovementPercent)
-		emitted = true
-		limit--
+		// One move per pass, like every other action this controller takes: the plan is
+		// recomputed from scratch next time, and a second move decided against numbers the
+		// first has already invalidated is a move decided against the past.
+		return true, nil
 	}
 	return emitted, nil
 }
@@ -1117,6 +1126,52 @@ func poolOfTenant(_ context.Context, object client.Object) []reconcile.Request {
 	return []reconcile.Request{{NamespacedName: client.ObjectKey{
 		Namespace: tenant.Namespace, Name: tenant.Spec.PoolRef.Name,
 	}}}
+}
+
+// clearSettledMigration takes a finished migration out of the way of the same move being made
+// again, and reports whether it did.
+//
+// A migration's name is a function of the tenant and the target, so the record of one move is
+// the name the next identical move needs. Nothing deletes a settled one - no finalizer, no TTL,
+// no owner reference - so a tenant that goes A to B, back to A, and is asked for B again found
+// its own history in the way. The Create failed with AlreadyExists, which this function's
+// caller used to swallow whole: no event, no log, no retry, and the drain that asked for the
+// move waited on it for ever while the instance stayed cordoned and un-reclaimable.
+//
+// Only a settled record is cleared. One still in flight is the ordinary idempotent case and is
+// left alone, and one parked at the preflight gate is a decision waiting for a human - saying
+// so is the most this may do to it.
+func (r *PgElasticPoolReconciler) clearSettledMigration(
+	ctx context.Context,
+	pool *pgelasticv1alpha1.PgElasticPool,
+	name string,
+	move autoscale.Move,
+) (bool, error) {
+	existing := &pgelasticv1alpha1.PgTenantMigration{}
+	key := types.NamespacedName{Namespace: pool.Namespace, Name: name}
+	if err := r.Get(ctx, key, existing); err != nil {
+		// Gone between the Create and the Get: the next pass creates it cleanly.
+		return false, client.IgnoreNotFound(err)
+	}
+	if preflightRefused(existing) {
+		r.event(pool, corev1.EventTypeWarning, eventMigrationBlocked, actionEmitMigration,
+			"moving %s to %s is blocked by PgTenantMigration %q, which its preflight refused; "+
+				"resolve or delete it, because no later attempt at this move can be emitted "+
+				"while it exists",
+			move.Tenant, move.To, name)
+		return false, nil
+	}
+	if !migrationSettled(existing) {
+		return false, nil
+	}
+	if err := r.Delete(ctx, existing); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	r.event(pool, corev1.EventTypeNormal, eventMigrationBlocked, actionEmitMigration,
+		"cleared settled PgTenantMigration %q, which named the same move of %s to %s that is "+
+			"being asked for again",
+		name, move.Tenant, move.To)
+	return true, nil
 }
 
 func migrationNameFor(move autoscale.Move) string {

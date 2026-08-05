@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -278,3 +279,82 @@ var _ = Describe("reclaiming the member scale-in emptied", func() {
 })
 
 var reclaimNamespaces int
+
+// A migration's name is a function of the tenant and the target, and nothing deletes a
+// settled one - no finalizer, no TTL, no owner reference. So the record of one move is the
+// name the next identical move needs, and a tenant that goes A to B, back to A, and is asked
+// for B again finds its own history in the way. The Create fails with AlreadyExists, which
+// used to be swallowed whole: no event, no log, no retry, and a drain waiting on that move
+// waited for ever with the instance cordoned and un-reclaimable.
+var _ = Describe("emitting a move whose name a finished migration already holds", Ordered, func() {
+	const namespace = "emit-again"
+
+	var reconciler *PgElasticPoolReconciler
+	var pool *pgelasticv1alpha1.PgElasticPool
+
+	BeforeAll(func() {
+		ensureNamespace(namespace)
+		elasticClass := makeElasticClass("emit-again-class", defaultControllerName)
+		Expect(k8sClient.Create(ctx, elasticClass)).To(Succeed())
+		pool = makePool(namespace, "emit-again-pool", elasticClass.Name, 900)
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+		DeferCleanup(func() { deleteAndAwait(pool, elasticClass) })
+		awaitCached(elasticClass, pool)
+	})
+
+	BeforeEach(func() {
+		reconciler = &PgElasticPoolReconciler{
+			Client: cachedClient, Scheme: cachedClient.Scheme(),
+			Recorder: events.NewFakeRecorder(64),
+		}
+	})
+
+	settledMigration := func(move autoscale.Move, phase pgelasticv1alpha1.TenantMigrationPhase) {
+		GinkgoHelper()
+		existing := &pgelasticv1alpha1.PgTenantMigration{
+			ObjectMeta: metav1.ObjectMeta{Name: migrationNameFor(move), Namespace: namespace},
+			Spec: pgelasticv1alpha1.PgTenantMigrationSpec{
+				TenantRef:         corev1.LocalObjectReference{Name: move.Tenant},
+				TargetInstanceRef: corev1.LocalObjectReference{Name: move.To},
+			},
+		}
+		Expect(k8sClient.Create(ctx, existing)).To(Succeed())
+		fetched := &pgelasticv1alpha1.PgTenantMigration{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(existing), fetched)).To(Succeed())
+		fetched.Status.Phase = phase
+		Expect(k8sClient.Status().Update(ctx, fetched)).To(Succeed())
+		awaitCached(fetched)
+	}
+
+	It("clears the finished record so the move can be made again", func() {
+		move := autoscale.Move{Tenant: "again-completed", From: "m-a", To: "m-b"}
+		settledMigration(move, pgelasticv1alpha1.TenantMigrationPhaseCompleted)
+
+		progressed, err := reconciler.emitMigrations(ctx, pool, []autoscale.Move{move}, nil)
+
+		Expect(err).NotTo(HaveOccurred())
+		Expect(progressed).To(BeTrue(),
+			"the pass reported no progress, so the drain that asked for this move waits for ever")
+		Eventually(func() bool {
+			err := k8sClient.Get(ctx, client.ObjectKey{
+				Namespace: namespace, Name: migrationNameFor(move),
+			}, &pgelasticv1alpha1.PgTenantMigration{})
+			return apierrors.IsNotFound(err)
+		}).Should(BeTrue(), "the settled record still holds the name the new move needs")
+	})
+
+	// The ordinary idempotent case: one already in flight is the reason the Create is allowed
+	// to fail at all, and deleting it would abandon a migration mid-flight.
+	It("leaves a migration that is still running exactly where it is", func() {
+		move := autoscale.Move{Tenant: "again-running", From: "m-a", To: "m-b"}
+		settledMigration(move, pgelasticv1alpha1.TenantMigrationPhaseCatchup)
+
+		progressed, err := reconciler.emitMigrations(ctx, pool, []autoscale.Move{move}, nil)
+
+		Expect(err).NotTo(HaveOccurred())
+		Expect(progressed).To(BeFalse())
+		Expect(k8sClient.Get(ctx, client.ObjectKey{
+			Namespace: namespace, Name: migrationNameFor(move),
+		}, &pgelasticv1alpha1.PgTenantMigration{})).To(Succeed())
+	})
+})
