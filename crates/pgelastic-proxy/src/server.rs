@@ -711,9 +711,15 @@ async fn serve(
     socket: TcpStream,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    // One deadline over everything an unauthenticated peer can make the proxy do, not over the
+    // pre-startup negotiation alone. The startup packet is the cheap half; the SCRAM exchange
+    // that follows is two more blocking reads from the same unproven peer, and it used to run
+    // with no bound at all - so a client that completed the startup packet and then simply
+    // stopped writing held one of `listen.maxClientConnections` for as long as it liked.
     let login = proxy.config.listen.client_login_timeout();
-    let accepted = tokio::time::timeout(
-        login,
+    let deadline = tokio::time::Instant::now() + login;
+    let accepted = tokio::time::timeout_at(
+        deadline,
         handshake::negotiate(
             socket,
             proxy.acceptor.as_ref(),
@@ -734,14 +740,28 @@ async fn serve(
         return Err(ProxyError::ShuttingDown);
     }
 
-    handshake::negotiate_protocol_version(&mut session).await?;
+    tokio::time::timeout_at(
+        deadline,
+        handshake::negotiate_protocol_version(&mut session),
+    )
+    .await
+    .map_err(|_| ProxyError::Timeout(login))??;
 
     let user = session.user()?.clone();
     // Loaded once and held. Proving a password and binding the login to a tenant are two
     // reads of the same table, and an adoption landing between them would decide the second
     // against a table the first never saw.
     let auth = proxy.auth();
-    if let Err(error) = handshake::authenticate_client(&mut session, &auth).await {
+    let authenticated = match tokio::time::timeout_at(
+        deadline,
+        handshake::authenticate_client(&mut session, &auth),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ProxyError::Timeout(login)),
+    };
+    if let Err(error) = authenticated {
         proxy.metrics.client_auth(AuthOutcome::Failure);
         proxy.metrics.client_rejected(RejectReason::Handshake);
         handshake::report(&mut session.stream, Some(&user), &error).await;

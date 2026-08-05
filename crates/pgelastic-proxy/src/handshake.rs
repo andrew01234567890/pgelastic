@@ -164,6 +164,15 @@ impl ClientAuth {
     }
 }
 
+/// The largest frame an unauthenticated peer may send.
+///
+/// The wire crate defaults to a gibibyte, which is a sensible ceiling for a tenant's own
+/// statements and an absurd one for a startup packet: it lets anybody who can open a socket
+/// have the proxy reserve a gibibyte per connection before proving anything at all.
+/// `PostgreSQL` itself caps a startup packet at 10 000 bytes and an authentication token at the
+/// same, so this is generous by two orders of magnitude and still bounded.
+const MAX_PRE_AUTH_FRAME: usize = 1 << 20;
+
 /// Settles encryption and reads the startup packet.
 pub async fn negotiate(
     socket: TcpStream,
@@ -172,7 +181,7 @@ pub async fn negotiate(
 ) -> Result<Accepted> {
     socket.set_nodelay(true)?;
     let mut stream: ClientStream = MaybeTls::Plain(Prefixed::new(Bytes::new(), socket));
-    let mut buf = MessageBuffer::new();
+    let mut buf = MessageBuffer::new().with_max_frame_len(MAX_PRE_AUTH_FRAME);
     let mut machine = PreStartupMachine::new();
 
     loop {
