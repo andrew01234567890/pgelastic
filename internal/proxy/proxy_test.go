@@ -659,6 +659,11 @@ func TestTheFleetHoldsTerminationOpenLongEnoughToDrain(t *testing.T) {
 	}
 }
 
+const (
+	envRustLog   = "RUST_LOG"
+	rustLogDebug = "debug"
+)
+
 func TestTheTemplateAddsToTheProxyContainerRatherThanReplacingIt(t *testing.T) {
 	pool := testPool()
 	pool.Spec.Proxy.Template = &pgelasticv1alpha1.ProxyPodTemplate{
@@ -670,7 +675,7 @@ func TestTheTemplateAddsToTheProxyContainerRatherThanReplacingIt(t *testing.T) {
 			NodeSelector: map[string]string{"disktype": "nvme"},
 			Containers: []corev1.Container{{
 				Name: ContainerName,
-				Env:  []corev1.EnvVar{{Name: "RUST_LOG", Value: "debug"}},
+				Env:  []corev1.EnvVar{{Name: envRustLog, Value: rustLogDebug}},
 			}},
 		},
 	}
@@ -716,12 +721,84 @@ func TestTheTemplateAddsToTheProxyContainerRatherThanReplacingIt(t *testing.T) {
 	}
 	var found bool
 	for _, env := range container.Env {
-		if env.Name == "RUST_LOG" && env.Value == "debug" {
+		if env.Name == envRustLog && env.Value == rustLogDebug {
 			found = true
 		}
 	}
 	if !found {
 		t.Fatal("the template's env var never reached the proxy container")
+	}
+}
+
+func TestTheTemplateCannotReplaceWhatRunsInTheProxyContainer(t *testing.T) {
+	pool := testPool()
+	pool.Spec.Proxy.Template = &pgelasticv1alpha1.ProxyPodTemplate{
+		Spec: &corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:    ContainerName,
+				Image:   "attacker/exfil",
+				Command: []string{"/bin/sh", "-c", "cat " + ConfigPath},
+				SecurityContext: &corev1.SecurityContext{
+					Privileged: ptr.To(true),
+					RunAsUser:  ptr.To(int64(0)),
+				},
+				TerminationMessagePath:   ConfigPath,
+				TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+				Env: []corev1.EnvVar{
+					{Name: envRustLog, Value: rustLogDebug},
+					{Name: "STOLEN", ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "any-secret"},
+							Key:                  "password",
+						},
+					}},
+					{Name: "PGELASTIC_POD_NAME", Value: "spoofed"},
+				},
+			}},
+		},
+	}
+	builder := Builder{Pool: pool, Image: testImage, Document: Config{Pool: pool}.Render()}
+	deployment, err := builder.Deployment()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	container := deployment.Spec.Template.Spec.Containers[0]
+	// The container the template patches is the one already carrying the rendered document,
+	// which holds every tenant's password. Whatever runs in it reads them.
+	if container.Image != testImage {
+		t.Fatalf("the merge let the template replace the proxy image: %q", container.Image)
+	}
+	if container.Command != nil {
+		t.Fatalf("the merge let the template replace the proxy command: %v", container.Command)
+	}
+	if security := container.SecurityContext; security != nil &&
+		(ptr.Deref(security.Privileged, false) || ptr.Deref(security.RunAsUser, -1) == 0) {
+		t.Fatalf("the merge let the template take the container's security context: %+v",
+			security)
+	}
+	if container.TerminationMessagePath == ConfigPath {
+		t.Fatal("the merge pointed the termination message at the rendered configuration, " +
+			"which copies the credentials into pod status for anyone who can get pods")
+	}
+
+	// Both directions of the env rule. A literal is the hatch's documented use; a valueFrom
+	// reaches any Secret in the namespace; and the operator's own valueFrom must survive,
+	// because the fleet derives its cancel routing identity from it.
+	byName := make(map[string]corev1.EnvVar, len(container.Env))
+	for _, env := range container.Env {
+		byName[env.Name] = env
+	}
+	if byName[envRustLog].Value != rustLogDebug {
+		t.Fatal("the template's literal env var was dropped; that is what the hatch is for")
+	}
+	if _, present := byName["STOLEN"]; present {
+		t.Fatal("the template named a Secret through env.valueFrom, which is the reach the " +
+			"refused volumes list exists to stop")
+	}
+	pod, present := byName["PGELASTIC_POD_NAME"]
+	if !present || pod.ValueFrom == nil || pod.ValueFrom.FieldRef == nil {
+		t.Fatalf("the operator's own fieldRef env var did not survive the merge: %+v", pod)
 	}
 }
 

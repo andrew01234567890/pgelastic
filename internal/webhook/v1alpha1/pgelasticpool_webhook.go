@@ -18,9 +18,12 @@ package v1alpha1
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -265,7 +268,10 @@ func proxyPodTemplateProblems(pool *pgelasticv1alpha1.PgElasticPool) field.Error
 					"rendered configuration mounted, which carries every tenant's credentials; "+
 					"name it %q to patch the generated container instead",
 					proxy.ContainerName)))
+			continue
 		}
+		problems = append(problems,
+			proxyContainerProblems(container, path.Child("containers").Index(index))...)
 	}
 	if len(spec.InitContainers) > 0 {
 		refuse("initContainers", "an init container shares the pod's volumes and service account")
@@ -288,6 +294,60 @@ func proxyPodTemplateProblems(pool *pgelasticv1alpha1.PgElasticPool) field.Error
 	if spec.SecurityContext != nil {
 		refuse("securityContext", "the pod security context is the operator's; set what you "+
 			"need through spec.proxy")
+	}
+	return problems
+}
+
+// proxyContainerFields are the fields of the proxy container a pool may set.
+//
+// Sizing, and the three probes because a pool that has tuned its own timeouts has a reason
+// to. Everything else decides what runs in the container, and the container is the one the
+// rendered configuration is mounted into.
+var proxyContainerFields = map[string]bool{
+	"name": true, "resources": true, "env": true,
+	"readinessProbe": true, "livenessProbe": true, "startupProbe": true,
+}
+
+// proxyContainerProblems refuses everything about the proxy container except the fields the
+// hatch exists for.
+//
+// It is an allowlist, and that is the whole point. Refusing a list of dangerous names is the
+// same mistake this gate already made once, one level down: `image` and `command` are the
+// obvious ones, but `lifecycle.postStart.exec` runs an arbitrary command with no image
+// override at all, and a `terminationMessagePath` pointed at the rendered configuration makes
+// the kubelet copy the credentials into pod status, where anybody with `get pods` can read
+// them. Neither needs root and neither replaces the image. corev1.Container also gains fields
+// with every apimachinery bump, and under an enumeration each new one is permitted by default.
+//
+// So the container is marshalled, the permitted keys are removed, and whatever is left is
+// refused by its own name.
+func proxyContainerProblems(container corev1.Container, path *field.Path) field.ErrorList {
+	var problems field.ErrorList
+	for index, env := range container.Env {
+		if env.ValueFrom != nil {
+			problems = append(problems, field.Forbidden(
+				path.Child("env").Index(index).Child("valueFrom"),
+				"an env var sourced from the namespace may name any Secret in it, which is "+
+					"the reach the refused volumes list exists to stop; set a literal value"))
+		}
+	}
+
+	encoded, err := json.Marshal(container)
+	if err != nil {
+		return append(problems, field.InternalError(path, err))
+	}
+	fields := map[string]json.RawMessage{}
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return append(problems, field.InternalError(path, err))
+	}
+	for _, name := range slices.Sorted(maps.Keys(fields)) {
+		if proxyContainerFields[name] {
+			continue
+		}
+		problems = append(problems, field.Forbidden(path.Child(name),
+			"the proxy container is the operator's - it runs with the rendered configuration "+
+				"mounted, which carries every tenant's password and backend SCRAM keys. "+
+				"spec.proxy.template.spec is for placement, scheduling, resources and probes"))
 	}
 	return problems
 }
