@@ -87,6 +87,43 @@ type Spec struct {
 	// than a list: memberships are revoked inside it and never outside, so a grant a DBA made
 	// by hand from a role we do not own is left exactly where it is.
 	Owned []string
+	// StatementTimeout and TempFileLimit are the tenant's tier-2 limits, in PostgreSQL's own
+	// spelling, applied to this login's role as well as to the tenant's owner role.
+	//
+	// Both, because a contained user dials as *its own* backend role. A limit that reached only
+	// the owner would be one every login escapes, and the class calls these hard limits.
+	StatementTimeout string
+	TempFileLimit    string
+}
+
+// roleSettings is the tier-2 limits as GUC name and value, in a fixed order so two passes over
+// one spec issue the same statements.
+func (s Spec) roleSettings() []struct{ Name, Value string } {
+	return []struct{ Name, Value string }{
+		{"statement_timeout", s.StatementTimeout},
+		{"temp_file_limit", s.TempFileLimit},
+	}
+}
+
+// parseRoleConfig turns pg_roles.rolconfig - a list of "name=value" strings - into a map.
+//
+// Joined with the ASCII record separator rather than a newline, because the transport splits
+// rows on a newline: a value carrying one is read back as a second row and the answer is
+// rejected.
+func parseRoleConfig(raw string) map[string]string {
+	settings := map[string]string{}
+	for entry := range strings.SplitSeq(raw, "\x1e") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, value, found := strings.Cut(entry, "=")
+		if !found {
+			continue
+		}
+		settings[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
+	}
+	return settings
 }
 
 // State is what the catalog currently says about the login.
@@ -104,6 +141,8 @@ type State struct {
 	CredentialCurrent bool
 	// MayConnect is has_database_privilege on the tenant's database.
 	MayConnect bool
+	// RoleSettings is pg_roles.rolconfig as a map, which is where ALTER ROLE ... SET lands.
+	RoleSettings map[string]string
 	// MemberOf is the memberships this login holds *within* Owned, sorted.
 	MemberOf []string
 }
@@ -114,7 +153,8 @@ func (s State) Settled(spec Spec) bool {
 		s.CanLogin == spec.Login &&
 		s.MayConnect &&
 		(spec.Verifier == "" || s.CredentialCurrent) &&
-		slices.Equal(s.MemberOf, sortedCopy(spec.MemberOf))
+		slices.Equal(s.MemberOf, sortedCopy(spec.MemberOf)) &&
+		s.settingsCurrent(spec)
 }
 
 // observeQuery reads everything in one round trip, because each round trip is an exec into a
@@ -138,7 +178,19 @@ const observeQuery = `SELECT coalesce((SELECT r.rolcanlogin::int::text FROM pg_r
    FROM pg_roles r, pg_database d WHERE r.rolname = %[1]s AND d.datname = %[3]s), '0'),
  coalesce((SELECT string_agg(g.rolname, ',' ORDER BY g.rolname) FROM pg_auth_members m
    JOIN pg_roles g ON g.oid = m.roleid JOIN pg_roles v ON v.oid = m.member
-   WHERE v.rolname = %[1]s AND g.rolname = ANY (%[4]s)), '')`
+   WHERE v.rolname = %[1]s AND g.rolname = ANY (%[4]s)), ''),
+ coalesce((SELECT array_to_string(r.rolconfig, e'\x1e') FROM pg_roles r WHERE r.rolname = %[1]s), '')`
+
+// settingsCurrent reports whether every declared tier-2 limit is already on the role. An
+// undeclared one is not compared: leaving a parameter alone is not the same as agreeing with it.
+func (s State) settingsCurrent(spec Spec) bool {
+	for _, setting := range spec.roleSettings() {
+		if setting.Value != "" && s.RoleSettings[setting.Name] != setting.Value {
+			return false
+		}
+	}
+	return true
+}
 
 // Observe reads the login out of the catalog.
 func Observe(ctx context.Context, sql SQL, at Endpoint, spec Spec) (State, error) {
@@ -155,7 +207,7 @@ func Observe(ctx context.Context, sql SQL, at Endpoint, spec Spec) (State, error
 	if err != nil {
 		return State{}, fmt.Errorf("reading the catalog on %s/%s: %w", at.Namespace, at.Instance, err)
 	}
-	if len(rows) != 1 || len(rows[0]) != 4 {
+	if len(rows) != 1 || len(rows[0]) != 5 {
 		return State{}, fmt.Errorf("unreadable catalog answer for role %q: %v", spec.Role, rows)
 	}
 
@@ -169,6 +221,7 @@ func Observe(ctx context.Context, sql SQL, at Endpoint, spec Spec) (State, error
 		CredentialCurrent: strings.TrimSpace(rows[0][1]) == "1",
 		MayConnect:        strings.TrimSpace(rows[0][2]) == "1",
 		MemberOf:          splitRoles(rows[0][3]),
+		RoleSettings:      parseRoleConfig(rows[0][4]),
 	}, nil
 }
 
@@ -210,7 +263,33 @@ func Ensure(ctx context.Context, sql SQL, at Endpoint, spec Spec) (State, error)
 	if err := memberships(ctx, sql, postgres, spec, state); err != nil {
 		return state, err
 	}
+	if err := roleSettings(ctx, sql, postgres, spec, state); err != nil {
+		return state, err
+	}
 	return Observe(ctx, sql, at, spec)
+}
+
+// roleSettings brings the tenant's tier-2 limits onto this login's role.
+//
+// The same limits the tenant's owner role carries, because a contained user dials as its own
+// backend role: a bound that reached only the owner would be one every login escapes, and the
+// workload class calls these hard limits rather than hints.
+//
+// An undeclared limit leaves the parameter alone rather than issuing RESET, exactly as the
+// tenant's own role treats it.
+func roleSettings(ctx context.Context, sql SQL, postgres Endpoint, spec Spec, state State) error {
+	for _, setting := range spec.roleSettings() {
+		if setting.Value == "" || state.RoleSettings[setting.Name] == setting.Value {
+			continue
+		}
+		// The name is a compile-time constant and never client text; the value is a quoted
+		// literal, which is what PostgreSQL accepts here for both of these.
+		if err := exec(ctx, sql, postgres, spec.Role, "%s SET "+setting.Name+" = %s",
+			alter(spec.Role), migration.QuoteLiteral(setting.Value)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // create makes the role with every privileged attribute spelled out and denied.

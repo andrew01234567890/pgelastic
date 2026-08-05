@@ -17,14 +17,16 @@ limitations under the License.
 package controller
 
 import (
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"math"
+	"time"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/ownership"
 	"github.com/andrew01234567890/pgelastic/internal/placement"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var _ = Describe("PgTenant controller", Ordered, func() {
@@ -168,5 +170,61 @@ var _ = Describe("PgTenant controller", Ordered, func() {
 
 		Expect(result.RequeueAfter).To(Equal(ownership.RetryUnresolved))
 		Expect(refetch(tenant).ResourceVersion).To(Equal(before))
+	})
+})
+
+// statement_timeout's bare-number unit is milliseconds, and a Go duration prints spellings
+// like "1m30s" that PostgreSQL will not parse. temp_file_limit's unit is kilobytes, and a
+// limit rounded down to zero would mean "no temporary files at all" - the opposite of a small
+// allowance - while -1 would mean no limit.
+var _ = Describe("rendering a tenant's tier-2 limits for ALTER ROLE", func() {
+	It("spells a statement timeout in milliseconds", func() {
+		Expect(durationSetting(&metav1.Duration{Duration: 90 * time.Second})).To(Equal("90000ms"))
+		Expect(durationSetting(&metav1.Duration{Duration: 1500 * time.Millisecond})).
+			To(Equal("1500ms"))
+	})
+
+	// 0 is PostgreSQL's spelling of "no timeout at all", so truncating a sub-millisecond limit
+	// to 0ms would turn the tightest bound an operator can ask for into no bound. Its sibling
+	// already floored at 1kB for the same reason; this one did not.
+	It("floors a sub-millisecond timeout rather than truncating it to no timeout", func() {
+		Expect(durationSetting(&metav1.Duration{Duration: 500 * time.Microsecond})).To(Equal("1ms"))
+		Expect(durationSetting(&metav1.Duration{Duration: time.Nanosecond})).To(Equal("1ms"))
+	})
+
+	// Past INT_MAX PostgreSQL refuses the ALTER outright with "value exceeds integer range",
+	// which fails the whole provisioning pass rather than this one setting.
+	It("caps both limits at PostgreSQL's own integer range", func() {
+		Expect(durationSetting(&metav1.Duration{Duration: 1000 * time.Hour})).To(Equal("2147483647ms"))
+		big := resource.NewQuantity(1<<62, resource.BinarySI)
+		Expect(quantitySetting(big)).To(Equal("2147483647kB"))
+	})
+
+	// The rounding is done in kilobytes, because adding 1023 to the largest quantity the API
+	// accepts overflows int64 - and an overflowed sum turned the most generous allowance an
+	// operator can express into the most restrictive.
+	It("does not invert the largest allowance into the smallest", func() {
+		Expect(quantitySetting(resource.NewQuantity(math.MaxInt64, resource.BinarySI))).
+			To(Equal("2147483647kB"))
+	})
+
+	It("treats an absent or non-positive timeout as undeclared", func() {
+		Expect(durationSetting(nil)).To(BeEmpty())
+		Expect(durationSetting(&metav1.Duration{})).To(BeEmpty())
+		Expect(durationSetting(&metav1.Duration{Duration: -time.Second})).To(BeEmpty())
+	})
+
+	It("spells a temp file limit in kilobytes, rounding up", func() {
+		Expect(quantitySetting(resource.NewQuantity(1<<30, resource.BinarySI))).
+			To(Equal("1048576kB"))
+		// Anything under a kilobyte is still an allowance, not a prohibition.
+		Expect(quantitySetting(resource.NewQuantity(1, resource.BinarySI))).To(Equal("1kB"))
+		Expect(quantitySetting(resource.NewQuantity(1025, resource.BinarySI))).To(Equal("2kB"))
+	})
+
+	It("treats an absent, zero or negative limit as undeclared", func() {
+		Expect(quantitySetting(nil)).To(BeEmpty())
+		Expect(quantitySetting(resource.NewQuantity(0, resource.BinarySI))).To(BeEmpty())
+		Expect(quantitySetting(resource.NewQuantity(-1, resource.BinarySI))).To(BeEmpty())
 	})
 })

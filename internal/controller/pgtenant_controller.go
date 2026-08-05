@@ -23,6 +23,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -364,6 +366,10 @@ func (r *PgTenantReconciler) provision(
 	}
 	spec := tenantSpecOf(tenant, connectionLimitOf(resolved))
 	spec.Verifier = credential.Verifier
+	// The two tier-2 limits, which policy.EffectiveFor has resolved and status.effective has
+	// been publishing since before anything applied them.
+	spec.StatementTimeout = durationSetting(resolved.effective.StatementTimeout)
+	spec.TempFileLimit = quantitySetting(resolved.effective.TempFileLimit)
 	state, err := tenantdb.Ensure(ctx, r.SQL, tenantEndpoint(tenant, host.Name), spec)
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "Could not provision the tenant's database",
@@ -494,6 +500,46 @@ func tenantSpecOf(tenant *pgelasticv1alpha1.PgTenant, connectionLimit int32) ten
 		Owner:           migration.BackendRoleName(tenant.Namespace, tenant.Name),
 		ConnectionLimit: connectionLimit,
 	}
+}
+
+// durationSetting renders a limit as PostgreSQL's own statement_timeout value.
+//
+// Milliseconds, because statement_timeout's bare-number unit is milliseconds and a Go
+// duration's String() produces spellings like "1m30s" that PostgreSQL will not parse.
+//
+// Floored at one millisecond and capped at PostgreSQL's own integer range. Both matter and
+// neither is defensive: 0 is PostgreSQL's spelling of "no timeout at all", so a sub-millisecond
+// limit truncated to 0ms would turn the tightest bound an operator can ask for into no bound -
+// and a value past INT_MAX is refused with "value exceeds integer range", which fails the whole
+// provisioning pass rather than just this setting.
+func durationSetting(limit *metav1.Duration) string {
+	if limit == nil || limit.Duration <= 0 {
+		return ""
+	}
+	milliseconds := min(max(limit.Milliseconds(), 1), math.MaxInt32)
+	return strconv.FormatInt(milliseconds, 10) + "ms"
+}
+
+// quantitySetting renders a limit as temp_file_limit's own unit, which is kilobytes.
+//
+// Rounded up, floored at one and capped at PostgreSQL's integer range, for the same three
+// reasons as its sibling: a limit rendered down to zero would mean "no temporary files at all",
+// which is the opposite of a small allowance; -1 would mean no limit; and a value past INT_MAX
+// is refused outright, which fails the provisioning pass rather than this one setting.
+//
+// The rounding is done in kilobytes rather than by adding 1023 to a byte count, because the
+// largest quantity the API accepts overflows int64 on that addition - and an overflowed sum
+// turns the most generous allowance an operator can express into the most restrictive.
+func quantitySetting(limit *resource.Quantity) string {
+	if limit == nil || limit.IsZero() || limit.Sign() < 0 {
+		return ""
+	}
+	bytes := limit.Value()
+	kilobytes := bytes / 1024
+	if bytes%1024 != 0 {
+		kilobytes++
+	}
+	return strconv.FormatInt(min(max(kilobytes, 1), math.MaxInt32), 10) + "kB"
 }
 
 // connectionLimitOf leaves the tenant's role uncapped, deliberately.

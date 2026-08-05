@@ -174,6 +174,13 @@ func (r *PgTenantUserReconciler) converge(
 		MemberOf: members,
 		Owned:    owned,
 	}
+	// Read off the tenant's published status rather than resolved again here: it is the same
+	// value the tenant controller put on the owner role, so the two cannot drift into a login
+	// that is bounded differently from the tenant it belongs to.
+	if effective := tenant.Status.Effective; effective != nil {
+		spec.StatementTimeout = durationSetting(effective.StatementTimeout)
+		spec.TempFileLimit = quantitySetting(effective.TempFileLimit)
+	}
 	// Provisioned even without a credential. Another login's memberOf may name this one, and
 	// a role that does not exist cannot be granted.
 	credentialled := spec.Login && user.Spec.CredentialsSecretRef != nil

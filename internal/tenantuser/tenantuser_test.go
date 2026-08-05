@@ -38,7 +38,7 @@ func at() Endpoint {
 
 // settled is the catalog answer for a login that already matches its spec.
 func settled(members string) migration.Row {
-	return migration.Row{"1", "1", "1", members}
+	return migration.Row{"1", "1", "1", members, ""}
 }
 
 func spec() Spec {
@@ -67,7 +67,7 @@ func TestASettledLoginIssuesNoStatements(t *testing.T) {
 // The role is the whole privilege surface a client reaches, so every privileged attribute is
 // denied by name rather than left to the default.
 func TestANewLoginIsCreatedWithEveryPrivilegedAttributeDenied(t *testing.T) {
-	sql := newFakeSQL().answer(migration.Row{"-1", "0", "0", ""})
+	sql := newFakeSQL().answer(migration.Row{"-1", "0", "0", "", ""})
 
 	if _, err := Ensure(context.Background(), sql, at(), spec()); err != nil {
 		t.Fatalf("ensuring: %v", err)
@@ -90,7 +90,7 @@ func TestANewLoginIsCreatedWithEveryPrivilegedAttributeDenied(t *testing.T) {
 // every backend the fleet opens count against rolconnlimit, so N replicas would breach a cap of
 // N by a factor of N - which is why the tenant's own role is uncapped for the same reason.
 func TestALoginsRoleIsNeverGivenAConnectionLimit(t *testing.T) {
-	sql := newFakeSQL().answer(migration.Row{"-1", "0", "0", ""})
+	sql := newFakeSQL().answer(migration.Row{"-1", "0", "0", "", ""})
 
 	if _, err := Ensure(context.Background(), sql, at(), spec()); err != nil {
 		t.Fatalf("ensuring: %v", err)
@@ -105,7 +105,7 @@ func TestALoginsRoleIsNeverGivenAConnectionLimit(t *testing.T) {
 // nothing to steal and nothing for the proxy to prove.
 func TestAGroupRoleIsCreatedNologinAndPasswordless(t *testing.T) {
 	group := Spec{Role: loginRole, Database: database, Login: false}
-	sql := newFakeSQL().answer(migration.Row{"-1", "0", "0", ""})
+	sql := newFakeSQL().answer(migration.Row{"-1", "0", "0", "", ""})
 
 	if _, err := Ensure(context.Background(), sql, at(), group); err != nil {
 		t.Fatalf("ensuring: %v", err)
@@ -124,7 +124,7 @@ func TestAGroupRoleIsCreatedNologinAndPasswordless(t *testing.T) {
 // that notices is comparing the stored verifier rather than trusting that a created role was
 // also credentialed.
 func TestALoginCarriedToAnotherInstanceHasItsCredentialReapplied(t *testing.T) {
-	sql := newFakeSQL().answer(migration.Row{"1", "0", "1", ""})
+	sql := newFakeSQL().answer(migration.Row{"1", "0", "1", "", ""})
 
 	if _, err := Ensure(context.Background(), sql, at(), spec()); err != nil {
 		t.Fatalf("ensuring: %v", err)
