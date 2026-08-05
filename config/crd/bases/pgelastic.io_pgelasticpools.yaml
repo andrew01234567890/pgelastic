@@ -810,18 +810,21 @@ spec:
                           rule: self.all(name, name.matches('^[a-zA-Z_][a-zA-Z0-9_]*([.][a-zA-Z_][a-zA-Z0-9_]*)?$'))
                       perTenantLogicalBackup:
                         description: |-
-                          perTenantLogicalBackup configures nightly per-tenant dumps, which are the only path
-                          that restores one tenant without touching the others.
+                          perTenantLogicalBackup reserves dump capacity on every member this template provisions.
+                          It schedules no dumps - see the field of the same name on PgInstance. Restoring one
+                          tenant without touching the others is what a PgRestore of scope Tenant does.
                         properties:
                           dumpTimeout:
                             default: 2h
                             description: |-
-                              dumpTimeout aborts and reschedules an overrunning dump rather than letting it hold
-                              the xmin horizon open indefinitely.
+                              dumpTimeout would abort and reschedule an overrunning dump rather than letting it hold
+                              the xmin horizon open indefinitely. Inert: nothing here executes a dump to time out.
                             type: string
                           enabled:
                             default: true
-                            description: enabled turns the nightly dump sweep on.
+                            description: |-
+                              enabled reserves the dump capacity below. It starts no sweep: there is no scheduler and
+                              no dump executor, so nothing here ever takes a dump.
                             type: boolean
                           maxConcurrentDumps:
                             default: 4
@@ -836,13 +839,14 @@ spec:
                             type: integer
                           retention:
                             default: 14d
-                            description: retention is how long dumps are kept.
+                            description: 'retention is how long dumps are kept. Inert:
+                              no dump is taken to retain.'
                             maxLength: 32
                             type: string
                           schedule:
                             default: 0 4 * * *
-                            description: schedule is a five-field cron expression
-                              for the sweep.
+                            description: 'schedule is a five-field cron expression
+                              for the sweep. Inert: no sweeper reads it.'
                             maxLength: 256
                             minLength: 1
                             type: string

@@ -270,9 +270,15 @@ type PgInstanceSpec struct {
 	// +optional
 	Backup *InstanceBackup `json:"backup,omitempty"`
 
-	// perTenantLogicalBackup configures the nightly per-database pg_dump that covers the
-	// "a tenant deleted their own data" case, which physical backup cannot address at
-	// tenant granularity without a scratch instance.
+	// perTenantLogicalBackup reserves the connections and the concurrency a per-database
+	// pg_dump needs, and is read for exactly that: instance sizing, and the parallelism a
+	// tenant migration's dump runs at.
+	//
+	// It does NOT schedule anything. There is no sweeper and no dump executor, so `schedule`,
+	// `retention` and `dumpTimeout` are stored and read by nothing, and enabling this buys no
+	// artifact to recover a tenant's own deletion from. The operator says so on the instance
+	// rather than leaving the field to imply otherwise; recovering one tenant is what
+	// PgRestore's Tenant scope does today.
 	// +optional
 	PerTenantLogicalBackup *PerTenantLogicalBackup `json:"perTenantLogicalBackup,omitempty"`
 
@@ -499,21 +505,27 @@ type InstanceBackup struct {
 	BackupStandby *bool `json:"backupStandby,omitempty"`
 }
 
-// PerTenantLogicalBackup configures nightly per-database dumps.
+// PerTenantLogicalBackup reserves the capacity a per-database dump needs.
+//
+// NOT IMPLEMENTED as a scheduled sweep. Only maxConcurrentDumps has a reader: instance sizing
+// charges the reserve, and a tenant migration's pg_dump runs at that parallelism. The other
+// fields are stored and read by nothing, so enabling this produces no artifact and is not a
+// recovery path for a tenant that deleted its own data - a PgRestore of scope Tenant is.
 type PerTenantLogicalBackup struct {
-	// enabled turns the nightly dump sweep on.
+	// enabled reserves the dump capacity below. It starts no sweep: there is no scheduler and
+	// no dump executor, so nothing here ever takes a dump.
 	// +kubebuilder:default=true
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
 
-	// schedule is a five-field cron expression for the sweep.
+	// schedule is a five-field cron expression for the sweep. Inert: no sweeper reads it.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=256
 	// +kubebuilder:default="0 4 * * *"
 	// +optional
 	Schedule *string `json:"schedule,omitempty"`
 
-	// retention is how long dumps are kept.
+	// retention is how long dumps are kept. Inert: no dump is taken to retain.
 	// +kubebuilder:validation:MaxLength=32
 	// +kubebuilder:default="14d"
 	// +optional
@@ -529,8 +541,8 @@ type PerTenantLogicalBackup struct {
 	// +optional
 	MaxConcurrentDumps *int32 `json:"maxConcurrentDumps,omitempty"`
 
-	// dumpTimeout aborts and reschedules an overrunning dump rather than letting it hold
-	// the xmin horizon open indefinitely.
+	// dumpTimeout would abort and reschedule an overrunning dump rather than letting it hold
+	// the xmin horizon open indefinitely. Inert: nothing here executes a dump to time out.
 	// +kubebuilder:default="2h"
 	// +optional
 	DumpTimeout *metav1.Duration `json:"dumpTimeout,omitempty"`
