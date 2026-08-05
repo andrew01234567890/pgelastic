@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
+	"github.com/andrew01234567890/pgelastic/internal/instance/pgconf"
 	"github.com/andrew01234567890/pgelastic/internal/instance/provision"
 	"github.com/andrew01234567890/pgelastic/internal/placement"
 	"github.com/andrew01234567890/pgelastic/internal/policy"
@@ -374,8 +375,30 @@ func (r *PgElasticPoolReconciler) proxyInstances(
 			User:     provision.OpsRole,
 			Password: password,
 		}
-		if capacity := member.Status.Capacity; capacity != nil {
-			entry.BackendConnections = capacity.Allocatable
+		// Published capacity when there is any, and the member's own rating when there is
+		// not.
+		//
+		// The operator withholds status.capacity the moment an instance leaves Ready, so a
+		// member being rolled published nothing - and an instance rendered with no
+		// backendConnections is one the proxy falls back to the POOL-WIDE budget for. A
+		// member restarting was therefore not merely uncounted: every tenant could be
+		// admitted against it up to the whole pool's budget, on the one instance least able
+		// to serve them.
+		//
+		// Its sizing class is the honest answer in the meantime. It is what the member was
+		// rated for, what it published while it was Ready, and what it will publish again -
+		// a fact about the machine rather than about its current phase, which is why it
+		// survives the phase changing. Zero would be more precise for the seconds it is
+		// actually down, and is not expressible: the allocator refuses a pool with no
+		// capacity at construction and again at every guarantee, so rendering it makes the
+		// fleet reject the whole document.
+		switch {
+		case member.Status.Capacity != nil:
+			entry.BackendConnections = member.Status.Capacity.Allocatable
+		default:
+			if class, err := pgconf.LookupSizingClass(member.Spec.Class); err == nil {
+				entry.BackendConnections = class.AllocatableConnections
+			}
 		}
 		instances = append(instances, entry)
 	}
