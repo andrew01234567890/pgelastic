@@ -90,7 +90,6 @@ type MemberObservation struct {
 	VotingMembers    []string
 	ConfigSHA256     string
 	PendingRestart   bool
-	MaxConnections   int32
 	// ClientBackends is how many client connections the postmaster is holding right now,
 	// counted as PostgreSQL counts them rather than as the proxy believes it opened them.
 	ClientBackends int32
@@ -211,7 +210,6 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		       EXISTS (SELECT 1 FROM pg_stat_wal_receiver),
 		       COALESCE(current_setting('pgelastic.config_sha256', true), ''),
 		       EXISTS (SELECT 1 FROM pg_settings WHERE pending_restart),
-		       current_setting('max_connections')::int,
 		       (SELECT count(*) FROM pg_stat_activity
 		         WHERE backend_type = 'client backend')::int,
 		       current_setting('synchronous_standby_names'),
@@ -232,7 +230,6 @@ func Observe(ctx context.Context, conn *pgx.Conn) (MemberObservation, error) {
 		&observation.WALReceiverActive,
 		&observation.ConfigSHA256,
 		&observation.PendingRestart,
-		&observation.MaxConnections,
 		&observation.ClientBackends,
 		&observation.SyncStandbyNames,
 		&observation.PrimaryEpoch,

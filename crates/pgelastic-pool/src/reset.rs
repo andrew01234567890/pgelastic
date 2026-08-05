@@ -272,8 +272,6 @@ pub fn plan(
         };
     }
 
-    let needs_scrub = !taint.is_clean() || context.tx_status != TransactionStatus::Idle;
-
     let steps = match policy {
         ResetPolicy::None => {
             if taint.is_clean() {
@@ -285,20 +283,18 @@ pub fn plan(
                 };
             }
         }
-        ResetPolicy::DirtyTracked => {
-            if needs_scrub {
-                with_rollback(
-                    context.tx_status,
-                    if taint.is_clean() {
-                        Vec::new()
-                    } else {
-                        vec![ResetStep::DiscardAll]
-                    },
-                )
-            } else {
+        // No scrub-needed test, because there was never a case it decided. It read
+        // `!taint.is_clean() || tx_status != Idle`, and when it was false the session was
+        // both clean and idle - which is exactly when with_rollback(Idle, vec![]) returns the
+        // empty vec the other arm returned by hand.
+        ResetPolicy::DirtyTracked => with_rollback(
+            context.tx_status,
+            if taint.is_clean() {
                 Vec::new()
-            }
-        }
+            } else {
+                vec![ResetStep::DiscardAll]
+            },
+        ),
         ResetPolicy::SmartDiscard => with_rollback(context.tx_status, smart_steps(taint)),
         ResetPolicy::DiscardAll => with_rollback(context.tx_status, vec![ResetStep::DiscardAll]),
         ResetPolicy::Verified => with_rollback(
