@@ -50,9 +50,6 @@ func NewSession() string {
 	return hex.EncodeToString(token)
 }
 
-// Session is the identity this agent process claims backups under.
-func (s *Supervisor) Session() string { return s.session }
-
 // reconcileBackup acts on the operator's election, and only on this member's own.
 //
 // The backup runs in a goroutine on the supervisor's own context rather than the observe

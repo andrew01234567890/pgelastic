@@ -27,7 +27,6 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pgelasticv1alpha1 "github.com/andrew01234567890/pgelastic/api/v1alpha1"
 	"github.com/andrew01234567890/pgelastic/internal/instance/pgtool"
@@ -230,9 +229,4 @@ func DialPeer(ctx context.Context, host string, port int32) bool {
 	}
 	_ = conn.Close()
 	return true
-}
-
-// APIClient is the narrow view of the API server the agent needs.
-type APIClient interface {
-	Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error
 }

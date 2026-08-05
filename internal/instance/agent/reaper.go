@@ -42,11 +42,6 @@ type Process struct {
 	Executable string
 }
 
-// ProcessTable enumerates the processes visible to this PID namespace.
-type ProcessTable interface {
-	Processes() ([]Process, error)
-}
-
 // SelectReapable picks the orphans this agent is responsible for waiting on.
 //
 // The scoping is the whole point. A generic init reaper - tini, dumb-init, a bare

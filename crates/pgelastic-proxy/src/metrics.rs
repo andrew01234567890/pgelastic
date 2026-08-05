@@ -446,10 +446,6 @@ impl Metrics {
         .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn active_clients(&self) -> i64 {
-        self.clients_active.load(Ordering::Relaxed)
-    }
-
     pub fn checkout(&self, reused: bool) {
         if reused {
             &self.checkouts_reused

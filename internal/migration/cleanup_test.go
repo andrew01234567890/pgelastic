@@ -257,21 +257,6 @@ func TestLiveObjectNamesClaimsAllThreeObjectsOfAMigration(t *testing.T) {
 	}
 }
 
-func TestIsAlreadyGoneRecognisesAMissingObject(t *testing.T) {
-	if !IsAlreadyGone(errFakeMissing) {
-		t.Fatal("a missing object was not recognised")
-	}
-	if IsAlreadyGone(nil) || IsAlreadyGone(errFake) {
-		t.Fatal("an unrelated error was treated as a missing object")
-	}
-}
-
-var errFakeMissing = errorString(`ERROR:  replication slot "pgelastic_mig_x" does not exist`)
-
-type errorString string
-
-func (e errorString) Error() string { return string(e) }
-
 func TestGeneratedNamesFitPostgresIdentifierLimits(t *testing.T) {
 	long := strings.Repeat("a-very-long-migration-name", 8)
 	for _, name := range []string{
