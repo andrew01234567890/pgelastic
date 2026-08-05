@@ -94,6 +94,9 @@ type Spec struct {
 	// the owner would be one every login escapes, and the class calls these hard limits.
 	StatementTimeout string
 	TempFileLimit    string
+	// ReadOnly stops this login writing while its tenant is over its storage quota. On every
+	// login as well as the owner, for the reason the two limits above are.
+	ReadOnly bool
 }
 
 // roleSettings is the tier-2 limits as GUC name and value, in a fixed order so two passes over
@@ -102,7 +105,17 @@ func (s Spec) roleSettings() []struct{ Name, Value string } {
 	return []struct{ Name, Value string }{
 		{"statement_timeout", s.StatementTimeout},
 		{"temp_file_limit", s.TempFileLimit},
+		{"default_transaction_read_only", readOnlySetting(s.ReadOnly)},
 	}
+}
+
+// readOnlySetting is always a value, never the empty string: a tenant that deletes its way back
+// under its quota must have its writes admitted again on the next pass.
+func readOnlySetting(readOnly bool) string {
+	if readOnly {
+		return "on"
+	}
+	return "off"
 }
 
 // parseRoleConfig turns pg_roles.rolconfig - a list of "name=value" strings - into a map.

@@ -135,7 +135,9 @@ var _ = Describe("PgTenant controller", Ordered, func() {
 
 		fetched := refetch(tenant)
 		Expect(fetched.Status.ObservedGeneration).To(Equal(fetched.Generation))
-		Expect(fetched.Status.Conditions).To(HaveLen(3))
+		// Accepted, Ready, Placed and Throttled: the last is the storage cap's current-state
+		// flag, set on every pass so that lifting it is as visible as applying it.
+		Expect(fetched.Status.Conditions).To(HaveLen(4))
 		for _, condition := range fetched.Status.Conditions {
 			Expect(condition.ObservedGeneration).To(Equal(fetched.Generation),
 				"condition %s carries a stale generation", condition.Type)
@@ -226,5 +228,49 @@ var _ = Describe("rendering a tenant's tier-2 limits for ALTER ROLE", func() {
 		Expect(quantitySetting(nil)).To(BeEmpty())
 		Expect(quantitySetting(resource.NewQuantity(0, resource.BinarySI))).To(BeEmpty())
 		Expect(quantitySetting(resource.NewQuantity(-1, resource.BinarySI))).To(BeEmpty())
+	})
+})
+
+// The storage cap on ElasticClassDensity had zero production readers. A tenant past it now has
+// its roles opened read-only by default, which is PostgreSQL deciding what a write is rather
+// than the proxy guessing from statement text — an approach that was written, measured against
+// a real backend, and withdrawn because BEGIN;…;COMMIT walked straight past it.
+var _ = Describe("deciding whether a tenant is over its storage cap", func() {
+	class := func(quota *resource.Quantity) *pgelasticv1alpha1.PgElasticClass {
+		return &pgelasticv1alpha1.PgElasticClass{
+			Spec: pgelasticv1alpha1.PgElasticClassSpec{
+				Density: &pgelasticv1alpha1.ElasticClassDensity{MaxStoragePerTenant: quota},
+			},
+		}
+	}
+	tenantUsing := func(bytes *int64) *pgelasticv1alpha1.PgTenant {
+		return &pgelasticv1alpha1.PgTenant{
+			Status: pgelasticv1alpha1.PgTenantStatus{
+				Utilization: &pgelasticv1alpha1.PgTenantUtilization{StorageBytes: bytes},
+			},
+		}
+	}
+
+	It("is over only when the measurement exceeds the cap", func() {
+		quota := resource.NewQuantity(1000, resource.BinarySI)
+		Expect(overStorageQuota(tenantUsing(ptrTo(int64(1001))), class(quota))).To(BeTrue())
+		Expect(overStorageQuota(tenantUsing(ptrTo(int64(1000))), class(quota))).To(BeFalse())
+		Expect(overStorageQuota(tenantUsing(ptrTo(int64(0))), class(quota))).To(BeFalse())
+	})
+
+	// Refusing until a figure arrives would refuse every tenant for the first scrape interval
+	// of its life, and a cap that fires before anything is stored is not a cap.
+	It("treats an unmeasured tenant as under its cap", func() {
+		quota := resource.NewQuantity(1000, resource.BinarySI)
+		Expect(overStorageQuota(tenantUsing(nil), class(quota))).To(BeFalse())
+		Expect(overStorageQuota(&pgelasticv1alpha1.PgTenant{}, class(quota))).To(BeFalse())
+	})
+
+	// A class that draws no line, or whose class has gone, is one nobody has capped.
+	It("treats an undeclared or absent cap as no cap", func() {
+		Expect(overStorageQuota(tenantUsing(ptrTo(int64(1<<40))), class(nil))).To(BeFalse())
+		Expect(overStorageQuota(tenantUsing(ptrTo(int64(1<<40))), nil)).To(BeFalse())
+		zero := resource.NewQuantity(0, resource.BinarySI)
+		Expect(overStorageQuota(tenantUsing(ptrTo(int64(1<<40))), class(zero))).To(BeFalse())
 	})
 })

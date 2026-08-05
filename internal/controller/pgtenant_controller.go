@@ -156,6 +156,11 @@ func (r *PgTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	setCondition(&status.Conditions, tenant.Generation, pgelasticv1alpha1.ConditionAccepted,
 		conditionStatus(accepted), resolved.reason, resolved.message)
+	// Declared since the CRD was written and set by nothing until now. It is the current-state
+	// flag for the storage cap, which is why the login controller reads it rather than working
+	// the comparison out a second time and disagreeing for one reconcile whenever a scrape
+	// lands between the two.
+	setStorageThrottle(&status, tenant, resolved.elasticClass)
 
 	placed, err := r.place(ctx, tenant, resolved, &status)
 	if err != nil {
@@ -182,10 +187,14 @@ func (r *PgTenantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 // resolution is the outcome of walking a tenant's references.
 type resolution struct {
-	pool      *pgelasticv1alpha1.PgElasticPool
-	effective policy.Effective
-	reason    string
-	message   string
+	pool *pgelasticv1alpha1.PgElasticPool
+	// elasticClass is the pool's class, or nil when it does not resolve. Carried because the
+	// storage cap lives on it, and a tenant whose class is gone is one nobody has drawn a line
+	// for rather than one at its limit.
+	elasticClass *pgelasticv1alpha1.PgElasticClass
+	effective    policy.Effective
+	reason       string
+	message      string
 }
 
 // resolve walks the pool and workload class references and returns the effective policy
@@ -217,7 +226,7 @@ func (r *PgTenantReconciler) resolve(
 
 	workloadClassName, err := resolver.WorkloadClassNameFor(ctx, tenant, pool, elasticClass)
 	if errors.Is(err, policy.ErrNoWorkloadClass) {
-		return resolution{pool: pool, reason: pgelasticv1alpha1.ReasonPending, message: err.Error()}, nil
+		return resolution{pool: pool, elasticClass: elasticClass, reason: pgelasticv1alpha1.ReasonPending, message: err.Error()}, nil
 	} else if err != nil {
 		return resolution{}, err
 	}
@@ -227,15 +236,16 @@ func (r *PgTenantReconciler) resolve(
 		if !apierrors.IsNotFound(err) {
 			return resolution{}, err
 		}
-		return resolution{pool: pool, reason: pgelasticv1alpha1.ReasonPending, message: fmt.Sprintf(
+		return resolution{pool: pool, elasticClass: elasticClass, reason: pgelasticv1alpha1.ReasonPending, message: fmt.Sprintf(
 			"PgWorkloadClass %q does not exist", workloadClassName)}, nil
 	}
 
 	effective := policy.EffectiveFor(tenant, workloadClass)
 	return resolution{
-		pool:      pool,
-		effective: effective,
-		reason:    pgelasticv1alpha1.ReasonAccepted,
+		pool:         pool,
+		elasticClass: elasticClass,
+		effective:    effective,
+		reason:       pgelasticv1alpha1.ReasonAccepted,
 		message: fmt.Sprintf(
 			"effective capacity resolved from PgWorkloadClass %q: guaranteed %d, burstable %d, weight %d",
 			effective.WorkloadClassName, effective.Guaranteed, effective.Burstable, effective.Weight),
@@ -370,6 +380,7 @@ func (r *PgTenantReconciler) provision(
 	// been publishing since before anything applied them.
 	spec.StatementTimeout = durationSetting(resolved.effective.StatementTimeout)
 	spec.TempFileLimit = quantitySetting(resolved.effective.TempFileLimit)
+	spec.ReadOnly = overStorageQuota(tenant, resolved.elasticClass)
 	state, err := tenantdb.Ensure(ctx, r.SQL, tenantEndpoint(tenant, host.Name), spec)
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "Could not provision the tenant's database",
@@ -500,6 +511,68 @@ func tenantSpecOf(tenant *pgelasticv1alpha1.PgTenant, connectionLimit int32) ten
 		Owner:           migration.BackendRoleName(tenant.Namespace, tenant.Name),
 		ConnectionLimit: connectionLimit,
 	}
+}
+
+// setStorageThrottle publishes whether the tenant is over its storage cap.
+//
+// A condition rather than status.throttle: that field counts admission rejections over a
+// window, and this is a state the tenant is in right now.
+func setStorageThrottle(
+	status *pgelasticv1alpha1.PgTenantStatus,
+	tenant *pgelasticv1alpha1.PgTenant,
+	class *pgelasticv1alpha1.PgElasticClass,
+) {
+	over := overStorageQuota(tenant, class)
+	reason, message := pgelasticv1alpha1.ReasonAccepted, "within every declared limit"
+	if over {
+		reason = string(pgelasticv1alpha1.ThrottleStorageQuota)
+		message = "the tenant is over its class's maxStoragePerTenant, so its roles open " +
+			"read-only transactions by default until it is not"
+	}
+	setCondition(&status.Conditions, tenant.Generation, pgelasticv1alpha1.ConditionThrottled,
+		conditionStatus(over), reason, message)
+}
+
+// StorageThrottled reports whether this tenant's roles are currently held read-only.
+//
+// Exported for the login controller, which must apply the same posture to every login: a flag
+// that reached only the tenant's owner role would be one every contained user writes past.
+func StorageThrottled(tenant *pgelasticv1alpha1.PgTenant) bool {
+	return meta.IsStatusConditionTrue(tenant.Status.Conditions,
+		pgelasticv1alpha1.ConditionThrottled)
+}
+
+// overStorageQuota reports whether the tenant's last measured size is past the cap its class
+// draws, which is what makes its role read-only until it is not.
+//
+// **PostgreSQL decides what a write is.** An earlier attempt classified statement text in the
+// proxy and was withdrawn: it was bypassed by `BEGIN; ... ; COMMIT` at any usage level, and it
+// refused `COPY (SELECT ... FROM ...) TO`, the chunked-DELETE idiom and any SELECT whose literal
+// contained the word `into` - the statements a tenant needs to get back under its limit.
+//
+// The cost of doing it here is that a DELETE is refused too, because a DELETE is a write and
+// PostgreSQL is not going to pretend otherwise. A tenant recovers with an explicit
+// `SET transaction_read_only = off` for the transaction that deletes, which is a deliberate
+// override rather than an accident - the same shape as every other tier-2 limit, and the CRD
+// says so.
+//
+// A tenant nobody has measured yet is under quota. Refusing until a figure arrives would refuse
+// every tenant for the first scrape interval of its life.
+func overStorageQuota(
+	tenant *pgelasticv1alpha1.PgTenant,
+	class *pgelasticv1alpha1.PgElasticClass,
+) bool {
+	if class == nil || class.Spec.Density == nil || class.Spec.Density.MaxStoragePerTenant == nil {
+		return false
+	}
+	quota := class.Spec.Density.MaxStoragePerTenant.Value()
+	if quota <= 0 {
+		return false
+	}
+	if tenant.Status.Utilization == nil || tenant.Status.Utilization.StorageBytes == nil {
+		return false
+	}
+	return *tenant.Status.Utilization.StorageBytes > quota
 }
 
 // durationSetting renders a limit as PostgreSQL's own statement_timeout value.

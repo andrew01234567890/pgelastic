@@ -37,8 +37,12 @@ func at() Endpoint {
 }
 
 // settled is the catalog answer for a login that already matches its spec.
+//
+// The rolconfig column carries the read-only posture, because Ensure always writes that one:
+// it is computed from a measurement that moves, so it has to be lifted as well as applied, and
+// a login whose catalogue does not carry it yet is one that still owes a statement.
 func settled(members string) migration.Row {
-	return migration.Row{"1", "1", "1", members, ""}
+	return migration.Row{"1", "1", "1", members, "default_transaction_read_only=off"}
 }
 
 func spec() Spec {

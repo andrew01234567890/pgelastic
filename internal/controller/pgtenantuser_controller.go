@@ -181,6 +181,10 @@ func (r *PgTenantUserReconciler) converge(
 		spec.StatementTimeout = durationSetting(effective.StatementTimeout)
 		spec.TempFileLimit = quantitySetting(effective.TempFileLimit)
 	}
+	// Read off the tenant's own role rather than recomputed: the tenant controller decides
+	// whether the tenant is over its quota, and two controllers deciding that separately would
+	// disagree for one reconcile every time a scrape lands between them.
+	spec.ReadOnly = StorageThrottled(tenant)
 	// Provisioned even without a credential. Another login's memberOf may name this one, and
 	// a role that does not exist cannot be granted.
 	credentialled := spec.Login && user.Spec.CredentialsSecretRef != nil

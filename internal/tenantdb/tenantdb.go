@@ -108,6 +108,16 @@ type Spec struct {
 	// try.
 	StatementTimeout string
 	TempFileLimit    string
+	// ReadOnly makes every transaction this role opens read-only by default, which is how a
+	// tenant over its storage quota is stopped from growing further.
+	//
+	// PostgreSQL decides what a write is, which is the whole point: the proxy cannot tell from
+	// statement text, and an attempt to - bypassed by `BEGIN; ...; COMMIT` and refusing the
+	// very statements a tenant needs to recover - was written, measured and withdrawn.
+	//
+	// Always written rather than left alone, unlike the two limits above it: this one is
+	// computed from a measurement that moves, so it has to be lifted as well as applied.
+	ReadOnly bool
 }
 
 // roleSettings is the tier-2 limits as GUC name and value, in a fixed order so two passes
@@ -116,7 +126,18 @@ func (s Spec) roleSettings() []struct{ Name, Value string } {
 	return []struct{ Name, Value string }{
 		{"statement_timeout", s.StatementTimeout},
 		{"temp_file_limit", s.TempFileLimit},
+		{"default_transaction_read_only", readOnlySetting(s.ReadOnly)},
 	}
+}
+
+// readOnlySetting is always a value, never the empty string, because unlike the tier-2 limits
+// this setting has to be taken away again: a tenant that deletes its way back under its quota
+// must have its writes admitted on the next pass.
+func readOnlySetting(readOnly bool) string {
+	if readOnly {
+		return "on"
+	}
+	return "off"
 }
 
 // roleConfigSeparator joins rolconfig's entries in the projection above.

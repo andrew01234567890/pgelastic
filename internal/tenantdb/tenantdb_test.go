@@ -368,6 +368,50 @@ func TestTheTenantRoleIsCreatedWithNoPrivilegedAttribute(t *testing.T) {
 	}
 }
 
+// PostgreSQL decides what a write is. The predicate that tried to decide it from statement text
+// was bypassed by BEGIN;...;COMMIT at any usage level and refused the statements a tenant needs
+// to recover, and was withdrawn; this is what replaced it.
+func TestBeingOverQuotaMakesTheRoleReadOnlyAndComingBackUnderLiftsIt(t *testing.T) {
+	cluster := tenantdbtest.NewCluster()
+	ctx := context.Background()
+
+	over := spec()
+	over.ReadOnly = true
+	if _, err := tenantdb.Ensure(ctx, cluster, endpoint(), over); err != nil {
+		t.Fatalf("provisioning failed: %v", err)
+	}
+	if got := cluster.RoleSetting(tenantRole, "default_transaction_read_only"); got != "on" {
+		t.Fatalf("a tenant over its quota carries default_transaction_read_only %q", got)
+	}
+
+	// The half a one-way flag would have got wrong: the figure that set it moves, so the
+	// posture has to be taken away again or a tenant that deletes its way back stays stuck.
+	under := spec()
+	under.ReadOnly = false
+	if _, err := tenantdb.Ensure(ctx, cluster, endpoint(), under); err != nil {
+		t.Fatalf("the second pass failed: %v", err)
+	}
+	if got := cluster.RoleSetting(tenantRole, "default_transaction_read_only"); got != "off" {
+		t.Fatalf("a tenant back under its quota is still read-only: %q", got)
+	}
+}
+
+func TestAnUnchangedReadOnlyPostureIsNotReapplied(t *testing.T) {
+	cluster := tenantdbtest.NewCluster()
+	ctx := context.Background()
+
+	if _, err := tenantdb.Ensure(ctx, cluster, endpoint(), spec()); err != nil {
+		t.Fatalf("provisioning failed: %v", err)
+	}
+	cluster.Forget()
+	if _, err := tenantdb.Ensure(ctx, cluster, endpoint(), spec()); err != nil {
+		t.Fatalf("the second pass failed: %v", err)
+	}
+	if cluster.Ran("default_transaction_read_only") != 0 {
+		t.Fatal("an unchanged posture was reapplied, so every reconcile writes to the catalogue")
+	}
+}
+
 // The fake returns already-structured rows, so it cannot by itself catch a projection whose
 // text the real transport mis-splits. This asserts the property the transport actually needs:
 // whatever separator the query joins rolconfig with must survive migration.parseRows, which
