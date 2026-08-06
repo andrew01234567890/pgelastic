@@ -183,19 +183,6 @@ func TestPreflightTreatsAnUnobservedTenantAsNotCold(t *testing.T) {
 	}
 }
 
-// TestPreflightReportsALargeObjectAsAnAdmissionHole is the assertion rather than the check.
-// Large objects are refused at signup; meeting one here means admission let it through.
-func TestPreflightReportsALargeObjectAsAnAdmissionHole(t *testing.T) {
-	sql := passingSource().scalarAnswer("FROM pg_largeobject_metadata", "3")
-	result := RunPreflight(context.Background(), sql, passingInput())
-	if result.Passed() {
-		t.Fatal("a source holding large objects was admitted")
-	}
-	if !strings.Contains(result.Message(), "admission let them in") {
-		t.Fatalf("the refusal blames the migration rather than admission: %s", result.Message())
-	}
-}
-
 func TestPreflightReportsAnUnlistedExtensionAsAnAdmissionHole(t *testing.T) {
 	sql := passingSource().answer("SELECT extname FROM pg_extension", Row{AlwaysInstalledExtensions[0]}, Row{"postgis"})
 	result := RunPreflight(context.Background(), sql, passingInput())
@@ -350,5 +337,54 @@ func TestAMultiMajorJumpIsRefused(t *testing.T) {
 	}
 	if !strings.Contains(check.Detail, "jump of 2") {
 		t.Errorf("the refusal does not name the size of the jump: %q", check.Detail)
+	}
+}
+
+// Large objects are not publishable, so an online move would arrive with the rows that
+// reference them and without the objects. `pg_dump` carries them, so the offline strategy is
+// unaffected - and refusing there refused a move that works.
+//
+// It refused there. The check was unconditional, and preflight cannot fault, so a tenant that
+// had ever called `lo_from_bytea` - a function PostgreSQL grants to PUBLIC and this tree never
+// revokes - parked in Preflight for ever under every strategy. The drain finalizer on its
+// instance held with it, so one large object made a PgInstance permanently undrainable.
+func TestALargeObjectRefusesOnlyTheOnlinePath(t *testing.T) {
+	for _, probe := range []struct {
+		name    string
+		input   PreflightInput
+		refused bool
+	}{
+		{"offline carries them", PreflightInput{Online: false, ForbidLargeObjects: true}, false},
+		{"online without the toggle", PreflightInput{Online: true, ForbidLargeObjects: false}, false},
+		{"online with the toggle", PreflightInput{Online: true, ForbidLargeObjects: true}, true},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			sql := passingSource().
+				scalarAnswer("FROM pg_largeobject_metadata", "3")
+			in := probe.input
+			in.Source = sourceAt
+			in.Target = targetAt
+
+			result := RunPreflight(context.Background(), sql, in)
+
+			// Asked of this check alone. The whole verdict folds in gates the fake source
+			// cannot answer, so it would say nothing about the one under test.
+			var found *Check
+			for i := range result.Checks {
+				if result.Checks[i].Name == CheckLargeObjects {
+					found = &result.Checks[i]
+				}
+			}
+			switch {
+			case !probe.refused && found != nil:
+				t.Fatalf("the large-object gate ran where it should not have: %s", found.Detail)
+			case probe.refused && found == nil:
+				t.Fatal("the large-object gate did not run on the online path")
+			case probe.refused && found.Passed:
+				t.Fatal("three large objects passed the online gate")
+			case probe.refused && !strings.Contains(found.Detail, "Offline strategy"):
+				t.Fatalf("the refusal does not name the way out: %s", found.Detail)
+			}
+		})
 	}
 }

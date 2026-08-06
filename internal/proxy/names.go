@@ -115,6 +115,11 @@ const ContainerName = "proxy"
 // without a second spelling that has to be kept in step with the API's.
 const EnvLogFormat = "PGELASTIC_LOG_FORMAT"
 
+// EnvLogLevel is the proxy's log filter. The binary reads RUST_LOG through
+// tracing_subscriber's EnvFilter and falls back to "info", so this is the name it already
+// honours rather than one invented for it.
+const EnvLogLevel = "RUST_LOG"
+
 // DefaultReplicas matches the spec.proxy.replicas CRD default and is applied to a pool
 // whose fleet was written before the default existed.
 const DefaultReplicas int32 = 3

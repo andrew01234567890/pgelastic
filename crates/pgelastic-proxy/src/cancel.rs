@@ -243,6 +243,34 @@ pub async fn deliver(
     tls: Option<&crate::tls::BackendTls>,
     connect_timeout: std::time::Duration,
 ) -> Result<()> {
+    // Bounded here rather than at each call site, because one of the two forgot. The
+    // client-facing path in `server.rs` awaited this bare, and it runs inside the task holding
+    // that peer's client-connection permit - so a cancel aimed at an instance that has stopped
+    // answering parked a permit against `maxClientConnections` for as long as the socket took
+    // to fail, which for a black-holed address is for ever. It is also the one arm of `serve`
+    // that escapes the login deadline every other arm is wrapped in.
+    //
+    // A choke point, so a third caller cannot miss it.
+    match tokio::time::timeout(
+        crate::txn::CANCEL_DELIVERY_TIMEOUT,
+        deliver_inner(target, tls, connect_timeout),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::error::ProxyError::backend(format!(
+            "delivering a cancel to {} took longer than {:?}",
+            target.address,
+            crate::txn::CANCEL_DELIVERY_TIMEOUT
+        ))),
+    }
+}
+
+async fn deliver_inner(
+    target: &CancelTarget,
+    tls: Option<&crate::tls::BackendTls>,
+    connect_timeout: std::time::Duration,
+) -> Result<()> {
     let Some(key_data) = target.key_data.clone() else {
         return Ok(());
     };
@@ -260,6 +288,69 @@ pub async fn deliver(
     // message, so there is nothing to read back.
     let _ = stream.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod delivery_bound_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A cancel must not outlive the release that stopped waiting for it.
+    ///
+    /// `settle_cancels` waits `CANCEL_WAIT_TIMEOUT` for a cancel that has been picked up and
+    /// then logs "releasing anyway" and hands the link on. In transaction mode the next holder
+    /// is another tenant, so a delivery still in flight past that point cancels a stranger's
+    /// statement. The constants were five seconds against two.
+    ///
+    /// A compile-time assertion guards the ordering; this says out loud what it is for.
+    #[test]
+    fn delivery_is_abandoned_before_a_release_stops_waiting() {
+        assert!(
+            crate::txn::CANCEL_DELIVERY_TIMEOUT < crate::txn::CANCEL_WAIT_TIMEOUT,
+            "a cancel bounded at {:?} outlives a release that waits {:?}, so it lands on \
+             whichever tenant holds the link next",
+            crate::txn::CANCEL_DELIVERY_TIMEOUT,
+            crate::txn::CANCEL_WAIT_TIMEOUT,
+        );
+    }
+
+    /// The bound lives inside `deliver` rather than at its callers, because one caller forgot:
+    /// the client-facing path awaited it bare while holding a client-connection permit.
+    #[tokio::test]
+    async fn a_backend_that_never_answers_does_not_park_the_caller() {
+        // A routable address with nothing listening that will not refuse promptly: the
+        // documentation-only range blackholes rather than resets.
+        let target = CancelTarget {
+            address: std::sync::Arc::from("192.0.2.1:5432"),
+            key_data: Some(pgelastic_wire::BackendKeyData {
+                process_id: 1,
+                key: CancelKey::new(Bytes::from_static(b"abcd")).expect("a cancel key"),
+            }),
+            instance: crate::route::InstanceId::new("probe"),
+            client: None,
+        };
+
+        // A connect timeout far longer than the delivery bound, which is the point: without
+        // the bound inside `deliver` the caller waits for this instead, holding a
+        // client-connection permit the whole time.
+        let connect = std::time::Duration::from_secs(60);
+        let started = tokio::time::Instant::now();
+        let result = deliver(&target, None, connect).await;
+
+        assert!(result.is_err(), "a black-holed cancel reported success");
+        let waited = started.elapsed();
+        assert!(
+            waited < connect,
+            "delivery waited {waited:?}, out to the connect timeout - the caller's \
+             client-connection permit is held for all of it, and a black-holed address holds \
+             it for ever"
+        );
+        assert!(
+            waited < crate::txn::CANCEL_DELIVERY_TIMEOUT + Duration::from_millis(500),
+            "delivery took {waited:?}, well past its own bound"
+        );
+    }
 }
 
 #[cfg(test)]

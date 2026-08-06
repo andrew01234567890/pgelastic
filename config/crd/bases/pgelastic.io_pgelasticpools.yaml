@@ -159,8 +159,13 @@ spec:
                     type: string
                   maxWaitSeconds:
                     default: 30
-                    description: maxWaitSeconds bounds how long a client waits for
-                      a backend before it is denied.
+                    description: |-
+                      maxWaitSeconds bounds how long a client waits for a backend before it is denied.
+
+                      The same bound as spec.timeouts.checkout, which carries the same default. This one wins
+                      when it is set; otherwise the timeout group's value applies. Set one or the other, not
+                      both - two numbers for one bound is how this field came to be stored, defaulted and read
+                      by nothing at all.
                     format: int32
                     maximum: 3600
                     minimum: 0
@@ -814,17 +819,9 @@ spec:
                           It schedules no dumps - see the field of the same name on PgInstance. Restoring one
                           tenant without touching the others is what a PgRestore of scope Tenant does.
                         properties:
-                          dumpTimeout:
-                            default: 2h
-                            description: |-
-                              dumpTimeout would abort and reschedule an overrunning dump rather than letting it hold
-                              the xmin horizon open indefinitely. Inert: nothing here executes a dump to time out.
-                            type: string
                           enabled:
                             default: true
-                            description: |-
-                              enabled reserves the dump capacity below. It starts no sweep: there is no scheduler and
-                              no dump executor, so nothing here ever takes a dump.
+                            description: enabled reserves the dump capacity below.
                             type: boolean
                           maxConcurrentDumps:
                             default: 4
@@ -837,19 +834,6 @@ spec:
                             maximum: 16
                             minimum: 1
                             type: integer
-                          retention:
-                            default: 14d
-                            description: 'retention is how long dumps are kept. Inert:
-                              no dump is taken to retain.'
-                            maxLength: 32
-                            type: string
-                          schedule:
-                            default: 0 4 * * *
-                            description: 'schedule is a five-field cron expression
-                              for the sweep. Inert: no sweeper reads it.'
-                            maxLength: 256
-                            minLength: 1
-                            type: string
                         type: object
                       postgresVersion:
                         default: "18"
@@ -1105,7 +1089,13 @@ spec:
                     type: string
                   logLevel:
                     default: Info
-                    description: logLevel sets the proxy's log verbosity.
+                    description: |-
+                      logLevel sets the proxy's log verbosity.
+
+                      Carried to the fleet as RUST_LOG, which the proxy already honours. It is part of the pod
+                      spec, so changing it restarts the fleet and drops established client sessions - which is
+                      worth knowing before raising it during an incident. Info is the proxy's own default and
+                      is not rendered, so a pool that asks for it does not roll for it.
                     enum:
                     - Debug
                     - Info
@@ -10395,8 +10385,10 @@ spec:
                     type: string
                   checkout:
                     default: 30s
-                    description: checkout bounds how long a client waits to be granted
-                      a backend.
+                    description: |-
+                      checkout bounds how long a client waits to be granted a backend.
+
+                      spec.admission.maxWaitSeconds is the same bound and takes precedence when it is set.
                     type: string
                   clientIdleInTransaction:
                     default: 60s

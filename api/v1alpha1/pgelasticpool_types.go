@@ -378,6 +378,11 @@ type PoolAdmission struct {
 	QueueDepthPerTenant *int32 `json:"queueDepthPerTenant,omitempty"`
 
 	// maxWaitSeconds bounds how long a client waits for a backend before it is denied.
+	//
+	// The same bound as spec.timeouts.checkout, which carries the same default. This one wins
+	// when it is set; otherwise the timeout group's value applies. Set one or the other, not
+	// both - two numbers for one bound is how this field came to be stored, defaulted and read
+	// by nothing at all.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=3600
 	// +kubebuilder:default=30
@@ -594,6 +599,8 @@ type PoolTimeouts struct {
 	Connect *metav1.Duration `json:"connect,omitempty"`
 
 	// checkout bounds how long a client waits to be granted a backend.
+	//
+	// spec.admission.maxWaitSeconds is the same bound and takes precedence when it is set.
 	// +kubebuilder:default="30s"
 	// +optional
 	Checkout *metav1.Duration `json:"checkout,omitempty"`
@@ -1266,6 +1273,11 @@ type PoolMetering struct {
 // PoolObservability configures proxy logging and metrics exposition.
 type PoolObservability struct {
 	// logLevel sets the proxy's log verbosity.
+	//
+	// Carried to the fleet as RUST_LOG, which the proxy already honours. It is part of the pod
+	// spec, so changing it restarts the fleet and drops established client sessions - which is
+	// worth knowing before raising it during an incident. Info is the proxy's own default and
+	// is not rendered, so a pool that asks for it does not roll for it.
 	// +kubebuilder:validation:Enum=Debug;Info;Warn;Error
 	// +kubebuilder:default=Info
 	// +optional

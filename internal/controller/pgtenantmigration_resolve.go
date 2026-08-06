@@ -112,6 +112,7 @@ func preflightInput(
 		RequireReplicaIdentity:      true,
 		ForbidPreparedTransactions:  true,
 		RequireColdTenant:           true,
+		ForbidLargeObjects:          true,
 		MaxSourceUtilizationPercent: sourceUtilizationCeiling(object, pool),
 		TargetFreeBytes:             freeBytes(target),
 		// The allowlist is what the tenant asked for and admission accepted. Anything
@@ -129,6 +130,7 @@ func preflightInput(
 		input.RequireReplicaIdentity = ptr.Deref(spec.RequireReplicaIdentity, true)
 		input.ForbidPreparedTransactions = ptr.Deref(spec.ForbidPreparedTransactions, true)
 		input.RequireColdTenant = ptr.Deref(spec.RequireColdTenant, true)
+		input.ForbidLargeObjects = ptr.Deref(spec.ForbidLargeObjects, true)
 	}
 	return input
 }

@@ -6,6 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
 
 use crate::budget::{CapacityBudget, TenantEntry};
 use crate::config::{AdmissionSpec, AdmissionStrategy, CANCEL_CREDIT_CAP, PoolSpec, TenantSpec};
@@ -725,6 +726,16 @@ impl<C: Clock> Allocator<C> {
     pub fn backend_died(&mut self, server: ServerId) -> Vec<Grant> {
         self.close_server(server);
         self.drain_queue()
+    }
+
+    /// Changes how long a queued client may wait before its ticket expires.
+    ///
+    /// Adoptable rather than fixed at construction, because its four sibling `[pool]` bounds
+    /// already are: a change to one of them is picked up at the next checkout, and a change to
+    /// this one used to roll every replica in the fleet - dropping every client of every tenant
+    /// to alter a number about waiting.
+    pub fn set_max_wait(&mut self, max_wait: Duration) {
+        self.admission.max_wait = max_wait;
     }
 
     pub fn expire_queued(&mut self) -> Vec<Expired> {

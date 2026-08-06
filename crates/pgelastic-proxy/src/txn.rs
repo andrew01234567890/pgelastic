@@ -54,7 +54,7 @@ use crate::vars::{self, VariableCache};
 /// How long a release waits for a cancel that has been picked up but not yet
 /// delivered. A cancel connection that cannot be opened must not strand a
 /// backend for the life of the pool.
-const CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What a session is currently bound to.
 ///
@@ -282,8 +282,25 @@ pub async fn run(
     ending
 }
 
-/// How long the deadline's own cancel may take before it is abandoned.
-const CANCEL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a cancel's delivery may take before it is abandoned.
+///
+/// **Strictly less than [`CANCEL_WAIT_TIMEOUT`]**, and that ordering is the whole point. The
+/// release waits `CANCEL_WAIT_TIMEOUT` for a cancel that has been picked up, and then hands the
+/// link on regardless. A delivery bound longer than that wait meant a cancel could still be in
+/// flight after the link had been given to somebody else - and in transaction mode the somebody
+/// else is another tenant, whose statement it then cancels. It was five seconds against a
+/// two-second wait, so the window was three seconds wide on every cancel that could not connect
+/// promptly.
+///
+/// A cancel is best effort by construction - `PostgreSQL`'s own is - so abandoning a slow one is
+/// the cheap side of this trade. Cancelling a stranger's query is not.
+pub(crate) const CANCEL_DELIVERY_TIMEOUT: Duration = Duration::from_millis(1500);
+
+const _: () = assert!(
+    CANCEL_DELIVERY_TIMEOUT.as_millis() < CANCEL_WAIT_TIMEOUT.as_millis(),
+    "a cancel must not outlive the release that stopped waiting for it, or it lands on \
+     whichever tenant holds the link next"
+);
 
 impl Running<'_> {
     async fn drive(

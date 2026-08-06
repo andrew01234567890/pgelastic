@@ -1092,24 +1092,9 @@ func (in *PerTenantLogicalBackup) DeepCopyInto(out *PerTenantLogicalBackup) {
 		*out = new(bool)
 		**out = **in
 	}
-	if in.Schedule != nil {
-		in, out := &in.Schedule, &out.Schedule
-		*out = new(string)
-		**out = **in
-	}
-	if in.Retention != nil {
-		in, out := &in.Retention, &out.Retention
-		*out = new(string)
-		**out = **in
-	}
 	if in.MaxConcurrentDumps != nil {
 		in, out := &in.MaxConcurrentDumps, &out.MaxConcurrentDumps
 		*out = new(int32)
-		**out = **in
-	}
-	if in.DumpTimeout != nil {
-		in, out := &in.DumpTimeout, &out.DumpTimeout
-		*out = new(v1.Duration)
 		**out = **in
 	}
 }

@@ -213,6 +213,24 @@ impl OutstandingQueue {
         });
     }
 
+    /// Withdraws the `Sync` requests at the back of the queue.
+    ///
+    /// `PostgreSQL` ignores `Flush` and `Sync` received in copy-in mode, so the `Sync` every
+    /// driver pipelines behind the `Execute` that opens a `COPY ... FROM STDIN` draws no
+    /// `ReadyForQuery`. It is recorded before the `CopyInResponse` says the mode was entered,
+    /// so it can only be withdrawn later - and the client's own `CopyDone` is the one instant
+    /// that is both late enough for every ignored `Sync` to be on the queue and early enough
+    /// that no `Sync` the backend *will* answer has joined them.
+    pub fn discard_trailing_syncs(&mut self) {
+        while self
+            .entries
+            .back()
+            .is_some_and(|entry| entry.kind == RequestKind::Sync)
+        {
+            self.entries.pop_back();
+        }
+    }
+
     /// Removes and returns the synthesised responses that have reached the head.
     ///
     /// Call after every push and every [`apply`](Self::apply); a fake entry is

@@ -55,6 +55,10 @@ const (
 	// appear here; finding one means admission has a hole, and reporting it as an ordinary
 	// preflight refusal would hide that.
 	CheckAdmissionInvariants CheckName = "AdmissionInvariants"
+
+	// CheckLargeObjects refuses an online move of a source holding large objects, which
+	// logical replication cannot carry. Offline dumps them, so it is not asked.
+	CheckLargeObjects CheckName = "LargeObjects"
 	// CheckFailoverSlotStack is the online path's precondition. Without the full PG18
 	// stack a failover during the migration destroys the slot, and without
 	// synchronized_standby_slots the subscriber can consume changes no standby has flushed
@@ -159,6 +163,10 @@ type PreflightInput struct {
 	// AllowedExtensions is the pool's curated allowlist, against which the source's
 	// installed extensions are asserted.
 	AllowedExtensions []string
+	// ForbidLargeObjects is spec.forbidLargeObjects, and it is asked only on the online path.
+	// The offline strategy dumps and reloads large objects, so refusing there would refuse a
+	// move that works.
+	ForbidLargeObjects bool
 }
 
 // ContractPair is the operator's record of the two instances' collation contracts.
@@ -191,6 +199,9 @@ func RunPreflight(ctx context.Context, sql SQL, in PreflightInput) PreflightResu
 		checks = append(checks,
 			checkPublishableRelations(ctx, sql, in.Source),
 			CheckFailoverSlots(ctx, sql, in.Source, in.SourceStandbys))
+		if in.ForbidLargeObjects {
+			checks = append(checks, checkLargeObjects(ctx, sql, in.Source))
+		}
 	}
 	return PreflightResult{Checks: checks}
 }
@@ -257,6 +268,36 @@ func checkPublishableRelations(ctx context.Context, sql SQL, at Endpoint) Check 
 		"every relation on the source is one logical replication can carry")
 }
 
+// checkLargeObjects refuses a source holding large objects, on the online path only.
+//
+// Logical replication does not carry them - they live in pg_largeobject, which is not a
+// publishable relation - so an online move would arrive with the rows and without the objects
+// they point at, and nothing would report it. `pg_dump` carries them perfectly well, so the
+// offline strategy is unaffected and is the way out.
+//
+// This used to sit inside checkAdmissionInvariants, unconditional and calling itself an
+// assertion that "admission has a hole". It was not one. `lo_from_bytea` and friends are
+// granted to PUBLIC and nothing in this tree revokes them, so any tenant can create a large
+// object at any time - and while that was an unconditional refusal, such a tenant could not be
+// moved by ANY strategy. Preflight cannot fault, so the migration parked in Preflight for ever
+// rather than failing, and the drain finalizer on its instance held with it: one
+// `SELECT lo_from_bytea(...)` made a PgInstance permanently undrainable.
+func checkLargeObjects(ctx context.Context, sql SQL, at Endpoint) Check {
+	count, err := scalarInt64(ctx, sql, at,
+		`SELECT count(*)::text FROM pg_largeobject_metadata`)
+	if err != nil {
+		return failed(CheckLargeObjects, "could not count the source's large objects: "+err.Error())
+	}
+	if count > 0 {
+		return failed(CheckLargeObjects, fmt.Sprintf(
+			"the source holds %d large object(s), which logical replication does not carry: the "+
+				"tenant would arrive with the rows that reference them and without the objects "+
+				"themselves, and nothing would report it. Use the Offline strategy, which dumps "+
+				"and reloads them, or drop them and retry", count))
+	}
+	return passed(CheckLargeObjects, "the source holds no large objects")
+}
+
 func checkPreparedTransactions(ctx context.Context, sql SQL, at Endpoint) Check {
 	gids, err := firstColumn(ctx, sql, at,
 		`SELECT gid FROM pg_prepared_xacts WHERE database = current_database() ORDER BY 1`)
@@ -285,11 +326,6 @@ var AlwaysInstalledExtensions = []string{"plpgsql"}
 // preflight refusal would let that hole go on being invisible while migrations quietly
 // degraded to the offline path one tenant at a time.
 func checkAdmissionInvariants(ctx context.Context, sql SQL, at Endpoint, allowed []string) Check {
-	largeObjects, err := scalarInt64(ctx, sql, at, `SELECT count(*)::text FROM pg_largeobject_metadata`)
-	if err != nil {
-		return failed(CheckAdmissionInvariants, "could not assert the admission invariants: "+err.Error())
-	}
-
 	permitted := make(map[string]bool, len(allowed)+len(AlwaysInstalledExtensions))
 	for _, name := range slices.Concat(AlwaysInstalledExtensions, allowed) {
 		permitted[name] = true
@@ -305,18 +341,12 @@ func checkAdmissionInvariants(ctx context.Context, sql SQL, at Endpoint, allowed
 		}
 	}
 
-	var breaches []string
-	if largeObjects > 0 {
-		breaches = append(breaches, fmt.Sprintf("%d large object(s)", largeObjects))
-	}
 	if len(unlisted) > 0 {
-		breaches = append(breaches, "extension(s) outside the pool's allowlist: "+strings.Join(unlisted, ", "))
-	}
-	if len(breaches) > 0 {
 		return failed(CheckAdmissionInvariants, fmt.Sprintf(
-			"the source holds %s, which tenant admission refuses outright. Finding them here means "+
-				"admission let them in, not that this migration should degrade to the offline path",
-			strings.Join(breaches, " and ")))
+			"the source holds extension(s) outside the pool's allowlist: %s, which tenant "+
+				"admission refuses outright. Finding them here means admission let them in, "+
+				"not that this migration should degrade to the offline path",
+			strings.Join(unlisted, ", ")))
 	}
 	return passed(CheckAdmissionInvariants,
 		"the admission invariants tenant signup enforces still hold on the source")
