@@ -274,6 +274,13 @@ pub struct PoolManager {
     tracked: Arc<crate::vars::Tracked>,
     /// How long one link may stay pinned, in seconds, zero for no bound.
     max_pin_duration_seconds: AtomicU64,
+    /// How long a client may wait for a backend before it is denied.
+    ///
+    /// An atomic for the same reason its four siblings are: `[pool]`'s bounds are the adoptable
+    /// half of the document, so changing one is picked up at the next checkout instead of
+    /// recreating every replica in the fleet. This one was left in the structural half, so
+    /// altering a number about waiting dropped every client of every tenant on the pool.
+    query_wait_seconds: AtomicU64,
     /// When the budget gauges were last refreshed, in milliseconds since
     /// `budget_epoch`. See [`publish_budget`](Self::publish_budget).
     budget_published_ms: AtomicU64,
@@ -321,6 +328,7 @@ impl PoolManager {
         let max_pinned_percent = u64::from(config.max_pinned_percent);
         let server_idle_timeout_seconds = config.server_idle_timeout_seconds;
         let max_pin_duration_seconds = config.max_pin_duration_seconds;
+        let query_wait_seconds = config.query_wait_seconds;
         let mut allocator = Allocator::new(pool_spec, admission)
             .map_err(|e| ProxyError::config(format!("pool capacity: {e}")))?;
 
@@ -366,6 +374,7 @@ impl PoolManager {
             max_pinned_percent: AtomicU64::new(max_pinned_percent),
             server_idle_timeout_seconds: AtomicU64::new(server_idle_timeout_seconds),
             max_pin_duration_seconds: AtomicU64::new(max_pin_duration_seconds),
+            query_wait_seconds: AtomicU64::new(query_wait_seconds),
             tracked,
             budget_published_ms: AtomicU64::new(0),
             budget_epoch: std::time::Instant::now(),
@@ -464,7 +473,23 @@ impl PoolManager {
             .max_pin_duration_seconds
             .swap(pin_for, Ordering::Relaxed)
             != pin_for;
-        deadline_moved || idle_moved || pinned_moved || pin_for_moved || reap_moved
+        let wait_for = config.query_wait_seconds;
+        let wait_moved = self.query_wait_seconds.swap(wait_for, Ordering::Relaxed) != wait_for;
+        if wait_moved {
+            // The allocator holds its own copy, and it is the half that expires a ticket
+            // already queued. Leaving it behind would apply the new bound to clients that
+            // arrive next and not to the ones already waiting under the old one.
+            self.lock()
+                .allocator
+                .set_max_wait(Duration::from_secs(wait_for));
+        }
+        deadline_moved || idle_moved || pinned_moved || pin_for_moved || reap_moved || wait_moved
+    }
+
+    /// How long a client may wait for a backend before it is denied, as it stands now.
+    #[must_use]
+    pub fn query_wait_timeout(&self) -> Duration {
+        Duration::from_secs(self.query_wait_seconds.load(Ordering::Relaxed))
     }
 
     /// The statement deadline in force now, or `None` when the pool sets none.
@@ -820,7 +845,7 @@ impl PoolManager {
 
         let notice = tokio::time::sleep(self.config.notify_after());
         tokio::pin!(notice);
-        let deadline = tokio::time::sleep(self.config.query_wait_timeout());
+        let deadline = tokio::time::sleep(self.query_wait_timeout());
         tokio::pin!(deadline);
         let mut notified = false;
 
@@ -846,7 +871,7 @@ impl PoolManager {
                         "{code}: waiting for a backend connection ({blocked_by}); \
                          waited {:?} of {:?}",
                         started.elapsed(),
-                        self.config.query_wait_timeout(),
+                        self.query_wait_timeout(),
                     );
                     let _ = crate::wire_io::write_backend(
                         client,

@@ -368,6 +368,7 @@ impl Config {
         structural.pool.max_pinned_percent = 0;
         structural.pool.max_pin_duration_seconds = 0;
         structural.pool.server_idle_timeout_seconds = 0;
+        structural.pool.query_wait_seconds = 0;
         // An instance's allocatable capacity moves whenever that instance rolls, because the
         // operator withholds it while a member is not serving. Leaving it here meant rolling
         // one instance restarted the whole fleet and dropped every client of every tenant on
@@ -1959,6 +1960,21 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(next.pool.server_idle_timeout_seconds, 90);
+        assert!(current.is_dynamic_change(&next));
+    }
+
+    /// The odd one out of the five `[pool]` bounds. Its four siblings were made adoptable so a
+    /// timeout could be changed without recreating every replica; this one was left behind, so
+    /// altering how long a client may wait for a backend dropped every client of every tenant
+    /// on the pool to do it.
+    #[test]
+    fn changing_the_query_wait_changes_no_process_either() {
+        let current = Config::from_str(MINIMAL).unwrap();
+        let next = Config::from_str(&format!(
+            "configVersion = \"2\"\n{MINIMAL}\n[pool]\nqueryWaitSeconds = 5\n"
+        ))
+        .unwrap();
+        assert_eq!(next.pool.query_wait_seconds, 5);
         assert!(current.is_dynamic_change(&next));
     }
 
