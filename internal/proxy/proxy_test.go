@@ -1274,3 +1274,37 @@ func TestTheAdmissionWaitIsTheFieldTheOperatorSet(t *testing.T) {
 			rendered(testPool()))
 	}
 }
+
+// spec.observability.logLevel was validated, defaulted and read by nothing, so an operator
+// raising the level during an incident got no more logs and no indication why. The proxy reads
+// RUST_LOG through EnvFilter, so the fix is to hand it the name it already honours.
+func TestTheProxyLogLevelReachesTheFleet(t *testing.T) {
+	levelIn := func(pool *pgelasticv1alpha1.PgElasticPool) (string, bool) {
+		t.Helper()
+		deployment, err := (Builder{Pool: pool, Image: testImage}).Deployment()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, env := range deployment.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == EnvLogLevel {
+				return env.Value, true
+			}
+		}
+		return "", false
+	}
+
+	pool := testPool()
+	pool.Spec.Observability = &pgelasticv1alpha1.PoolObservability{LogLevel: "Debug"}
+	if value, ok := levelIn(pool); !ok || value != "debug" {
+		t.Fatalf("logLevel did not reach the fleet: %q present=%v", value, ok)
+	}
+
+	// Info is what the proxy picks with no RUST_LOG at all. Rendering it would roll every
+	// fleet in the estate to hand the process the value it already had.
+	quiet := testPool()
+	quiet.Spec.Observability = &pgelasticv1alpha1.PoolObservability{LogLevel: "Info"}
+	if value, ok := levelIn(quiet); ok {
+		t.Fatalf("the default level was rendered as %q, so adopting this change rolls every "+
+			"pool that never asked for anything", value)
+	}
+}

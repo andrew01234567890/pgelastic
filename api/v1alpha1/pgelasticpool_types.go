@@ -1273,6 +1273,11 @@ type PoolMetering struct {
 // PoolObservability configures proxy logging and metrics exposition.
 type PoolObservability struct {
 	// logLevel sets the proxy's log verbosity.
+	//
+	// Carried to the fleet as RUST_LOG, which the proxy already honours. It is part of the pod
+	// spec, so changing it restarts the fleet and drops established client sessions - which is
+	// worth knowing before raising it during an incident. Info is the proxy's own default and
+	// is not rendered, so a pool that asks for it does not roll for it.
 	// +kubebuilder:validation:Enum=Debug;Info;Warn;Error
 	// +kubebuilder:default=Info
 	// +optional

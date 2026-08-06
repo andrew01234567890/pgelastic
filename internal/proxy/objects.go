@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -407,8 +408,16 @@ func (b Builder) env() []corev1.EnvVar {
 	// Omitted entirely for a pool with no observability block, rather than set to the
 	// default. Adding it unconditionally would roll every proxy fleet in the estate - and a
 	// proxy roll drops client sessions - to hand the process a value it already picks.
-	if observability := b.Pool.Spec.Observability; observability != nil && observability.LogFormat != "" {
-		env = append(env, corev1.EnvVar{Name: EnvLogFormat, Value: observability.LogFormat})
+	if observability := b.Pool.Spec.Observability; observability != nil {
+		if observability.LogFormat != "" {
+			env = append(env, corev1.EnvVar{Name: EnvLogFormat, Value: observability.LogFormat})
+		}
+		// The proxy reads RUST_LOG and falls back to "info", so a pool that asks for Info is
+		// asking for what it already gets: setting it anyway would roll every fleet in the
+		// estate to hand the process a value it had.
+		if level := strings.ToLower(observability.LogLevel); level != "" && level != "info" {
+			env = append(env, corev1.EnvVar{Name: EnvLogLevel, Value: level})
+		}
 	}
 	return env
 }
