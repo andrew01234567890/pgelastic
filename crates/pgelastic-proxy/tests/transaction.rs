@@ -10,10 +10,13 @@
 mod harness;
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+use futures_util::SinkExt;
 use harness::{BACKEND_DATABASE, RawClient, Stack, stack_with};
 use pgelastic_wire::BackendMessage;
 
@@ -1331,4 +1334,68 @@ inlineFrameBytes = 8192
         .expect("reading the row back")
         .get(0);
     assert_eq!(length, 64 * 1024);
+}
+
+/// COPY payload past the inline limit, on the transaction path.
+///
+/// `on_client_opaque` decides from the tag byte alone what an undecodable frame was, and `d`
+/// (`CopyData`) must map to nothing: the payload is data inside a request already on the
+/// outstanding queue, so recording each chunk would desynchronise the ledger in the other
+/// direction, and pinning on it would take a link out of rotation for every bulk load.
+///
+/// The COPY test in postgres18.rs was cited as the guard on that. It is not: it declares no
+/// `[pool]` section, so it runs in the default session mode and never enters
+/// `on_client_opaque` at all. Until this test there was no coverage of the `d` branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_copy_chunk_is_data_rather_than_a_request() {
+    let stack = stack_with(
+        "\
+[pool]
+mode = \"transaction\"
+backendConnections = 2
+
+[limits]
+inlineFrameBytes = 8192
+",
+    )
+    .await;
+    let client = stack.connect().await;
+
+    client
+        .batch_execute("CREATE TABLE bulk (id int, payload text)")
+        .await
+        .expect("creating the table");
+
+    let sink = client
+        .copy_in("COPY bulk FROM STDIN WITH (FORMAT text)")
+        .await
+        .expect("opening the copy");
+    futures_util::pin_mut!(sink);
+
+    // Each chunk is far past the inline limit, so every one takes the streaming path.
+    for chunk in 0..8 {
+        let mut buffer = String::with_capacity(64 * 1024);
+        let padding = "x".repeat(120);
+        for row in 0..400 {
+            let id = chunk * 400 + row;
+            writeln!(buffer, "{id}\tpayload-{id}-{padding}").expect("building a chunk");
+        }
+        assert!(
+            buffer.len() > 8192,
+            "a chunk did not exceed the inline limit"
+        );
+        sink.send(Bytes::from(buffer))
+            .await
+            .expect("sending a chunk");
+    }
+    let copied = sink.finish().await.expect("finishing the copy");
+    assert_eq!(copied, 3_200);
+
+    // The session survives, which it would not if a chunk had been recorded as a request.
+    let rows: i64 = client
+        .query_one("SELECT count(*) FROM bulk", &[])
+        .await
+        .expect("the session did not survive the copy")
+        .get(0);
+    assert_eq!(rows, 3_200);
 }

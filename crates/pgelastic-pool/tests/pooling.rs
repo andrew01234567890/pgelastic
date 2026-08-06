@@ -165,6 +165,15 @@ fn an_extended_protocol_copy_is_held_by_the_outstanding_queue_as_well() {
     );
 
     link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward, Origin::Client);
+    assert_eq!(
+        link.can_check_in(),
+        Err(CheckInBlock::OutstandingRequests(1)),
+        "the Sync sent with the Execute reached a backend in copy-in mode, which discards \
+         Flush and Sync, so it draws no ReadyForQuery and is not outstanding"
+    );
+
+    // The second Sync - the one after the CopyDone - is the one the backend answers.
+    link.observe_frontend(&FrontendMessage::Sync, Relay::Forward, Origin::Client);
     link.observe_backend(&BackendMessage::CommandComplete(Bytes::from_static(
         b"COPY 1",
     )))

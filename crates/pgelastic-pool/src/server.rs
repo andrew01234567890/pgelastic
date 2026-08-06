@@ -372,6 +372,11 @@ impl ServerLink {
         let disposition = relay.disposition();
         match message {
             FrontendMessage::CopyDone | FrontendMessage::CopyFail(_) => {
+                // Only for a copy-in this link knows is open. The backend ignores a `CopyDone`
+                // outside copy mode, so a stray one must move nothing here either.
+                if self.copy == CopyState::In {
+                    self.outstanding.discard_trailing_syncs();
+                }
                 self.copy = CopyState::None;
             }
             // Two conditions, and they are independent.
@@ -742,6 +747,49 @@ pub(crate) mod tests {
 
         link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward, Origin::Client);
         assert_eq!(link.copy(), CopyState::None);
+    }
+
+    /// The `Sync` every driver pipelines behind the `Execute` that opens a COPY reaches the
+    /// backend in copy-in mode, where `PostgreSQL` discards it. Left on the queue it makes
+    /// every response after the copy answer the request before the one it belongs to.
+    #[test]
+    fn a_sync_the_backend_ignored_in_copy_in_leaves_the_queue() {
+        let mut link = logged_in();
+        link.observe_frontend(&FrontendMessage::Sync, Relay::Forward, Origin::Client);
+        link.observe_backend(&BackendMessage::CopyInResponse(copy_response()))
+            .unwrap();
+        assert_eq!(link.outstanding().len(), 1);
+
+        link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward, Origin::Client);
+        assert!(link.outstanding().is_empty());
+    }
+
+    /// The `Sync` after the `CopyDone` is answered, so the withdrawal has to stop at the end
+    /// of the copy rather than take every `Sync` it can find.
+    #[test]
+    fn the_sync_that_ends_the_copy_batch_stays_on_the_queue() {
+        let mut link = logged_in();
+        link.observe_backend(&BackendMessage::CopyInResponse(copy_response()))
+            .unwrap();
+        link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward, Origin::Client);
+        link.observe_frontend(&FrontendMessage::Sync, Relay::Forward, Origin::Client);
+        assert_eq!(
+            link.outstanding().kinds().collect::<Vec<_>>(),
+            vec![RequestKind::Sync]
+        );
+    }
+
+    /// A `CopyDone` outside copy-in mode is ignored by the backend, so it must move nothing
+    /// here: a client that sends a stray one would otherwise unrecord a `Sync` that is coming.
+    #[test]
+    fn a_stray_copy_done_withdraws_nothing() {
+        let mut link = logged_in();
+        link.observe_frontend(&FrontendMessage::Sync, Relay::Forward, Origin::Client);
+        link.observe_frontend(&FrontendMessage::CopyDone, Relay::Forward, Origin::Client);
+        assert_eq!(
+            link.outstanding().kinds().collect::<Vec<_>>(),
+            vec![RequestKind::Sync]
+        );
     }
 
     #[test]
