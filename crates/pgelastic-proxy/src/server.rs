@@ -746,7 +746,7 @@ async fn serve(
     .map_err(|_| ProxyError::Timeout(login))??;
 
     let mut session = match accepted {
-        Accepted::Cancel(request) => return cancel(proxy, &request).await,
+        Accepted::Cancel(request) => return bounded_cancel(proxy, &request, deadline, login).await,
         Accepted::Session(session) => session,
     };
 
@@ -1114,6 +1114,24 @@ async fn relay(
 }
 
 /// Transaction mode: the client keeps its socket, the backend changes under it.
+/// A cancel, under the same deadline as every other arm of `serve`.
+///
+/// `serve` bounds the whole pre-auth phase because an unauthenticated peer must not be able to
+/// make the proxy hold anything for longer than it says it will. The cancel arm was outside
+/// that bound, and it runs inside the task holding that peer's client-connection permit - so a
+/// cancel aimed at an address that never answers held a permit against `maxClientConnections`
+/// for as long as the socket took to fail. Belt and braces over the bound inside `deliver`.
+async fn bounded_cancel(
+    proxy: &Arc<Proxy>,
+    request: &pgelastic_wire::CancelRequest,
+    deadline: tokio::time::Instant,
+    login: std::time::Duration,
+) -> Result<()> {
+    tokio::time::timeout_at(deadline, cancel(proxy, request))
+        .await
+        .map_err(|_| ProxyError::Timeout(login))?
+}
+
 async fn multiplexed(
     proxy: &Arc<Proxy>,
     session: &mut handshake::ClientSession,
