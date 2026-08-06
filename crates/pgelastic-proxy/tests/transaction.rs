@@ -1278,3 +1278,57 @@ async fn session_mode_still_binds_one_client_to_one_backend() {
         "session mode must keep the session's own state"
     );
 }
+
+/// A statement larger than the relay's inline limit, in transaction mode.
+///
+/// The relay streams a frame past `inlineFrameBytes` straight through without decoding it, so it
+/// never becomes a `FrontendMessage` and the request never reached the outstanding ledger. The
+/// backend answers it anyway: the statement executes and commits, and the `ReadyForQuery` that
+/// follows arrives against an empty queue and underflows - so the session dies *after* the write
+/// landed, and a driver that retries what looks like a failure writes it twice.
+///
+/// Only the transaction path reaches this. `PoolModeConfig` defaults to `Session`, and
+/// `on_client_opaque` lives in the transaction relay - which is why an earlier attempt at this
+/// test, written with no `[pool]` section, could not reproduce the defect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_statement_commits_and_the_session_survives() {
+    let stack = stack_with(
+        "\
+[pool]
+mode = \"transaction\"
+backendConnections = 2
+
+[limits]
+inlineFrameBytes = 8192
+",
+    )
+    .await;
+    let client = stack.connect().await;
+
+    client
+        .batch_execute("CREATE TABLE wide (id int primary key, payload text)")
+        .await
+        .expect("creating the table");
+
+    // One simple-protocol statement well past the inline limit.
+    let payload = "y".repeat(64 * 1024);
+    client
+        .batch_execute(&format!("INSERT INTO wide VALUES (1, '{payload}')"))
+        .await
+        .expect("an oversized statement that PostgreSQL accepts");
+
+    // The same session, still usable. This is where it died.
+    let rows: i64 = client
+        .query_one("SELECT count(*) FROM wide", &[])
+        .await
+        .expect("the session did not survive the oversized statement")
+        .get(0);
+    assert_eq!(rows, 1, "the oversized statement did not commit");
+
+    let length: i32 = client
+        .query_one("SELECT length(payload) FROM wide WHERE id = 1", &[])
+        .await
+        .expect("reading the row back")
+        .get(0);
+    assert_eq!(length, 64 * 1024);
+}
