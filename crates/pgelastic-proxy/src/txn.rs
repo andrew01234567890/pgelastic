@@ -1105,7 +1105,7 @@ impl Running<'_> {
                     // permanent `26000` for every client that later lands here rather than a
                     // one-transaction annoyance. Dropping the view costs a re-`Parse`.
                     if matches!(message, BackendMessage::ErrorResponse(_)) {
-                        checkout.conn.statements.clear();
+                        checkout.conn.statements.forget();
                     }
                     if reaction.disposition.forwards() {
                         self.witness.observe_backend(&message);

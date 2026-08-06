@@ -368,6 +368,13 @@ pub struct ServerStatements {
     capacity: usize,
     names: HashMap<u64, StatementName>,
     recency: VecDeque<u64>,
+    /// Set when the view was dropped without the backend being told.
+    ///
+    /// `forget` is called on an `ErrorResponse` because the view may name a statement the
+    /// backend does not have. The backend may equally still hold one this view has forgotten,
+    /// and re-`Parse`ing under the same generated name then draws `42P05 already exists`.
+    /// While this is set, every first `Parse` of a name closes it first.
+    forgotten: bool,
 }
 
 impl ServerStatements {
@@ -376,6 +383,7 @@ impl ServerStatements {
             capacity: capacity.max(1),
             names: HashMap::new(),
             recency: VecDeque::new(),
+            forgotten: false,
         }
     }
 
@@ -417,6 +425,13 @@ impl ServerStatements {
                 evict,
                 name: statement.name.clone(),
             },
+            // Closing the name we are about to parse is not a contradiction: a `Close` of a
+            // statement the backend does not have is a no-op that answers `CloseComplete`, and
+            // one it does have is exactly the collision this avoids.
+            None if self.forgotten => ServerAction::EvictThenParse {
+                evict: statement.name.clone(),
+                name: statement.name.clone(),
+            },
             None => ServerAction::Parse(statement.name.clone()),
         }
     }
@@ -424,10 +439,23 @@ impl ServerStatements {
     /// Forgets everything, because the backend has.
     ///
     /// Called when a `DEALLOCATE ALL` or `DISCARD ALL` passes through, and
-    /// whenever the link is scrubbed.
+    /// whenever the link is scrubbed. The backend really has forgotten in both of those, so
+    /// nothing needs closing afterwards.
     pub fn clear(&mut self) {
         self.names.clear();
         self.recency.clear();
+        self.forgotten = false;
+    }
+
+    /// Forgets everything without knowing what the backend still holds.
+    ///
+    /// Called on an `ErrorResponse`, where the view may name a statement the backend does not
+    /// have - and, just as possibly, the backend holds one this view is about to forget. Until
+    /// each name has been closed once, every `Parse` is preceded by a `Close`.
+    pub fn forget(&mut self) {
+        self.names.clear();
+        self.recency.clear();
+        self.forgotten = true;
     }
 
     fn touch(&mut self, id: u64) {

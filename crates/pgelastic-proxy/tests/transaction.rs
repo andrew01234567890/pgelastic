@@ -1399,3 +1399,35 @@ inlineFrameBytes = 8192
         .get(0);
     assert_eq!(rows, 3_200);
 }
+
+/// A pipelined error must not make the next statement vanish.
+///
+/// `pump_backend` drops the link's prepared-statement view on any `ErrorResponse`, because it
+/// cannot tell which request the error belonged to and a view naming a statement the backend
+/// does not have would be a permanent `26000`. That is the safe direction. What it opens is the
+/// other one: a client `Parse` already on the wire is forgotten, the next `Bind` re-`Parse`s
+/// under the same generated name, and the backend - which does have it - answers `42P05`. That
+/// error is the pool's own, so it is skipped, and the client's `Bind` and `Execute` are
+/// discarded with it. The client gets a bare `ReadyForQuery`: no `BindComplete`, no rows, and
+/// no error to explain it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_error_beside_a_pipelined_statement_does_not_swallow_it() {
+    let stack = stack_with(ONE).await;
+    let client = stack.connect().await;
+
+    for _ in 0..8 {
+        let (failed, ok) = tokio::join!(
+            client.batch_execute("SELECT 1 / 0"),
+            client.query_one("SELECT count(*) FROM pg_catalog.pg_class", &[]),
+        );
+
+        assert!(
+            failed.is_err(),
+            "a division by zero was reported as success"
+        );
+        let rows: i64 = ok
+            .expect("the statement pipelined beside a failing one was answered")
+            .get(0);
+        assert!(rows > 0, "the catalogue query returned {rows}");
+    }
+}
