@@ -1243,3 +1243,34 @@ func routingTenantsLine(t *testing.T, rendered string) string {
 	t.Fatalf("no routing tenants line in:\n%s", rendered)
 	return ""
 }
+
+// Two API fields name this bound, with the same default, and only spec.timeouts.checkout was
+// ever read. A pool that told admission to give up after five seconds waited thirty, and the
+// number it set was stored, defaulted, validated and inert.
+func TestTheAdmissionWaitIsTheFieldTheOperatorSet(t *testing.T) {
+	rendered := func(pool *pgelasticv1alpha1.PgElasticPool) string {
+		t.Helper()
+		return Config{Pool: pool}.Render().TOML
+	}
+
+	pool := testPool()
+	pool.Spec.Admission = &pgelasticv1alpha1.PoolAdmission{MaxWaitSeconds: ptr.To(int32(5))}
+	if !strings.Contains(rendered(pool), "queryWaitSeconds = 5") {
+		t.Fatalf("spec.admission.maxWaitSeconds did not reach the fleet:\n%s", rendered(pool))
+	}
+
+	// The other field still works, and is what applies when the specific one is unset.
+	fallback := testPool()
+	fallback.Spec.Timeouts = &pgelasticv1alpha1.PoolTimeouts{
+		Checkout: &metav1.Duration{Duration: 7 * time.Second},
+	}
+	if !strings.Contains(rendered(fallback), "queryWaitSeconds = 7") {
+		t.Fatalf("spec.timeouts.checkout stopped applying:\n%s", rendered(fallback))
+	}
+
+	// And the shared default when neither is set, which both fields document as 30.
+	if !strings.Contains(rendered(testPool()), "queryWaitSeconds = 30") {
+		t.Fatalf("a pool that set neither did not get the documented default:\n%s",
+			rendered(testPool()))
+	}
+}

@@ -320,6 +320,10 @@ const defaultGlobalStatementsLimit = 2048
 // was already written down onto every pool in an estate at once.
 const defaultQueryDeadlineSeconds = 120
 
+// defaultQueryWaitSeconds matches the default both API fields that name this bound carry, so
+// a pool that sets neither gets what both of them say it will.
+const defaultQueryWaitSeconds = 30
+
 // defaultIdleInTransactionSeconds must match the +kubebuilder:default on
 // spec.timeouts.clientIdleInTransaction, and is reached for the same reason as its sibling.
 const defaultIdleInTransactionSeconds = 60
@@ -382,13 +386,13 @@ func (c Config) renderPool(out *strings.Builder, dynamic bool) {
 	writeInt(out, "headroomPercent", int64(headroomPercent(c.Pool)))
 	writeInt(out, "maxClientConnections", int64(maxClientConnections(c.Pool)))
 	writeString(out, "resetPolicy", resetPolicy(pooling))
-	writeInt(out, "queryWaitSeconds", seconds(timeouts(c.Pool).Checkout, 30))
 	// Written only into the full document. The proxy adopts this one at a checkout boundary,
 	// so leaving it in the structural half would mean an operator could not change a statement
 	// deadline without rolling the whole fleet and dropping every client of every tenant to do
 	// it. The Rust side clears the same field in Config::structural, and the two halves have to
 	// agree or the pods roll for a change the binary was willing to adopt.
 	if dynamic {
+		writeInt(out, "queryWaitSeconds", queryWaitSeconds(c.Pool))
 		writeInt(out, "queryDeadlineSeconds", queryDeadlineSeconds(c.Pool))
 		writeInt(out, "clientIdleInTransactionSeconds",
 			openBoundSeconds(timeouts(c.Pool).ClientIdleInTransaction, defaultIdleInTransactionSeconds))
@@ -586,6 +590,20 @@ func seconds(duration *metav1.Duration, fallback int64) int64 {
 		return fallback
 	}
 	return int64((duration.Duration + time.Second - 1) / time.Second)
+}
+
+// queryWaitSeconds is how long a client may wait for a backend before it is denied.
+//
+// Two API fields say this, with the same default, and only one was ever read. An operator
+// reaching for spec.admission.maxWaitSeconds - which sits beside queueDepthPerTenant, where
+// somebody thinking about admission would look - set a number that did nothing, and the pool
+// went on waiting for whatever spec.timeouts.checkout said. The more specific field wins when
+// it is set; otherwise the timeout group's, and then the shared default.
+func queryWaitSeconds(pool *pgelasticv1alpha1.PgElasticPool) int64 {
+	if admission := pool.Spec.Admission; admission != nil && admission.MaxWaitSeconds != nil {
+		return int64(*admission.MaxWaitSeconds)
+	}
+	return seconds(timeouts(pool).Checkout, defaultQueryWaitSeconds)
 }
 
 func queryDeadlineSeconds(pool *pgelasticv1alpha1.PgElasticPool) int64 {

@@ -159,8 +159,13 @@ spec:
                     type: string
                   maxWaitSeconds:
                     default: 30
-                    description: maxWaitSeconds bounds how long a client waits for
-                      a backend before it is denied.
+                    description: |-
+                      maxWaitSeconds bounds how long a client waits for a backend before it is denied.
+
+                      The same bound as spec.timeouts.checkout, which carries the same default. This one wins
+                      when it is set; otherwise the timeout group's value applies. Set one or the other, not
+                      both - two numbers for one bound is how this field came to be stored, defaulted and read
+                      by nothing at all.
                     format: int32
                     maximum: 3600
                     minimum: 0
@@ -10395,8 +10400,10 @@ spec:
                     type: string
                   checkout:
                     default: 30s
-                    description: checkout bounds how long a client waits to be granted
-                      a backend.
+                    description: |-
+                      checkout bounds how long a client waits to be granted a backend.
+
+                      spec.admission.maxWaitSeconds is the same bound and takes precedence when it is set.
                     type: string
                   clientIdleInTransaction:
                     default: 60s
