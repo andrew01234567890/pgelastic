@@ -333,25 +333,11 @@ spec:
                 description: |-
                   perTenantLogicalBackup reserves the connections and the concurrency a per-database
                   pg_dump needs, and is read for exactly that: instance sizing, and the parallelism a
-                  tenant migration's dump runs at.
-
-                  It does NOT schedule anything. There is no sweeper and no dump executor, so `schedule`,
-                  `retention` and `dumpTimeout` are stored and read by nothing, and enabling this buys no
-                  artifact to recover a tenant's own deletion from. The operator says so on the instance
-                  rather than leaving the field to imply otherwise; recovering one tenant is what
-                  PgRestore's Tenant scope does today.
+                  tenant migration's dump runs at. It schedules nothing.
                 properties:
-                  dumpTimeout:
-                    default: 2h
-                    description: |-
-                      dumpTimeout would abort and reschedule an overrunning dump rather than letting it hold
-                      the xmin horizon open indefinitely. Inert: nothing here executes a dump to time out.
-                    type: string
                   enabled:
                     default: true
-                    description: |-
-                      enabled reserves the dump capacity below. It starts no sweep: there is no scheduler and
-                      no dump executor, so nothing here ever takes a dump.
+                    description: enabled reserves the dump capacity below.
                     type: boolean
                   maxConcurrentDumps:
                     default: 4
@@ -364,19 +350,6 @@ spec:
                     maximum: 16
                     minimum: 1
                     type: integer
-                  retention:
-                    default: 14d
-                    description: 'retention is how long dumps are kept. Inert: no
-                      dump is taken to retain.'
-                    maxLength: 32
-                    type: string
-                  schedule:
-                    default: 0 4 * * *
-                    description: 'schedule is a five-field cron expression for the
-                      sweep. Inert: no sweeper reads it.'
-                    maxLength: 256
-                    minLength: 1
-                    type: string
                 type: object
               poolRef:
                 description: |-

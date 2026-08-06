@@ -521,10 +521,7 @@ var _ = Describe("v1alpha1 CRD round-trip", Ordered, func() {
 							},
 							PerTenantLogicalBackup: &pgelasticv1alpha1.PerTenantLogicalBackup{
 								Enabled:            ptrTo(true),
-								Schedule:           ptrTo("0 4 * * *"),
-								Retention:          ptrTo("14d"),
 								MaxConcurrentDumps: ptrTo(int32(4)),
-								DumpTimeout:        duration(2 * time.Hour),
 							},
 						},
 					},
@@ -786,10 +783,7 @@ var _ = Describe("v1alpha1 CRD round-trip", Ordered, func() {
 					},
 					PerTenantLogicalBackup: &pgelasticv1alpha1.PerTenantLogicalBackup{
 						Enabled:            ptrTo(true),
-						Schedule:           ptrTo("0 4 * * *"),
-						Retention:          ptrTo("14d"),
 						MaxConcurrentDumps: ptrTo(int32(4)),
-						DumpTimeout:        duration(2 * time.Hour),
 					},
 					Admission: &pgelasticv1alpha1.InstanceAdmission{
 						Schedulable: ptrTo(true),

@@ -272,13 +272,7 @@ type PgInstanceSpec struct {
 
 	// perTenantLogicalBackup reserves the connections and the concurrency a per-database
 	// pg_dump needs, and is read for exactly that: instance sizing, and the parallelism a
-	// tenant migration's dump runs at.
-	//
-	// It does NOT schedule anything. There is no sweeper and no dump executor, so `schedule`,
-	// `retention` and `dumpTimeout` are stored and read by nothing, and enabling this buys no
-	// artifact to recover a tenant's own deletion from. The operator says so on the instance
-	// rather than leaving the field to imply otherwise; recovering one tenant is what
-	// PgRestore's Tenant scope does today.
+	// tenant migration's dump runs at. It schedules nothing.
 	// +optional
 	PerTenantLogicalBackup *PerTenantLogicalBackup `json:"perTenantLogicalBackup,omitempty"`
 
@@ -505,31 +499,22 @@ type InstanceBackup struct {
 	BackupStandby *bool `json:"backupStandby,omitempty"`
 }
 
-// PerTenantLogicalBackup reserves the capacity a per-database dump needs.
+// PerTenantLogicalBackup reserves the connections a per-database dump needs.
 //
-// NOT IMPLEMENTED as a scheduled sweep. Only maxConcurrentDumps has a reader: instance sizing
-// charges the reserve, and a tenant migration's pg_dump runs at that parallelism. The other
-// fields are stored and read by nothing, so enabling this produces no artifact and is not a
-// recovery path for a tenant that deleted its own data - a PgRestore of scope Tenant is.
+// It schedules nothing. There is no sweeper and no dump executor: this sizes the reserve an
+// instance holds outside every tenant's budget, and sets the parallelism a tenant migration's
+// pg_dump runs at. Recovering one tenant without touching the others is what a PgRestore of
+// scope Tenant does.
+//
+// It once also carried a cron schedule, a retention and a dump timeout, all defaulted and all
+// read by nothing - so an operator could enable a "nightly backup" that produced no artifact
+// and discover it at the moment they needed one. They are gone rather than documented as
+// inert; a field that does nothing is worse than an absent one, because it is reassuring.
 type PerTenantLogicalBackup struct {
-	// enabled reserves the dump capacity below. It starts no sweep: there is no scheduler and
-	// no dump executor, so nothing here ever takes a dump.
+	// enabled reserves the dump capacity below.
 	// +kubebuilder:default=true
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
-
-	// schedule is a five-field cron expression for the sweep. Inert: no sweeper reads it.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=256
-	// +kubebuilder:default="0 4 * * *"
-	// +optional
-	Schedule *string `json:"schedule,omitempty"`
-
-	// retention is how long dumps are kept. Inert: no dump is taken to retain.
-	// +kubebuilder:validation:MaxLength=32
-	// +kubebuilder:default="14d"
-	// +optional
-	Retention *string `json:"retention,omitempty"`
 
 	// maxConcurrentDumps caps simultaneous dumps on this instance. Each open dump holds
 	// back the instance-wide xmin horizon, which blocks vacuum for every tenant on the
@@ -540,12 +525,6 @@ type PerTenantLogicalBackup struct {
 	// +kubebuilder:default=4
 	// +optional
 	MaxConcurrentDumps *int32 `json:"maxConcurrentDumps,omitempty"`
-
-	// dumpTimeout would abort and reschedule an overrunning dump rather than letting it hold
-	// the xmin horizon open indefinitely. Inert: nothing here executes a dump to time out.
-	// +kubebuilder:default="2h"
-	// +optional
-	DumpTimeout *metav1.Duration `json:"dumpTimeout,omitempty"`
 }
 
 // InstanceAdmission controls tenant placement onto this instance.
